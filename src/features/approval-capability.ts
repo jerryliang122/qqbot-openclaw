@@ -38,6 +38,7 @@ import {
   buildApprovalKeyboard,
   buildExecApprovalText,
   buildPluginApprovalText,
+  buildSystemAgentApprovalText,
   resolveApprovalTarget,
 } from "./approval-helpers.js";
 
@@ -147,7 +148,7 @@ const qqbotApprovalNativeRuntime = createChannelApprovalNativeRuntimeAdapter<
   QQBotPreparedTarget,
   QQBotPendingEntry
 >({
-  eventKinds: ["exec", "plugin"],
+  eventKinds: ["exec", "plugin", "system-agent"],
 
   availability: {
     isConfigured: ({ cfg, accountId }) =>
@@ -164,7 +165,9 @@ const qqbotApprovalNativeRuntime = createChannelApprovalNativeRuntimeAdapter<
       const text =
         view.approvalKind === "exec"
           ? buildExecApprovalText(view, nowMs)
-          : buildPluginApprovalText(view, nowMs);
+          : view.approvalKind === "system-agent"
+            ? buildSystemAgentApprovalText(view, nowMs)
+            : buildPluginApprovalText(view, nowMs);
       const keyboard = buildApprovalKeyboard(
         view.approvalId,
         view.approvalKind,
@@ -278,7 +281,7 @@ function createQQBotApprovalCapability(): ChannelApprovalCapability {
     },
 
     nativeRuntime: createLazyChannelApprovalNativeRuntimeAdapter({
-      eventKinds: ["exec", "plugin"],
+      eventKinds: ["exec", "plugin", "system-agent"],
       isConfigured: ({ cfg, accountId }) => isNativeDeliveryEnabled(cfg, accountId),
       shouldHandle: ({ cfg, accountId, request }) => {
         const target = resolveQQTarget(request as never);

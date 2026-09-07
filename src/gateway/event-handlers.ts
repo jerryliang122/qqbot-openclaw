@@ -211,6 +211,7 @@ async function handleApproval(
     await resolveApprovalOverGateway({
       cfg,
       approvalId: parsed.approvalId,
+      approvalKind: parsed.approvalKind,
       decision: parsed.decision,
       senderId: operatorId,
       clientDisplayName: 'QQBot Approval Handler',

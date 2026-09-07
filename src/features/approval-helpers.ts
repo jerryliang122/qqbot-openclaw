@@ -13,6 +13,7 @@
 
 import type {
   ExecApprovalPendingView,
+  PendingApprovalView,
   PluginApprovalPendingView,
 } from "openclaw/plugin-sdk/approval-handler-runtime";
 import { resolveExecApprovalCommandDisplay } from "openclaw/plugin-sdk/approval-runtime";
@@ -21,7 +22,13 @@ import type { InlineKeyboard, KeyboardButton } from "../types.js";
 
 // ============ Types ============
 
-export type ApprovalKind = "exec" | "plugin";
+export type ApprovalKind = "exec" | "plugin" | "system-agent";
+
+// The SDK re-exports only the pending-view union, not the system-agent member.
+export type SystemAgentApprovalPendingView = Extract<
+  PendingApprovalView,
+  { approvalKind: "system-agent" }
+>;
 export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
 
 export interface ApprovalTarget {
@@ -129,6 +136,28 @@ export function buildPluginApprovalText(
   return lines.join("\n");
 }
 
+export function buildSystemAgentApprovalText(
+  view: SystemAgentApprovalPendingView,
+  nowMs = Date.now(),
+): string {
+  const expiresIn = Math.max(0, Math.round((view.expiresAtMs - nowMs) / 1000));
+
+  const lines: string[] = ["🛡️ 系统变更审批", ""];
+  lines.push(`📋 ${view.title}`);
+  if (view.description) lines.push(`📝 ${view.description}`);
+  if (view.operationSummary) lines.push(`📊 ${view.operationSummary}`);
+  if (view.commandText) {
+    lines.push(formatCommandPreview(view.commandText));
+  }
+  if (view.cwd) {
+    lines.push(`📁 目录:\n${formatApprovalMetadata(view.cwd)}`);
+  }
+  if (view.host) lines.push(`🖥️ 主机: ${view.host}`);
+  if (view.agentId) lines.push(`🤖 Agent:\n${formatApprovalMetadata(view.agentId)}`);
+  lines.push("", `⏱️ 超时: ${expiresIn} 秒`);
+  return lines.join("\n");
+}
+
 // ============ Keyboard Builder ============
 
 /**
@@ -220,12 +249,13 @@ export function resolveApprovalTarget(
  * Expected format: `approve:v2:<approvalKind>:<encodedApprovalId>:<decision>`.
  * The approvalKind is baked into the payload so the resolve path doesn't need
  * to infer it from the ID prefix, and the ID is URL-encoded so colons in
- * `exec:<uuid>` / `plugin:<uuid>` IDs survive unambiguously.
+ * `exec:<uuid>` / `plugin:<uuid>` / `system-agent:<uuid>` IDs survive
+ * unambiguously.
  *
  * Returns null if the data does not match the approval button format.
  */
 export function parseApprovalButtonData(buttonData: string): ParsedApprovalAction | null {
-  const m = buttonData.match(/^approve:v2:(exec|plugin):([^:]+):(allow-once|allow-always|deny)$/);
+  const m = buttonData.match(/^approve:v2:(exec|plugin|system-agent):([^:]+):(allow-once|allow-always|deny)$/);
   if (!m || m[0] !== buttonData) return null;
   const kind = m[1] as ApprovalKind;
   const encodedId = m[2];
