@@ -24,6 +24,7 @@ import { getQQBotDataDir } from '../utils/platform.js';
 import { buildUserAgent } from '../bot-instance.js';
 import { createPluginWebhookAdapter } from '../adapter/webhook.js';
 import { getPersistedRefIndexStore } from '../features/ref-index-store.js';
+import { recordOutboundMessageId } from '../features/outbound-echo-store.js';
 import { getCachedMsgId } from '../features/msgid-cache.js';
 import { notifyOutboundMessageSent } from '../features/typing-refresh.js';
 
@@ -140,6 +141,20 @@ export class QQBotGateway {
       ).catch((err) => {
         this.log.error(`Interaction error: ${err}`);
       });
+    });
+
+    // 平台原始事件观测：一切未被 SDK 映射为 message/interaction 的推送
+    // （入群申请、好友变动、reaction、media_upload_finish、未来新增类型）
+    // 都走这里 —— 此前被静默丢弃，是入站诊断的主要盲区
+    this.bot.on('rawEvent', (evt: { eventType?: string; data?: unknown }) => {
+      let preview = '{}';
+      try {
+        preview = JSON.stringify(evt?.data ?? {});
+      } catch {
+        preview = '<unserializable>';
+      }
+      if (preview.length > 300) preview = `${preview.slice(0, 300)}…`;
+      this.log.info(`[rawEvent] t=${evt?.eventType ?? '?'} payload=${preview}`);
     });
 
     await this.bot.start(signal);
@@ -259,6 +274,9 @@ export class QQBotGateway {
     const senderName = this.account.config.name ?? appId;
 
     const storeEntry = (msg: MessageResponse, content: string, scope: string, mediaKind?: string): void => {
+      // 出站 id 先登记回声表（不依赖 ext_info.ref_idx 是否返回），
+      // 供 inboundGuard 识别平台回投的 bot 自身消息
+      recordOutboundMessageId(accountId, msg.id);
       const refIdx = msg.ext_info?.ref_idx;
       if (!refIdx) return;
       
@@ -309,6 +327,7 @@ export class QQBotGateway {
       const origComplete = session.complete.bind(session);
       session.complete = async (): Promise<any> => {
         const result = await origComplete();
+        recordOutboundMessageId(accountId, result?.id);
         if (result?.ext_info?.ref_idx) {
           getPersistedRefIndexStore(accountId).set(result.ext_info.ref_idx, {
             messageId: result.id, content: lastContent, senderId: appId, senderName,

@@ -29,6 +29,7 @@ import { getPersistedRefIndexStore } from '../features/ref-index-store.js';
 import { createPolicyInjector } from '../middleware/policy-injector.js';
 import { getHistoryStore, historyGroupKey } from '../features/history-store.js';
 import { dynamicAccessControl } from '../middleware/access-control.js';
+import { inboundGuard } from '../middleware/inbound-guard.js';
 import { secretCapture } from '../middleware/secret-capture.js';
 import { c2cTypingIndicator } from '../middleware/typing.js';
 import { stripMentionText } from '../utils/mention.js';
@@ -48,7 +49,14 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
   bot.use(errorHandler());
 
   // 2. 消息过滤：bot 回声 + 消息去重
-  bot.use(messageFilter({ skipSelfEcho: false }));
+  //    skipSelfEcho 必须开启：SDK 注明 QQ 会把 bot 自身出站消息回投为入站
+  //    事件（群聊尤其常见，按 author.bot 识别）；私聊回声无该标记，
+  //    由 inboundGuard 的出站 id 比对兜底
+  bot.use(messageFilter({ skipSelfEcho: true }));
+
+  // 2.5 入站事件守卫：出站回声（c2c）+ 重复推送长窗口去重 + 空内容事件
+  //     三个检查都打 INFO 日志留痕；详见 src/middleware/inbound-guard.ts
+  bot.use(inboundGuard({ accountId: account.accountId }));
 
   // 3. 动态策略注入 — 每条消息注入 ctx.state.policy
   //    后续 dynamicAccessControl / mentionGate / historyBuffer 自动读取
