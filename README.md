@@ -4,7 +4,7 @@
 
 # QQ Bot Channel Plugin for OpenClaw
 
-**Forked version with enhanced features for group/C2C differential handling and message coalescing**
+**Forked version with framework-delegated group queueing, room-event ingestion for full-mode groups, and passive-first outbound delivery**
 
 **Connect your AI assistant to QQ — private chat, group chat, and rich media, all in one plugin.**
 
@@ -37,9 +37,12 @@ Scan to join the QQ group chat
 
 | Feature | Description |
 |---------|-------------|
-| 🔄 **Differential Handling** | Group: message coalescing (all messages processed, fast messages merged); C2C: user can interrupt (new message cancels old) |
-| 🔒 **Multi-Scene** | C2C private chat, group chat (@mention / autonomous dual mode) |
-| 👥 **Group Fine-Tuning** | Per-group @trigger rules, tool policies, custom prompts, message filtering, coalescing config |
+| 🔄 **Group Queueing** | Group messages dispatch immediately; queueing/merging is delegated to the OpenClaw framework followup queue (collect mode) — active turns are never interrupted, bursts merge into one batch |
+| 👁️ **Room Events** (opt-in) | In groups with full-message push mode, the bot can read every message like a normal member; un-@'d traffic arrives as passive room events (read-only — the AI speaks only via the proactive `message` tool) |
+| 🔔 **Three Wake Modes** | @mention, name patterns (`mentionPatterns`, e.g. "沈处"), and quote-of-bot-message all trigger normal replies |
+| 📤 **Passive-First Outbound** | Every send prefers passive reply (msg_id) to conserve the 1000/day proactive budget; quota-aware fallback never hard-fails |
+| 🔒 **Multi-Scene** | C2C private chat, group chat (@mention / autonomous / room-event modes) |
+| 👥 **Group Fine-Tuning** | Per-group @trigger rules, tool policies, custom prompts, history modes, queueing strategy, room-event policy |
 | 🌐 **Dual Transport** | WebSocket (default) or Webhook (HTTP callback) — switch via config |
 | 🖼️ **Rich Media** | Send & receive images, voice, video, and files |
 | 🎙️ **Voice (STT/TTS)** | Speech-to-text transcription & text-to-speech replies |
@@ -258,6 +261,14 @@ Toggle group @trigger behavior at runtime — changes persist instantly, no rest
 | `/bot-group-always` (no arg) | View current setting |
 
 > ⚠️ This command modifies the account-level `defaultRequireMention`. It has lower priority than per-group `groups.{groupId}.requireMention` settings.
+
+#### `/bot-group-info` — Group Push Mode & Effective Config (in-group)
+
+> **You**: `/bot-group-info` *(sent in a group)*
+>
+> **QQBot**: 🤖 群信息 — push mode inference (AT / full), requireMention, queueing strategy, history mode, room-event policy, today's proactive message usage
+
+Answers "why does this group have no context" diagnostics: the push mode is chosen by the **group owner** when adding the bot (AT only / AT + recent N / full), and this command shows what the plugin actually observes plus every effective config value.
 
 ---
 
@@ -540,8 +551,10 @@ Besides `requireMention`, each group supports these settings:
 | `ignoreOtherMentions` | `boolean` | `false` | If enabled, messages that @mention others but not the bot are silently dropped (not recorded, no AI trigger) |
 | `toolPolicy` | `"full" \| "restricted" \| "none"` | `"restricted"` | Tool scope available to AI in this group. `full`=all tools; `restricted`=sensitive tools restricted (e.g., command execution, file ops); `none`=no tool calls allowed |
 | `prompt` | `string` | built-in default | Group-specific system prompt, appended after global systemPrompt |
-| `historyLimit` | `number` | `50` | Cached group history message count |
-| `coalesce` | `object` | `{enabled: true, maxBuffer: 50}` | Message coalescing config for this group (see below) |
+| `historyLimit` | `number` | `20` | Cached group history message count (0 disables) |
+| `historyMode` | `"clear" \| "rolling"` | `"clear"` | `clear`: wipe history after each reply (legacy). `rolling`: bot outbounds are recorded too, and history is trimmed to after the bot's last message (AI sees what it last said) |
+| `unmentionedInbound` | `"user_request" \| "room_event"` | `"user_request"` | `room_event`: read all messages like a group member; un-@'d traffic becomes passive room events (see [Room Events](#room-events-for-full-mode-groups-unmentionedinbound--opt-in); requires full-push-mode group) |
+| `coalesce` | `object` | `{strategy: "framework", enabled: true, maxBuffer: 50}` | Group queueing config (see [Group Message Queueing](#group-message-queueing-configuration-coalesce--groupcoalesce)) |
 
 **Full example with multiple groups:**
 
@@ -605,21 +618,23 @@ Control which groups are allowed via `groupPolicy`:
 
 The plugin implements different message handling strategies for group and private chats:
 
-#### Group Chat (Coalescing Strategy)
+#### Group Chat (Framework Queue Strategy)
 
 - **All messages are processed** — nothing is dropped
-- **Fast messages are merged** — when multiple messages arrive quickly, they are combined into one context
-- **SessionKey format**: `qqbot:{accountId}:group:{groupId}:coalescing`
-- **Admission strategy**: `cancel-only` — doesn't cancel ongoing tasks
+- **Immediate dispatch** — messages go straight to the framework; no plugin-side waiting room
+- **Queueing by the framework** — while a turn is active, subsequent messages queue behind it (`collect` mode: merged into one batch after the active turn finishes; 500ms debounce absorbs bursts, queue cap with overflow summarizing)
+- **Never interrupts** — an active turn always completes; new messages wait their turn
+- **SessionKey format**: `qqbot:{accountId}:group:{groupId}:coalescing` (legacy naming, kept for session continuity)
+- **Admission strategy**: `exclusive` (framework durable-ingress convention) with **no abort signal** — interruption is structurally impossible
 
 **Example behavior**:
 
 ```
 User A: "Question 1"  → Start processing
-User B: "Question 2"  → Buffer and wait
-User C: "Question 3"  → Buffer and wait
+User B: "Question 2"  → Queued in framework followup queue
+User C: "Question 3"  → Queued in framework followup queue
 
-Question 1 completes → Merge [Q1, Q2, Q3] → AI sees combined context
+Question 1 completes → [Q2, Q3] drain as one merged batch → AI sees combined context, single reply
 ```
 
 #### C2C Private Chat (Exclusive Strategy)
@@ -627,7 +642,7 @@ Question 1 completes → Merge [Q1, Q2, Q3] → AI sees combined context
 - **User can interrupt** — sending a new message cancels the previous one
 - **Last message wins** — only the most recent message is processed
 - **SessionKey format**: `qqbot:{accountId}:{userId}`
-- **Admission strategy**: `exclusive` — new message cancels old
+- **Admission strategy**: `exclusive` with abort signal — new message cancels old
 
 **Example behavior**:
 
@@ -638,21 +653,22 @@ User A: "Question 2"  → Cancel Q1, start processing Q2
 
 #### Why This Design?
 
-- **In groups**: All user messages should be preserved and addressed
+- **In groups**: All user messages should be preserved and addressed; a group is multi-user, so interruption would steal one member's answer from another
 - **In C2C**: Users can change their mind mid-conversation
 - **Aligns with user expectations** in different chat contexts
 
 ---
 
-### Message Coalescing Configuration (`groupCoalesce`)
+### Group Message Queueing Configuration (`coalesce` / `groupCoalesce`)
 
-Control how group messages are merged when they arrive in quick succession:
+Control how group messages are queued and merged when they arrive in quick succession:
 
 ```json
 {
   "channels": {
     "qqbot": {
       "groupCoalesce": {
+        "strategy": "framework",
         "enabled": true,
         "maxBuffer": 50
       },
@@ -674,47 +690,36 @@ Control how group messages are merged when they arrive in quick succession:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | `boolean` | `true` | Enable/disable message coalescing |
-| `maxBuffer` | `number` | `50` | Maximum number of messages to buffer per group |
+| `strategy` | `"framework" \| "plugin"` | `"framework"` | Queueing engine: `framework` delegates to the OpenClaw followup queue (recommended); `plugin` restores the legacy in-plugin busy-buffering coalescer (rollback switch) |
+| `enabled` | `boolean` | `true` | Under `framework` strategy: `true` → framework `collect` mode (queue + merge batches); `false` → `followup` mode (queue without merging — preserves the legacy "disable merging" intent while never interrupting active turns). Under `plugin` strategy: gates the plugin coalescer |
+| `maxBuffer` | `number` | `50` | Plugin-strategy buffer cap (ignored by the framework queue, which has its own cap + overflow summarizing) |
 
 **Priority chain**: `groups.{groupId}.coalesce` > `groupCoalesce` (account-level) > defaults
 
-**When enabled**:
+**When enabled** (framework `collect`):
 
-- Fast messages in groups are buffered and merged
-- The AI sees combined context with clear formatting:
-  ```
-  [Merged messages begins]
-  [User A] Question 1
-  [User B] Question 2
-  [Merged messages ends]
-  [Current message]
-  [User C] Question 3 (@you)
-  ```
-- Prevents message loss and ensures all user input is addressed
+- Messages during an active turn queue up and drain as one merged batch
+- 500ms debounce absorbs rapid-fire bursts even on an idle group
+- Queue overflow is summarized (never hard-dropped like the old buffer-full behavior)
+- The AI sees combined context with per-sender attribution, single reply per batch
 
-**Configuration example**:
+---
+
+### Room Events for Full-Mode Groups (`unmentionedInbound`) — opt-in
+
+> Requires the group owner to have set the group's push mode to **full message reception** (receive all messages). In AT-mode groups this setting has no observable effect (un-@'d messages never arrive).
+
+By default, un-@'d group messages only land in the history buffer. With `unmentionedInbound: "room_event"`, the bot **reads every message like a normal group member**:
 
 ```json
 {
   "channels": {
     "qqbot": {
-      "groupCoalesce": {
-        "enabled": true,
-        "maxBuffer": 50
-      },
       "accounts": {
         "default": {
           "groups": {
-            "*": {
-              "coalesce": {
-                "maxBuffer": 50
-              }
-            },
-            "HIGH_TRAFFIC_GROUP": {
-              "coalesce": {
-                "maxBuffer": 100
-              }
+            "GROUP_OPENID": {
+              "unmentionedInbound": "room_event"
             }
           }
         }
@@ -724,6 +729,65 @@ Control how group messages are merged when they arrive in quick succession:
 }
 ```
 
+Behavior once enabled:
+
+- **@mention / name pattern / quote-of-bot** → normal turn with full reply rights (wake modes, see below)
+- **Everything else** → passive room event: the AI reads it as context, its natural text output is **not delivered** (structural silence — the framework doesn't even inject the NO_REPLY instruction), and it can only speak by proactively calling the `message` tool
+- Room events never steer or interrupt an active turn — they queue behind it
+- Room-event speech goes out through the passive-first outbound path (see below)
+
+> ⚠️ **Cost note**: each room event runs one inference pass ("reading" the message). In an active group this adds real token spend — enable per group deliberately.
+
+#### Wake Modes (what counts as "being addressed")
+
+| Wake mode | Mechanism | Config |
+|-----------|-----------|--------|
+| @mention | `GROUP_AT_MESSAGE_CREATE` event / `mentions[].is_you` / content markers | built-in |
+| **Name patterns** | Content matches a configured pattern (e.g. group members call the bot "沈处") | `agents.list.<id>.groupChat.mentionPatterns: ["沈处"]` — note this lives in the `agents` section, not `channels.qqbot`; effective in full-mode groups only |
+| **Quote of bot message** | User quotes/replies to a bot outbound (resolved via ref-index) | built-in (`isImplicitMention`) |
+
+Name-pattern false positives ("people talking *about* the bot") are handled gracefully: the turn runs with normal reply rights, and the LLM can output `NO_REPLY` to stay silent (the framework injects this guidance automatically — no prompt changes needed).
+
+---
+
+### Passive-First Outbound (protects the 1000/day proactive budget)
+
+QQ Bot proactive messages (sent without msg_id) have a daily budget (~1000/day). The plugin prefers passive replies (msg_id) everywhere:
+
+- Framework-provided `replyToId` is used when available; otherwise the freshest cached msg_id is attached (msgid-cache TTL matches the platform's passive window: 5min group / 30min c2c)
+- Attaching a msg_id is **quota-aware**: the passive quota (5 replies per msg_id per 5min in groups) is atomically checked and consumed before the send — when exhausted, the send gracefully degrades to proactive instead of failing with platform error 40034128
+- Residual proactive sends are counted per account per day (`/bot-group-info` shows usage; a warning is logged at 80% of the budget)
+- Quiet groups (no message within the passive window) can only be reached proactively — that's a platform constraint, not a bug
+
+---
+
+### Group Rate Limiting (`rateLimit`) — enabled by default
+
+Three-tier sliding-window throttling with conservative defaults (normal usage never hits them):
+
+| Tier | Default | Keyed by |
+|------|---------|----------|
+| `perSender` | 20 msgs / min | sender openid |
+| `perGroup` | 60 msgs / min | group openid (c2c falls back to sender) |
+| `global` | 300 msgs / min | all messages |
+
+```json
+{
+  "channels": {
+    "qqbot": {
+      "rateLimit": {
+        "enabled": true,
+        "perSender": { "max": 20, "windowMs": 60000 },
+        "perGroup": { "max": 60, "windowMs": 60000 },
+        "global": { "max": 300, "windowMs": 60000 }
+      }
+    }
+  }
+}
+```
+
+Rate-limited messages are dropped with an INFO log (no auto-reply, to avoid burning quota). Keep this enabled for room-event groups.
+
 ---
 
 ### Middleware Execution Order
@@ -732,23 +796,25 @@ The plugin processes messages through a carefully ordered middleware chain:
 
 1. **Error Handler** — Catches exceptions at the outermost layer
 2. **Message Filter** — Bot echo + message deduplication
-3. **Policy Injector** — Injects `ctx.state.policy` with dynamic config
-4. **History Buffer** — Caches all group messages (including non-@)
-5. **Access Control** — Dynamic pairing/allowlist checks
-6. **Mention Gate** — Filters based on @mention rules
-7. **Content Sanitizer** — Strips @markers, parses face tags
-8. **Rate Limiter** — Three-layer throttling
-9. **Slash Commands** — Intercepts `/bot-*` commands
-10. **Message Coalescer** (groups only) — Merges fast messages
-11. **Typing Indicator** (C2C only) — Shows "typing..." status
-12. **Quote Reference** — Parses quoted message context
-13. **Attachment Processor** — Downloads/converts media
-14. **Envelope Formatter** — Builds final message body
+3. **Inbound Guard** — Drops outbound echoes (c2c), duplicate pushes (30min window), contentless events
+4. **Policy Injector** — Injects `ctx.state.policy` with dynamic config
+5. **History Buffer** — Caches all group messages (including non-@; skipped for room-event groups)
+6. **Access Control** — Dynamic pairing/allowlist checks
+7. **Mention Gate** — Filters based on @mention rules (+ quote-of-bot implicit mention)
+8. **Content Sanitizer** — Strips @markers, parses face tags
+9. **Rate Limiter** — Three-layer throttling (enabled by default, see `rateLimit`)
+10. **Slash Commands** — Intercepts `/bot-*` commands
+11. **Secret Capture** (c2c only) — One-shot env-var secret input interception
+12. **Message Coalescer** (groups, `strategy: "plugin"` only) — Legacy busy-buffering fallback
+13. **Typing Indicator** (C2C only) — Shows "typing..." status
+14. **Quote Reference** — Parses quoted message context
+15. **Attachment Processor** — Downloads/converts media
+16. **Envelope Formatter** — Builds final message body
 
 **Key points**:
 
-- History buffer runs **before** mention gate → all messages are cached
-- Message coalescer only runs for **group** messages
+- Inbound guard and history buffer run **before** mention gate → junk is dropped early, all real messages are cached
+- The coalescer only runs when `coalesce.strategy: "plugin"` — with the default `framework` strategy, messages dispatch immediately and the OpenClaw followup queue handles merging
 - Typing indicator only runs for **C2C** messages
 
 ---

@@ -9,7 +9,7 @@
 
 **让你的 AI 助手接入 QQ — 私聊、群聊、富媒体，一个插件全搞定。**
 
-### 🚀 当前版本： `v2.0.1`
+### 🚀 当前版本： `v2.1.0`
 
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![QQ Bot](https://img.shields.io/badge/QQ_Bot-API_v2-red)](https://bot.q.qq.com/wiki/)
@@ -31,8 +31,12 @@
 
 | 功能 | 说明 |
 |------|------|
-| 🔒 **多场景支持** | C2C 私聊、群聊（@提及 / 自主发言双模式） |
-| 👥 **群聊精细管控** | 按群配置 @触发规则、工具权限、自定义提示词、消息过滤 |
+| 🔄 **群消息排队** | 群消息即时进入框架，排队/合并交给 OpenClaw 框架队列（collect 模式）——正在处理的任务绝不被打断，突发消息合并成一批 |
+| 👁️ **房间事件（可选）** | 全量模式群里，bot 像普通群成员一样读到每条消息；未 @ 的消息作为被动房间事件（只读，AI 想发言走主动 `message` 工具） |
+| 🔔 **三种唤醒方式** | @提及、称呼唤醒（`mentionPatterns`，如「沈处」）、引用 bot 消息，均触发正常回复 |
+| 📤 **被动优先出站** | 所有发送优先走被动回复（msg_id）以节省每天约 1000 条主动消息预算；配额感知降级，绝不硬失败 |
+| 🔒 **多场景支持** | C2C 私聊、群聊（@提及 / 自主发言 / 房间事件模式） |
+| 👥 **群聊精细管控** | 按群配置 @触发规则、工具权限、自定义提示词、历史模式、排队策略、房间事件策略 |
 | 🌐 **双传输模式** | WebSocket（默认）或 Webhook（HTTP 回调）— 配置切换 |
 | 🖼️ **富媒体消息** | 支持图片、语音、视频、文件的收发 |
 | 🎙️ **语音能力 (STT/TTS)** | 语音转文字自动转录 & 文字转语音回复 |
@@ -254,6 +258,14 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 | `/bot-group-always`（无参数） | 查看当前设置 |
 
 > ⚠️ 此指令修改账户级 `defaultRequireMention`，优先级低于具体群的 `groups.{groupId}.requireMention` 配置。
+
+#### `/bot-group-info` — 群推送模式与生效配置查询（群内使用）
+
+> **你**：`/bot-group-info`（在群里发送）
+>
+> **QQBot**：🤖 群信息 — 推送模式推断（AT 系 / 全量）、requireMention、排队策略、历史模式、房间事件策略、今日主动消息用量
+
+回答「这个群为什么没上下文」这类排障问题：推送模式由**群主**拉 bot 进群时选择（仅 @ / @+最近N / 全量），此指令展示插件实际观测到的模式与所有生效配置值。
 
 ---
 
@@ -554,7 +566,37 @@ openclaw message send --channel "qqbot" \
 | `ignoreOtherMentions` | `boolean` | `false` | 是否忽略 @了其他人但没 @机器人的消息。开启后这类消息直接丢弃，不记录历史、不触发 AI |
 | `toolPolicy` | `"full" \| "restricted" \| "none"` | `"restricted"` | 群聊中 AI 可使用的工具范围。`full`=全部可用；`restricted`=限制敏感工具（如命令执行、文件操作）；`none`=禁止所有工具调用 |
 | `prompt` | `string` | 内置默认提示词 | 该群专属的系统提示词，会追加到全局 systemPrompt 之后 |
-| `historyLimit` | `number` | `50` | 群历史消息缓存条数 |
+| `historyLimit` | `number` | `20` | 群历史消息缓存条数（0 禁用） |
+| `historyMode` | `"clear" \| "rolling"` | `"clear"` | `clear`：每次回复后清空历史（旧行为）。`rolling`：bot 自己的发言也计入历史，回复后裁剪到 bot 最后一条发言之后（AI 能看到自己上次说到哪） |
+| `unmentionedInbound` | `"user_request" \| "room_event"` | `"user_request"` | `room_event`：像普通群成员一样读到所有消息，未 @ 的作为被动房间事件（详见下文；需群主开启全量推送模式） |
+| `coalesce` | `object` | `{strategy: "framework", enabled: true, maxBuffer: 50}` | 群消息排队配置。`strategy: "framework"`（默认）交给框架队列（`enabled=true`→collect 合并批处理；`false`→followup 排队不合并）；`"plugin"` 回退旧版插件内合并器 |
+
+#### 房间事件模式（全量模式群，可选）
+
+> 前提：群主把该群的推送范围设为「接收所有消息」（全量模式）。AT 模式的群收不到未 @ 消息，此配置无效果。
+
+```json
+"groups": {
+  "GROUP_OPENID": { "unmentionedInbound": "room_event" }
+}
+```
+
+开启后的行为：
+
+- **被 @ / 被称呼 / 引用 bot 消息** → 正常回复（完整回复权）
+- **其余所有消息** → 被动房间事件：AI 只读上下文，最终文本**不投递**（结构性沉默），想发言必须主动调用 `message` 工具
+- 房间事件绝不打断正在处理的任务，只排队
+- ⚠️ 成本提示：每条消息跑一次推理（「读」消息），活跃群请按群显式开启
+
+**称呼唤醒**（群友不打 @、直接叫名字）：在 `agents` 段（不在 `channels.qqbot` 下）配置：
+
+```json
+"agents": {
+  "list": [{ "id": "default", "groupChat": { "mentionPatterns": ["沈处"] } }]
+}
+```
+
+误唤醒有兜底：LLM 判断「只是在聊我、不是在叫我」时可输出 `NO_REPLY` 保持沉默（框架自动注入该指引，无需改提示词）。
 
 **完整群配置示例：**
 
