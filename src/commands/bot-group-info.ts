@@ -37,7 +37,7 @@ export function botGroupInfo(account: ResolvedQQBotAccount): SlashCommand {
         '',
         `requireMention：${cfg.requireMention ? '是（需 @ 才响应）' : '否（所有消息都响应）'}`,
         `未 @ 消息入站：${cfg.unmentionedInbound === 'room_event' ? '**room_event**（被动房间事件进框架，AI 只读、想发言走主动 message 工具）' : '拦截（只进历史，不上报）'}`,
-        `排队策略：${cfg.coalesce.strategy === 'framework' ? `框架队列（${cfg.coalesce.enabled ? 'collect 合并批处理' : 'followup 排队不合并'}）` : '插件 coalescer（旧版行为）'}`,
+        `排队策略：框架队列（${cfg.coalesce.enabled ? 'collect 合并批处理' : 'followup 排队不合并'}）`,
         `历史缓存：${cfg.historyLimit} 条（0=禁用，模式 ${cfg.historyMode === 'rolling' ? 'rolling（bot 发言计入）' : 'clear（回复后清空）'}）`,
         `工具策略：${cfg.toolPolicy}`,
         '',

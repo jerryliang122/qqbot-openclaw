@@ -155,9 +155,9 @@ test("kind=plugin 时 button_data 前缀为 approve:v2:plugin:", () => {
 // ======================================================================
 group("6. resolveApprovalTarget");
 
-test("sessionKey direct -> c2c", () => {
+test("legacy direct scope no longer matches", () => {
   const r = resolveApprovalTarget("agent:main:qqbot:direct:ABCDEF12", null);
-  assert.deepStrictEqual(r, { type: "c2c", id: "ABCDEF12" });
+  assert.strictEqual(r, null);
 });
 
 test("sessionKey group -> group", () => {

@@ -112,8 +112,8 @@ test('qqbotPlugin has auth adapter', () => {
   assert.ok(qqbotPlugin.auth.login, 'auth should have login');
 });
 
-test('qqbotPlugin has onboarding adapter', () => {
-  assert.ok(qqbotPlugin.onboarding, 'qqbotPlugin should have onboarding adapter');
+test('qqbotPlugin has setup wizard', () => {
+  assert.ok(qqbotPlugin.setupWizard, 'qqbotPlugin should have setupWizard (guided setup)');
 });
 
 test('outbound adapter has deliveryMode', () => {

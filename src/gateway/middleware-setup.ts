@@ -33,7 +33,6 @@ import { inboundGuard } from '../middleware/inbound-guard.js';
 import { secretCapture } from '../middleware/secret-capture.js';
 import { c2cTypingIndicator } from '../middleware/typing.js';
 import { stripMentionText } from '../utils/mention.js';
-import { groupMessageCoalescer } from '../features/message-coalescer.js';
 import { resolveGroupConfigFromAccount } from '../config.js';
 
 export interface MiddlewareSetupOptions {
@@ -141,50 +140,8 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
   //     拦截后不再触发 typing / envelope；多问题 ask_user 答案消息红线放行
   bot.use(secretCapture({ accountId: account.accountId }));
 
-  // 10. 群聊消息排队
-  //     - strategy=framework（默认）：本中间件整段跳过，消息逐条立即 dispatch，
-  //       排队/合并交给框架 followup 队列（dispatch 侧传 queueModeOverride）
-  //     - strategy=plugin：插件内建 busy-buffering coalescer（旧版行为，回退用）
-  //     - 配置从 ctx.state.policy.group 读取（由 policyInjector 注入）
-  bot.use(groupMessageCoalescer({
-      accountId: account.accountId,
-      isEnabled: (ctx) => {
-        const groupOpenid = ctx.message.groupOpenid;
-        if (!groupOpenid) return false;
-        const coalesce = resolveGroupConfigFromAccount(account, groupOpenid).coalesce;
-        return coalesce.strategy === "plugin" && coalesce.enabled;
-      },
-      maxBuffer: (ctx) => {
-        const groupOpenid = ctx.message.groupOpenid;
-        return groupOpenid
-          ? resolveGroupConfigFromAccount(account, groupOpenid).coalesce.maxBuffer
-          : 50;
-      },
-      onCoalesce: (buffered) => {
-        if (buffered.length === 1) {
-          return buffered[0]!;
-        }
-        
-        const last = buffered[buffered.length - 1]!;
-        
-        // 合并附件
-        const attachments = buffered.flatMap((c) => c.message.attachments ?? []);
-        if (attachments.length > 0) {
-          last.message.attachments = attachments;
-        }
-        
-        // 透传原始消息列表，供 assembleBody 使用
-        last.state.mergedMessages = buffered;
-        
-        // 清除 assembledBody，让下游重新构建
-        delete last.state.assembledBody;
-        
-        return last;
-      },
-      onBufferFull: (ctx) => {
-        ctx.log.warn?.(`[coalescer] buffer full for group ${ctx.message.groupOpenid}`);
-      },
-    }));
+  // 10. 群聊消息排队已完全交给框架队列（dispatch 侧按 coalesce.enabled 传
+  //     queueModeOverride collect/followup），插件内不再做 busy-buffering。
 
   // 11. C2C 输入状态指示器（配额感知：优先占被动回复配额，耗尽后与回复
   //     消息一样降级为主动发送；续期间隔默认 20s 且不低于 20s，

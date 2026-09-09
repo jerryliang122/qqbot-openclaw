@@ -58,7 +58,7 @@ function normalizeAppId(raw: unknown): string {
 
 function detectConfigPath(): string | null {
   const home = process.env.HOME || "/home/ubuntu";
-  for (const app of ["openclaw", "clawdbot", "moltbot"]) {
+  for (const app of ["openclaw"]) {
     const p = path.join(home, `.${app}`, `${app}.json`);
     if (fs.existsSync(p)) return p;
   }

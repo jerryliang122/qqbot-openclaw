@@ -2,7 +2,7 @@
  * Runtime Adapters — 一次 resolve，全程复用。
  *
  * Capability Probe 模式：按候选 API 路径探测，选出第一个可用函数。
- * 对每个 runtime API 维护一个"候选列表"（最新在前），未来 API 改名时只需 +1 行。
+ * 构建基线为 openclaw 2026.9.2（peer >=2026.9.2），不再保留对更旧版本的回退。
  *
  * 调用方通过 `resolveRuntimeAdapters(runtime)` 获取适配层对象，
  * 后续所有 dispatch / channel 代码只使用 adapters 上的方法。
@@ -14,19 +14,19 @@ import type { PluginLogger } from '../utils/plugin-logger.js';
 // ── 类型 ──
 
 export interface RuntimeAdapters {
-  /** 入站事件处理（自动适配 inbound.run / turn.run） */
+  /** 入站事件处理 */
   inboundRun: ((params: any) => Promise<any>) | null;
   /** 回复分发（带 block buffer） */
   dispatchReply: ((params: any) => Promise<any>) | null;
   /** Agent 路由解析 */
   resolveAgentRoute: ((params: any) => any) | null;
-  /** 构建入站上下文（自动适配 inbound.buildContext / reply.finalizeInboundContext） */
+  /** 构建入站上下文 */
   buildInboundContext: ((params: any) => any) | null;
   /** Session store path 解析 */
   resolveStorePath: ((storeConfig: any, opts: any) => string) | null;
   /** Session 记录 */
   recordInboundSession: ((params: any) => Promise<void>) | null;
-  /** 格式化 envelope（自动适配 formatAgentEnvelope / formatInboundEnvelope） */
+  /** 格式化 envelope */
   formatEnvelope: ((params: any) => string) | null;
   /** 解析 envelope format options */
   resolveEnvelopeFormatOptions: ((cfg: any) => any) | null;
@@ -37,16 +37,7 @@ export interface RuntimeAdapters {
   /** 获取当前配置快照 */
   getConfig: (() => any) | null;
   /**
-   * 持久化配置变更（高低版本兼容）。
-   *
-   * 内部优先级：
-   *   1. mutateConfigFile（新版 API，原子操作，支持 afterWrite 策略）
-   *   2. writeConfigFile（旧版 API，整体覆盖）
-   *
-   * 调用方只需传入完整 config 对象，不必关心框架版本差异。
-   */
-  /**
-   * 持久化配置变更（高低版本兼容）。
+   * 持久化配置变更。
    *
    * 接受一个 mutator 回调，接收当前 config 对象（可变），
    * 可直接修改或返回新对象。适配器负责确保写入和热重载。
@@ -110,8 +101,7 @@ export function resolveRuntimeAdapters(
   const version = (rt as any).version ?? 'unknown';
 
   const inboundRun = probeFunction(rt, [
-    ['channel', 'inbound', 'run'],      // current (2026-05+)
-    ['channel', 'turn', 'run'],          // legacy (removed 2026-05-27)
+    ['channel', 'inbound', 'run'],
   ]);
 
   const dispatchReply = probeFunction(rt, [
@@ -122,49 +112,13 @@ export function resolveRuntimeAdapters(
     ['channel', 'routing', 'resolveAgentRoute'],
   ]);
 
-  // 构建入站上下文：新 API 优先，低版本 fallback 到 deprecated finalizeInboundContext
-  // 两个 API 签名不同，通过 wrapper 统一为 buildInboundContext(params) 接口
   const rawBuildContext = probeFunction(rt, [
     ['channel', 'inbound', 'buildContext'],
   ]);
-  const rawFinalizeContext = !rawBuildContext
-    ? probeFunction(rt, [['channel', 'reply', 'finalizeInboundContext']])
-    : null;
 
   const buildInboundContext: RuntimeAdapters['buildInboundContext'] = rawBuildContext
     ? (params) => rawBuildContext(params)
-    : rawFinalizeContext
-      ? (params) => {
-          // 将统一参数转换为旧 API 的 rawCtxPayload 格式
-          const isCommand = params.access?.commands?.authorized ?? false;
-          const rawCtx = {
-            Body: params.message.body,
-            BodyForAgent: params.message.bodyForAgent,
-            RawBody: params.message.rawBody,
-            CommandBody: params.message.commandBody ?? params.message.rawBody,
-            CommandSource: isCommand ? 'text' : undefined,
-            CommandTurn: params.command ?? undefined,
-            CommandAuthorized: isCommand,
-            From: params.from,
-            To: params.reply.to,
-            SessionKey: params.route.routeSessionKey,
-            AccountId: params.route.accountId ?? params.accountId,
-            ChatType: params.conversation.kind,
-            ChatId: params.conversation.id,
-            GroupSystemPrompt: params.conversation.label,
-            SenderId: params.sender.id,
-            SenderName: params.sender.name,
-            Provider: params.provider ?? params.channel,
-            Surface: params.surface ?? params.channel,
-            MessageSid: params.messageId,
-            Timestamp: params.timestamp ?? Date.now(),
-            OriginatingChannel: params.channel,
-            OriginatingTo: params.reply.originatingTo ?? params.reply.to,
-            ...params.extra,
-          };
-          return rawFinalizeContext(rawCtx);
-        }
-      : null;
+    : null;
 
   const resolveStorePath = probeFunction(rt, [
     ['channel', 'session', 'resolveStorePath'],
@@ -174,10 +128,8 @@ export function resolveRuntimeAdapters(
     ['channel', 'session', 'recordInboundSession'],
   ]);
 
-  // 格式化 envelope：新 API 优先，低版本 fallback 到 deprecated formatInboundEnvelope
   const formatEnvelope = probeFunction(rt, [
-    ['channel', 'reply', 'formatAgentEnvelope'],    // current (2026-06+)
-    ['channel', 'reply', 'formatInboundEnvelope'],  // deprecated，低版本兼容
+    ['channel', 'reply', 'formatAgentEnvelope'],
   ]);
 
   const resolveEnvelopeFormatOptions = probeFunction(rt, [
@@ -194,32 +146,18 @@ export function resolveRuntimeAdapters(
 
   const getConfig = probeFunction(rt, [
     ['config', 'current'],
-  ]) ?? probeFunction(rt, [
-    ['getConfig'],
-  ]) ?? probeFunction(rt, [
-    ['config', 'loadConfig'],
   ]);
 
-  // config 持久化：优先 mutateConfigFile（新版，原子操作），fallback writeConfigFile（旧版）
   const rawMutateConfig = probeFunction(rt, [['config', 'mutateConfigFile']]);
-  const rawWriteConfig = probeFunction(rt, [['config', 'writeConfigFile']]);
 
   const persistConfig: RuntimeAdapters['persistConfig'] = rawMutateConfig
     ? async (mutator: (cfg: any) => any) => {
-        // 新版 API：mutate 回调接收当前 config，可直接修改或返回新对象
         await rawMutateConfig({
           afterWrite: 'hot-reload',
           mutate: mutator,
         });
       }
-    : rawWriteConfig && getConfig
-      ? async (mutator: (cfg: any) => any) => {
-          // 旧版 API：先读取当前 config → 应用 mutator → 整体写入
-          const current = JSON.parse(JSON.stringify(getConfig()));
-          mutator(current);
-          await rawWriteConfig(current);
-        }
-      : null;
+    : null;
 
   // 日志汇总
   const resolved = [
@@ -233,7 +171,7 @@ export function resolveRuntimeAdapters(
     chunkMarkdownText && 'chunkMarkdownText',
     saveRemoteMedia && 'saveRemoteMedia',
     getConfig && 'getConfig',
-    persistConfig && `persistConfig(${rawMutateConfig ? 'mutate' : 'write'})`,
+    persistConfig && 'persistConfig',
   ].filter(Boolean);
 
   log?.info(
@@ -287,12 +225,9 @@ export function getAdapters(
 }
 
 /**
- * 持久化配置（auth.login 场景，兼容高低版本）。
+ * 持久化配置（auth.login 场景）。
  *
- * 探测顺序：
- *   1. config.mutateConfigFile  — 新版原子操作
- *   2. config.writeConfigFile   — 旧版整体覆盖
- *   3. writeConfigFile          — 更旧的顶层 API
+ * 走 config.mutateConfigFile（原子操作，支持 afterWrite 策略）。
  */
 export async function persistAuthConfig(
   runtime: Record<string, unknown>,
@@ -301,27 +236,13 @@ export async function persistAuthConfig(
 ): Promise<void> {
   const config: Record<string, unknown> | undefined = runtime.config as any;
 
-  if (typeof config?.mutateConfigFile === 'function') {
-    await (config.mutateConfigFile as Function)({
-      mutate: () => cfg,
-      afterWrite,
-    });
-    return;
+  if (typeof config?.mutateConfigFile !== 'function') {
+    throw new Error('persistAuthConfig: runtime.config.mutateConfigFile is unavailable (requires openclaw >= 2026.9.2)');
   }
-  if (typeof config?.writeConfigFile === 'function') {
-    await (config.writeConfigFile as Function)(cfg);
-    return;
-  }
-  if (typeof runtime.writeConfigFile === 'function') {
-    await (runtime.writeConfigFile as Function)(cfg);
-    return;
-  }
-
-  // 最后兜底：裸写文件
-  const { homedir } = await import('node:os');
-  const { join } = await import('node:path');
-  const { writeFileSync } = await import('node:fs');
-  writeFileSync(join(homedir(), '.openclaw', 'openclaw.json'), JSON.stringify(cfg, null, 2) + '\n', 'utf-8');
+  await (config.mutateConfigFile as Function)({
+    mutate: () => cfg,
+    afterWrite,
+  });
 }
 
 /**

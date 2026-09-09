@@ -22,18 +22,13 @@ const OPTIONAL: ApiProbe[] = [
     name: 'channel.reply.dispatchReplyWithBufferedBlockDispatcher',
     probe: (rt) => typeof (rt as any).channel?.reply?.dispatchReplyWithBufferedBlockDispatcher === 'function',
   },
-  { name: 'channel.inbound.run (degraded)', probe: (rt) => {
-    const c = (rt as any).channel;
-    return typeof c?.inbound?.run === 'function' || typeof c?.turn?.run === 'function';
-  }},
+  { name: 'channel.inbound.run (degraded)', probe: (rt) => typeof (rt as any).channel?.inbound?.run === 'function' },
   { name: 'channel.inbound.buildContext', probe: (rt) => typeof (rt as any).channel?.inbound?.buildContext === 'function' },
   { name: 'channel.reply.formatAgentEnvelope', probe: (rt) => typeof (rt as any).channel?.reply?.formatAgentEnvelope === 'function' },
   { name: 'channel.text.chunkMarkdownText', probe: (rt) => typeof (rt as any).channel?.text?.chunkMarkdownText === 'function' },
   { name: 'channel.routing.resolveAgentRoute', probe: (rt) => typeof (rt as any).channel?.routing?.resolveAgentRoute === 'function' },
-  { name: 'channel.session.resolveStorePath (deprecated)', probe: (rt) => typeof (rt as any).channel?.session?.resolveStorePath === 'function' },
-  { name: 'channel.session.recordInboundSession (deprecated)', probe: (rt) => typeof (rt as any).channel?.session?.recordInboundSession === 'function' },
-  { name: 'channel.reply.finalizeInboundContext (deprecated)', probe: (rt) => typeof (rt as any).channel?.reply?.finalizeInboundContext === 'function' },
-  { name: 'channel.reply.formatInboundEnvelope (deprecated)', probe: (rt) => typeof (rt as any).channel?.reply?.formatInboundEnvelope === 'function' },
+  { name: 'channel.session.resolveStorePath', probe: (rt) => typeof (rt as any).channel?.session?.resolveStorePath === 'function' },
+  { name: 'channel.session.recordInboundSession', probe: (rt) => typeof (rt as any).channel?.session?.recordInboundSession === 'function' },
   { name: 'config.current', probe: (rt) => typeof (rt as any).config?.current === 'function' },
 ];
 

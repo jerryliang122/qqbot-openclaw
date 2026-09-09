@@ -81,14 +81,9 @@ const DEFAULT_GROUP_POLICY: GroupPolicy = "open";
 /** 群历史缓存条数默认值 */
 const DEFAULT_GROUP_HISTORY_LIMIT = 20;
 
-/** 单条消息默认处理超时（0 = 不限制） */
-const DEFAULT_PROCESSING_TIMEOUT_MS = 0;
-
 /** 群消息合并默认配置 */
 const DEFAULT_GROUP_COALESCE_CONFIG: Required<GroupCoalesceConfig> = {
-  strategy: "framework",
   enabled: true,
-  maxBuffer: 50,
 };
 
 const DEFAULT_GROUP_CONFIG: Omit<Required<GroupConfig>, "prompt" | "coalesce" | "historyMode" | "unmentionedInbound"> & { coalesce: Required<GroupCoalesceConfig>; historyMode: 'clear' | 'rolling'; unmentionedInbound: 'user_request' | 'room_event' } = {
@@ -151,9 +146,7 @@ export function resolveGroupConfigFromAccount(account: ResolvedQQBotAccount, gro
   const accountDefaultCoalesce = account.config?.groupCoalesce ?? DEFAULT_GROUP_COALESCE_CONFIG;
 
   const coalesce = {
-    strategy: specificCfg.coalesce?.strategy ?? wildcardCfg.coalesce?.strategy ?? accountDefaultCoalesce.strategy ?? DEFAULT_GROUP_COALESCE_CONFIG.strategy,
     enabled: specificCfg.coalesce?.enabled ?? wildcardCfg.coalesce?.enabled ?? accountDefaultCoalesce.enabled ?? DEFAULT_GROUP_COALESCE_CONFIG.enabled,
-    maxBuffer: specificCfg.coalesce?.maxBuffer ?? wildcardCfg.coalesce?.maxBuffer ?? accountDefaultCoalesce.maxBuffer ?? DEFAULT_GROUP_COALESCE_CONFIG.maxBuffer,
   };
 
   return {
@@ -226,11 +219,11 @@ function firstNonEmptyEnv(...values: Array<string | undefined>): string {
 
 /** 文档变量名优先，同时兼容旧的下划线变量名。 */
 export function resolveQQBotEnvAppId(): string {
-  return firstNonEmptyEnv(process.env.QQBOT_APPID, process.env.QQBOT_APP_ID);
+  return firstNonEmptyEnv(process.env.QQBOT_APPID);
 }
 
 export function resolveQQBotEnvClientSecret(): string {
-  return firstNonEmptyEnv(process.env.QQBOT_SECRET, process.env.QQBOT_CLIENT_SECRET);
+  return firstNonEmptyEnv(process.env.QQBOT_SECRET);
 }
 
 /**
@@ -272,25 +265,6 @@ export function resolveDefaultQQBotAccountId(cfg: OpenClawConfig): string {
     }
   }
   return DEFAULT_ACCOUNT_ID;
-}
-
-/**
- * 解析单条消息处理超时时间（ms）。
- * 优先级：账户配置 > 环境变量 OPENCLAW_PROCESSING_TIMEOUT_MS > 默认
- * 返回 0 表示不限制超时。
- */
-export function resolveProcessingTimeoutMs(
-  accountConfig?: QQBotAccountConfig,
-): number {
-  if (accountConfig?.processingTimeoutMs !== undefined) {
-    return accountConfig.processingTimeoutMs;
-  }
-  const env = process.env.OPENCLAW_PROCESSING_TIMEOUT_MS;
-  if (env) {
-    const v = Number(env);
-    if (!Number.isNaN(v) && v >= 0) return v;
-  }
-  return DEFAULT_PROCESSING_TIMEOUT_MS;
 }
 
 /**
@@ -352,22 +326,8 @@ export function resolveQQBotAccount(
     markdownSupport: accountConfig.markdownSupport !== false,
     commandPanelNative: accountConfig.commands?.native !== false,
     userAgentSuffix: resolveUserAgentSuffix(cfg),
-    processingTimeoutMs: resolveProcessingTimeoutMs(accountConfig),
-    config: normalizeAccountConfig(accountConfig),
+    config: accountConfig,
   };
-}
-
-/** 兼容旧版 streaming: boolean 格式 → { mode: "partial" | "off" }，对齐框架 schema。
- *  布尔 true 归一化为流式打印机（sendMode: "stream"，向后兼容默认行为）。 */
-function normalizeAccountConfig(raw: QQBotAccountConfig): QQBotAccountConfig {
-  if (typeof (raw as any).streaming === 'boolean') {
-    const { streaming, ...rest } = raw as any;
-    return {
-      ...rest,
-      streaming: { mode: streaming ? 'partial' : 'off', sendMode: 'stream' },
-    };
-  }
-  return raw;
 }
 
 /**
@@ -440,9 +400,4 @@ export function resolveGroupCoalesceConfig(cfg: OpenClawConfig, groupOpenid: str
 /** 解析群消息合并是否启用 */
 export function resolveGroupCoalesceEnabled(cfg: OpenClawConfig, groupOpenid: string, accountId?: string): boolean {
   return resolveGroupCoalesceConfig(cfg, groupOpenid, accountId).enabled;
-}
-
-/** 解析群消息合并最大缓冲数 */
-export function resolveGroupCoalesceMaxBuffer(cfg: OpenClawConfig, groupOpenid: string, accountId?: string): number {
-  return resolveGroupCoalesceConfig(cfg, groupOpenid, accountId).maxBuffer;
 }

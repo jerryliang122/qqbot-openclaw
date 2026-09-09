@@ -11,12 +11,11 @@
  * - 因此 checkPassiveReplyQuota 在 msg_id 过期时返回 false，而非重置配额
  *
  * 使用方式：
- * 1. 推荐：使用 checkAndConsumePassiveReplyQuota 进行原子操作
- * 2. 兼容：先 checkPassiveReplyQuota，成功后 consumePassiveReplyQuota
- * 3. 失败回滚：如果 API 调用失败，调用 rollbackPassiveReplyQuota
+ * 1. 推荐：使用 checkAndConsumePassiveReplyQuota 进行原子操作（失败用 rollback 回滚）
+ * 2. 纯探测（不消耗配额）：checkPassiveReplyQuota
  */
 
-import type { QuotaState, QuotaCheckParams, QuotaConsumeParams } from '../types-plugin.js';
+import type { QuotaState, QuotaCheckParams } from '../types-plugin.js';
 
 const quotaCache = new Map<string, QuotaState>();
 const MAX_CACHE_SIZE = 10000;
@@ -27,8 +26,8 @@ const QUOTA_LIMITS = {
 };
 
 /**
- * 检查被动回复配额
- * @deprecated 建议使用 checkAndConsumePassiveReplyQuota 进行原子操作
+ * 检查被动回复配额（纯探测，不消耗配额）。
+ * 需要同时消耗配额时使用 checkAndConsumePassiveReplyQuota。
  */
 export function checkPassiveReplyQuota(params: QuotaCheckParams): boolean {
   const { accountId, msgId, scope } = params;
@@ -59,36 +58,6 @@ export function checkPassiveReplyQuota(params: QuotaCheckParams): boolean {
 }
 
 /**
- * 消耗被动回复配额
- * @deprecated 建议使用 checkAndConsumePassiveReplyQuota 进行原子操作
- */
-export function consumePassiveReplyQuota(params: QuotaConsumeParams): void {
-  const { accountId, msgId, scope, log } = params;
-  const key = `${accountId}:${scope}:${msgId}`;
-  const now = Date.now();
-
-  const ttl = QUOTA_LIMITS[scope].ttlMs;
-
-  let cached = quotaCache.get(key);
-  if (cached && now > cached.expiresAt) {
-    cached = undefined;
-  }
-  cached = cached || { count: 0, expiresAt: now + ttl };
-  cached.count += 1;
-
-  quotaCache.set(key, cached);
-
-  if (quotaCache.size > MAX_CACHE_SIZE) {
-    const oldestKey = quotaCache.keys().next().value;
-    if (oldestKey) {
-      quotaCache.delete(oldestKey);
-    }
-  }
-
-  log?.debug?.(`[${accountId}] consumed passive quota: ${key} count=${cached.count}`);
-}
-
-/**
  * 回滚被动回复配额（API 调用失败时使用）
  */
 export function rollbackPassiveReplyQuota(params: {
@@ -111,7 +80,7 @@ export function rollbackPassiveReplyQuota(params: {
  * 推荐使用此函数，避免 check-then-consume 竞态
  */
 export function checkAndConsumePassiveReplyQuota(
-  params: QuotaCheckParams & { log?: QuotaConsumeParams['log'] },
+  params: QuotaCheckParams & { log?: { debug?: (message: string) => void } },
 ): { canReply: boolean; rollback: () => void } {
   const { accountId, msgId, scope, log } = params;
 

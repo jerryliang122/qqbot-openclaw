@@ -321,9 +321,7 @@ function resolveAudioPolicy(cfg: Record<string, unknown>): AudioPolicyResolved {
   return {
     sttDirectFormats: normalizeFormats((policy?.sttDirectFormats as string[]) ?? []),
     uploadDirectFormats: normalizeFormats(
-      (policy?.uploadDirectFormats as string[]) ??
-      (qqbot?.voiceDirectUploadFormats as string[]) ??
-      ['.wav', '.mp3', '.silk'],
+      (policy?.uploadDirectFormats as string[]) ?? ['.wav', '.mp3', '.silk'],
     ),
     transcodeEnabled: (policy?.transcodeEnabled as boolean) !== false,
   };

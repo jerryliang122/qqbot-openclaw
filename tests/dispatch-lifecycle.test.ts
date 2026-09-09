@@ -299,56 +299,9 @@ await test('dispatch 抛错且无可见回复 → 发送兜底消息并向上传
   assert.ok(fallback, 'dispatch 抛错且无可见回复时必须发送兜底消息');
 });
 
-group('修4: legacy ctx 映射补 ChatId（echo 防环 conversation key）');
-
-await test('buildInboundContext legacy 映射包含 ChatId（供框架 outbound-echo 丢弃检查）', async () => {
-  _resetAdaptersCache();
-  // 构造仅有旧版 finalizeInboundContext 的 runtime，触发 resolve.ts 的 legacy 映射
-  const rawCtxPayloads: any[] = [];
-  const runtime = {
-    version: 'legacy-test',
-    channel: {
-      reply: {
-        finalizeInboundContext: (rawCtx: any) => {
-          rawCtxPayloads.push(rawCtx);
-          return rawCtx;
-        },
-        dispatchReplyWithBufferedBlockDispatcher: async () => {
-          return { queuedFinal: true, counts: { final: 1 } };
-        },
-      },
-      session: {
-        resolveStorePath: () => '',
-        recordInboundSession: async () => {},
-      },
-      routing: {
-        resolveAgentRoute: (params: any) => ({
-          sessionKey: `qqbot:test:${params.peer.id}`,
-          accountId: params.accountId,
-          agentId: 'default',
-        }),
-      },
-    },
-    config: { current: {} },
-  } as any;
-
-  const { msg, ctx } = makeMsgAndCtx({ scope: 'group', targetId: 'GROUP_X' });
-  const account = makeAccount();
-  installFakeGateway();
-
-  // dispatchToOpenClaw 走 legacy 分支（无 inbound.run）
-  await dispatchToOpenClaw(ctx, msg, account, runtime);
-
-  assert.ok(rawCtxPayloads.length > 0, 'legacy finalizeInboundContext 应被调用');
-  const rawCtx = rawCtxPayloads[0];
-  assert.ok(rawCtx.ChatId, 'legacy 映射必须包含 ChatId');
-  assert.equal(rawCtx.ChatId, 'GROUP_X', 'ChatId 应为会话 key（群 openid）');
-  assert.equal(rawCtx.MessageSid, msg.messageId, 'MessageSid 应为平台消息 id');
-});
-
 // ── 结果 ──
 
-group('修4: 群聊框架排队（coalesce.strategy=framework）');
+group('修4: 群聊框架排队（排队交给框架队列）');
 
 await test('群聊 turn：admission=exclusive、无 abortSignal（不打断）、queueModeOverride=collect', async () => {
   _resetAdaptersCache();
@@ -406,32 +359,6 @@ await test('群聊 coalesce.enabled=false → queueModeOverride=followup（排�
 
   const replyOptions = (capturedDispatch as any)?.replyOptions;
   assert.equal(replyOptions?.queueModeOverride, 'followup', '关闭合并但保留不打断语义 → followup');
-});
-
-await test('群聊 coalesce.strategy=plugin → 不传 queueModeOverride（插件 coalescer 负责）', async () => {
-  _resetAdaptersCache();
-  const { msg, ctx } = makeMsgAndCtx({ scope: 'group', targetId: 'GROUP_X' });
-  let capturedDispatch: CapturedDispatch | undefined;
-
-  const runtime = makeFakeRuntime({
-    onInboundRun: async (params) => {
-      const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
-      await plan.runDispatch();
-      return { dispatched: true };
-    },
-    dispatchReply: (params2: any) => {
-      capturedDispatch = params2;
-      return { queuedFinal: true, counts: { final: 1 } };
-    },
-  });
-
-  const account = makeAccount();
-  account.config.groups = { GROUP_X: { coalesce: { strategy: 'plugin' } } };
-  installFakeGateway();
-  await dispatchToOpenClaw(ctx, msg, account, runtime);
-
-  const replyOptions = (capturedDispatch as any)?.replyOptions;
-  assert.equal(replyOptions?.queueModeOverride, undefined, 'plugin 策略不传 queueModeOverride');
 });
 
 await test('c2c turn：queueModeOverride 不传（c2c 插嘴语义不变）', async () => {

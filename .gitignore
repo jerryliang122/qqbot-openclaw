@@ -8,4 +8,7 @@ package-lock.json
 openclaw.json
 *.tgz
 *.log
-pnpm-lock.yaml
+pnpm-lock.yaml.zcode/
+
+# ZCode local session files
+.zcode/

@@ -48,13 +48,7 @@ export async function handleMessage(
     ? `qqbot:group:${msg.replyTarget.targetId}`
     : `qqbot:c2c:${msg.replyTarget.targetId}`;
 
-  const mergedCount = (ctx.state.mergedMessages as unknown[] | undefined)?.length;
-  // mergedMessages 由插件 coalescer（coalesce.strategy=plugin 回退路径）合并批次时写入
-  if (mergedCount) {
-    hlog.info(`merged batch count=${mergedCount} msgId=${msg.messageId}`);
-  } else {
-    hlog.debug(`enter msgId=${msg.messageId} scope=${scope} contentLen=${(msg.content ?? '').length}`);
-  }
+  hlog.debug(`enter msgId=${msg.messageId} scope=${scope} contentLen=${(msg.content ?? '').length}`);
 
   try {
     // 群推送模式推断（AT 系 vs 全量）：按事件类型记录；首次观测与模式变化都打 INFO
@@ -269,9 +263,6 @@ async function handleQuestion(
 
   try {
     const questionGatewayRuntime = await getQuestionGatewayRuntime();
-    if (!questionGatewayRuntime) {
-      throw new Error('OpenClaw host does not export question-gateway-runtime (requires 2026.8.1+)');
-    }
     const result = await questionGatewayRuntime.resolveOption({
       cfg,
       questionId: parsed.questionId,

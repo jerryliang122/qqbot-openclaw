@@ -131,56 +131,6 @@ openclaw config
 
 ---
 
-## 🛠️ 项目脚本
-
-项目中提供了一些便捷脚本，简化日常操作：
-
-### 一键升级并启动
-```bash
-# 基本用法
-./scripts/upgrade-via-source.sh
-
-# 指定 appid 和 secret
-./scripts/upgrade-via-source.sh --appid 123456789 --secret your_secret
-
-# 同时启用 markdown
-./scripts/upgrade-via-source.sh --appid 123456789 --secret your_secret --markdown yes
-
-# 查看帮助
-./scripts/upgrade-via-source.sh --help
-```
-
-**环境变量方式：**
-```bash
-export QQBOT_APPID="123456789"
-export QQBOT_SECRET="your_secret"
-export QQBOT_MARKDOWN="no"
-./scripts/upgrade-via-source.sh
-```
-
-### markdown 设置脚本
-```bash
-# 启用 markdown
-./scripts/set-markdown.sh enable
-
-# 禁用 markdown
-./scripts/set-markdown.sh disable
-
-# 查看当前状态
-./scripts/set-markdown.sh status
-
-# 交互式选择
-./scripts/set-markdown.sh
-```
-
-### 升级脚本（清理旧版本）
-```bash
-# 清理旧版本插件和配置
-bash ./scripts/cleanup-legacy-plugins.sh
-```
-
----
-
 ## 📁 常用路径
 
 | 路径 | 说明 |
@@ -211,10 +161,6 @@ openclaw channels list
 
 ### 重新安装插件
 ```bash
-# 1. 清理旧版本
-bash ./scripts/cleanup-legacy-plugins.sh
-
-# 2. 重新安装
 openclaw plugins install .
 
 # 3. 重新配置通道

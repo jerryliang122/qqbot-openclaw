@@ -220,7 +220,6 @@ export function buildApprovalKeyboard(
  * Extract the delivery target from a sessionKey or turnSourceTo string.
  *
  * Expected formats:
- *   agent:main:qqbot:direct:OPENID  -> { type: "c2c", id: "OPENID" }
  *   agent:main:qqbot:c2c:OPENID     -> { type: "c2c", id: "OPENID" }
  *   agent:main:qqbot:group:GROUPID  -> { type: "group", id: "GROUPID" }
  *
@@ -232,7 +231,7 @@ export function resolveApprovalTarget(
 ): ApprovalTarget | null {
   const sk = sessionKey ?? turnSourceTo;
   if (!sk) return null;
-  const m = sk.match(/qqbot:(c2c|direct|group):([A-F0-9]+)/i);
+  const m = sk.match(/qqbot:(c2c|group):([A-F0-9]+)/i);
   if (!m) return null;
   const scope = m[1];
   const id = m[2];

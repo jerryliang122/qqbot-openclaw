@@ -11,7 +11,7 @@ import { getAdapters } from '../adapter/resolve.js';
 
 const MAX_LINES_PER_FILE = 1000;
 const MAX_FILES = 4;
-const LOG_KEYWORDS = ['gateway', 'openclaw', 'clawdbot', 'moltbot'];
+const LOG_KEYWORDS = ['gateway', 'openclaw'];
 const LOG_PATTERN = new RegExp(LOG_KEYWORDS.join('|'), 'i');
 
 interface LogFileEntry {
@@ -143,7 +143,7 @@ function collectRecentLogFiles(logDirs: string[], runtime: PluginRuntime): LogFi
 
   for (const dir of logDirs) {
     // 知名文件名
-    for (const name of ['gateway.log', 'gateway.err.log', 'openclaw.log', 'clawdbot.log', 'moltbot.log']) {
+    for (const name of ['gateway.log', 'gateway.err.log', 'openclaw.log']) {
       pushFile(path.join(dir, name), dir);
     }
     // 扫描所有 .log/.txt，按关键词过滤

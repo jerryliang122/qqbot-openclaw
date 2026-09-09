@@ -26,7 +26,6 @@ import {
 import { loadCredentialBackup } from './features/credential-backup.js';
 import { qqbotSetupWizard } from './setup/surface.js';
 import { qqbotLogin } from './setup/login.js';
-import { qqbotOnboardingAdapter } from './features/onboarding.js';
 import { createQQBotPluginBase } from './plugin-base.js';
 import { qqbotMessageAdapter } from './message-adapter.js';
 import { qqbotMessagingAdapter } from './messaging-adapter.js';
@@ -225,15 +224,7 @@ export const qqbotPlugin = createChatChannelPlugin({
     // auth.login 类型断言：框架接口可能不包含 login 字段
     // 运行时行为正确，类型断言确保类型安全
     auth: { login: qqbotLogin as unknown as NonNullable<Parameters<typeof createChatChannelPlugin>[0]['base']['auth']>['login'] },
-    // onboarding 字段：框架 ChatChannelPluginBase 不包含此字段，但运行时需要
-    // 使用类型断言绕过类型检查
-    ...(qqbotOnboardingAdapter ? { onboarding: qqbotOnboardingAdapter } : {}),
 
     approvalCapability: getQQBotApprovalCapability(),
   },
 });
-
-// Re-export for backward compatibility
-export { stripMentionText } from './utils/mention.js';
-export { detectWasMentioned } from './utils/mention.js';
-export { TEXT_CHUNK_LIMIT } from './constants.js';

@@ -74,7 +74,6 @@ function makeAccount(overrides?: Partial<ResolvedQQBotAccount>): ResolvedQQBotAc
     markdownSupport: true,
     commandPanelNative: true,
     userAgentSuffix: '',
-    processingTimeoutMs: 0,
     config: {},
     ...overrides,
   };

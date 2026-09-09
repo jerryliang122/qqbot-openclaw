@@ -6,7 +6,7 @@
  */
 
 import type { TypingParams, TypingState } from './types-plugin.js';
-import { checkPassiveReplyQuota, consumePassiveReplyQuota, inferQQBotScope } from './features/quota-manager.js';
+import { checkAndConsumePassiveReplyQuota, inferQQBotScope } from './features/quota-manager.js';
 
 const activeTypingSessions = new Map<string, TypingState>();
 
@@ -37,10 +37,11 @@ export async function startTypingWithRenewal(
     return;
   }
 
-  const canPassiveReply = await checkPassiveReplyQuota({
+  const { canReply: canPassiveReply, rollback } = checkAndConsumePassiveReplyQuota({
     accountId,
     msgId: replyToId,
     scope: 'c2c',
+    log,
   });
 
   const msgIdToSend = canPassiveReply ? replyToId : undefined;
@@ -51,12 +52,9 @@ export async function startTypingWithRenewal(
 
   const sent = await sendTyping({ to, msgId: msgIdToSend });
   if (!sent) {
+    rollback();
     log?.debug?.(`[${accountId}] typing start failed: send failed`);
     return;
-  }
-
-  if (canPassiveReply) {
-    await consumePassiveReplyQuota({ accountId, msgId: replyToId, scope: 'c2c', log });
   }
 
   log?.debug?.(`[${accountId}] typing started: ${sessionKey}`);
@@ -98,10 +96,11 @@ async function handleTypingRenewal(
     return;
   }
 
-  const canPassiveReply = await checkPassiveReplyQuota({
+  const { canReply: canPassiveReply, rollback } = checkAndConsumePassiveReplyQuota({
     accountId,
     msgId: replyToId,
     scope: 'c2c',
+    log,
   });
 
   const msgIdToSend = canPassiveReply ? replyToId : undefined;
@@ -112,13 +111,10 @@ async function handleTypingRenewal(
 
   const renewed = await sendTyping({ to, msgId: msgIdToSend });
   if (!renewed) {
+    rollback();
     log?.debug?.(`[${accountId}] typing renewal failed: send failed`);
     activeTypingSessions.delete(sessionKey);
     return;
-  }
-
-  if (canPassiveReply) {
-    await consumePassiveReplyQuota({ accountId, msgId: replyToId, scope: 'c2c', log });
   }
 
   state.renewalCount += 1;

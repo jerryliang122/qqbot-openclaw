@@ -31,13 +31,6 @@ export interface ResolvedQQBotAccount {
   commandPanelNative: boolean;
   /** User-Agent 尾部追加内容 */
   userAgentSuffix: string;
-  /**
-   * 单条消息最大处理时间（ms）。0 表示不限制。默认 0（不限制）。
-   * 
-   * 注意：此配置目前已不再使用，因为已移除插件级的 concurrencyGuard 中间件，
-   * 并发控制由 OpenClaw 框架的 session lane 机制处理。
-   */
-  processingTimeoutMs: number;
   config: QQBotAccountConfig;
 }
 
@@ -47,22 +40,15 @@ export type GroupPolicy = "open" | "allowlist" | "disabled";
 /** 工具策略：full=全部 | restricted=限制敏感工具 | none=禁止 */
 export type ToolPolicy = "full" | "restricted" | "none";
 
-/** 群消息排队策略 */
-export type GroupCoalesceStrategy = "framework" | "plugin";
-
 /** 群消息合并配置 */
 export interface GroupCoalesceConfig {
   /**
-   * 排队策略（默认 framework）：
-   * - framework：消息逐条立即 dispatch，排队/合并交给 OpenClaw 框架的 followup 队列
-   *   （此模式下 enabled=true → 框架 collect 合并批处理；enabled=false → followup 排队不合并）
-   * - plugin：使用插件内建 coalescer busy-buffering（旧版行为，回退用）
+   * 是否启用消息合并（默认 true）：
+   * - true：框架 collect 合并批处理
+   * - false：followup 排队不合并
+   * 排队/合并完全由 OpenClaw 框架的 followup 队列承担。
    */
-  strategy?: GroupCoalesceStrategy;
-  /** 是否启用消息合并（默认 true；strategy=plugin 时门控插件 coalescer） */
   enabled?: boolean;
-  /** 最大缓冲消息数（默认 50，仅 strategy=plugin 生效） */
-  maxBuffer?: number;
 }
 
 /** 指令面板配置 */
@@ -167,11 +153,6 @@ export interface QQBotAccountConfig {
   /** 是否支持 markdown 消息（默认 true，设为 false 可禁用） */
   markdownSupport?: boolean;
   /**
-   * @deprecated 请使用 audioFormatPolicy.uploadDirectFormats
-   * 可直接上传的音频格式（不转换为 SILK），向后兼容
-   */
-  voiceDirectUploadFormats?: string[];
-  /**
    * 音频格式策略配置
    * 统一管理入站（STT）和出站（上传）的音频格式转换行为
    */
@@ -243,34 +224,15 @@ export interface QQBotAccountConfig {
    *               partial 接收逻辑（状态机/串行/去重）保持不变，仅替换下发通道。
    *               适合不想要打字机效果、只想收到一条完整回复的场景。
    */
-  streaming?:
-    | boolean
-    | {
-        mode: 'partial' | 'off';
-        sendMode?: 'stream' | 'static';
-      };
+  streaming?: {
+    mode: 'partial' | 'off';
+    sendMode?: 'stream' | 'static';
+  };
   /**
    * STT (语音转文字) 配置
    * 配置后，收到语音消息时会自动调用 STT 服务转录为文字
    */
   stt?: STTChannelConfig;
-  /**
-   * ⚠️ 已废弃 - 此配置已不再使用
-   * 
-   * 原用途：单条消息最大处理时间（毫秒），由已移除的 concurrencyGuard 中间件实现超时保护。
-   * 
-   * 移除 concurrencyGuard 后的影响：
-   * - 此配置字段被读取但不会产生任何超时行为
-   * - 环境变量 OPENCLAW_PROCESSING_TIMEOUT_MS 也被忽略
-   * - 框架级的 session lane 没有提供消息级超时机制
-   * 
-   * 如果需要超时保护，请考虑：
-   * - 在 OpenClaw 框架配置中设置全局超时
-   * - 或等待插件重新实现消息级超时机制
-   * 
-   * @deprecated Since v2.0.1 - concurrencyGuard 已移除
-   */
-  processingTimeoutMs?: number;
   /**
    * User-Agent 尾部追加内容（用于私有化部署标识等场景）
    * 追加在 `QQBotPlugin/{version} (Node/{nodeVersion}; {os}; OpenClaw/{version})` 之后

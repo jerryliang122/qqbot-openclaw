@@ -27,7 +27,6 @@ const mockAccount: ResolvedQQBotAccount = {
   enabled: true,
   markdownSupport: true,
   userAgentSuffix: '',
-  processingTimeoutMs: 0,
   config: {},
 };
 

@@ -21,49 +21,6 @@ declare module "openclaw/plugin-sdk" {
   // ============ 插件运行时 ============
 
   /**
-   * Channel Activity 接口
-   */
-  export interface ChannelActivity {
-    record?: (...args: unknown[]) => void;
-    recordActivity?: (key: string, data?: unknown) => void;
-    [key: string]: unknown;
-  }
-
-  /**
-   * Channel Routing 接口
-   */
-  export interface ChannelRouting {
-    resolveAgentRoute?: (...args: unknown[]) => unknown;
-    resolveSenderAndSession?: (options: unknown) => unknown;
-    [key: string]: unknown;
-  }
-
-  /**
-   * Channel Reply 接口
-   */
-  export interface ChannelReply {
-    handleIncomingMessage?: (options: unknown) => Promise<unknown>;
-    formatInboundEnvelope?: (...args: unknown[]) => unknown;
-    finalizeInboundContext?: (...args: unknown[]) => unknown;
-    resolveEnvelopeFormatOptions?: (...args: unknown[]) => unknown;
-    handleAutoReply?: (...args: unknown[]) => Promise<unknown>;
-    [key: string]: unknown;
-  }
-
-  /**
-   * Channel 接口（用于 PluginRuntime）
-   * 注意：这是一个宽松的类型定义，实际 SDK 中的类型更复杂
-   */
-  export interface ChannelInterface {
-    recordInboundSession?: (options: unknown) => void;
-    handleIncomingMessage?: (options: unknown) => Promise<unknown>;
-    activity?: ChannelActivity;
-    routing?: ChannelRouting;
-    reply?: ChannelReply;
-    [key: string]: unknown;
-  }
-
-  /**
    * 插件运行时接口
    * 注意：channel 属性设为 any 是因为 SDK 内部类型非常复杂，
    * 且会随 SDK 版本变化。实际使用时 SDK 会提供正确的运行时类型。
@@ -79,13 +36,6 @@ declare module "openclaw/plugin-sdk" {
     /** Channel 接口 */
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     channel?: any;
-    /** 日志函数（旧版，建议使用 logging.getChildLogger） */
-    log: {
-      info: (message: string, ...args: unknown[]) => void;
-      warn: (message: string, ...args: unknown[]) => void;
-      error: (message: string, ...args: unknown[]) => void;
-      debug: (message: string, ...args: unknown[]) => void;
-    };
     /** 结构化日志（框架自动追加 channel 前缀） */
     logging: {
       shouldLogVerbose: () => boolean;
@@ -437,8 +387,6 @@ declare module "openclaw/plugin-sdk" {
     capabilities?: ChannelPluginCapabilities;
     /** 重载配置 */
     reload?: { configPrefixes?: string[] };
-    /** Onboarding 适配器 */
-    onboarding?: ChannelOnboardingAdapter;
     /** 配置方法 */
     config?: ChannelPluginConfig<TAccount>;
     /** Setup 方法 */
@@ -462,87 +410,6 @@ declare module "openclaw/plugin-sdk" {
     /** deliver 函数 - 发送消息 */
     deliver?: (ctx: unknown) => Promise<unknown>;
     /** 其他插件属性 */
-    [key: string]: unknown;
-  }
-
-  // ============ Onboarding 类型 ============
-
-  /**
-   * Onboarding 状态结果
-   */
-  export interface ChannelOnboardingStatus {
-    channel?: string;
-    configured: boolean;
-    statusLines?: string[];
-    selectionHint?: string;
-    quickstartScore?: number;
-    [key: string]: unknown;
-  }
-
-  /**
-   * Onboarding 状态字符串枚举（部分 API 使用）
-   */
-  export type ChannelOnboardingStatusString =
-    | "not-configured"
-    | "configured"
-    | "connected"
-    | "error";
-
-  /**
-   * Onboarding 状态上下文
-   */
-  export interface ChannelOnboardingStatusContext {
-    /** 当前配置 */
-    config: OpenClawConfig;
-    /** 账户 ID */
-    accountId?: string;
-    /** Prompter */
-    prompter?: unknown;
-    /** 其他上下文 */
-    [key: string]: unknown;
-  }
-
-  /**
-   * Onboarding 配置上下文
-   */
-  export interface ChannelOnboardingConfigureContext {
-    /** 当前配置 */
-    config: OpenClawConfig;
-    /** 账户 ID */
-    accountId?: string;
-    /** 输入参数 */
-    input?: Record<string, unknown>;
-    /** Prompter */
-    prompter?: unknown;
-    /** 其他上下文 */
-    [key: string]: unknown;
-  }
-
-  /**
-   * Onboarding 结果
-   */
-  export interface ChannelOnboardingResult {
-    /** 是否成功 */
-    success: boolean;
-    /** 更新后的配置 */
-    config?: OpenClawConfig;
-    /** 错误信息 */
-    error?: string;
-    /** 消息 */
-    message?: string;
-    /** 其他结果字段 */
-    [key: string]: unknown;
-  }
-
-  /**
-   * Onboarding 适配器接口
-   */
-  export interface ChannelOnboardingAdapter {
-    /** 获取状态 */
-    getStatus?: (ctx: ChannelOnboardingStatusContext) => ChannelOnboardingStatus | Promise<ChannelOnboardingStatus>;
-    /** 配置函数 */
-    configure?: (ctx: ChannelOnboardingConfigureContext) => ChannelOnboardingResult | Promise<ChannelOnboardingResult>;
-    /** 其他适配器方法 */
     [key: string]: unknown;
   }
 

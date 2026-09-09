@@ -12,7 +12,6 @@ import { getQQBotDataDir } from '../utils/platform.js';
 
 const BACKUP_DIR = 'credential-backup';
 const BACKUP_FILENAME = 'current.json';
-const LEGACY_FILENAME = 'credential-backup.json';
 
 interface CredentialBackup {
   accountId: string;
@@ -56,16 +55,9 @@ export function saveCredentialBackup(accountId: string, appId: string, clientSec
  */
 export function loadCredentialBackup(accountId?: string): CredentialBackup | null {
   try {
-    // 优先读新路径
     const backupPath = getBackupPath();
     if (fs.existsSync(backupPath)) {
-      const data = readBackupFile(backupPath, accountId);
-      if (data) return data;
-    }
-    // 兼容旧路径（升级过渡）
-    const legacyPath = path.join(getQQBotDataDir('data'), LEGACY_FILENAME);
-    if (fs.existsSync(legacyPath)) {
-      return readBackupFile(legacyPath, accountId);
+      return readBackupFile(backupPath, accountId);
     }
     return null;
   } catch {

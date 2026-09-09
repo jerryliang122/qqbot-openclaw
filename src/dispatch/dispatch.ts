@@ -96,8 +96,8 @@ export async function dispatchToOpenClaw(
 
   dlog?.debug(`received sender=${envelope.senderId} scope=${envelope.chatScope} msgId=${envelope.messageId}`);
 
-  if (!adapters.dispatchReply) {
-    dlog?.error(`runtime adapter dispatchReply not available (openclaw=${adapters.version})`);
+  if (!adapters.inboundRun || !adapters.dispatchReply) {
+    dlog?.error(`runtime adapter inboundRun/dispatchReply not available (openclaw=${adapters.version}, requires >=2026.9.2)`);
     return;
   }
 
@@ -135,18 +135,16 @@ export async function dispatchToOpenClaw(
   const qualifiedTarget = envelope.targetId;
   const agentId = route.agentId ?? 'default';
 
-  // ── 群聊排队策略（coalesce.strategy=framework 时把排队交给框架）──
+  // ── 群聊排队策略（排队/合并交给框架 followup 队列）──
   // - enabled=true  → collect：活动 turn 期间到达的消息排队并在其后合并批处理
-  // - enabled=false → followup：排队但不合并（尊重旧配置「关闭合并」的意图，
+  // - enabled=false → followup：排队但不合并（尊重「关闭合并」的意图，
   //                   仍保证不打断活动 turn——远比框架默认 steer 插嘴安全）
-  // - strategy=plugin → 不传（插件 coalescer 已在中间件层处理，无需框架排队）
   const groupCfg = isGroup && envelope.groupId
     ? resolveGroupConfigFromAccount(account, envelope.groupId)
     : undefined;
-  const queueModeOverride =
-    groupCfg?.coalesce.strategy === 'framework'
-      ? groupCfg.coalesce.enabled ? 'collect' as const : 'followup' as const
-      : undefined;
+  const queueModeOverride = groupCfg
+    ? (groupCfg.coalesce.enabled ? 'collect' as const : 'followup' as const)
+    : undefined;
 
   // ── room_event 分类（全量模式群的被动房间事件）──
   // wasMentioned 三种唤醒方式：@（AT 事件 / mentions.is_you / 内容标记，由
@@ -200,7 +198,8 @@ export async function dispatchToOpenClaw(
   // （对齐 telegram 的 ctxPayload.InboundEventKind 约定）
   ctxPayload.InboundEventKind = inboundEventKind;
 
-  const ttsRuntime = (runtime as any)?.tts ?? (runtime as any)?.channel?.runtimeContexts?.get?.('tts');
+  // TTS 扩展点探测（runtime.tts / runtimeContexts），非核心 channel API
+  const ttsRuntime = (runtime as any)?.tts ?? (runtime as any)?.channel?.runtimeContexts?.get?.('tts'); // @adapter-bypass: TTS extension point probe
 
   const debounceConfig = account.config?.deliverDebounce;
   const debouncer = debounceConfig?.enabled !== false
@@ -288,9 +287,7 @@ export async function dispatchToOpenClaw(
       if (isAskUserPayload(payloadWithChannelData as any) && text) {
         const { questionId, optionValues } = (payloadWithChannelData as any).channelData.askUser;
         const questionRuntime = await getQuestionGatewayRuntime();
-        if (!questionRuntime) {
-          dlog?.warn('[question] host does not export question-gateway-runtime; falling back to plain text');
-        } else {
+        {
           const keyboard = buildQuestionKeyboard(questionId, optionValues);
           const bot = tryGetBotForAccount(account.accountId);
           if (bot) {
@@ -434,139 +431,83 @@ export async function dispatchToOpenClaw(
   const hadDispatchError = () => dispatchError !== undefined;
 
   try {
-    if (!adapters.inboundRun) {
-      // 低版本：手动 session + dispatchReply 直调
-      if (adapters.recordInboundSession) {
-        try {
-          await adapters.recordInboundSession({
-            storePath,
-            sessionKey: route.sessionKey,
-            ctx: ctxPayload,
-          });
-        } catch { /* best-effort */ }
-      }
-      await adapters.dispatchReply!({
-        ctx: ctxPayload,
-        cfg,
-        dispatcherOptions: {
-          deliver: deliverHandler,
-        },
-        replyOptions: {
-          abortSignal: combinedAbortSignal,
-          runId: envelope.messageId,
-          ...(queueModeOverride ? { queueModeOverride } : {}),
-          ...(inboundEventKind === 'room_event' ? { sourceReplyDeliveryMode: 'message_tool_only' as const } : {}),
-          ...(streamingController?.isStaticSendMode
-            ? {
-                // 对齐 telegram 模式一：显式关掉 SDK block streaming，绕开 coalescer
-                // （minChars=800/idleMs=1000 的 buffer 会造成文本延迟）。
-                // 文本由 onPartialReply 累积，边界由 onToolStart 自己监听 flush。
-                disableBlockStreaming: true,
-                // 让 onToolStart 在 verbose 关闭时也能触发
-                // （默认受 requiresToolSummaryVisibility 门控，verbose off 时不触发）
-                allowToolLifecycleWhenProgressHidden: true,
-                // 工具【开始执行前】触发：把已累积的上一段文本立即发出
-                // （不等工具执行完，对齐 telegram prepareAnswerLaneForToolProgress）
-                onToolStart: async () => { await streamingController.flushSegment(); },
-              }
-            : {}),
-          ...(streamingController
-            ? {
-                onPartialReply: async (p: { text?: string }) => {
-                  if (p.text) await streamingController.onPartialReply(p.text);
-                },
-                // 兜底：onToolStart 未覆盖的边界（如纯文本段切换、部分 provider 事件差异）
-                // 仍由 onAssistantMessageStart 触发分段。stream 模式不传，保持原行为。
-                onAssistantMessageStart: streamingController.isStaticSendMode
-                  ? async () => { await streamingController.flushSegment(); }
-                  : undefined,
-              }
-            : {}),
-        },
-      });
-      if (streamingController && !streamingController.isTerminal) {
-        await streamingController.finalize();
-      }
-      if (debouncer) await debouncer.flushAll();
-    } else {
-      await adapters.inboundRun!({
-        channel: 'qqbot',
-        accountId: route.accountId,
-        raw: envelope,
-        adapter: {
-          ingest: (raw: any) => ({
-            id: envelope.messageId,
-            rawText: assembled.rawBody,
-            textForAgent: assembled.agentBody,
-            textForCommands: assembled.rawBody,
-            raw,
-          }),
-          resolveTurn: (_input: unknown, _eventClass: unknown, _preflight: unknown) => ({
-            channel: 'qqbot',
-            accountId: route.accountId,
-            routeSessionKey: route.sessionKey,
-            storePath,
-            ctxPayload,
-            recordInboundSession: adapters.recordInboundSession,
-            record: {
-              onRecordError: (err: unknown) => {
-                dlog?.error(`Session record error: ${err}`);
+    await adapters.inboundRun!({
+      channel: 'qqbot',
+      accountId: route.accountId,
+      raw: envelope,
+      adapter: {
+        ingest: (raw: any) => ({
+          id: envelope.messageId,
+          rawText: assembled.rawBody,
+          textForAgent: assembled.agentBody,
+          textForCommands: assembled.rawBody,
+          raw,
+        }),
+        resolveTurn: (_input: unknown, _eventClass: unknown, _preflight: unknown) => ({
+          channel: 'qqbot',
+          accountId: route.accountId,
+          routeSessionKey: route.sessionKey,
+          storePath,
+          ctxPayload,
+          recordInboundSession: adapters.recordInboundSession,
+          record: {
+            onRecordError: (err: unknown) => {
+              dlog?.error(`Session record error: ${err}`);
+            },
+          },
+          runDispatchLifecycle: {
+            // 同一 lifecycle 对象必须同时出现在 runDispatchLifecycle 与
+            // replyOptions.turnAdoptionLifecycle（框架校验所有权一致性）。
+            turnAdoptionLifecycle,
+            onDispatchSkipped: (reason: string) => {
+              dlog?.info(`dispatch skipped reason=${reason} sessionKey=${route.sessionKey}`);
+            },
+          },
+          runDispatch: () => {
+            return adapters.dispatchReply!({
+              ctx: ctxPayload,
+              cfg,
+              dispatcherOptions: {
+                deliver: deliverHandler,
               },
-            },
-            runDispatchLifecycle: {
-              // 同一 lifecycle 对象必须同时出现在 runDispatchLifecycle 与
-              // replyOptions.turnAdoptionLifecycle（框架校验所有权一致性）。
-              turnAdoptionLifecycle,
-              onDispatchSkipped: (reason: string) => {
-                dlog?.info(`dispatch skipped reason=${reason} sessionKey=${route.sessionKey}`);
+              replyOptions: {
+                abortSignal: combinedAbortSignal,
+                runId: envelope.messageId,
+                turnAdoptionLifecycle,
+                ...(queueModeOverride ? { queueModeOverride } : {}),
+                ...(inboundEventKind === 'room_event' ? { sourceReplyDeliveryMode: 'message_tool_only' as const } : {}),
+                ...(streamingController?.isStaticSendMode
+                  ? {
+                      // 对齐 telegram 模式一：显式关掉 SDK block streaming，绕开 coalescer
+                      // （minChars=800/idleMs=1000 的 buffer 会造成文本延迟）。
+                      // 文本由 onPartialReply 累积，边界由 onToolStart 自己监听 flush。
+                      disableBlockStreaming: true,
+                      // 让 onToolStart 在 verbose 关闭时也能触发
+                      // （默认受 requiresToolSummaryVisibility 门控，verbose off 时不触发）
+                      allowToolLifecycleWhenProgressHidden: true,
+                      // 工具【开始执行前】触发：把已累积的上一段文本立即发出
+                      // （不等工具执行完，对齐 telegram prepareAnswerLaneForToolProgress）
+                      onToolStart: async () => { await streamingController.flushSegment(); },
+                    }
+                  : {}),
+                ...(streamingController
+                  ? {
+                      onPartialReply: async (p: { text?: string }) => {
+                        if (p.text) await streamingController.onPartialReply(p.text);
+                      },
+                      // 兜底：block 信号未覆盖的边界（如部分 provider 不发 text_end）
+                      // 仍由 onAssistantMessageStart 触发分段。stream 模式不传，保持原行为。
+                      onAssistantMessageStart: streamingController.isStaticSendMode
+                        ? async () => { await streamingController.flushSegment(); }
+                        : undefined,
+                    }
+                  : {}),
               },
-            },
-            runDispatch: () => {
-              return adapters.dispatchReply!({
-                ctx: ctxPayload,
-                cfg,
-                dispatcherOptions: {
-                  deliver: deliverHandler,
-                },
-                replyOptions: {
-                  abortSignal: combinedAbortSignal,
-                  runId: envelope.messageId,
-                  turnAdoptionLifecycle,
-                  ...(queueModeOverride ? { queueModeOverride } : {}),
-                  ...(inboundEventKind === 'room_event' ? { sourceReplyDeliveryMode: 'message_tool_only' as const } : {}),
-                  ...(streamingController?.isStaticSendMode
-                    ? {
-                        // 对齐 telegram 模式一：显式关掉 SDK block streaming，绕开 coalescer
-                        // （minChars=800/idleMs=1000 的 buffer 会造成文本延迟）。
-                        // 文本由 onPartialReply 累积，边界由 onToolStart 自己监听 flush。
-                        disableBlockStreaming: true,
-                        // 让 onToolStart 在 verbose 关闭时也能触发
-                        // （默认受 requiresToolSummaryVisibility 门控，verbose off 时不触发）
-                        allowToolLifecycleWhenProgressHidden: true,
-                        // 工具【开始执行前】触发：把已累积的上一段文本立即发出
-                        // （不等工具执行完，对齐 telegram prepareAnswerLaneForToolProgress）
-                        onToolStart: async () => { await streamingController.flushSegment(); },
-                      }
-                    : {}),
-                  ...(streamingController
-                    ? {
-                        onPartialReply: async (p: { text?: string }) => {
-                          if (p.text) await streamingController.onPartialReply(p.text);
-                        },
-                        // 兜底：block 信号未覆盖的边界（如部分 provider 不发 text_end）
-                        // 仍由 onAssistantMessageStart 触发分段。stream 模式不传，保持原行为。
-                        onAssistantMessageStart: streamingController.isStaticSendMode
-                          ? async () => { await streamingController.flushSegment(); }
-                          : undefined,
-                      }
-                    : {}),
-                },
-              });
-            },
-          }),
-        },
-      });
-    }
+            });
+          },
+        }),
+      },
+    });
   } catch (err) {
     dispatchError = err;
     dlog?.error(`dispatch failed: ${err instanceof Error ? err.message : String(err)}`);

@@ -1,99 +1,95 @@
 /**
- * Pairing Runtime 动态加载（兼容旧版框架）
+ * Pairing Runtime — openclaw/plugin-sdk/conversation-runtime
  *
- * 从 OpenClaw 安装目录动态加载 conversation-runtime 模块中的配对函数。
- * 不支持时返回 null，配对功能降级为不可用。
+ * readAllowFromStore / issueChallenge / buildReply 直接来自稳定 subpath。
+ *
+ * approveCode 例外：`approveChannelPairingCode` 在 2026.9.2 未从任何
+ * plugin-sdk subpath 导出（只存在于内部 pairing-store chunk 与
+ * `openclaw pairing approve` CLI），走与网关同源的 CLI 执行
+ * （见 secret-store-cli 的 resolveOpenClawCli 同源约束）。
  */
+import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import path from 'node:path';
+import * as path from 'node:path';
+import { resolveOpenClawCli } from '../features/secret-store-cli.js';
 
 export interface PairingApi {
   readAllowFromStore: (params: { channel: string; accountId: string }) => Promise<string[]>;
   issueChallenge: (params: { channel: string; id: string; accountId: string }) => Promise<{ code: string }>;
   buildReply: (params: { code: string; channel: string }) => string;
-  approveCode: (params: { channel: string; code: string; accountId?: string }) => Promise<{ id: string } | null>;
+  /** 经 `openclaw pairing approve` 执行；返回是否成功 */
+  approveCode: (params: { channel: string; code: string; accountId?: string }) => Promise<{ approved: boolean }>;
 }
 
-let _api: PairingApi | null | undefined;
+let _req: NodeRequire | undefined;
 
-/** 获取 Pairing API，首次调用触发加载并缓存 */
-export function getPairingApi(): PairingApi | null {
-  if (_api !== undefined) return _api;
-  _api = loadPairingApi();
-  return _api;
+function getReq(): NodeRequire {
+  _req ??= createRequire(
+    typeof __filename !== 'undefined' ? __filename : path.join(process.cwd(), 'noop.js'),
+  );
+  return _req;
 }
 
-function loadPairingApi(): PairingApi | null {
-  const currentFile = __filename;
-  const req = createRequire(currentFile);
-  const pluginRoot = path.resolve(path.dirname(currentFile), '..', '..');
-  const fs = req('node:fs') as typeof import('node:fs');
+let _mod: {
+  readChannelAllowFromStore: (channel: string, env?: unknown, accountId?: string) => Promise<string[]>;
+  upsertChannelPairingRequest: (params: { channel: string; id: string; accountId?: string }) => Promise<{ code: string }>;
+  buildPairingReply: (params: { channel: string; idLine?: string; code: string }) => string;
+} | undefined;
 
-  const tryLoad = (root: string) => {
-    for (const rel of ['dist/plugin-sdk/conversation-runtime.js', 'plugin-sdk/conversation-runtime.js']) {
-      const p = path.join(root, rel);
-      try {
-        if (fs.existsSync(p)) return req(p);
-      } catch { /* try next */ }
-    }
-    return null;
-  };
+function loadMod(): NonNullable<typeof _mod> {
+  _mod ??= getReq()('openclaw/plugin-sdk/conversation-runtime');
+  return _mod!;
+}
 
-  let mod: any = null;
-  try {
-    const { findOpenclawRoot } = req(path.join(pluginRoot, 'scripts', 'link-sdk-core.cjs')) as {
-      findOpenclawRoot: (root: string) => string | null;
-    };
-    const root = findOpenclawRoot(pluginRoot);
-    if (root) mod = tryLoad(root);
-  } catch { /* fallback */ }
-
-  if (!mod) {
-    try {
-      const entry = process.argv[1];
-      if (entry) {
-        const realEntry = fs.realpathSync(entry);
-        let dir = path.dirname(realEntry);
-        for (let i = 0; i < 6; i++) {
-          mod = tryLoad(dir);
-          if (mod) break;
-          const parent = path.dirname(dir);
-          if (parent === dir) break;
-          dir = parent;
-        }
-      }
-    } catch { /* fallback */ }
-  }
-
-  if (!mod?.readChannelAllowFromStore) return null;
-
+/** 获取 Pairing API（conversation-runtime 为稳定导出，加载失败即抛错） */
+export function getPairingApi(): PairingApi {
+  const mod = loadMod();
   return {
-    // readChannelAllowFromStore(channel, env?, accountId?) — 位置参数
     readAllowFromStore: (params) =>
       mod.readChannelAllowFromStore(params.channel, undefined, params.accountId),
-
-    // upsertChannelPairingRequest({ channel, id, accountId }) — 对象参数
     issueChallenge: (params) =>
       mod.upsertChannelPairingRequest({
         channel: params.channel,
         id: params.id,
         accountId: params.accountId,
-      }).then((r: any) => ({ code: r.code as string })),
-
-    // buildPairingReply({ channel, idLine, code }) — 对象参数
+      }).then((r) => ({ code: r.code })),
     buildReply: (params) =>
       mod.buildPairingReply({
         channel: params.channel,
         idLine: '', // qqbot 无额外 ID 信息，留空即可
         code: params.code,
       }),
-
-    // approveChannelPairingCode({ channel, code, accountId? }) — 对象参数
-    approveCode: (params) =>
-      mod.approveChannelPairingCode({
-        channel: params.channel,
-        code: params.code,
-        accountId: params.accountId,
-      }),
+    approveCode: (params) => approveViaCli(params),
   };
+}
+
+const APPROVE_TIMEOUT_MS = 30_000;
+
+async function approveViaCli(params: {
+  channel: string;
+  code: string;
+  accountId?: string;
+}): Promise<{ approved: boolean }> {
+  const cli = resolveOpenClawCli();
+  const args = [
+    ...cli.args,
+    'pairing',
+    'approve',
+    '--channel',
+    params.channel,
+    ...(params.accountId ? ['--account', params.accountId] : []),
+    params.code,
+  ];
+  return new Promise((resolve) => {
+    const child = spawn(cli.cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => child.kill('SIGKILL'), APPROVE_TIMEOUT_MS);
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolve({ approved: false });
+    });
+    child.on('close', (codeNum) => {
+      clearTimeout(timer);
+      resolve({ approved: codeNum === 0 });
+    });
+  });
 }

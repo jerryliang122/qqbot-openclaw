@@ -85,11 +85,6 @@ async function checkPairingMode(
   opts: { accountId: string; getRuntime: () => any; senderId: string },
 ): Promise<void> {
   const api = getPairingApi();
-  if (!api) {
-    ctx.log?.info?.(`[access] pairing unavailable for ${opts.senderId}`);
-    ctx.stop('access:pairing_unavailable');
-    return;
-  }
 
   try {
     const storeIds = await api.readAllowFromStore({

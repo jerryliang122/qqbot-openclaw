@@ -1,60 +1,13 @@
 /**
- * Setup 工具动态加载（plugin-sdk/setup + plugin-sdk/setup-tools）
+ * Setup 工具 re-export（plugin-sdk/setup + plugin-sdk/setup-tools）
  *
- * 新版本 openclaw 有这些导出，旧版本可能缺失。
- * 不可用时提供最小降级实现。
+ * 构建基线 openclaw 2026.9.2，两个 subpath 均为正式导出，直接转发。
  */
-import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
-
-// CJS 兼容：__filename 在 CJS 中可用，ESM 中使用 import.meta.url
-const __file = typeof __filename !== 'undefined' 
-  ? __filename 
-  : fileURLToPath(import.meta.url);
-const req = createRequire(__file);
-
-let _setup: typeof import('openclaw/plugin-sdk/setup') | null | undefined;
-let _tools: typeof import('openclaw/plugin-sdk/setup-tools') | null | undefined;
-
-function loadSetup() {
-  if (_setup !== undefined) return _setup;
-  try { _setup = req('openclaw/plugin-sdk/setup'); } catch { _setup = null; }
-  return _setup;
-}
-
-function loadTools() {
-  if (_tools !== undefined) return _tools;
-  try { _tools = req('openclaw/plugin-sdk/setup-tools'); } catch { _tools = null; }
-  return _tools;
-}
-
 export type { ChannelSetupWizard } from 'openclaw/plugin-sdk/setup';
 
-export const DEFAULT_ACCOUNT_ID = 'default';
+export {
+  createStandardChannelSetupStatus,
+  setSetupChannelEnabled,
+} from 'openclaw/plugin-sdk/setup';
 
-export function createStandardChannelSetupStatus(
-  ...args: Parameters<NonNullable<typeof _setup>['createStandardChannelSetupStatus']>
-): ReturnType<NonNullable<typeof _setup>['createStandardChannelSetupStatus']> {
-  const mod = loadSetup();
-  if (mod) return mod.createStandardChannelSetupStatus(...args);
-  return {
-    channelLabel: args[0]?.channelLabel ?? 'QQ Bot',
-    configuredLabel: 'Configured',
-    unconfiguredLabel: 'Not configured',
-    resolveConfigured: () => false,
-  } as unknown as ReturnType<NonNullable<typeof _setup>['createStandardChannelSetupStatus']>;
-}
-
-export function setSetupChannelEnabled(
-  ...args: Parameters<NonNullable<typeof _setup>['setSetupChannelEnabled']>
-): void {
-  loadSetup()?.setSetupChannelEnabled?.(...args);
-}
-
-export function formatDocsLink(
-  ...args: Parameters<NonNullable<typeof _tools>['formatDocsLink']>
-): ReturnType<NonNullable<typeof _tools>['formatDocsLink']> {
-  const mod = loadTools();
-  if (mod) return mod.formatDocsLink(...args);
-  return (args[1] ? `${args[1]}: ${args[0]}` : args[0]) as ReturnType<NonNullable<typeof _tools>['formatDocsLink']>;
-}
+export { formatDocsLink } from 'openclaw/plugin-sdk/setup-tools';

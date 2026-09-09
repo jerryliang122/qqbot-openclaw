@@ -43,7 +43,6 @@ const mockAccount = {
   accountId: 'test-account',
   appId: 'test-appid',
   clientSecret: 'test-secret',
-  processingTimeoutMs: 0,
   config: {},
   userAgentSuffix: '',
 };

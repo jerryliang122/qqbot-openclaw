@@ -53,7 +53,6 @@ export default plugin;
 export { qqbotPlugin } from './src/channel.js';
 export { setQQBotRuntime, getQQBotRuntime } from './src/runtime.js';
 export { getBotForAccount, tryGetBotForAccount, buildUserAgent } from './src/bot-instance.js';
-export { qqbotOnboardingAdapter } from './src/features/onboarding.js';
 export { QQBotGateway } from './src/gateway/index.js';
 export { sendText, sendMedia } from './src/outbound/outbound-service.js';
 export { parseTarget } from './src/outbound/target.js';
@@ -75,7 +74,6 @@ export { qqbotChannelOutbound } from './src/outbound-adapter.js';
 export { ReplyLimiter } from './src/outbound/reply-limiter.js';
 export {
   checkPassiveReplyQuota,
-  consumePassiveReplyQuota,
   inferQQBotScope,
   clearQuotaCache,
   getQuotaStats,

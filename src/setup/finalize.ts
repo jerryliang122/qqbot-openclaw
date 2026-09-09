@@ -2,9 +2,9 @@
  * openclaw setup 引导 — QQ Bot 扫码/手动绑定
  */
 import type { OpenClawConfig } from 'openclaw/plugin-sdk';
-import { DEFAULT_ACCOUNT_ID, formatDocsLink } from '../adapter/setup.js';
+import { formatDocsLink } from '../adapter/setup.js';
 import { qrConnect } from '@tencent-connect/qqbot-connector';
-import { applyQQBotAccountConfig, resolveQQBotAccount } from '../config.js';
+import { DEFAULT_ACCOUNT_ID, applyQQBotAccountConfig, resolveQQBotAccount } from '../config.js';
 import { resolveAccountKey } from './account-key.js';
 
 type Prompter = {

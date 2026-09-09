@@ -12,7 +12,7 @@ const path = require("node:path");
 const fs = require("node:fs");
 const os = require("node:os");
 
-const CLI_NAMES = ["openclaw", "clawdbot", "moltbot"];
+const CLI_NAMES = ["openclaw"];
 
 /**
  * 比较版本号是否 >= target

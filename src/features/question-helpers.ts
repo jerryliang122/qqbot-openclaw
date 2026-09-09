@@ -70,19 +70,15 @@ export interface QuestionGatewayRuntime {
   }) => Promise<{ status: string }>;
 }
 
-let questionRuntimePromise: Promise<QuestionGatewayRuntime | null> | undefined;
+let questionRuntimePromise: Promise<QuestionGatewayRuntime> | undefined;
 
 /**
- * question gateway 是 OpenClaw 2026.8.1+ 的可选能力。
- * 旧版 host 不导出该 subpath，必须在发送按钮前完成能力探测，避免投递死按钮。
+ * question gateway runtime（openclaw/plugin-sdk/question-gateway-runtime，
+ * 2026.8.1+ 稳定导出，peer 已要求 >=2026.9.2）。
  */
-export function getQuestionGatewayRuntime(): Promise<QuestionGatewayRuntime | null> {
+export function getQuestionGatewayRuntime(): Promise<QuestionGatewayRuntime> {
   questionRuntimePromise ??= import('openclaw/plugin-sdk/question-gateway-runtime')
-    .then((mod) => {
-      const runtime = mod.questionGatewayRuntime as QuestionGatewayRuntime | undefined;
-      return runtime && typeof runtime.resolveOption === 'function' ? runtime : null;
-    })
-    .catch(() => null);
+    .then((mod) => mod.questionGatewayRuntime as QuestionGatewayRuntime);
   return questionRuntimePromise;
 }
 

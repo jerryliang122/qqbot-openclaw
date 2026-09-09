@@ -197,13 +197,11 @@ async function main(): Promise<void> {
 
   // 测试 7: 文档公开的环境变量名必须可直接启动 default 账户
   await test('QQBOT_APPID / QQBOT_SECRET 环境变量兼容', async () => {
-    const keys = ['QQBOT_APPID', 'QQBOT_SECRET', 'QQBOT_APP_ID', 'QQBOT_CLIENT_SECRET'] as const;
+    const keys = ['QQBOT_APPID', 'QQBOT_SECRET'] as const;
     const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
     try {
       process.env.QQBOT_APPID = ' documented-app-id ';
       process.env.QQBOT_SECRET = ' documented-secret ';
-      delete process.env.QQBOT_APP_ID;
-      delete process.env.QQBOT_CLIENT_SECRET;
 
       const { listQQBotAccountIds, resolveQQBotAccount } = await import('../src/config.js');
       const cfg = {} as any;

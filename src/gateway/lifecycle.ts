@@ -133,8 +133,7 @@ async function initFeatures(
 function registerApprovalNativeContext(accountId: string, ctx: StartAccountContext): void {
   const channelRuntime = (ctx as { channelRuntime?: { runtimeContexts?: any } }).channelRuntime;
   const registry = channelRuntime?.runtimeContexts;
-  if (!registry || typeof registry.register !== 'function') {
-    // 框架版本不支持运行时上下文注册 → native 审批降级为不可用（不影响消息收发）。
+  if (!registry) {
     return;
   }
   try {

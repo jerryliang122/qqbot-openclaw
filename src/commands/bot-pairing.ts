@@ -26,9 +26,6 @@ export function botPairing(_getRuntime: () => PluginRuntime): SlashCommand {
       }
 
       const api = getPairingApi();
-      if (!api) {
-        return '⚠️ 当前 OpenClaw 版本不支持配对审批功能。';
-      }
 
       try {
         const result = await api.approveCode({
@@ -36,7 +33,7 @@ export function botPairing(_getRuntime: () => PluginRuntime): SlashCommand {
           code,
         });
 
-        if (!result?.id) {
+        if (!result?.approved) {
           return [
             `⚠️ 配对码 \`${code}\` 无效或已过期。`,
             '',
@@ -44,11 +41,7 @@ export function botPairing(_getRuntime: () => PluginRuntime): SlashCommand {
           ].join('\n');
         }
 
-        return [
-          '✅ 已批准用户访问。',
-          '',
-          `用户 ID: \`${result.id}\``,
-        ].join('\n');
+        return '✅ 已批准用户访问。';
       } catch (err) {
         return `❌ 审批失败: ${(err as Error).message}`;
       }

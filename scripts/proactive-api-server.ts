@@ -32,10 +32,10 @@ import type { ResolvedQQBotAccount } from "../src/types.js";
 // 默认端口
 const DEFAULT_PORT = 3721;
 
-// 自动检测配置文件路径（兼容 openclaw / clawdbot / moltbot）
+// 自动检测配置文件路径（openclaw）
 function detectConfigPath(): string | null {
   const home = process.env.HOME || "/home/ubuntu";
-  for (const app of ["openclaw", "clawdbot", "moltbot"]) {
+  for (const app of ["openclaw"]) {
     const p = path.join(home, `.${app}`, `${app}.json`);
     if (fs.existsSync(p)) return p;
   }

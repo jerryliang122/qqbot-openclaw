@@ -33,8 +33,6 @@ const REF_BEGIN = '[Reference message begins]';
 const REF_END = '[Reference message ends]';
 const HISTORY_BEGIN = '[Chat history begins]';
 const HISTORY_END = '[Chat history ends]';
-const MERGE_CTX_BEGIN = '[Merged messages begins]';
-const MERGE_CTX_END = '[Merged messages ends]';
 const CURRENT_MSG = '[Current message]';
 
 export interface AssembledBody {
@@ -65,7 +63,6 @@ export function assembleBody(
   const processed = ctx.state.processedAttachments as ProcessedAttachments | undefined;
   const quote = ctx.state.quote as ResolvedQuote | undefined;
   const history = ctx.state.history as HistoryEntry[] | undefined;
-  const mergedMessages = ctx.state.mergedMessages as MiddlewareContext[] | undefined;
 
   // ── Layer 1: userContent（清洗后的文本 + 语音转录 + 附件描述） ──
   const userContent = buildUserContent(ctx.message.content ?? '', processed);
@@ -73,10 +70,8 @@ export function assembleBody(
   // ── Layer 2: quotePart ──
   const quotePart = buildQuotePart(quote);
 
-  // ── Layer 3: userMessage（群带 [sender] 前缀 + (@you)，合并消息特殊处理） ──
-  const userMessage = mergedMessages && mergedMessages.length > 0
-    ? buildMergedUserMessage({ messages: mergedMessages, quotePart, isGroup, wasMentioned, getRuntime })
-    : buildUserMessage({ msg, userContent, quotePart, isGroup, wasMentioned });
+  // ── Layer 3: userMessage（群带 [sender] 前缀 + (@you)） ──
+  const userMessage = buildUserMessage({ msg, userContent, quotePart, isGroup, wasMentioned });
 
   // ── Layer 4: dynamicCtx（媒体元数据块 + msg_elements 上下文） ──
   const dynamicCtx = buildDynamicCtx(processed, msg, quote);
@@ -90,10 +85,8 @@ export function assembleBody(
     history,
   });
 
-  // ── webBody（合并消息包含全部前置 + 最后一条 + quotePart，对齐 agentBody） ──
-  const bodyContent = mergedMessages && mergedMessages.length > 0
-    ? userMessage
-    : `${quotePart}${userContent}`;
+  // ── webBody ──
+  const bodyContent = `${quotePart}${userContent}`;
 
   // ── webBody 外层 envelope 渲染（用 formatInboundEnvelope 包装） ──
   const webBody = getRuntime
@@ -144,84 +137,9 @@ function buildUserMessage(input: {
   return `${quotePart}${userContent}`;
 }
 
-/** Layer 3（合并版）：消息合并处理
- * 
- * 由群聊消息合并中间件触发：
- * - 当群聊中快速发送多条消息时，中间件会将它们合并
- * - 合并后的消息会通过 ctx.state.mergedMessages 传递
- * - 本函数将多条消息格式化为一个统一的消息体
- * 
- * 格式示例：
- * [Merged messages begins]
- * [小明] 问题 1
- * [小红] 问题 2
- * [Merged messages ends]
- * [Current message]
- * [小华] 问题 3 (@you)
+/** Layer 3（合并版）：消息合并处理已移除——群消息合并完全交给框架队列
+ * （coalesce.enabled → dispatch 侧 queueModeOverride collect/followup）。
  */
-function buildMergedUserMessage(input: {
-  messages: MiddlewareContext[];
-  quotePart: string;
-  isGroup: boolean;
-  wasMentioned: boolean;
-  getRuntime?: () => any;
-}): string {
-  const { messages, quotePart, isGroup, wasMentioned, getRuntime } = input;
-  if (messages.length <= 1) {
-    const single = messages[0]!;
-    return buildUserMessage({
-      msg: single.message,
-      userContent: single.message.content ?? '',
-      quotePart,
-      isGroup,
-      wasMentioned,
-    });
-  }
-
-  const formatEnvelope = getRuntime
-    ? getAdapters(getRuntime()).formatEnvelope
-    : null;
-
-  const lines = messages.map((ctx, i) => {
-    const isLast = i === messages.length - 1;
-    const line = formatMergedLine(ctx, { isGroup, isLast, wasMentioned, formatEnvelope });
-    return line && isLast ? `${quotePart}${line}` : line;
-  }).filter(Boolean);
-
-  if (!isGroup || allSameSender(messages)) {
-    return lines.join('\n');
-  }
-
-  const last = lines.pop()!;
-  return [MERGE_CTX_BEGIN, ...lines, MERGE_CTX_END, CURRENT_MSG, last].join('\n');
-}
-
-function formatMergedLine(
-  ctx: MiddlewareContext,
-  opts: { isGroup: boolean; isLast: boolean; wasMentioned: boolean; formatEnvelope: ((p: Record<string, unknown>) => string) | null },
-): string {
-  const m = ctx.message;
-  const content = (m.content ?? '').trim();
-  const atYouTag = opts.isLast && opts.wasMentioned ? ' (@you)' : '';
-
-  if (opts.formatEnvelope && opts.isGroup) {
-    return opts.formatEnvelope({
-      channel: 'qqbot',
-      from: formatSenderLabel(m.senderName, m.senderId),
-      timestamp: normalizeTimestamp(m.timestamp),
-      body: content + atYouTag,
-      chatType: 'group',
-    });
-  }
-  return opts.isGroup
-    ? `${formatSenderLabel(m.senderName, m.senderId)}: ${content}${atYouTag}`
-    : content;
-}
-
-function allSameSender(messages: MiddlewareContext[]): boolean {
-  const first = messages[0]?.message.senderId;
-  return messages.every((c) => c.message.senderId === first);
-}
 
 /** Layer 4：- Images / - Voice / - ASR 元数据块 + msg_elements 引用上下文 */
 function buildDynamicCtx(
