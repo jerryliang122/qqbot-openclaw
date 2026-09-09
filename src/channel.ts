@@ -40,11 +40,30 @@ import { stripMentionText } from './utils/mention.js';
 
 /**
  * QQBot Threading Adapter
- * QQBot 不支持 thread/topic，返回 'off' 模式
+ *
+ * QQBot 无 thread/topic（replyToMode 恒 off），但 buildToolContext **不能**
+ * 返回 undefined：框架在 message_tool_only（room_event）模式下，靠它提供的
+ * currentChannelId/currentMessagingTarget 解析 message 工具的隐式当前来源
+ * 路由——缺失时发送会落入 internal-ui sink（只进 openclaw 会话记录/WebUI，
+ * QQ 侧无消息、无出站 HTTP 请求；2026-09-09 用户反馈事故）。context.To 即
+ * 限定可路由目标（qqbot:group:{gid} / qqbot:c2c:{openid}），直接透传即可。
  */
-const qqbotThreadingAdapter = {
+export const qqbotThreadingAdapter = {
   resolveReplyToMode: () => 'off' as const,
-  buildToolContext: () => undefined,
+  buildToolContext: ({ context }: {
+    context: { To?: string; From?: string; ChatType?: string };
+  }) => {
+    const target = context.To || context.From;
+    if (!target) return undefined;
+    return {
+      currentChannelId: target,
+      currentMessagingTarget: target,
+      ...(context.ChatType === 'group' || context.ChatType === 'direct'
+        ? { currentChatType: context.ChatType as 'group' | 'direct' }
+        : {}),
+      replyToMode: 'off' as const,
+    };
+  },
   resolveAutoThreadId: () => undefined,
 };
 

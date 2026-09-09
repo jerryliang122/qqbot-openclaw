@@ -362,6 +362,45 @@ test('unmentionedInbound 级联：具体群 > "*" > 默认 user_request', () => 
   assert.equal(resolveGroupConfigFromAccount(bare, 'GROUP_ANY').unmentionedInbound, 'user_request');
 });
 
+group('message 工具隐式路由（room_event 出站修复）');
+
+await test('buildToolContext 从 context.To 提供可路由目标（修复 internal-ui sink 事故）', async () => {
+  const { qqbotThreadingAdapter } = await import('../src/channel.ts');
+
+  // 框架要求：message_tool_only 模式下 message 工具的隐式当前来源路由依赖
+  // currentChannelId/currentMessagingTarget；缺失会导致发送落入 internal-ui
+  // sink（只进 openclaw 会话记录，QQ 侧无消息无出站 HTTP，2026-09-09 事故）
+  const ctxGroup = qqbotThreadingAdapter.buildToolContext?.({
+    cfg: {} as any,
+    accountId: 'default',
+    context: { To: 'qqbot:group:GROUP_ROOM', From: 'qqbot:group:GROUP_ROOM', ChatType: 'group' },
+  });
+  assert.ok(ctxGroup, 'buildToolContext 必须返回对象（返回 undefined 会触发 internal-ui sink）');
+  assert.equal(ctxGroup.currentChannelId, 'qqbot:group:GROUP_ROOM');
+  assert.equal(ctxGroup.currentMessagingTarget, 'qqbot:group:GROUP_ROOM');
+  assert.equal(ctxGroup.currentChatType, 'group');
+
+  const ctxC2c = qqbotThreadingAdapter.buildToolContext?.({
+    cfg: {} as any,
+    context: { To: 'qqbot:c2c:USER_1', ChatType: 'direct' },
+  });
+  assert.ok(ctxC2c);
+  assert.equal(ctxC2c.currentChannelId, 'qqbot:c2c:USER_1');
+  assert.equal(ctxC2c.currentChatType, 'direct');
+
+  // To/From 全缺时可返回 undefined（框架另有兜底），但不得产生空目标
+  const ctxBare = qqbotThreadingAdapter.buildToolContext?.({ cfg: {} as any, context: {} });
+  assert.equal(ctxBare, undefined);
+});
+
+await test('出站适配器接受限定目标（message 工具 to=qqbot:group:X 可达）', async () => {
+  // 与 buildToolContext 提供的 currentChannelId 同格式，验证 parseTarget 链路
+  const { parseTarget } = await import('../src/outbound/target.ts');
+  const parsed = parseTarget('qqbot:group:GROUP_ROOM');
+  assert.equal(parsed.scope, 'group');
+  assert.equal(parsed.targetId, 'GROUP_ROOM');
+});
+
 // ── 结果 ──
 
 console.log('\n' + '='.repeat(60));
