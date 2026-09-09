@@ -5,8 +5,8 @@ import { getUpdateInfo } from '../features/update-checker.js';
 import { checkCommandAuth } from './config-util.js';
 
 const PLUGIN_VERSION = getPackageVersion();
-const DEFAULT_UPGRADE_URL = 'https://docs.qq.com/doc/DSGxOZk1oVnVKVkpq';
-const GITHUB_URL = 'https://github.com/tencent-connect/openclaw-qqbot';
+const DEFAULT_UPGRADE_URL = 'https://github.com/jerryliang122/qqbot-openclaw/blob/main/CHANGELOG.md';
+const GITHUB_URL = 'https://github.com/jerryliang122/qqbot-openclaw';
 
 /** /bot-upgrade — 检查更新并查看升级指引 */
 export function botUpgrade(account: ResolvedQQBotAccount): SlashCommand {
@@ -49,7 +49,7 @@ export function botUpgrade(account: ResolvedQQBotAccount): SlashCommand {
         `最新版本：**v${info.latest}**`,
         '',
         `📖 升级指引：[点击查看](${url})`,
-        `🌟 官方 GitHub 仓库：[点击前往](${GITHUB_URL})`,
+        `🌟 GitHub 仓库：[点击前往](${GITHUB_URL})`,
       ].join('\n');
     },
   };

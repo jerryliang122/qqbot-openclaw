@@ -1,8 +1,8 @@
 # 更新日志 (Changelog)
 
-本项目（`jerryliang122/openclaw-qqbot`）自 **v1.0.0** 起按自己的发版机制独立发版，版本号与上游旧版本（`tencent-connect/openclaw-qqbot` 2.x）**完全脱钩**：1.0.0 是本仓库独立维护后的第一个正式版本，其内容 = 上游 2.1.0 基础上的大量功能重构 + v1.0.0 的全面兼容性清理。
+本项目（GitHub 仓库 `jerryliang122/qqbot-openclaw`，npm 包 `@jerryliang122/openclaw-qqbot`）自 **v1.0.0** 起按自己的发版机制独立发版，版本号与上游旧版本（`tencent-connect/openclaw-qqbot` 2.x）**完全脱钩**：1.0.0 是本仓库独立维护后的第一个正式版本，其内容 = 上游 2.1.0 基础上的大量功能重构 + v1.0.0 的全面兼容性清理。
 
-- 发版流程：推送 `v*` tag → GitHub Actions 自动校验版本一致性、跑全量检查、构建产物 → 创建 GitHub Release 并附 `npm pack` 产物
+- 发版流程：推送 `v*` tag → GitHub Actions 自动校验版本一致性、跑全量检查、构建产物 → **自动发布 npm**（`@jerryliang122/openclaw-qqbot`，需仓库 secret `NPM_TOKEN`）→ 创建 GitHub Release 并附 `npm pack` 产物
 - 版本规则：语义化版本（SemVer）。Major 位变更意味着存在 Breaking Change（配置格式 / 运行要求 / 公开 API）
 - 运行要求：**OpenClaw >= 2026.9.2**（peer 依赖硬性要求，见 package.json）
 
@@ -99,10 +99,10 @@
 
 ```bash
 # 从旧版本升级（含上游 2.x 装机）
-openclaw plugins install git+https://github.com/jerryliang122/openclaw-qqbot.git#v1.0.0
+openclaw plugins install git+https://github.com/jerryliang122/qqbot-openclaw.git#v1.0.0
 
 # 或源码安装
-git clone https://github.com/jerryliang122/openclaw-qqbot.git
+git clone https://github.com/jerryliang122/qqbot-openclaw.git
 cd openclaw-qqbot && npm install && npm run build
 openclaw plugins install .
 ```
@@ -118,8 +118,9 @@ openclaw plugins install .
 1. 更新 `CHANGELOG.md` 新版本段落
 2. `package.json` 的 `version` 改为目标版本
 3. 提交并打 tag：`git tag v1.0.0 && git push origin main --tags`
-4. GitHub Actions（`.github/workflows/release.yml`）自动：校验 tag 与 package.json 一致 → typecheck / lint / build / 全量测试 → `npm pack` → 创建 GitHub Release 并附 tarball
-5. Release 发布即完成，无需发布 npm（本仓库不发布 npm）
+4. GitHub Actions（`.github/workflows/release.yml`）自动：校验 tag 与 package.json 一致 → typecheck / lint / build / 全量测试 → **`npm publish`（发布 `@jerryliang122/openclaw-qqbot`）** → `npm pack` → 创建 GitHub Release 并附 tarball
+
+**npm 发布前置（一次性配置）**：npmjs.com → 头像 → Access Tokens → Generate New Token → **Granular token**（Packages and scopes 权限 Read and write）或经典 **Automation** token → 复制后到 GitHub 仓库 Settings → Secrets and variables → Actions → New repository secret，名称 `NPM_TOKEN`，值为 token。未配置时发版 workflow 会在 publish 步骤明确报错。
 
 ---
 

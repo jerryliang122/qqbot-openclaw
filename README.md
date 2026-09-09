@@ -12,10 +12,10 @@
 
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![QQ Bot](https://img.shields.io/badge/QQ_Bot-API_v2-red)](https://bot.q.qq.com/wiki/)
-[![Platform](https://img.shields.io/badge/OpenClaw-%3E%3D2026.9.2-orange)](https://github.com/jerryliang122/openclaw-qqbot)
+[![Platform](https://img.shields.io/badge/OpenClaw-%3E%3D2026.9.2-orange)](https://github.com/jerryliang122/qqbot-openclaw)
 [![Node.js](https://img.shields.io/badge/Node.js->=18-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Fork](https://img.shields.io/badge/fork-enhanced-9cf)](https://github.com/jerryliang122/openclaw-qqbot)
+[![Fork](https://img.shields.io/badge/fork-enhanced-9cf)](https://github.com/jerryliang122/qqbot-openclaw)
 
 <br/>
 
@@ -23,7 +23,7 @@
 
 > This is an **independently maintained fork** with its own versioning (v1.x, decoupled from the upstream 2.x line). Upstream: [tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot).
 >
-> **Requirements**: OpenClaw `>= 2026.9.2` · **Not published to npm** — install directly from GitHub or local source. See [CHANGELOG](CHANGELOG.md) for differences vs the old version and the upgrade guide.
+> **Requirements**: OpenClaw `>= 2026.9.2` · Published to npm as [`@jerryliang122/openclaw-qqbot`](https://www.npmjs.com/package/@jerryliang122/openclaw-qqbot). See [CHANGELOG](CHANGELOG.md) for differences vs the old version and the upgrade guide.
 
 Scan to join the QQ group chat
 
@@ -46,7 +46,7 @@ Scan to join the QQ group chat
 | 🌐 **Dual Transport** | WebSocket (default) or Webhook (HTTP callback) — switch via config |
 | 🖼️ **Rich Media** | Send & receive images, voice, video, and files |
 | 🎙️ **Voice (STT/TTS)** | Speech-to-text transcription & text-to-speech replies |
-| 🔥 **One-Click Hot Upgrade** | Send `/bot-upgrade` in private chat to upgrade — no server login needed |
+| 🔄 **Update Check** | `/bot-upgrade` checks the npm registry for new versions and links the upgrade guide |
 | ⏰ **Scheduled Push** | Proactive message delivery via scheduled tasks |
 | 🔗 **URL Support** | Direct URL sending in private chat (no restrictions) |
 | ⌨️ **Typing Indicator** | "Bot is typing..." status shown in real-time |
@@ -194,19 +194,15 @@ Shows framework version, plugin version, and a direct link to the official repos
 
 <img width="360" src="docs/images/slash-help.jpg" alt="Help Demo" />
 
-#### `/bot-upgrade` — One-Click Hot Upgrade
+#### `/bot-upgrade` — Version Check & Upgrade Guide
 
 > **You**: `/bot-upgrade`
 >
-> **QQBot**: 📌 Current: v1.0.0 / ✅ New version available / Click button below to confirm
+> **QQBot**: 📌 Current: v1.0.0 / 🆕 New version available / 📖 Upgrade guide link
 
-Credentials are automatically backed up before upgrade. Version existence is verified against npm before proceeding. Auto-recovery on failure.
+Checks the installed version against the npm registry (`@jerryliang122/openclaw-qqbot`) and returns a link to the upgrade guide (repo CHANGELOG by default; override with `channels.qqbot.upgradeUrl`). Actual upgrading is done on the host via `openclaw plugins install` — see [Getting Started](#-getting-started).
 
-> ⚠️ Hot upgrade is currently not supported on Windows. Sending `/bot-upgrade` on Windows will return a manual upgrade guide instead.
-
-> **Note**: For this forked version, `/bot-upgrade` will upgrade from the GitHub repository. Make sure you have git access.
-
-<img width="360" src="docs/images/hot-update.jpg" alt="Hot Upgrade Demo" />
+<img width="360" src="docs/images/hot-update.jpg" alt="Upgrade Demo" />
 
 #### `/bot-logs` — Log Export
 
@@ -297,23 +293,31 @@ Answers "why does this group have no context" diagnostics: the push mode is chos
 
 ### Step 2 — Install / Upgrade the Plugin
 
-> **Note**: This fork is not published to npm. Install from GitHub. Requires OpenClaw >= 2026.9.2.
+> **Note**: The unscoped npm name `openclaw-qqbot` belongs to the original upstream project — this fork publishes as the scoped package `@jerryliang122/openclaw-qqbot`. Requires OpenClaw >= 2026.9.2.
 
-**Option A: Install from GitHub (Recommended)**
+**Option A: Install from npm (Recommended)**
 
 ```bash
-# Install directly from GitHub
-openclaw plugins install git+https://github.com/jerryliang122/openclaw-qqbot.git
+openclaw plugins install @jerryliang122/openclaw-qqbot
 
-# Or install a specific release tag
-openclaw plugins install git+https://github.com/jerryliang122/openclaw-qqbot.git#v1.0.0
+# Or a specific version
+openclaw plugins install @jerryliang122/openclaw-qqbot@1.0.0
 ```
 
-**Option B: Install from Local Source**
+**Option B: Install from GitHub**
+
+```bash
+openclaw plugins install git+https://github.com/jerryliang122/qqbot-openclaw.git
+
+# Or a specific release tag
+openclaw plugins install git+https://github.com/jerryliang122/qqbot-openclaw.git#v1.0.0
+```
+
+**Option C: Install from Local Source**
 
 ```bash
 # Clone the repo
-git clone https://github.com/jerryliang122/openclaw-qqbot.git
+git clone https://github.com/jerryliang122/qqbot-openclaw.git
 cd openclaw-qqbot
 
 # Build
@@ -347,7 +351,6 @@ openclaw gateway restart
 
 > Environment variables `QQBOT_APPID` / `QQBOT_SECRET` are also supported.
 
-> **For the official version**: See [tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot)
 
 ### Step 3 — Test
 
@@ -941,8 +944,8 @@ After receiving a private message, the bot shows "typing…" and renews it perio
 
 This is a forked version. For contributors to the official version, see [tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot/graphs/contributors).
 
-<a href="https://github.com/jerryliang122/openclaw-qqbot/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=jerryliang122/openclaw-qqbot" />
+<a href="https://github.com/jerryliang122/qqbot-openclaw/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=jerryliang122/qqbot-openclaw" />
 </a>
 
 ## 💖 Acknowledgements
@@ -959,6 +962,6 @@ This is a forked version. For contributors to the official version, see [tencent
 
 <div align="center">
 
-[![Star History Chart](https://api.star-history.com/svg?repos=jerryliang122/openclaw-qqbot&type=date&legend=top-left)](https://www.star-history.com/#jerryliang122/openclaw-qqbot&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=jerryliang122/qqbot-openclaw&type=date&legend=top-left)](https://www.star-history.com/#jerryliang122/qqbot-openclaw&type=date&legend=top-left)
 
 </div>

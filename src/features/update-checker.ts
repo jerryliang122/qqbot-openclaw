@@ -12,7 +12,7 @@ import https from "node:https";
 import { getPackageVersion } from "../utils/pkg-version.js";
 import type { PluginLogger } from '../utils/plugin-logger.js';
 
-const PKG_NAME = "@tencent-connect/openclaw-qqbot";
+const PKG_NAME = "@jerryliang122/openclaw-qqbot";
 const ENCODED_PKG = encodeURIComponent(PKG_NAME);
 
 const REGISTRIES = [

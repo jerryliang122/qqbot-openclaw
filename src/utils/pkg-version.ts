@@ -1,7 +1,7 @@
 /**
  * 版本号获取工具。
  *
- * - getPackageVersion(): 插件自身版本（@tencent-connect/openclaw-qqbot）
+ * - getPackageVersion(): 插件自身版本（@jerryliang122/openclaw-qqbot）
  * - getOpenclawVersion():  OpenClaw 框架版本（PluginRuntime.version）
  */
 

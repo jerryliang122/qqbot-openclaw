@@ -10,14 +10,14 @@
 **让你的 AI 助手接入 QQ — 私聊、群聊、富媒体，一个插件全搞定。**
 
 > 本仓库为**独立维护的 fork**，自 v1.0.0 起独立发版（与上游 2.x 版本线完全脱钩）。
-> 运行要求：OpenClaw `>= 2026.9.2`；不发布 npm，直接从 GitHub 安装。
+> 运行要求：OpenClaw `>= 2026.9.2`；npm 包名 [`@jerryliang122/openclaw-qqbot`](https://www.npmjs.com/package/@jerryliang122/openclaw-qqbot)。
 > 与旧版本的差异及升级指南见 [CHANGELOG](CHANGELOG.md)。上游仓库：[tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot)。
 
 ### 🚀 当前版本： `v1.0.0`
 
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![QQ Bot](https://img.shields.io/badge/QQ_Bot-API_v2-red)](https://bot.q.qq.com/wiki/)
-[![Platform](https://img.shields.io/badge/OpenClaw-%3E%3D2026.9.2-orange)](https://github.com/jerryliang122/openclaw-qqbot)
+[![Platform](https://img.shields.io/badge/OpenClaw-%3E%3D2026.9.2-orange)](https://github.com/jerryliang122/qqbot-openclaw)
 [![Node.js](https://img.shields.io/badge/Node.js->=18-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 
@@ -44,7 +44,7 @@
 | 🌐 **双传输模式** | WebSocket（默认）或 Webhook（HTTP 回调）— 配置切换 |
 | 🖼️ **富媒体消息** | 支持图片、语音、视频、文件的收发 |
 | 🎙️ **语音能力 (STT/TTS)** | 语音转文字自动转录 & 文字转语音回复 |
-| 🔥 **一键热更新** | 私聊发送 `/bot-upgrade` 即可完成版本升级，无需登录服务器 |
+| 🔄 **版本检查** | 私聊发送 `/bot-upgrade` 检查 npm 新版本并附升级指引 |
 | ⏰ **定时推送** | 支持定时任务触发后主动推送消息 |
 | 🔗 **URL 无限制** | 私聊可直接发送 URL |
 | ⌨️ **输入状态** | 实时显示"Bot 正在输入中…"状态 |
@@ -192,17 +192,15 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 <img width="360" src="docs/images/slash-help.jpg" alt="Help 演示" />
 
-#### `/bot-upgrade` — 一键热更新
+#### `/bot-upgrade` — 版本检查与升级指引
 
 > **你**：`/bot-upgrade`
 >
-> **QQBot**：📌当前版本 v1.0.0 / ✅发现新版本 / 点击下方按钮确认升级
+> **QQBot**：📌当前版本 v1.0.0 / 🆕发现新版本 / 📖升级指引链接
 
-升级流程自动备份凭证，升级失败自动恢复。本 fork 从 GitHub 仓库拉取更新（需要运行主机可访问 git）。
+对比 npm registry（`@jerryliang122/openclaw-qqbot`）上的最新版本，并返回升级指引链接（默认指向仓库 CHANGELOG，可用 `channels.qqbot.upgradeUrl` 覆盖）。实际升级在主机上通过 `openclaw plugins install` 完成，见[快速开始](#-快速开始)。
 
-> ⚠️ 热更新指令暂不支持 Windows 系统，在 Windows 上发送 `/bot-upgrade` 会返回手动升级指引。
-
-<img width="360" src="docs/images/hot-update.jpg" alt="一键热更新演示" />
+<img width="360" src="docs/images/hot-update.jpg" alt="升级检查演示" />
 
 #### `/bot-logs` — 日志导出
 
@@ -295,22 +293,30 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 ### 第二步 — 安装 / 升级插件
 
-> 本 fork 不发布 npm，从 GitHub 安装。要求 OpenClaw >= 2026.9.2。
+> 无 scope 的 npm 包名 `openclaw-qqbot` 属于上游原项目——本 fork 以 `@jerryliang122/openclaw-qqbot` 发布。要求 OpenClaw >= 2026.9.2。
 
-**方式 A：从 GitHub 安装（推荐）**
+**方式 A：从 npm 安装（推荐）**
 
 ```bash
-# 直接从 GitHub 安装
-openclaw plugins install git+https://github.com/jerryliang122/openclaw-qqbot.git
+openclaw plugins install @jerryliang122/openclaw-qqbot
 
 # 或安装指定版本
-openclaw plugins install git+https://github.com/jerryliang122/openclaw-qqbot.git#v1.0.0
+openclaw plugins install @jerryliang122/openclaw-qqbot@1.0.0
 ```
 
-**方式 B：源码安装**
+**方式 B：从 GitHub 安装**
 
 ```bash
-git clone https://github.com/jerryliang122/openclaw-qqbot.git
+openclaw plugins install git+https://github.com/jerryliang122/qqbot-openclaw.git
+
+# 或安装指定版本
+openclaw plugins install git+https://github.com/jerryliang122/qqbot-openclaw.git#v1.0.0
+```
+
+**方式 C：源码安装**
+
+```bash
+git clone https://github.com/jerryliang122/qqbot-openclaw.git
 cd openclaw-qqbot
 
 # 构建
@@ -322,7 +328,7 @@ openclaw plugins link .
 
 # 或（方式二：pack）
 npm pack
-openclaw plugins install ./openclaw-qqbot-1.0.0.tgz
+openclaw plugins install ./jerryliang122-openclaw-qqbot-1.0.0.tgz
 ```
 
 **配置凭证**
@@ -759,8 +765,8 @@ STT 支持两级配置，按优先级查找：
 
 感谢所有为本项目做出贡献的开发者！上游贡献者见 [tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot/graphs/contributors)。
 
-<a href="https://github.com/jerryliang122/openclaw-qqbot/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=jerryliang122/openclaw-qqbot" />
+<a href="https://github.com/jerryliang122/qqbot-openclaw/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=jerryliang122/qqbot-openclaw" />
 </a>
 
 ## 💖 致谢
@@ -779,6 +785,6 @@ STT 支持两级配置，按优先级查找：
 
 <div align="center">
 
-[![Star History Chart](https://api.star-history.com/svg?repos=jerryliang122/openclaw-qqbot&type=date&legend=top-left)](https://www.star-history.com/#jerryliang122/openclaw-qqbot&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=jerryliang122/qqbot-openclaw&type=date&legend=top-left)](https://www.star-history.com/#jerryliang122/qqbot-openclaw&type=date&legend=top-left)
 
 </div>

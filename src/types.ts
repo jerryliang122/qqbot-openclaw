@@ -165,22 +165,9 @@ export interface QQBotAccountConfig {
   urlDirectUpload?: boolean;
   /**
    * /bot-upgrade 指令返回的升级指引网址
-   * 默认: https://doc.weixin.qq.com/doc/w3_AKEAGQaeACgCNHrh1CbHzTAKtT2gB?scode=AJEAIQdfAAozxFEnLZAKEAGQaeACg
+   * 默认: 本仓库 CHANGELOG（含各版本升级说明）
    */
   upgradeUrl?: string;
-  /**
-   * /bot-upgrade 指令的行为模式
-   * - "doc"：展示升级文档链接（安全模式）
-   * - "hot-reload"：检测到新版本时直接执行 npm 升级脚本进行热更新（默认）
-   */
-  upgradeMode?: "doc" | "hot-reload";
-  /**
-   * /bot-upgrade 热更新时使用的 npm 包名
-   * 支持 "scope/name"（自动补 @）或 "@scope/name" 格式
-   * 默认: "@tencent-connect/openclaw-qqbot"
-   * 示例: "ryantest/openclaw-qqbot"
-   */
-  upgradePkg?: string;
   /**
    * 群消息是否默认需要 @机器人才响应（默认 true）
    * 优先级低于 groups.{groupId}.requireMention 和 groups."*".requireMention
