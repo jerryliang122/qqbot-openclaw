@@ -59,10 +59,11 @@ group('中间件注册顺序');
 
 test('应该注册 errorHandler 作为第一个中间件', () => {
   mockMiddlewares.length = 0;
-  
-  // 模拟 middleware-setup.ts 的注册顺序
+
+  // 模拟 middleware-setup.ts 的注册顺序（与源码保持同步）
   mockBot.use(function errorHandler() {});
   mockBot.use(function messageFilter() {});
+  mockBot.use(function inboundGuard() {});
   mockBot.use(function policyInjector() {});
   mockBot.use(function historyBuffer() {});
   mockBot.use(function dynamicAccessControl() {});
@@ -70,15 +71,17 @@ test('应该注册 errorHandler 作为第一个中间件', () => {
   mockBot.use(function contentSanitizer() {});
   mockBot.use(function rateLimiter() {});
   mockBot.use(function slashCommand() {});
+  mockBot.use(function secretCapture() {});
+  mockBot.use(function groupMessageCoalescer() {});
   mockBot.use(function c2cTypingIndicator() {});
   mockBot.use(function quoteRef() {});
   mockBot.use(function attachmentProcessor() {});
   mockBot.use(function envelopeFormatter() {});
-  
-  assert.strictEqual(mockMiddlewares[0], 'errorHandler', 
+
+  assert.strictEqual(mockMiddlewares[0], 'errorHandler',
     'errorHandler 应该是第一个注册的中间件');
-  assert.strictEqual(mockMiddlewares.length, 13, 
-    '应该注册 13 个中间件（移除 concurrencyGuard 后）');
+  assert.strictEqual(mockMiddlewares.length, 16,
+    '应该注册 16 个中间件（errorHandler→envelopeFormatter）');
 });
 
 test('不应该注册 concurrencyGuard 中间件', () => {
@@ -136,9 +139,34 @@ group('中间件链顺序验证');
 test('斜杠命令应该在限流之后', () => {
   const slashIndex = mockMiddlewares.indexOf('slashCommand');
   const rateLimiterIndex = mockMiddlewares.indexOf('rateLimiter');
-  
-  assert.ok(slashIndex > rateLimiterIndex, 
+
+  assert.ok(slashIndex > rateLimiterIndex,
     `slashCommand (index ${slashIndex}) 应该在 rateLimiter (index ${rateLimiterIndex}) 之后`);
+});
+
+test('密钥捕获应该在斜杠命令之后', () => {
+  const secretIndex = mockMiddlewares.indexOf('secretCapture');
+  const slashIndex = mockMiddlewares.indexOf('slashCommand');
+
+  assert.ok(secretIndex > slashIndex,
+    `secretCapture (index ${secretIndex}) 应该在 slashCommand (index ${slashIndex}) 之后`);
+});
+
+test('入站守卫应该在历史缓冲与门控之前', () => {
+  const guardIndex = mockMiddlewares.indexOf('inboundGuard');
+  const historyIndex = mockMiddlewares.indexOf('historyBuffer');
+  const gateIndex = mockMiddlewares.indexOf('mentionGate');
+
+  assert.ok(guardIndex >= 0 && guardIndex < historyIndex && guardIndex < gateIndex,
+    `inboundGuard (index ${guardIndex}) 应先于 historyBuffer (${historyIndex}) 与 mentionGate (${gateIndex})`);
+});
+
+test('群消息排队（coalescer/framework）应该在密钥捕获之后', () => {
+  const coalescerIndex = mockMiddlewares.indexOf('groupMessageCoalescer');
+  const secretIndex = mockMiddlewares.indexOf('secretCapture');
+
+  assert.ok(coalescerIndex > secretIndex,
+    `groupMessageCoalescer (index ${coalescerIndex}) 应该在 secretCapture (index ${secretIndex}) 之后`);
 });
 
 test('引用消息解析应该在输入状态之后', () => {

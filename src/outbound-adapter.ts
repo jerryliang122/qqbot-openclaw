@@ -20,6 +20,8 @@ import type { SendMediaParams, SendMediaResult } from './outbound/media-send.js'
 import type { SendResult } from './outbound/outbound-service.js';
 import type { OpenClawConfig } from 'openclaw/plugin-sdk';
 import { resolveQQBotAccount } from './config.js';
+import { parseTarget } from './outbound/target.js';
+import { getCachedMsgId } from './features/msgid-cache.js';
 import { sanitizeQQBotText } from './outbound/sanitize.js';
 import { chunkQQBotMarkdown } from './outbound/chunker.js';
 import { isApprovalPayload } from './features/approval-utils.js';
@@ -248,6 +250,22 @@ function resolveMCPAgentId(
 }
 
 /**
+ * 被动优先的 replyToId 解析：框架未显式给 replyToId 时（message 工具 / 框架
+ * 直发路径），从 msgid-cache 取该会话最新未过期 msg_id，让发送走配额感知的
+ * 被动通道（保每日主动预算）。无缓存（静群超 TTL）→ undefined → 主动发送。
+ */
+function resolvePassiveFirstReplyToId(to: string, explicitReplyToId?: string | null): string | undefined {
+  if (explicitReplyToId) return explicitReplyToId;
+  try {
+    const { scope, targetId } = parseTarget(to);
+    if (!targetId) return undefined;
+    return getCachedMsgId(scope, targetId);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * 创建框架 ChannelOutboundAdapter 契约入口。
  *
  * 框架可用性判定要求 outbound.sendText 存在（channel-resolution.ts /
@@ -267,7 +285,7 @@ export function createQQBotChannelOutbound(params: QQBotOutboundAdapterParams = 
         to: ctx.to,
         text: ctx.text ?? '',
         accountId: ctx.accountId ?? undefined,
-        replyToId: ctx.replyToId ?? undefined,
+        replyToId: resolvePassiveFirstReplyToId(ctx.to, ctx.replyToId),
         account,
       });
       if (result.error) throw new Error(result.error);
@@ -282,7 +300,7 @@ export function createQQBotChannelOutbound(params: QQBotOutboundAdapterParams = 
         source: ctx.mediaUrl ?? '',
         text: ctx.text,
         accountId: resolvedAccountId,
-        replyToId: ctx.replyToId ?? undefined,
+        replyToId: resolvePassiveFirstReplyToId(ctx.to, ctx.replyToId),
         account,
         agentId: resolveMCPAgentId(ctx.to, resolvedAccountId, ctx.cfg),
       });

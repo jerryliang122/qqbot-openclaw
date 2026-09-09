@@ -256,28 +256,42 @@ function buildDynamicCtx(
     lines.push(`- ASR: ${asrTexts.join(' | ')}`);
   }
 
-  // msg_elements 上下文（仅当非引用消息时解析，避免与 quotePart 重复）
-  if (!quote) {
-    const elementsCtx = buildMsgElementsContext(msg);
-    if (elementsCtx.length > 0) {
-      lines.push(REF_BEGIN, ...elementsCtx, REF_END);
-    }
+  // msg_elements 上下文（引用内容本身来自 msg_elements[0] 时跳过该元素避免重复，
+  // 其余元素——如 AT+最近N 模式平台附带的消息记录——仍照常渲染）
+  const quoteConsumedFirstElement = quote?.source === 'msg_elements';
+  const elementsCtx = buildMsgElementsContext(msg, quoteConsumedFirstElement);
+  if (elementsCtx.length > 0) {
+    lines.push(REF_BEGIN, ...elementsCtx, REF_END);
   }
 
   return lines.length > 0 ? `${lines.join('\n')}\n\n` : '';
 }
 
+/** 检测平台预渲染文本（示例3形态：`=== 消息 1 ===` + `[消息内容]` 行） */
+function isPlatformPrerenderedContent(content: string): boolean {
+  return /^===\s*消息\s*\d+\s*===/.test(content.trimStart()) && content.includes('[消息内容]');
+}
+
 /** 从 msg_elements 提取上下文（非引用消息也解析，如被回复的 bot 消息等） */
-function buildMsgElementsContext(msg: QQBotInboundMessage): string[] {
+function buildMsgElementsContext(msg: QQBotInboundMessage, skipFirstElement = false): string[] {
   const elements = msg.msgElements;
   if (!elements || elements.length === 0) return [];
 
   const lines: string[] = [];
   let index = 0;
-  for (const el of elements) {
+  for (let i = 0; i < elements.length; i++) {
+    if (skipFirstElement && i === 0) continue;
+    const el = elements[i]!;
     const content = el.content?.trim();
-    if (!content) continue;
+    const attachments = Array.isArray(el.attachments) ? el.attachments : [];
+    if (!content && attachments.length === 0) continue;
     index += 1;
+
+    // 平台已预渲染的多消息文本（如聊天记录转发）直接透传，避免二次包裹
+    if (content && isPlatformPrerenderedContent(content)) {
+      lines.push(`=== 消息记录 ${index} ===`, content);
+      continue;
+    }
 
     const author = (el as Record<string, unknown>).author as
       | { username?: string }
@@ -286,9 +300,15 @@ function buildMsgElementsContext(msg: QQBotInboundMessage): string[] {
 
     lines.push(
       `=== 消息 ${index} ===`,
-      `[消息内容] ${content}`,
-      `[发送者] ${sender}`,
+      `[消息内容] ${content || '（无文本）'}`,
     );
+    for (const att of attachments) {
+      const a = att as { url?: string; content_type?: string };
+      const kind = a.content_type ?? 'attachment';
+      const url = a.url ?? '';
+      lines.push(`[附件] ${kind}${url ? `: ${url}` : ''}`);
+    }
+    lines.push(`[发送者] ${sender}`);
   }
 
   return lines;

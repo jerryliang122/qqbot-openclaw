@@ -47,11 +47,21 @@ export type GroupPolicy = "open" | "allowlist" | "disabled";
 /** 工具策略：full=全部 | restricted=限制敏感工具 | none=禁止 */
 export type ToolPolicy = "full" | "restricted" | "none";
 
+/** 群消息排队策略 */
+export type GroupCoalesceStrategy = "framework" | "plugin";
+
 /** 群消息合并配置 */
 export interface GroupCoalesceConfig {
-  /** 是否启用消息合并（默认 true） */
+  /**
+   * 排队策略（默认 framework）：
+   * - framework：消息逐条立即 dispatch，排队/合并交给 OpenClaw 框架的 followup 队列
+   *   （此模式下 enabled=true → 框架 collect 合并批处理；enabled=false → followup 排队不合并）
+   * - plugin：使用插件内建 coalescer busy-buffering（旧版行为，回退用）
+   */
+  strategy?: GroupCoalesceStrategy;
+  /** 是否启用消息合并（默认 true；strategy=plugin 时门控插件 coalescer） */
   enabled?: boolean;
-  /** 最大缓冲消息数（默认 50） */
+  /** 最大缓冲消息数（默认 50，仅 strategy=plugin 生效） */
   maxBuffer?: number;
 }
 
@@ -81,8 +91,43 @@ export interface GroupConfig {
   prompt?: string;
   /** 群历史消息缓存条数（0 禁用，默认 20） */
   historyLimit?: number;
+  /**
+   * 群历史清理时机（默认 clear）：
+   * - clear：每次回复后整清（旧语义，"自上次回复以来的窗口"）
+   * - rolling：回复后裁剪到最后一条 bot 出站之后（bot 发言也计入历史，
+   *   对齐 telegram selectAfterLastSelf 的滚动窗口语义）
+   */
+  historyMode?: 'clear' | 'rolling';
+  /**
+   * 未被 @ 的群消息入站策略（默认 user_request，仅全量模式群有实际意义）：
+   * - user_request：维持现状——mentionGate 拦截未 @ 消息（只进历史，不上报）
+   * - room_event：门控放行全部消息，未被 @/称呼/引用的作为 room_event 被动
+   *   房间事件进框架（AI 只读上下文，不自动回复，想发言走主动 message 工具；
+   *   框架自动压制 typing/流式/steer）。成本提示：每条消息一次推理 pass。
+   */
+  unmentionedInbound?: 'user_request' | 'room_event';
   /** 群消息合并配置（覆盖账号级配置） */
   coalesce?: GroupCoalesceConfig;
+}
+
+/** 限流单层配置（滑动窗口） */
+export interface RateLimitTierConfig {
+  /** 窗口内最大消息数 */
+  max: number;
+  /** 窗口时长（毫秒） */
+  windowMs: number;
+}
+
+/** 三层限流配置（sender / group / global） */
+export interface RateLimitConfig {
+  /** 是否启用（默认 true；保守默认阈值，正常使用不会触发） */
+  enabled?: boolean;
+  /** 单发送者限流（默认 20 条/分钟） */
+  perSender?: RateLimitTierConfig;
+  /** 单群限流（默认 60 条/分钟，c2c 按 sender 归组） */
+  perGroup?: RateLimitTierConfig;
+  /** 全局限流（默认 300 条/分钟） */
+  global?: RateLimitTierConfig;
 }
 
 /** 消息接收传输方式 */
@@ -115,6 +160,8 @@ export interface QQBotAccountConfig {
   groupAllowFrom?: string[];
   /** 群配置映射（按 groupOpenid 索引，"*" 为默认） */
   groups?: Record<string, GroupConfig>;
+  /** 三层限流（sender/group/global，默认启用保守阈值） */
+  rateLimit?: RateLimitConfig;
   /** 系统提示词，会添加在用户消息前面 */
   systemPrompt?: string;
   /** 是否支持 markdown 消息（默认 true，设为 false 可禁用） */

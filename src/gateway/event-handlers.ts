@@ -28,6 +28,7 @@ import {
 } from '../features/question-helpers.js';
 import { recordKnownUser } from '../features/proactive.js';
 import { cacheMsgId } from '../features/msgid-cache.js';
+import { recordGroupEvent } from '../features/group-mode-store.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { resolveGroupConfigFromAccount, resolveGroupPolicy, resolveMentionPatterns } from '../config.js';
 import { getPackageVersion } from '../utils/pkg-version.js';
@@ -48,8 +49,7 @@ export async function handleMessage(
     : `qqbot:c2c:${msg.replyTarget.targetId}`;
 
   const mergedCount = (ctx.state.mergedMessages as unknown[] | undefined)?.length;
-  // 注意：mergedCount 目前始终为 undefined，因为已移除 concurrencyGuard 中间件
-  // 保留此日志以便未来调试或恢复消息合并功能
+  // mergedMessages 由插件 coalescer（coalesce.strategy=plugin 回退路径）合并批次时写入
   if (mergedCount) {
     hlog.info(`merged batch count=${mergedCount} msgId=${msg.messageId}`);
   } else {
@@ -57,6 +57,19 @@ export async function handleMessage(
   }
 
   try {
+    // 群推送模式推断（AT 系 vs 全量）：按事件类型记录，模式变化打 INFO 留痕
+    if (scope === 'group') {
+      const modeChange = recordGroupEvent(
+        account.accountId,
+        msg.replyTarget.targetId,
+        (msg as { rawEventType?: string }).rawEventType ?? '',
+        Array.isArray((msg as { msgElements?: unknown[] }).msgElements),
+      );
+      if (modeChange) {
+        hlog.info(`[group-mode] push mode changed to ${modeChange} for group=${msg.replyTarget.targetId}`);
+      }
+    }
+
     cacheMsgId(scope, msg.replyTarget.targetId, msg.messageId);
 
     recordKnownUser({

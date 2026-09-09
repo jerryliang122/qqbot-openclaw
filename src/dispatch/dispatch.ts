@@ -23,7 +23,7 @@ import { buildCtxPayload } from './ctx-builder.js';
 import { DeliverDebouncer } from '../outbound/debounce.js';
 import { StreamingController, shouldUseStreaming } from '../outbound/streaming-controller.js';
 import { getAdapters } from '../adapter/resolve.js';
-import { clearGroupHistory } from '../features/history-store.js';
+import { clearGroupHistory, trimGroupHistoryAfterLastBot } from '../features/history-store.js';
 import {
   isAskUserPayload,
   isNonSingleAskUserPayload,
@@ -35,9 +35,14 @@ import {
   getQuestionGatewayRuntime,
 } from '../features/question-helpers.js';
 import { tryGetBotForAccount } from '../bot-instance.js';
+import { resolveGroupConfigFromAccount, resolveMentionPatterns } from '../config.js';
+import { detectWasMentioned } from '../utils/mention.js';
 
 /** 失败兜底文案（对齐 telegram：Something went wrong while processing your request.） */
 const FAILURE_FALLBACK_TEXT = 'Something went wrong while processing your request. Please try again.';
+
+/** 每进程只打一次「框架排队已接管线」INFO（排障锚点，确认 collect 真实生效） */
+let frameworkQueueAnnounced = false;
 
 /**
  * 合并 AbortSignal（Node >= 20.3 使用 AbortSignal.any，低版本手工 fan-in）。
@@ -105,7 +110,8 @@ export async function dispatchToOpenClaw(
   const isGroup = envelope.chatScope === 'group';
 
   // 群聊/私聊差异化 sessionKey：
-  // - 群聊：使用 group:{groupId}:coalescing 后缀，表明消息已经过合并处理
+  // - 群聊：group:{groupId}:coalescing 后缀（历史遗留命名，保留以延续存量群会话 lane；
+  //   排队/合并现已由框架 followup 队列按该 sessionKey 处理）
   // - 私聊：保持原有格式，允许用户"插嘴"（新消息取消旧消息）
   const peerId = envelope.chatScope === 'group' 
     ? (envelope.groupId ?? envelope.senderId) 
@@ -128,9 +134,53 @@ export async function dispatchToOpenClaw(
 
   const qualifiedTarget = envelope.targetId;
   const agentId = route.agentId ?? 'default';
+
+  // ── 群聊排队策略（coalesce.strategy=framework 时把排队交给框架）──
+  // - enabled=true  → collect：活动 turn 期间到达的消息排队并在其后合并批处理
+  // - enabled=false → followup：排队但不合并（尊重旧配置「关闭合并」的意图，
+  //                   仍保证不打断活动 turn——远比框架默认 steer 插嘴安全）
+  // - strategy=plugin → 不传（插件 coalescer 已在中间件层处理，无需框架排队）
+  const groupCfg = isGroup && envelope.groupId
+    ? resolveGroupConfigFromAccount(account, envelope.groupId)
+    : undefined;
+  const queueModeOverride =
+    groupCfg?.coalesce.strategy === 'framework'
+      ? groupCfg.coalesce.enabled ? 'collect' as const : 'followup' as const
+      : undefined;
+
+  // ── room_event 分类（全量模式群的被动房间事件）──
+  // wasMentioned 三种唤醒方式：@（AT 事件 / mentions.is_you / 内容标记，由
+  // mentionGate 判定）、称呼（mentionPatterns，如「沈处」）、引用 bot 出站
+  // （mentionGate isImplicitMention）。均未命中且群开启 room_event 时，
+  // 该消息作为被动房间事件进框架：AI 只读上下文，最终文本不投递
+  // （message_tool_only），想发言走主动 message 工具；框架自动压 typing/
+  // 流式、排队不 steer。斜杠命令始终是显式用户意图 → user_request。
+  const mentionState = (ctx.state as { mention?: { wasMentioned?: boolean; implicit?: boolean } }).mention;
+  const nameMentioned = isGroup
+    ? detectWasMentioned({
+        eventType: (msg as { rawEventType?: string }).rawEventType,
+        mentions: (msg as { mentions?: Array<{ is_you?: boolean }> }).mentions,
+        content: msg.content,
+        mentionPatterns: resolveMentionPatterns(cfg, agentId),
+      })
+    : false;
+  const wasMentioned = !!(mentionState?.wasMentioned || mentionState?.implicit || nameMentioned);
+  const isSlash = /^\//.test(assembled.rawBody ?? '');
+  const inboundEventKind =
+    isGroup && groupCfg?.unmentionedInbound === 'room_event' && !wasMentioned && !isSlash
+      ? 'room_event' as const
+      : 'user_request' as const;
+
+  if (queueModeOverride && !frameworkQueueAnnounced) {
+    frameworkQueueAnnounced = true;
+    dlog?.info(`[queue] group turn queueing delegated to framework followup queue (mode=${queueModeOverride}); plugin coalescer bypassed`);
+  }
   const storePath = adapters.resolveStorePath?.((cfg as any)?.session?.store, { agentId }) ?? '';
 
   const ctxPayload = buildCtxPayload({ assembled, envelope, route, msg, ctx, adapters });
+  // room_event 分类标记：框架据此压制自动回复投递 / typing / steer
+  // （对齐 telegram 的 ctxPayload.InboundEventKind 约定）
+  ctxPayload.InboundEventKind = inboundEventKind;
 
   const ttsRuntime = (runtime as any)?.tts ?? (runtime as any)?.channel?.runtimeContexts?.get?.('tts');
 
@@ -331,33 +381,34 @@ export async function dispatchToOpenClaw(
   };
 
   // Turn adoption lifecycle（群聊/私聊差异化）：
-  // - 私聊：exclusive 模式，新消息取消旧消息（用户可"插嘴"）
-  // - 群聊：cancel-only 模式，不取消正在处理的任务（消息已由中间件合并）
-  // - abortSignal：仅私聊时传递，用于取消正在处理的任务
+  // - 私聊：exclusive + abortSignal，新消息取消旧消息（用户可"插嘴"）
+  // - 群聊：exclusive（框架 durable ingress 约定，对齐 telegram；cancel-only 是
+  //   gateway chat.send 的取消身份语义，不适用于通道入站）且不传 abortSignal——
+  //   新消息由框架 followup 队列排队，不打断正在处理的 turn
   const turnAbort = new AbortController();
-  const admission = isGroup ? 'cancel-only' as const : 'exclusive' as const;
-  
+  const admission = 'exclusive' as const;
+  // 仅私聊允许插嘴取消；群聊不打断（排队由框架 followup 队列处理）
+  const interruptible = !isGroup;
+
   const turnAdoptionLifecycle = {
     admission,
-    abortSignal: admission === 'exclusive' ? turnAbort.signal : undefined,
+    abortSignal: interruptible ? turnAbort.signal : undefined,
     onAdopted: () => {
-      dlog?.debug(`turn adopted (${admission}) sessionKey=${route.sessionKey}`);
+      dlog?.debug(`turn adopted (exclusive, ${isGroup ? 'group' : 'c2c'}) sessionKey=${route.sessionKey}`);
     },
     onDeferred: () => {
-      if (admission === 'exclusive') {
-        dlog?.debug(`turn deferred behind active turn sessionKey=${route.sessionKey}`);
-      }
+      dlog?.debug(`turn deferred behind active turn sessionKey=${route.sessionKey}`);
     },
     onAbandoned: () => {
-      if (admission === 'exclusive') {
+      if (interruptible) {
         dlog?.info(`turn abandoned (superseded) — aborting sessionKey=${route.sessionKey}`);
         turnAbort.abort();
       } else {
-        dlog?.debug(`turn cancelled but continuing sessionKey=${route.sessionKey}`);
+        dlog?.info(`group turn abandoned without owning reply lane sessionKey=${route.sessionKey}`);
       }
     },
   };
-  const combinedAbortSignal = admission === 'exclusive' 
+  const combinedAbortSignal = interruptible
     ? combineAbortSignals(ctx.signal, turnAbort.signal)
     : ctx.signal;
 
@@ -385,6 +436,8 @@ export async function dispatchToOpenClaw(
         replyOptions: {
           abortSignal: combinedAbortSignal,
           runId: envelope.messageId,
+          ...(queueModeOverride ? { queueModeOverride } : {}),
+          ...(inboundEventKind === 'room_event' ? { sourceReplyDeliveryMode: 'message_tool_only' as const } : {}),
           ...(streamingController?.isStaticSendMode
             ? {
                 // 对齐 telegram 模式一：显式关掉 SDK block streaming，绕开 coalescer
@@ -461,6 +514,8 @@ export async function dispatchToOpenClaw(
                   abortSignal: combinedAbortSignal,
                   runId: envelope.messageId,
                   turnAdoptionLifecycle,
+                  ...(queueModeOverride ? { queueModeOverride } : {}),
+                  ...(inboundEventKind === 'room_event' ? { sourceReplyDeliveryMode: 'message_tool_only' as const } : {}),
                   ...(streamingController?.isStaticSendMode
                     ? {
                         // 对齐 telegram 模式一：显式关掉 SDK block streaming，绕开 coalescer
@@ -501,9 +556,19 @@ export async function dispatchToOpenClaw(
 
   dlog?.debug(`dispatch completed sessionKey=${route.sessionKey}`);
 
-  // 群消息回复后清空历史缓存（避免下次 @ 时重复组包）
-  if (envelope.chatScope === 'group') {
-    clearGroupHistory(account.accountId, envelope.groupId ?? envelope.senderId);
+  // 群消息回复后处理历史缓存：
+  // - clear（默认）：整清，下次 @ 时组包"自上次回复以来"的窗口
+  // - rolling：裁剪到最后一条 bot 出站之后（bot 发言也计入历史，
+  //   AI 下次可看到自己上次说到哪；对齐 telegram selectAfterLastSelf）
+  if (envelope.chatScope === 'group' && envelope.groupId) {
+    const groupCfg = resolveGroupConfigFromAccount(account, envelope.groupId);
+    if (groupCfg.historyMode === 'rolling') {
+      trimGroupHistoryAfterLastBot(account.accountId, envelope.groupId, groupCfg.historyLimit);
+    } else {
+      clearGroupHistory(account.accountId, envelope.groupId);
+    }
+  } else if (envelope.chatScope === 'group') {
+    clearGroupHistory(account.accountId, envelope.senderId);
   }
 
   if (streamingController && !streamingController.isTerminal) {

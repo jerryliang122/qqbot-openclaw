@@ -17,8 +17,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { RefEntry, RefIndexStore } from '@tencent-connect/qqbot-nodejs';
 import { getQQBotDataDir } from '../utils/platform.js';
-import { createPluginLogger } from '../utils/plugin-logger.js';
-const log = createPluginLogger({ prefix: '[ref-index]' });
+import { createPluginLogger, type PluginLogger } from '../utils/plugin-logger.js';
+
+// 惰性初始化：plugin-logger → runtime → 本模块 → plugin-logger 存在循环导入，
+// 顶层直接 createPluginLogger 会在部分求值顺序下踩到未初始化的 tsx helper
+// （__name is not a function，2026-09-09 群聊架构改造触发）。首次使用时再建。
+let _log: PluginLogger | undefined;
+function log(): PluginLogger {
+  return (_log ??= createPluginLogger({ prefix: '[ref-index]' }));
+}
 
 
 // ── 常量 ──
@@ -109,7 +116,7 @@ export class PersistedRefIndexStore implements RefIndexStore {
         this.compactSync();
       }
     } catch (err) {
-      log.error(
+      log().error(
         `init failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
@@ -157,7 +164,7 @@ export class PersistedRefIndexStore implements RefIndexStore {
         await this.compact();
       }
     } catch (err) {
-      log.error(
+      log().error(
         `append failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
@@ -179,11 +186,11 @@ export class PersistedRefIndexStore implements RefIndexStore {
       await fs.promises.writeFile(tmpPath, content, 'utf8');
       await fs.promises.rename(tmpPath, this.filePath);
       this.diskLineCount = lines.length;
-      log.info(
+      log().info(
         `compacted to ${lines.length} entries`,
       );
     } catch (err) {
-      log.error(
+      log().error(
         `compact failed: ${err instanceof Error ? err.message : String(err)}`,
       );
       // 清理可能残留的 tmp 文件
@@ -211,7 +218,7 @@ export class PersistedRefIndexStore implements RefIndexStore {
       fs.renameSync(tmpPath, this.filePath);
       this.diskLineCount = lines.length;
     } catch (err) {
-      log.error(
+      log().error(
         `compactSync failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }

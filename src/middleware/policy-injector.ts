@@ -52,11 +52,16 @@ export function createPolicyInjector(account: ResolvedQQBotAccount): Middleware 
     if (scope === 'group') {
       const groupOpenid = msg.groupOpenid ?? '';
       const groupCfg = resolveGroupConfigFromAccount(account, groupOpenid);
+      // room_event 群：门控放行全部消息（mentionGate 以 requireMention=false
+      // 通过并保留 wasMentioned 标记），未 @/称呼/引用的消息在 dispatch 侧
+      // 分类为 room_event 被动房间事件（仅全量模式群实际会有这类消息到达）
+      const roomEvent = groupCfg.unmentionedInbound === 'room_event';
       policy.group = {
-        requireMention: groupCfg.requireMention,
+        requireMention: roomEvent ? false : groupCfg.requireMention,
         ignoreOtherMentions: groupCfg.ignoreOtherMentions,
         historyLimit: groupCfg.historyLimit,
         prompt: groupCfg.prompt,
+        unmentionedInbound: groupCfg.unmentionedInbound,
       };
     }
 

@@ -17,6 +17,7 @@ import { botClearStorage } from './bot-clear-storage.js';
 import { botLogs } from './bot-logs.js';
 import { botApprove } from './bot-approve.js';
 import { botGroupAlways } from './bot-group-always.js';
+import { botGroupInfo } from './bot-group-info.js';
 import { botPairing } from './bot-pairing.js';
 
 export interface CommandBuildOptions {
@@ -42,6 +43,7 @@ export function buildCommandList(account: ResolvedQQBotAccount, opts: CommandBui
     botClearStorage(account),
     botApprove(opts.getRuntime),
     botGroupAlways(account, opts.getRuntime),
+    botGroupInfo(account),
     botPairing(opts.getRuntime),
   );
 

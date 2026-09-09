@@ -59,19 +59,46 @@ async function main(): Promise<void> {
       },
     };
 
-    // 默认配置
+    // 默认配置（strategy 默认 framework，排队交给框架）
     const defaultConfig = resolveGroupCoalesceConfig(cfg, 'GROUP_456', 'default');
+    assert.equal(defaultConfig.strategy, 'framework');
     assert.equal(defaultConfig.enabled, true);
     assert.equal(defaultConfig.maxBuffer, 100);
 
     // 群级配置覆盖
     const groupConfig = resolveGroupCoalesceConfig(cfg, 'GROUP_123', 'default');
+    assert.equal(groupConfig.strategy, 'framework');
     assert.equal(groupConfig.enabled, true);
     assert.equal(groupConfig.maxBuffer, 200);
 
     // 快捷函数
     assert.equal(resolveGroupCoalesceEnabled(cfg, 'GROUP_456', 'default'), true);
     assert.equal(resolveGroupCoalesceMaxBuffer(cfg, 'GROUP_123', 'default'), 200);
+  });
+
+  // 测试 2b: strategy 级联覆盖（回退到插件 coalescer）
+  await test('coalesce.strategy 级联（具体群 > "*" > 账号级 > 默认 framework）', async () => {
+    const { resolveGroupConfigFromAccount } = await import('../src/config.js');
+
+    const account: any = {
+      accountId: 'default',
+      config: {
+        groupCoalesce: { strategy: 'plugin' },
+        groups: {
+          '*': { coalesce: { strategy: 'plugin' } },
+          GROUP_PLUGIN: { coalesce: { strategy: 'plugin' } },
+          GROUP_FRAMEWORK: { coalesce: { strategy: 'framework' } },
+        },
+      },
+    };
+
+    assert.equal(resolveGroupConfigFromAccount(account, 'GROUP_PLUGIN').coalesce.strategy, 'plugin');
+    assert.equal(resolveGroupConfigFromAccount(account, 'GROUP_FRAMEWORK').coalesce.strategy, 'framework');
+    // 未配置的群落到 "*"（plugin）
+    assert.equal(resolveGroupConfigFromAccount(account, 'GROUP_OTHER').coalesce.strategy, 'plugin');
+
+    const bareAccount: any = { accountId: 'default', config: {} };
+    assert.equal(resolveGroupConfigFromAccount(bareAccount, 'GROUP_ANY').coalesce.strategy, 'framework');
   });
 
   // 测试 3: 验证消息合并中间件行为
@@ -138,15 +165,16 @@ async function main(): Promise<void> {
     assert.ok(!c2cSessionKey.includes(':coalescing'));
   });
 
-  // 测试 5: 验证 admission 策略差异
-  await test('admission 策略差异（群聊 cancel-only / 私聊 exclusive）', async () => {
-    // 群聊应该使用 cancel-only
-    const groupAdmission = 'cancel-only';
-    assert.equal(groupAdmission, 'cancel-only');
-
-    // 私聊应该使用 exclusive
+  // 测试 5: admission 语义（2026-09 起群聊/私聊均为 exclusive；差异在可打断性）
+  await test('admission 策略（群聊/私聊均 exclusive，群聊不打断由框架队列保证）', async () => {
+    // 群聊与私聊统一使用 exclusive（框架 durable ingress 约定）
+    const groupAdmission = 'exclusive';
     const c2cAdmission = 'exclusive';
+    assert.equal(groupAdmission, 'exclusive');
     assert.equal(c2cAdmission, 'exclusive');
+
+    // 真正的差异：c2c 传 abortSignal（可插嘴取消），群聊不传（排队不打断）——
+    // 行为断言见 dispatch-lifecycle.test.ts「修4: 群聊框架排队」组
   });
 
   // 测试 6: 验证消息合并后的 body 组装

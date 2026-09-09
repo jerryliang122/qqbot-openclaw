@@ -57,6 +57,11 @@ export function buildCtxPayload(params: CtxPayloadParams): any {
 
   const msgTimestamp = (msg as any).timestamp ?? (msg as any).Timestamp;
 
+  // 群成员角色（平台 member_role：admin/owner）→ sender.roles，
+  // 供框架群权限/工具策略分级使用；c2c / 未标注为空
+  const memberRole = (msg as { raw?: { author?: { member_role?: string } } }).raw?.author?.member_role;
+  const senderRoles = memberRole === 'admin' || memberRole === 'owner' ? [memberRole] : undefined;
+
   return adapters.buildInboundContext?.({
     channel: 'qqbot',
     accountId: route.accountId,
@@ -65,7 +70,7 @@ export function buildCtxPayload(params: CtxPayloadParams): any {
     messageId: envelope.messageId,
     timestamp: msgTimestamp ? new Date(msgTimestamp).getTime() : Date.now(),
     from: envelope.targetId,
-    sender: { id: envelope.senderId, name: envelope.senderName },
+    sender: { id: envelope.senderId, name: envelope.senderName, ...(senderRoles ? { roles: senderRoles } : {}) },
     conversation: {
       kind: convKind,
       id: peerId,

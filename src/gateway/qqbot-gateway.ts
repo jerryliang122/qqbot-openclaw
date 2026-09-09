@@ -25,6 +25,10 @@ import { buildUserAgent } from '../bot-instance.js';
 import { createPluginWebhookAdapter } from '../adapter/webhook.js';
 import { getPersistedRefIndexStore } from '../features/ref-index-store.js';
 import { recordOutboundMessageId } from '../features/outbound-echo-store.js';
+import { recordOutboundToGroupHistory } from '../features/history-store.js';
+import { resolveGroupConfigFromAccount } from '../config.js';
+import { checkAndConsumePassiveReplyQuota } from '../features/quota-manager.js';
+import { recordProactiveSend } from '../features/proactive-budget.js';
 import { getCachedMsgId } from '../features/msgid-cache.js';
 import { notifyOutboundMessageSent } from '../features/typing-refresh.js';
 
@@ -165,12 +169,19 @@ export class QQBotGateway {
   }
 
   async sendText(target: ReplyTarget, text: string, opts?: SendOptions): Promise<MessageResponse> {
-    const result = await withTimeout(
-      this.bot.sendText(attachMsgId(target, opts), text),
-      this.textTimeout, 'sendText',
-    );
-    this.notifyTypingRefresh(target);
-    return result;
+    const { target: resolved, rollback } = this.attachMsgIdWithQuota(target, opts);
+    if (!resolved.msgId) recordProactiveSend(this.account.accountId);
+    try {
+      const result = await withTimeout(
+        this.bot.sendText(resolved, text),
+        this.textTimeout, 'sendText',
+      );
+      this.notifyTypingRefresh(target);
+      return result;
+    } catch (err) {
+      rollback();
+      throw err;
+    }
   }
 
   async sendMedia(
@@ -178,15 +189,21 @@ export class QQBotGateway {
     source: string,
     opts?: SendOptions & { fileType?: MediaFileType },
   ): Promise<MessageResponse> {
-    const resolvedTarget = attachMsgId(target, opts);
+    const { target: resolvedTarget, rollback } = this.attachMsgIdWithQuota(target, opts);
+    if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
     const fileType = opts?.fileType ?? MediaFileType.IMAGE;
     const sourceOpts = resolveMediaSource(source);
-    const result = await withTimeout(
-      this.bot.sendMedia({ target: resolvedTarget, fileType, ...sourceOpts, content: opts?.text }),
-      this.mediaTimeout, 'sendMedia',
-    );
-    this.notifyTypingRefresh(target);
-    return result.message ?? { id: '', timestamp: Date.now() };
+    try {
+      const result = await withTimeout(
+        this.bot.sendMedia({ target: resolvedTarget, fileType, ...sourceOpts, content: opts?.text }),
+        this.mediaTimeout, 'sendMedia',
+      );
+      this.notifyTypingRefresh(target);
+      return result.message ?? { id: '', timestamp: Date.now() };
+    } catch (err) {
+      rollback();
+      throw err;
+    }
   }
 
   async sendVoice(
@@ -194,30 +211,34 @@ export class QQBotGateway {
     source: { url?: string; base64?: string; localPath?: string },
     opts?: SendOptions,
   ): Promise<MessageResponse> {
-    const resolvedTarget = attachMsgId(target, opts);
+    const { target: resolvedTarget, rollback } = this.attachMsgIdWithQuota(target, opts);
+    if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
 
-    if (source.base64) {
-      const result = await withTimeout(
-        this.bot.sendMedia({ target: resolvedTarget, fileType: MediaFileType.VOICE, fileData: source.base64, content: opts?.text }),
-        this.mediaTimeout, 'sendVoice(base64)',
+    const send = (params: Record<string, unknown>, label: string) =>
+      withTimeout(
+        this.bot.sendMedia({
+          target: resolvedTarget,
+          fileType: MediaFileType.VOICE,
+          ...params,
+          content: opts?.text,
+        } as any),
+        this.mediaTimeout, label,
       );
+    try {
+      let result: { message?: MessageResponse };
+      if (source.base64) {
+        result = await send({ fileData: source.base64 }, 'sendVoice(base64)');
+      } else if (source.localPath) {
+        result = await send({ localPath: source.localPath }, 'sendVoice(path)');
+      } else {
+        result = await send({ url: source.url! }, 'sendVoice(url)');
+      }
       this.notifyTypingRefresh(target);
       return result.message ?? { id: '', timestamp: Date.now() };
+    } catch (err) {
+      rollback();
+      throw err;
     }
-    if (source.localPath) {
-      const result = await withTimeout(
-        this.bot.sendMedia({ target: resolvedTarget, fileType: MediaFileType.VOICE, localPath: source.localPath, content: opts?.text }),
-        this.mediaTimeout, 'sendVoice(path)',
-      );
-      this.notifyTypingRefresh(target);
-      return result.message ?? { id: '', timestamp: Date.now() };
-    }
-    const result = await withTimeout(
-      this.bot.sendMedia({ target: resolvedTarget, fileType: MediaFileType.VOICE, url: source.url!, content: opts?.text }),
-      this.mediaTimeout, 'sendVoice(url)',
-    );
-    this.notifyTypingRefresh(target);
-    return result.message ?? { id: '', timestamp: Date.now() };
   }
 
   async sendVideo(
@@ -225,14 +246,20 @@ export class QQBotGateway {
     source: string,
     opts?: SendOptions,
   ): Promise<MessageResponse> {
-    const resolvedTarget = attachMsgId(target, opts);
+    const { target: resolvedTarget, rollback } = this.attachMsgIdWithQuota(target, opts);
+    if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
     const sourceOpts = resolveMediaSource(source);
-    const result = await withTimeout(
-      this.bot.sendMedia({ target: resolvedTarget, fileType: MediaFileType.VIDEO, ...sourceOpts, content: opts?.text }),
-      this.mediaTimeout, 'sendVideo',
-    );
-    this.notifyTypingRefresh(target);
-    return result.message ?? { id: '', timestamp: Date.now() };
+    try {
+      const result = await withTimeout(
+        this.bot.sendMedia({ target: resolvedTarget, fileType: MediaFileType.VIDEO, ...sourceOpts, content: opts?.text }),
+        this.mediaTimeout, 'sendVideo',
+      );
+      this.notifyTypingRefresh(target);
+      return result.message ?? { id: '', timestamp: Date.now() };
+    } catch (err) {
+      rollback();
+      throw err;
+    }
   }
 
   async sendFile(
@@ -240,14 +267,20 @@ export class QQBotGateway {
     source: string,
     opts?: SendOptions & { fileName?: string },
   ): Promise<MessageResponse> {
-    const resolvedTarget = attachMsgId(target, opts);
+    const { target: resolvedTarget, rollback } = this.attachMsgIdWithQuota(target, opts);
+    if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
     const sourceOpts = resolveMediaSource(source);
-    const result = await withTimeout(
-      this.bot.sendMedia({ target: resolvedTarget, fileType: MediaFileType.FILE, ...sourceOpts, fileName: opts?.fileName, content: opts?.text }),
-      this.mediaTimeout, 'sendFile',
-    );
-    this.notifyTypingRefresh(target);
-    return result.message ?? { id: '', timestamp: Date.now() };
+    try {
+      const result = await withTimeout(
+        this.bot.sendMedia({ target: resolvedTarget, fileType: MediaFileType.FILE, ...sourceOpts, fileName: opts?.fileName, content: opts?.text }),
+        this.mediaTimeout, 'sendFile',
+      );
+      this.notifyTypingRefresh(target);
+      return result.message ?? { id: '', timestamp: Date.now() };
+    } catch (err) {
+      rollback();
+      throw err;
+    }
   }
 
   openStream(target: ReplyTarget, msgId: string): StreamSession {
@@ -273,13 +306,11 @@ export class QQBotGateway {
     const { accountId, appId } = this.account;
     const senderName = this.account.config.name ?? appId;
 
-    const storeEntry = (msg: MessageResponse, content: string, scope: string, mediaKind?: string): void => {
+    const storeEntry = (msg: MessageResponse, content: string, target: { scope: string; targetId?: string }, mediaKind?: string): void => {
       // 出站 id 先登记回声表（不依赖 ext_info.ref_idx 是否返回），
       // 供 inboundGuard 识别平台回投的 bot 自身消息
       recordOutboundMessageId(accountId, msg.id);
-      const refIdx = msg.ext_info?.ref_idx;
-      if (!refIdx) return;
-      
+
       // 修复运算符优先级问题：当 content 非空时直接使用，否则回退到媒体标签
       let finalContent = content;
       if (!content && mediaKind) {
@@ -289,10 +320,30 @@ export class QQBotGateway {
           : mediaKind === 'file' ? '[文件]'
           : `[${mediaKind}]`;
       }
+
+      // rolling 历史模式：群出站记入 historyBuffer（isBot 标记，
+      // 供"裁剪到最后一条 bot 发言"定位；historyLimit=0 或 room_event 群
+      // ——上下文以框架 transcript 为准——时 no-op）
+      if (
+        target.scope === 'group' &&
+        target.targetId &&
+        resolveGroupConfigFromAccount(this.account, target.targetId).unmentionedInbound !== 'room_event'
+      ) {
+        recordOutboundToGroupHistory(accountId, target.targetId, {
+          messageId: msg.id,
+          senderId: appId,
+          senderName,
+          content: finalContent || '[消息]',
+        }, resolveGroupConfigFromAccount(this.account, target.targetId).historyLimit);
+      }
+
+      const refIdx = msg.ext_info?.ref_idx;
+      if (!refIdx) return;
+
       const entry = {
         messageId: msg.id, content: finalContent, senderId: appId, senderName,
         timestamp: typeof msg.timestamp === 'number' ? new Date(msg.timestamp).toISOString() : msg.timestamp,
-        isBot: true, scope,
+        isBot: true, scope: target.scope,
       };
       getPersistedRefIndexStore(accountId).set(refIdx, entry as any);
     };
@@ -301,7 +352,7 @@ export class QQBotGateway {
     const origSendText = this.bot.sendText.bind(this.bot);
     this.bot.sendText = async (target, text, ...rest) => {
       const result = await origSendText(target, text, ...rest);
-      storeEntry(result, text, target.scope);
+      storeEntry(result, text, target);
       return result;
     };
 
@@ -310,7 +361,7 @@ export class QQBotGateway {
     this.bot.sendMedia = async (params: any) => {
       const result = await origSendMedia(params);
       const msg = (result as any).message as MessageResponse | undefined;
-      if (msg) storeEntry(msg, '', params.target?.scope ?? '', params.mediaKind);
+      if (msg) storeEntry(msg, '', params.target ?? { scope: '' }, params.mediaKind);
       return result;
     };
 
@@ -340,13 +391,37 @@ export class QQBotGateway {
       return session;
     };
   }
-}
 
-function attachMsgId(target: ReplyTarget, opts?: SendOptions): ReplyTarget {
-  if (opts?.msgId) return { ...target, msgId: opts.msgId };
-  // 无显式 msgId 时尝试从缓存获取
-  const cached = getCachedMsgId(target.scope, target.targetId);
-  return cached ? { ...target, msgId: cached } : target;
+  /**
+   * 配额感知的 msg_id 挂接（被动优先）。
+   *
+   * - 显式 msgId（opts.msgId）：上游 adapter 已做配额记账（quotaReserved），
+   *   直接透传，不重复消费。
+   * - 无显式 msgId：尝试挂 msgid-cache 最新条目；挂接前经 quota-manager
+   *   原子预检+扣减——配额耗尽则不挂（降级主动，避免平台 40034128 硬失败），
+   *   API 抛错时由调用方 rollback 释放已扣减的额度。
+   */
+  private attachMsgIdWithQuota(
+    target: ReplyTarget,
+    opts?: SendOptions,
+  ): { target: ReplyTarget; rollback: () => void } {
+    if (opts?.msgId) {
+      return { target: { ...target, msgId: opts.msgId }, rollback: () => {} };
+    }
+    const cached = getCachedMsgId(target.scope, target.targetId);
+    if (!cached) return { target, rollback: () => {} };
+
+    const reservation = checkAndConsumePassiveReplyQuota({
+      accountId: this.account.accountId,
+      msgId: cached,
+      scope: target.scope,
+    });
+    if (!reservation.canReply) {
+      this.log.debug?.(`passive quota exhausted for msgId=${cached}; falling back to proactive`);
+      return { target, rollback: () => {} };
+    }
+    return { target: { ...target, msgId: cached }, rollback: reservation.rollback };
+  }
 }
 
 function resolveMediaSource(source: string): { url?: string; localPath?: string; fileData?: string } {

@@ -63,12 +63,17 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
   bot.use(createPolicyInjector(account));
 
   // 4. 群历史缓冲 — 放在门控之前，确保所有消息（含未 @bot）都计入上下文
-  //    limit 从 ctx.state.policy.group.historyLimit 读取，key 带 accountId 前缀隔离多账号
+  //    limit 从 ctx.state.policy.group.historyLimit 读取，key 带 accountId 前缀隔离多账号；
+  //    room_event 群返回 undefined 跳过记录——该模式下每条消息已作为入站事件
+  //    进框架持久化 transcript，插件历史快照会造成双份上下文
   bot.use(historyBuffer({
     store: getHistoryStore(),
     groupKey: (ctx) => {
       const gid = ctx.message.groupOpenid;
       if (ctx.message.kind !== 'group' || !gid) return undefined;
+      if (resolveGroupConfigFromAccount(account, gid).unmentionedInbound === 'room_event') {
+        return undefined;
+      }
       return historyGroupKey(account.accountId, gid);
     },
   }));
@@ -80,7 +85,23 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
   }));
 
   // 6. 群聊 @bot 门控（从 ctx.state.policy.group 读取动态配置）
-  bot.use(mentionGate());
+  //    isImplicitMention：引用 bot 出站消息 = 隐式被点名（对齐 telegram
+  //    reply-to-bot 语义）。ref-index get 为同步内存查询，可直接放同步回调；
+  //    仅全量模式（GROUP_MESSAGE_CREATE）下未 @ 消息才可能带引用进到这里。
+  bot.use(mentionGate({
+      isImplicitMention: (ctx) => {
+        const msg = ctx.message as { refMsgIdx?: string };
+        if (!msg?.refMsgIdx) return false;
+        try {
+          const entry = getPersistedRefIndexStore(account.accountId).get(msg.refMsgIdx) as
+            | { isBot?: boolean }
+            | undefined;
+          return entry?.isBot === true;
+        } catch {
+          return false;
+        }
+      },
+    }));
   // 7. 内容清洗（去 @marker、表情标签、多余空白）
   // SDK 用 appId 匹配 @标记，但 QQ openid 不等于 appId，追加 stripMentionText 正确剥离
   bot.use(contentSanitizer({
@@ -89,7 +110,24 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
   }));
 
   // 8. 三层限流（sender / group / global）
-  bot.use(rateLimiter());
+  //    默认启用保守阈值（20/min、60/min、300/min），正常使用不会触发；
+  //    触发即 INFO 留痕（不自动回复，避免烧被动配额/刷屏）。账号级
+  //    channels.qqbot.rateLimit 可覆盖或 {enabled:false} 关闭。
+  {
+    const rl = account.config.rateLimit ?? {};
+    if (rl.enabled !== false) {
+      bot.use(rateLimiter({
+        perSender: rl.perSender ?? { max: 20, windowMs: 60_000 },
+        perGroup: rl.perGroup ?? { max: 60, windowMs: 60_000 },
+        global: rl.global ?? { max: 300, windowMs: 60_000 },
+        onLimit: (ctx, tier) => {
+          ctx.log.info?.(
+            `[rate-limit] dropped (${tier}) sender=${(ctx.message as any).senderId ?? '-'} group=${(ctx.message as any).groupOpenid ?? '-'}`,
+          );
+        },
+      }));
+    }
+  }
 
   // 9. 斜杠命令（命令匹配后直接 reply + stop）
   //    依赖：ctx.state.policy（policyInjector, #3）、ctx.message.*（原始消息）
@@ -102,18 +140,18 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
   //     拦截后不再触发 typing / envelope；多问题 ask_user 答案消息红线放行
   bot.use(secretCapture({ accountId: account.accountId }));
 
-  // 10. 群聊消息合并中间件
-  //     - 群聊：所有消息都应该被处理，快速消息应该被合并
-  //     - 私聊：用户可以"插嘴"，新消息取消旧消息（由框架 session lane 处理）
-  //     - 放在斜杠命令之后、副作用中间件之前
-  //     - 从 ctx.state.policy.group 读取配置（由 policyInjector 注入）
+  // 10. 群聊消息排队
+  //     - strategy=framework（默认）：本中间件整段跳过，消息逐条立即 dispatch，
+  //       排队/合并交给框架 followup 队列（dispatch 侧传 queueModeOverride）
+  //     - strategy=plugin：插件内建 busy-buffering coalescer（旧版行为，回退用）
+  //     - 配置从 ctx.state.policy.group 读取（由 policyInjector 注入）
   bot.use(groupMessageCoalescer({
       accountId: account.accountId,
       isEnabled: (ctx) => {
         const groupOpenid = ctx.message.groupOpenid;
-        return groupOpenid
-          ? resolveGroupConfigFromAccount(account, groupOpenid).coalesce.enabled
-          : false;
+        if (!groupOpenid) return false;
+        const coalesce = resolveGroupConfigFromAccount(account, groupOpenid).coalesce;
+        return coalesce.strategy === "plugin" && coalesce.enabled;
       },
       maxBuffer: (ctx) => {
         const groupOpenid = ctx.message.groupOpenid;

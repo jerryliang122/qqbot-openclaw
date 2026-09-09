@@ -92,7 +92,6 @@ const fakeAccount = {
 // ── Layer 4 · buildDynamicCtx 表驱动 ─────────────────────
 
 group('buildDynamicCtx · Voice/ASR 投影与去重');
-
 interface DynCtxCase {
   name: string;
   processed: ProcessedAttachments;
@@ -298,11 +297,11 @@ test('群被@且有 history：前置 [Chat messages since...] 块', () => {
   const msg = makeMsg({ sanitizedContent: '问题', kind: 'group', senderId: 'u1', senderName: 'Me' });
   const { agentBody } = assembleBody(ctx, msg, fakeAccount);
   assert.ok(
-    agentBody.startsWith('[Chat messages since your last reply — CONTEXT ONLY]\n'),
+    agentBody.startsWith('[Chat history begins]\n'),
     `agentBody=\n${agentBody}`,
   );
   assert.ok(agentBody.includes('[A (a)] msg-a\n[B (b)] msg-b'), agentBody);
-  assert.ok(agentBody.includes('[CURRENT MESSAGE — reply to this]\n[Me (u1)] 问题 (@you)'), agentBody);
+  assert.ok(agentBody.includes('[Chat history ends]\n[Current message]\n[Me (u1)] 问题 (@you)'), agentBody);
 });
 
 test('群未被@：不前置 history 块', () => {
@@ -382,6 +381,99 @@ function makeProcessed(input: {
     otherInfo: input.otherInfo ?? '',
   };
 }
+
+// ── msg_elements 上下文渲染（AT+最近N / 引用 / 转发） ──────
+
+group('buildDynamicCtx · msg_elements 渲染');
+
+function makeElementsMsg(elements: unknown[], kind: 'group' | 'c2c' = 'group') {
+  return {
+    ...makeMsg({ sanitizedContent: '看看这个', kind, senderId: 'u1', senderName: 'Me' }),
+    msgElements: elements,
+  } as never;
+}
+
+test('普通元素：渲染 消息N/内容/发送者', () => {
+  const msg = makeElementsMsg([
+    { content: '今天的学习计划已完成', author: { username: '小明' } },
+    { content: '很棒！继续保持', author: { username: '小红' } },
+  ]);
+  const ctx = makeCtx({ sanitizedContent: '看看这个', kind: 'group', senderId: 'u1', senderName: 'Me' });
+  const { agentBody } = assembleBody(ctx, msg as never, fakeAccount);
+  assert.ok(agentBody.includes('[Reference message begins]'), agentBody);
+  assert.ok(agentBody.includes('=== 消息 1 ===\n[消息内容] 今天的学习计划已完成\n[发送者] 小明'), agentBody);
+  assert.ok(agentBody.includes('=== 消息 2 ===\n[消息内容] 很棒！继续保持\n[发送者] 小红'), agentBody);
+});
+
+test('平台预渲染文本：直接透传不二次包裹', () => {
+  const prerendered = '=== 消息 1 ===\n[消息内容] 今天的学习计划已完成\n\n=== 消息 2 ===\n[消息内容] 很棒！继续保持';
+  const msg = makeElementsMsg([{ content: prerendered, author: { username: '小明' } }]);
+  const ctx = makeCtx({ sanitizedContent: '看看这个', kind: 'group', senderId: 'u1', senderName: 'Me' });
+  const { agentBody } = assembleBody(ctx, msg as never, fakeAccount);
+  // 只应有一层 "=== 消息 1 ==="，且原文完整保留
+  assert.equal(agentBody.split('=== 消息 1 ===').length - 1, 1, `agentBody=\n${agentBody}`);
+  assert.ok(agentBody.includes(prerendered), agentBody);
+  assert.ok(!agentBody.includes('[消息内容] === 消息 1 ==='), '不得把预渲染文本再包一层 [消息内容]');
+});
+
+test('quote 与 msg_elements 上下文并列：quote 消费第 0 个元素时跳过该元素、渲染其余', () => {
+  const msg = makeElementsMsg([
+    { content: '被引用的那条消息', author: { username: '小明' } },
+    { content: '最近消息记录里的另一条', author: { username: '小红' } },
+  ]);
+  const ctx = makeCtx({
+    sanitizedContent: '关于这个',
+    kind: 'group',
+    senderId: 'u1',
+    senderName: 'Me',
+    state: {
+      quote: { refKey: 'REF_1', source: 'msg_elements', rawContent: '被引用的那条消息', text: '被引用的那条消息' },
+    },
+  });
+  const { agentBody } = assembleBody(ctx, msg as never, fakeAccount);
+  // 引用块渲染（quotePart）
+  assert.ok(agentBody.includes('[Quoted message begins]'), agentBody);
+  assert.ok(agentBody.includes('被引用的那条消息'), agentBody);
+  // 其余元素仍渲染为上下文
+  assert.ok(agentBody.includes('[Reference message begins]'), 'quote 存在时其余 msg_elements 上下文不应被吞掉');
+  assert.ok(agentBody.includes('最近消息记录里的另一条'), agentBody);
+  // 被引用元素不再重复出现在 Reference 块中
+  const refBlock = agentBody.split('[Reference message begins]')[1]?.split('[Reference message ends]')[0] ?? '';
+  assert.ok(!refBlock.includes('被引用的那条消息'), 'quote 消费的元素不应在 Reference 块重复渲染');
+});
+
+test('quote 来自 store（bot 出站）：msg_elements 全量渲染不互斥', () => {
+  const msg = makeElementsMsg([
+    { content: '上下文消息', author: { username: '小明' } },
+  ]);
+  const ctx = makeCtx({
+    sanitizedContent: '接着说',
+    kind: 'group',
+    senderId: 'u1',
+    senderName: 'Me',
+    state: {
+      quote: { refKey: 'REF_BOT', source: 'store', text: 'bot 之前说的话' },
+    },
+  });
+  const { agentBody } = assembleBody(ctx, msg as never, fakeAccount);
+  assert.ok(agentBody.includes('[Quoted message begins]'), agentBody);
+  assert.ok(agentBody.includes('bot 之前说的话'), agentBody);
+  assert.ok(agentBody.includes('上下文消息'), 'store 来源的 quote 不应吞掉 msg_elements 上下文');
+});
+
+test('元素级 attachments：渲染为 [附件] 行', () => {
+  const msg = makeElementsMsg([
+    {
+      content: '',
+      author: { username: '小明' },
+      attachments: [{ url: 'https://example.com/a.jpg', content_type: 'image/jpeg' }],
+    },
+  ]);
+  const ctx = makeCtx({ sanitizedContent: '看看图', kind: 'group', senderId: 'u1', senderName: 'Me' });
+  const { agentBody } = assembleBody(ctx, msg as never, fakeAccount);
+  assert.ok(agentBody.includes('[附件] image/jpeg: https://example.com/a.jpg'), agentBody);
+  assert.ok(agentBody.includes('[消息内容] （无文本）'), agentBody);
+});
 
 // ── 总结 ─────────────────────────────────────────────────
 

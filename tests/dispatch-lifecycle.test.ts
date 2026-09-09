@@ -348,6 +348,117 @@ await test('buildInboundContext legacy 映射包含 ChatId（供框架 outbound-
 
 // ── 结果 ──
 
+group('修4: 群聊框架排队（coalesce.strategy=framework）');
+
+await test('群聊 turn：admission=exclusive、无 abortSignal（不打断）、queueModeOverride=collect', async () => {
+  _resetAdaptersCache();
+  const { msg, ctx } = makeMsgAndCtx({ scope: 'group', targetId: 'GROUP_X' });
+  let capturedPlan: CapturedPlan | undefined;
+  let capturedDispatch: CapturedDispatch | undefined;
+
+  const runtime = makeFakeRuntime({
+    onInboundRun: async (params) => {
+      const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+      capturedPlan = plan;
+      await plan.runDispatch();
+      return { dispatched: true };
+    },
+    dispatchReply: (params2: any) => {
+      capturedDispatch = params2;
+      return { queuedFinal: true, counts: { final: 1 } };
+    },
+  });
+
+  const account = makeAccount();
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, runtime);
+
+  const lifecycle = (capturedPlan as any)?.runDispatchLifecycle?.turnAdoptionLifecycle;
+  assert.ok(lifecycle, '群聊 turn lifecycle 应存在');
+  assert.equal(lifecycle.admission, 'exclusive', '群聊 admission 应为 exclusive（durable ingress 约定）');
+  assert.equal(lifecycle.abortSignal, undefined, '群聊不传 abortSignal（不打断正在处理的 turn）');
+
+  const replyOptions = (capturedDispatch as any)?.replyOptions;
+  assert.equal(replyOptions?.queueModeOverride, 'collect', '默认 framework 策略 → collect 合并批处理');
+});
+
+await test('群聊 coalesce.enabled=false → queueModeOverride=followup（排队不合并）', async () => {
+  _resetAdaptersCache();
+  const { msg, ctx } = makeMsgAndCtx({ scope: 'group', targetId: 'GROUP_X' });
+  let capturedDispatch: CapturedDispatch | undefined;
+
+  const runtime = makeFakeRuntime({
+    onInboundRun: async (params) => {
+      const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+      await plan.runDispatch();
+      return { dispatched: true };
+    },
+    dispatchReply: (params2: any) => {
+      capturedDispatch = params2;
+      return { queuedFinal: true, counts: { final: 1 } };
+    },
+  });
+
+  const account = makeAccount();
+  account.config.groups = { GROUP_X: { coalesce: { enabled: false } } };
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, runtime);
+
+  const replyOptions = (capturedDispatch as any)?.replyOptions;
+  assert.equal(replyOptions?.queueModeOverride, 'followup', '关闭合并但保留不打断语义 → followup');
+});
+
+await test('群聊 coalesce.strategy=plugin → 不传 queueModeOverride（插件 coalescer 负责）', async () => {
+  _resetAdaptersCache();
+  const { msg, ctx } = makeMsgAndCtx({ scope: 'group', targetId: 'GROUP_X' });
+  let capturedDispatch: CapturedDispatch | undefined;
+
+  const runtime = makeFakeRuntime({
+    onInboundRun: async (params) => {
+      const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+      await plan.runDispatch();
+      return { dispatched: true };
+    },
+    dispatchReply: (params2: any) => {
+      capturedDispatch = params2;
+      return { queuedFinal: true, counts: { final: 1 } };
+    },
+  });
+
+  const account = makeAccount();
+  account.config.groups = { GROUP_X: { coalesce: { strategy: 'plugin' } } };
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, runtime);
+
+  const replyOptions = (capturedDispatch as any)?.replyOptions;
+  assert.equal(replyOptions?.queueModeOverride, undefined, 'plugin 策略不传 queueModeOverride');
+});
+
+await test('c2c turn：queueModeOverride 不传（c2c 插嘴语义不变）', async () => {
+  _resetAdaptersCache();
+  const { msg, ctx } = makeMsgAndCtx();
+  let capturedDispatch: CapturedDispatch | undefined;
+
+  const runtime = makeFakeRuntime({
+    onInboundRun: async (params) => {
+      const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+      await plan.runDispatch();
+      return { dispatched: true };
+    },
+    dispatchReply: (params2: any) => {
+      capturedDispatch = params2;
+      return { queuedFinal: true, counts: { final: 1 } };
+    },
+  });
+
+  const account = makeAccount();
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, runtime);
+
+  const replyOptions = (capturedDispatch as any)?.replyOptions;
+  assert.equal(replyOptions?.queueModeOverride, undefined, 'c2c 不传 queueModeOverride');
+});
+
 console.log('\n' + '='.repeat(60));
 console.log(`测试结果: ${passed} passed, ${failed} failed`);
 if (failedTests.length > 0) {

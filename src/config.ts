@@ -86,16 +86,19 @@ const DEFAULT_PROCESSING_TIMEOUT_MS = 0;
 
 /** 群消息合并默认配置 */
 const DEFAULT_GROUP_COALESCE_CONFIG: Required<GroupCoalesceConfig> = {
+  strategy: "framework",
   enabled: true,
   maxBuffer: 50,
 };
 
-const DEFAULT_GROUP_CONFIG: Omit<Required<GroupConfig>, "prompt" | "coalesce"> & { coalesce: Required<GroupCoalesceConfig> } = {
+const DEFAULT_GROUP_CONFIG: Omit<Required<GroupConfig>, "prompt" | "coalesce" | "historyMode" | "unmentionedInbound"> & { coalesce: Required<GroupCoalesceConfig>; historyMode: 'clear' | 'rolling'; unmentionedInbound: 'user_request' | 'room_event' } = {
   requireMention: true,
   ignoreOtherMentions: false,
   toolPolicy: "restricted",
   name: "",
   historyLimit: DEFAULT_GROUP_HISTORY_LIMIT,
+  historyMode: "clear",
+  unmentionedInbound: "user_request",
   coalesce: DEFAULT_GROUP_COALESCE_CONFIG,
 };
 
@@ -133,9 +136,11 @@ export function isGroupAllowed(cfg: OpenClawConfig, groupOpenid: string, account
   }).allowed;
 }
 
-export type ResolvedGroupConfig = Omit<Required<GroupConfig>, "prompt" | "coalesce"> & { 
+export type ResolvedGroupConfig = Omit<Required<GroupConfig>, "prompt" | "coalesce" | "historyMode" | "unmentionedInbound"> & {
   prompt: string;
   coalesce: Required<GroupCoalesceConfig>;
+  historyMode: 'clear' | 'rolling';
+  unmentionedInbound: 'user_request' | 'room_event';
 };
 
 export function resolveGroupConfigFromAccount(account: ResolvedQQBotAccount, groupOpenid: string): ResolvedGroupConfig {
@@ -146,6 +151,7 @@ export function resolveGroupConfigFromAccount(account: ResolvedQQBotAccount, gro
   const accountDefaultCoalesce = account.config?.groupCoalesce ?? DEFAULT_GROUP_COALESCE_CONFIG;
 
   const coalesce = {
+    strategy: specificCfg.coalesce?.strategy ?? wildcardCfg.coalesce?.strategy ?? accountDefaultCoalesce.strategy ?? DEFAULT_GROUP_COALESCE_CONFIG.strategy,
     enabled: specificCfg.coalesce?.enabled ?? wildcardCfg.coalesce?.enabled ?? accountDefaultCoalesce.enabled ?? DEFAULT_GROUP_COALESCE_CONFIG.enabled,
     maxBuffer: specificCfg.coalesce?.maxBuffer ?? wildcardCfg.coalesce?.maxBuffer ?? accountDefaultCoalesce.maxBuffer ?? DEFAULT_GROUP_COALESCE_CONFIG.maxBuffer,
   };
@@ -157,6 +163,8 @@ export function resolveGroupConfigFromAccount(account: ResolvedQQBotAccount, gro
     name: specificCfg.name ?? wildcardCfg.name ?? DEFAULT_GROUP_CONFIG.name,
     prompt: specificCfg.prompt ?? wildcardCfg.prompt ?? DEFAULT_GROUP_PROMPT,
     historyLimit: specificCfg.historyLimit ?? wildcardCfg.historyLimit ?? DEFAULT_GROUP_CONFIG.historyLimit,
+    historyMode: specificCfg.historyMode ?? wildcardCfg.historyMode ?? DEFAULT_GROUP_CONFIG.historyMode,
+    unmentionedInbound: specificCfg.unmentionedInbound ?? wildcardCfg.unmentionedInbound ?? DEFAULT_GROUP_CONFIG.unmentionedInbound,
     coalesce,
   };
 }
