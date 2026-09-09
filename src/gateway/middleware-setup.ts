@@ -97,7 +97,8 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
             | { isBot?: boolean }
             | undefined;
           return entry?.isBot === true;
-        } catch {
+        } catch (err) {
+          ctx.log.debug?.(`[mention] implicit quote-bot check failed: ${err instanceof Error ? err.message : String(err)}`);
           return false;
         }
       },

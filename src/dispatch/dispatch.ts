@@ -171,6 +171,24 @@ export async function dispatchToOpenClaw(
       ? 'room_event' as const
       : 'user_request' as const;
 
+  // 分类可观测性：room_event 事件触发一次推理 pass（成本排障命门），必须留痕；
+  // room_event 群里被唤醒为 user_request 时标注唤醒来源（@/称呼/引用），
+  // 便于观察 mentionPatterns 与引用唤醒的实际命中
+  if (inboundEventKind === 'room_event') {
+    dlog?.info(
+      `[room-event] passive room event group=${envelope.groupId} sender=${envelope.senderId} contentLen=${(msg.content ?? '').length}`,
+    );
+  } else if (isGroup && groupCfg?.unmentionedInbound === 'room_event' && !isSlash) {
+    const wakeSource = mentionState?.wasMentioned
+      ? 'mention'
+      : mentionState?.implicit
+        ? 'quote-bot'
+        : nameMentioned
+          ? 'name-pattern'
+          : 'unknown';
+    dlog?.info(`[wake] ${wakeSource} → user_request group=${envelope.groupId} sender=${envelope.senderId}`);
+  }
+
   if (queueModeOverride && !frameworkQueueAnnounced) {
     frameworkQueueAnnounced = true;
     dlog?.info(`[queue] group turn queueing delegated to framework followup queue (mode=${queueModeOverride}); plugin coalescer bypassed`);
@@ -563,7 +581,8 @@ export async function dispatchToOpenClaw(
   if (envelope.chatScope === 'group' && envelope.groupId) {
     const groupCfg = resolveGroupConfigFromAccount(account, envelope.groupId);
     if (groupCfg.historyMode === 'rolling') {
-      trimGroupHistoryAfterLastBot(account.accountId, envelope.groupId, groupCfg.historyLimit);
+      const kept = trimGroupHistoryAfterLastBot(account.accountId, envelope.groupId, groupCfg.historyLimit);
+      dlog?.debug(`[history] rolling trim group=${envelope.groupId} kept=${kept}`);
     } else {
       clearGroupHistory(account.accountId, envelope.groupId);
     }

@@ -46,16 +46,16 @@ export function recordOutboundToGroupHistory(
 /**
  * rolling 模式裁剪：删除最后一条 bot 出站（含）之前的全部条目，
  * 保留其后的人类消息（下次 @ 时组包，AI 由此知道自己上次说到哪）。
- * 无 bot 出站记录时不动（保守：等价于不清）。
+ * 无 bot 出站记录时不动（保守：等价于不清）。返回保留的条数（供日志）。
  */
-export function trimGroupHistoryAfterLastBot(accountId: string, groupId: string, limit: number): void {
+export function trimGroupHistoryAfterLastBot(accountId: string, groupId: string, limit: number): number {
   const store = _store;
-  if (!store?.list || !store.clear || !store.append) return;
+  if (!store?.list || !store.clear || !store.append) return 0;
   const key = historyGroupKey(accountId, groupId);
   const listed = store.list(key, 1_000_000);
-  if (listed instanceof Promise) return; // 异步后端不支持同步裁剪（当前为 MemoryHistoryStore 同步实现）
+  if (listed instanceof Promise) return 0; // 异步后端不支持同步裁剪（当前为 MemoryHistoryStore 同步实现）
   const entries: HistoryEntry[] = listed;
-  if (entries.length === 0) return;
+  if (entries.length === 0) return 0;
 
   let lastBotIdx = -1;
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -64,11 +64,12 @@ export function trimGroupHistoryAfterLastBot(accountId: string, groupId: string,
       break;
     }
   }
-  if (lastBotIdx < 0) return;
+  if (lastBotIdx < 0) return 0;
 
   const kept = entries.slice(lastBotIdx + 1);
   store.clear(key);
   for (const e of kept) {
     store.append(key, e, Math.max(limit, kept.length));
   }
+  return kept.length;
 }

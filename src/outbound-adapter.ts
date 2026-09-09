@@ -144,7 +144,7 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
         rollback();
         log?.debug?.(`[${resolvedAccountId}] rollback quota: send failed`);
       } else if (!canReply) {
-        log?.debug?.(`[${resolvedAccountId}] fallback to proactive send: quota exhausted or no msgId`);
+        log?.info?.(`[${resolvedAccountId}] [quota] fallback to proactive send: quota exhausted or no msgId`);
       }
 
       return result;

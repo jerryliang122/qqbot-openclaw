@@ -28,7 +28,7 @@ import {
 } from '../features/question-helpers.js';
 import { recordKnownUser } from '../features/proactive.js';
 import { cacheMsgId } from '../features/msgid-cache.js';
-import { recordGroupEvent } from '../features/group-mode-store.js';
+import { recordGroupEvent, getGroupModeFacts } from '../features/group-mode-store.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { resolveGroupConfigFromAccount, resolveGroupPolicy, resolveMentionPatterns } from '../config.js';
 import { getPackageVersion } from '../utils/pkg-version.js';
@@ -57,16 +57,21 @@ export async function handleMessage(
   }
 
   try {
-    // 群推送模式推断（AT 系 vs 全量）：按事件类型记录，模式变化打 INFO 留痕
+    // 群推送模式推断（AT 系 vs 全量）：按事件类型记录；首次观测与模式变化都打 INFO
+    // 留痕（模式由群主设置、可随时变，事后排障靠这两条日志定位「为什么收得到/收不到消息」）
     if (scope === 'group') {
+      const seenBefore = getGroupModeFacts(account.accountId, msg.replyTarget.targetId);
       const modeChange = recordGroupEvent(
         account.accountId,
         msg.replyTarget.targetId,
         (msg as { rawEventType?: string }).rawEventType ?? '',
         Array.isArray((msg as { msgElements?: unknown[] }).msgElements),
       );
+      const current = getGroupModeFacts(account.accountId, msg.replyTarget.targetId);
       if (modeChange) {
         hlog.info(`[group-mode] push mode changed to ${modeChange} for group=${msg.replyTarget.targetId}`);
+      } else if (!seenBefore && current) {
+        hlog.info(`[group-mode] first observation mode=${current.mode} group=${msg.replyTarget.targetId}`);
       }
     }
 

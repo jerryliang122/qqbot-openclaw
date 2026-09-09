@@ -417,7 +417,8 @@ export class QQBotGateway {
       scope: target.scope,
     });
     if (!reservation.canReply) {
-      this.log.debug?.(`passive quota exhausted for msgId=${cached}; falling back to proactive`);
+      // INFO：降级主动消耗每日预算，是出站行为的可观测分界点
+      this.log.info?.(`[quota] passive quota exhausted for msgId=${cached}; falling back to proactive send`);
       return { target, rollback: () => {} };
     }
     return { target: { ...target, msgId: cached }, rollback: reservation.rollback };
