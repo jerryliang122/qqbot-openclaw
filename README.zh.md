@@ -9,11 +9,15 @@
 
 **让你的 AI 助手接入 QQ — 私聊、群聊、富媒体，一个插件全搞定。**
 
-### 🚀 当前版本： `v2.1.0`
+> 本仓库为**独立维护的 fork**，自 v1.0.0 起独立发版（与上游 2.x 版本线完全脱钩）。
+> 运行要求：OpenClaw `>= 2026.9.2`；不发布 npm，直接从 GitHub 安装。
+> 与旧版本的差异及升级指南见 [CHANGELOG](CHANGELOG.md)。上游仓库：[tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot)。
+
+### 🚀 当前版本： `v1.0.0`
 
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![QQ Bot](https://img.shields.io/badge/QQ_Bot-API_v2-red)](https://bot.q.qq.com/wiki/)
-[![Platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://github.com/tencent-connect/openclaw-qqbot)
+[![Platform](https://img.shields.io/badge/OpenClaw-%3E%3D2026.9.2-orange)](https://github.com/jerryliang122/openclaw-qqbot)
 [![Node.js](https://img.shields.io/badge/Node.js->=18-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 
@@ -174,7 +178,7 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 > **你**：`/bot-version`
 >
-> **QQBot**：🦞框架版本：OpenClaw 2026.3.13 (61d171a) / 🤖QQBot 插件版本：v2.0.1 / 🌟官方 GitHub 仓库
+> **QQBot**：🦞框架版本：OpenClaw 2026.9.2 / 🤖QQBot 插件版本：v1.0.0 / 🌟GitHub 仓库
 
 一目了然查看框架版本、插件版本，并可直接跳转官方仓库。
 
@@ -192,16 +196,11 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 > **你**：`/bot-upgrade`
 >
-> **QQBot**：📌当前版本 v2.0.0 / ✅发现新版本 v2.0.1 / 点击下方按钮确认升级
+> **QQBot**：📌当前版本 v1.0.0 / ✅发现新版本 / 点击下方按钮确认升级
 
-升级流程自动备份凭证，升级前校验版本是否存在于 npm，升级失败自动恢复。
+升级流程自动备份凭证，升级失败自动恢复。本 fork 从 GitHub 仓库拉取更新（需要运行主机可访问 git）。
 
 > ⚠️ 热更新指令暂不支持 Windows 系统，在 Windows 上发送 `/bot-upgrade` 会返回手动升级指引。
-
-> ⚠️ v1.6.6 及以下版本暂不支持通过 `/bot-upgrade` 执行热更新，请通过以下命令升级：
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/tencent-connect/openclaw-qqbot/main/scripts/upgrade-via-npm.sh | bash
-> ```
 
 <img width="360" src="docs/images/hot-update.jpg" alt="一键热更新演示" />
 
@@ -296,73 +295,52 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 ### 第二步 — 安装 / 升级插件
 
-**方式零：QR 码扫码登录（推荐，无需手动填写凭证）**
+> 本 fork 不发布 npm，从 GitHub 安装。要求 OpenClaw >= 2026.9.2。
 
-v2.0.0 起支持 QR 码扫码绑定，无需手动复制 AppID/AppSecret：
+**方式 A：从 GitHub 安装（推荐）**
 
 ```bash
-# 安装插件
-openclaw plugins install @tencent-connect/openclaw-qqbot@latest
+# 直接从 GitHub 安装
+openclaw plugins install git+https://github.com/jerryliang122/openclaw-qqbot.git
 
-# 扫码登录（二选一）
-openclaw onboard
-# 或
+# 或安装指定版本
+openclaw plugins install git+https://github.com/jerryliang122/openclaw-qqbot.git#v1.0.0
+```
+
+**方式 B：源码安装**
+
+```bash
+git clone https://github.com/jerryliang122/openclaw-qqbot.git
+cd openclaw-qqbot
+
+# 构建
+npm install
+npm run build
+
+# 安装到 OpenClaw（方式一：link）
+openclaw plugins link .
+
+# 或（方式二：pack）
+npm pack
+openclaw plugins install ./openclaw-qqbot-1.0.0.tgz
+```
+
+**配置凭证**
+
+```bash
+# 扫码登录（推荐，无需手动填写凭证）
 openclaw channels login --channel qqbot
-```
 
-终端会显示一个二维码，用手机 QQ 扫描即可自动完成凭证写入和账户配置，整个过程无需手动输入任何密钥。
-
-**方式一：远程一键执行（最简单，无需 clone 仓库）**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/tencent-connect/openclaw-qqbot/main/scripts/upgrade-via-npm.sh \
-  | bash -s -- --appid YOUR_APPID --secret YOUR_SECRET
-```
-
-一行命令搞定：下载脚本 → 清理旧插件 → 安装 → 配置通道 → 启动服务。完成后打开 QQ 即可开始聊天！
-
-> 首次安装**必须**传 `--appid` 和 `--secret`。后续升级执行此指令可以升级为最新版：
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/tencent-connect/openclaw-qqbot/main/scripts/upgrade-via-npm.sh | bash
-> ```
-
-**方式二：本地脚本（已 clone 仓库时使用）**
-
-```bash
-# 通过 npm 安装
-bash ./scripts/upgrade-via-npm.sh --appid YOUR_APPID --secret YOUR_SECRET
-
-# 或通过源码安装
-bash ./scripts/upgrade-via-source.sh --appid YOUR_APPID --secret YOUR_SECRET
-```
-
-**常用参数：**
-
-| 参数 | 说明 |
-|------|------|
-| `--appid <id> --secret <secret>` | 配置通道（首次安装必填，或更换凭证时使用） |
-| `--version <版本号>` | 安装指定版本（仅 npm 脚本） |
-| `--self-version` | 安装本地 `package.json` 中的版本（仅 npm 脚本） |
-| `-h` / `--help` | 查看完整用法 |
-
-> 也可通过环境变量 `QQBOT_APPID` / `QQBOT_SECRET` 设置。
-
-**方式三：手动安装 / 升级**
-
-```bash
-# 卸载旧插件（首次安装可跳过）
-openclaw plugins uninstall qqbot
-openclaw plugins uninstall openclaw-qqbot
-
-# 安装最新版本
-openclaw plugins install @tencent-connect/openclaw-qqbot@latest
-
-# 配置通道（首次安装必做）
+# 或手动配置
 openclaw channels add --channel qqbot --token "AppID:AppSecret"
 
 # 启动 / 重启
 openclaw gateway restart
 ```
+
+> 环境变量 `QQBOT_APPID` / `QQBOT_SECRET` 同样支持。
+
+**从旧版本（上游 2.x）升级？** 请阅读 [CHANGELOG](CHANGELOG.md)——其中列出了全部破坏性变更（已移除的配置项、环境变量与行为）及迁移对照表。
 
 ### 第三步 — 测试
 
@@ -569,7 +547,7 @@ openclaw message send --channel "qqbot" \
 | `historyLimit` | `number` | `20` | 群历史消息缓存条数（0 禁用） |
 | `historyMode` | `"clear" \| "rolling"` | `"clear"` | `clear`：每次回复后清空历史（旧行为）。`rolling`：bot 自己的发言也计入历史，回复后裁剪到 bot 最后一条发言之后（AI 能看到自己上次说到哪） |
 | `unmentionedInbound` | `"user_request" \| "room_event"` | `"user_request"` | `room_event`：像普通群成员一样读到所有消息，未 @ 的作为被动房间事件（详见下文；需群主开启全量推送模式） |
-| `coalesce` | `object` | `{strategy: "framework", enabled: true, maxBuffer: 50}` | 群消息排队配置。`strategy: "framework"`（默认）交给框架队列（`enabled=true`→collect 合并批处理；`false`→followup 排队不合并）；`"plugin"` 回退旧版插件内合并器 |
+| `coalesce` | `object` | `{enabled: true}` | 群消息排队配置，完全交给框架队列（`enabled=true`→collect 合并批处理；`false`→followup 排队不合并） |
 
 #### 房间事件模式（全量模式群，可选）
 
@@ -723,6 +701,31 @@ STT 支持两级配置，按优先级查找：
 - 设置 `enabled: false` 可禁用（默认：`true`）
 - 配置后，AI 可生成并发送语音消息
 
+#### 流式回复 — 仅 C2C 私聊
+
+通过 QQ 流式接口逐段下发回复（打字机效果）。群聊不支持流式（平台限制）。未配置即关闭。
+
+```json
+{
+  "channels": {
+    "qqbot": {
+      "streaming": {
+        "mode": "partial",
+        "sendMode": "stream"
+      }
+    }
+  }
+}
+```
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `mode` | *（未配置 = 关闭）* | `"partial"` 开启流式接收；`"off"` 关闭 |
+| `sendMode` | `"stream"` | `"stream"` — QQ 流式打印机（打字机；已下发前缀不可变，尾部重写合并为追加）。`"static"` — 生成期间只累积，结束时一条完整消息发出（无打字机） |
+
+- 流式分片（`session.update`）仍消耗触发消息的被动回复配额
+- 流式出错时控制器自动降级为单条静态消息
+
 #### 正在输入指示器（typing）— 仅 C2C 私聊
 
 机器人收到私聊消息后会显示"正在输入中…"，并在 AI 处理期间周期性续期。
@@ -749,16 +752,15 @@ STT 支持两级配置，按优先级查找：
 
 ## 📚 文档与链接
 
-- [升级指南](docs/UPGRADE_GUIDE.zh.md) — 完整升级路径与迁移说明
+- [更新日志](CHANGELOG.md) — 与旧版本的差异、破坏性变更与各版本记录
 - [命令参考](docs/commands.md) — OpenClaw CLI 常用命令
-- [更新日志](CHANGELOG.md) — 各版本变更记录
 
 ## 🤝 贡献者
 
-感谢所有为本项目做出贡献的开发者！
+感谢所有为本项目做出贡献的开发者！上游贡献者见 [tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot/graphs/contributors)。
 
-<a href="https://github.com/tencent-connect/openclaw-qqbot/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=tencent-connect/openclaw-qqbot" />
+<a href="https://github.com/jerryliang122/openclaw-qqbot/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=jerryliang122/openclaw-qqbot" />
 </a>
 
 ## 💖 致谢
@@ -777,6 +779,6 @@ STT 支持两级配置，按优先级查找：
 
 <div align="center">
 
-[![Star History Chart](https://api.star-history.com/svg?repos=tencent-connect/openclaw-qqbot&type=date&legend=top-left)](https://www.star-history.com/#tencent-connect/openclaw-qqbot&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=jerryliang122/openclaw-qqbot&type=date&legend=top-left)](https://www.star-history.com/#jerryliang122/openclaw-qqbot&type=date&legend=top-left)
 
 </div>

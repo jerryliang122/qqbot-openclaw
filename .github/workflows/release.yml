@@ -1,0 +1,97 @@
+name: Release
+
+# 发版机制：CHANGELOG.md 增加版本段落 + package.json 改版本号 → 打 v* tag 推送。
+# 本 workflow 校验 tag 与 package.json 一致 → 全量检查 → 构建打包 → GitHub Release 附产物。
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Verify tag matches package.json version
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          TAG_VERSION="${GITHUB_REF_NAME}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag $TAG_VERSION does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+          echo "Releasing $TAG_VERSION"
+
+      - name: Verify CHANGELOG has an entry for this version
+        run: |
+          grep -q "## \[${GITHUB_REF_NAME#v}\]" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no section '## [${GITHUB_REF_NAME#v}]'"
+            exit 1
+          }
+
+      - name: Install dependencies
+        run: npm install --no-fund --no-audit
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Runtime access lint
+        run: npm run lint:runtime
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: |
+          status=0
+          for f in tests/*.test.ts; do
+            if ! npx tsx "$f"; then
+              echo "::error file=$f::test failed"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          node -e '
+            const fs = require("fs");
+            const ver = process.argv[1];
+            const md = fs.readFileSync("CHANGELOG.md", "utf8");
+            const start = md.indexOf(`## [${ver}]`);
+            if (start < 0) { console.error(`CHANGELOG has no section ## [${ver}]`); process.exit(1); }
+            const rest = md.slice(start);
+            const next = rest.slice(1).search(/^## /m);
+            const body = (next >= 0 ? rest.slice(0, next + 1) : rest)
+              .replace(/^## \[[^\]]+\][^\n]*\n/, "")
+              .replace(/\n+---\s*$/, "")
+              .trim();
+            fs.writeFileSync("release-notes.md", body + "\n");
+          ' "${GITHUB_REF_NAME#v}"
+          echo "--- release notes (head) ---"
+          head -20 release-notes.md
+
+      - name: Package (npm pack)
+        run: |
+          npm pack
+          echo "TARBALL=$(ls openclaw-qqbot-*.tgz | head -1)" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: ${{ env.TARBALL }}
+          generate_release_notes: false

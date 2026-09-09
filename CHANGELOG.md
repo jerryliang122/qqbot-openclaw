@@ -1,4 +1,132 @@
-# Changelog
+# 更新日志 (Changelog)
+
+本项目（`jerryliang122/openclaw-qqbot`）自 **v1.0.0** 起按自己的发版机制独立发版，版本号与上游旧版本（`tencent-connect/openclaw-qqbot` 2.x）**完全脱钩**：1.0.0 是本仓库独立维护后的第一个正式版本，其内容 = 上游 2.1.0 基础上的大量功能重构 + v1.0.0 的全面兼容性清理。
+
+- 发版流程：推送 `v*` tag → GitHub Actions 自动校验版本一致性、跑全量检查、构建产物 → 创建 GitHub Release 并附 `npm pack` 产物
+- 版本规则：语义化版本（SemVer）。Major 位变更意味着存在 Breaking Change（配置格式 / 运行要求 / 公开 API）
+- 运行要求：**OpenClaw >= 2026.9.2**（peer 依赖硬性要求，见 package.json）
+
+---
+
+## [1.0.0] - 2026-09-09
+
+### 1. 与上游旧版本（2.x）的差异总览
+
+以下能力为本仓库在长期使用中重构/新增，上游版本（含 2.1.0）不具备或行为不同：
+
+#### 群聊架构
+
+- **群聊三模式矩阵**：同时支持群主可选的三种推送模式——AT 纯模式（仅被 @ 收到事件）、AT+最近 N 条（`msg_elements` 携带上下文，≤10 条，含 per-element 作者与 message_type=102 聊天记录识别）、全量模式（每条消息推送 `GROUP_MESSAGE_CREATE`）。两事件共用同一 intent 与中间件链，插件按 per-group 推断实际模式（`src/features/group-mode-store.ts`），模式变化打 INFO 日志。
+- **群消息排队完全交给框架**：消息逐条立即 dispatch，排队/合并由 OpenClaw followup 队列承担（`coalesce.enabled=true` → `collect` 合并批处理；`false` → `followup` 排队不合并）。群 turn 使用 `exclusive` admission 且不传 abortSignal——进行中的 turn 结构性不可被打断。
+- **room_event 房间事件**（`unmentionedInbound: 'room_event'`，默认关）：全量模式群里未被唤醒的消息作为被动房间事件进框架——AI 只读上下文、最终文本不投递（结构性沉默）、只能通过主动 `message` 工具发言；被 @/称呼/引用时恢复正常回复。
+- **三种唤醒方式**：@提及（事件/mentions.is_you/内容标记）、称呼唤醒（`agents.list.<id>.groupChat.mentionPatterns`，如 `["沈处"]`）、引用 bot 出站消息（ref-index 隐式提及）。
+- **群历史模式 historyMode**：`clear`（回复后整清）与 `rolling`（bot 出站计入历史，裁剪到最后一条 bot 发言之后，对齐 telegram selectAfterLastSelf）。
+- **群级配置 ??-级联**：`groups.{gid}` > `groups."*"` > 账号级默认 > 内置默认，覆盖 requireMention / ignoreOtherMentions / toolPolicy / name / prompt / historyLimit / historyMode / unmentionedInbound / coalesce。
+
+#### 出站与配额
+
+- **被动优先出站**：全链路 msg_id 优先，保护主动消息每日 1000 条预算。挂载 msg_id 前经 quota-manager **原子预检+扣减**（群 5 次/msg_id/5min，c2c 4 次/60min），配额耗尽自动降级主动发送，API 失败自动 rollback——彻底消除平台 40034128 硬失败无兜底的问题。
+- **主动预算计量**（`src/features/proactive-budget.ts`）：按账号按天计数、跨天重置、80% 告警，`/bot-group-info` 可查。
+- **msgid-cache**：c2c 30min / 群 5min（与平台被动窗口对齐），静群（窗口内无消息）只能主动发送——平台约束。
+- **typing 配额感知**：typing 通知与回复共享被动配额，耗尽自动降级主动；20s QPS 约束自动钳制；出站消息后 5s 自动续期。
+
+#### 可靠性与观测
+
+- **入站事件守卫**（inbound-guard）：拦截出站回声（群按 author.bot、c2c 按 outbound-echo-store 比对）、重复推送（msg_seq/msg_idx 30min 长窗口去重）、空内容事件；带 msg_elements 的引用/转发消息放行。每次拦截打 INFO `[guard]` 日志。
+- **rawEvent 观测**：未被 SDK 映射的平台推送（入群申请、好友变动、reaction、media_upload_finish、未来新增类型）统一 INFO 记录，消除静默丢弃盲区。
+- **三层限流默认开启**：sender 20/min、group 60/min、global 300/min 滑动窗口，`channels.qqbot.rateLimit` 可覆盖或关闭；room_event 群强烈建议保持开启。
+- **member_role 提取**：admin/owner 从 raw.author 提取进 `sender.roles`，供框架权限分级。
+- **凭证备份**（credential-backup）：gateway 启动后写凭证快照，热更新被打断时自动恢复。
+
+#### 平台能力
+
+- **指令面板自动同步**：gateway ready 后把 openclaw essential 原生指令注册到 QQ Bot 指令面板（`/v2/panels`，经 SDK 通用网关），c2c/group 各一个面板，remark 打标幂等，用户手建面板绝不触碰；`channels.qqbot.commands.native` 门控（默认 true）。
+- **ask_user 交互**：单问题 → inline 按钮键盘（`questionGatewayRuntime.resolveOption` 认领）；多问题（2-3 题）→ 每题一张带按钮的卡片 + 答案缓冲 + 指令按钮确认卡（客户端以真实用户消息发出，走框架原生 keyed 文本认领）；isOther 题有「✍️ 其他」预填按钮。**绝不程序化提交多问题答案**、**绝不拦截真实入站消息**。
+- **密钥输入**（`qqbot_secret_input` 工具，c2c）：AI 发卡片 → 用户下一条消息被中间件拦截 → `openclaw secrets store set`（恒为 `env` kind，AI 可读）→ 消息绝不进入 AI 转录。多问题 ask_user 挂起时红线放行。
+- **`qqbot_platform_api` 工具**：任意 path 的平台 REST 调用（自动鉴权/重试），覆盖 SDK 未封装的新接口（群禁言、入群审批、自定义菜单等）。
+- **`qqbot_remind` 工具**：cron 主动消息提醒。
+- **域名切换能力**：默认仍走旧域名 `api.sgroup.qq.com`，`QQBOT_BASE_URL` / `QQBOT_TOKEN_BASE_URL` 环境变量随时切换 `api.bot.qq.com`，无需等 SDK 发版。
+- **SSRF 防护**：插件自身媒体/图片 fetch 经白名单与私网拦截（media-runtime 不可用时不再降级裸 fetch）。
+
+#### 工程与构建
+
+- 构建基线钉版 openclaw `2026.9.2`（devDependency 精确钉版，typecheck 对最老支持面验证）；peer `>=2026.9.2`。
+- tsup CJS 产物 + `new Function` 别名改写（规避安全扫描误报）；`preload.cjs` 同步保证 plugin-sdk 可解析。
+- 全部测试统一 `node:assert` + `tsx` 直跑风格，无外部测试框架依赖。
+- `npm run lint:runtime`：扫描 adapter/ 之外的直接 runtime 访问。
+
+### 2. v1.0.0 移除的兼容性功能（Breaking Changes）
+
+与上游断开后，**所有针对旧环境的兼容层一次性清除**。从上游 2.x（或本仓库更早状态）升级到 1.0.0 前请核对：
+
+#### 运行时兼容（openclaw < 2026.9.2 的探测/回退）
+
+- 删除 `channel.turn.run`、`reply.finalizeInboundContext`、`reply.formatInboundEnvelope`、顶层 `getConfig`/`config.loadConfig`、`writeConfigFile` 及裸写 `~/.openclaw/openclaw.json` 等全部旧 API 回退（src/adapter/resolve.ts）
+- 删除 dispatch 的「无 inbound.run 时手动 session + dispatchReply 直调」低版本整条分支
+- 删除 setup/media/workspace/pairing/question-helpers 各子路径加载失败的降级实现；media 不再降级裸 fetch（安全考虑）
+- 配对审批（`/bot-pairing approve`）改为 spawn 与网关同源的 `openclaw pairing approve` CLI（`approveChannelPairingCode` 无稳定导出）
+- `preload.cjs` 删除旧 tsc `.js` 产物回退，只加载 `dist/index.cjs`
+
+#### 用户配置兼容
+
+| 移除项 | 替代写法 |
+|---|---|
+| `streaming: true/false`（布尔旧格式） | `streaming: { "mode": "partial", "sendMode": "stream" }` |
+| 环境变量 `QQBOT_APP_ID` / `QQBOT_CLIENT_SECRET` | `QQBOT_APPID` / `QQBOT_SECRET` |
+| `voiceDirectUploadFormats` | `audioFormatPolicy.uploadDirectFormats` |
+| `processingTimeoutMs`（早已无效的死配置） | 无（并发控制由框架 session lane 承担） |
+| `coalesce.strategy: "plugin"` 与 `maxBuffer` | 无——插件内合并器已删除，排队完全交给框架；只保留 `coalesce.enabled` |
+| `OPENCLAW_PROCESSING_TIMEOUT_MS` 环境变量 | 无 |
+| 审批目标解析的 `qqbot:direct:` 旧 scope | `qqbot:c2c:`（框架实际产生的格式） |
+
+#### 死代码与旧生态
+
+- 删除 onboarding 适配器（2026.9.2 SDK 已无该概念，引导入口统一为 setupWizard）
+- 删除 `bin/qqbot-cli.js`（其 install/upgrade 安装的是**旧上游包** `@tencent-connect/openclaw-qqbot`，对本仓库完全错误）
+- 删除 `scripts/cleanup-legacy-plugins.sh`、`upgrade-via-npm.sh`、`upgrade-via-npm.ps1`、`upgrade-via-source.sh`、`set-markdown.sh` 与 `docs/UPGRADE_GUIDE*.md`（全部指向旧上游 URL / clawdbot 生态）
+- 清除全部 clawdbot / moltbot 残留（日志发现、CLI 名单、dev 脚本、版本探测）
+- 删除孤儿模块 `tts-provider.ts`、`cron-scheduler.ts`、`image-size.ts`
+- `getOpenclawVersion` 裁剪为直接读 `PluginRuntime.version`
+- 本地 SDK 类型 stub 裁剪（onboarding 类型组、deprecated 成员、旧版 rt.log 声明）
+
+#### API 变化（插件导出面）
+
+- 移除导出：`qqbotOnboardingAdapter`、`consumePassiveReplyQuota`、`stripMentionText`/`detectWasMentioned`/`TEXT_CHUNK_LIMIT` 的兼容 re-export（内部请直接 import 源模块）
+- `checkPassiveReplyQuota` 语义改为纯探测（不消耗配额）；需要消耗请用原子 API `checkAndConsumePassiveReplyQuota`（含 rollback）
+- `/bot-pairing approve` 返回 `{approved}` 布尔语义
+
+### 3. 升级到 1.0.0
+
+```bash
+# 从旧版本升级（含上游 2.x 装机）
+openclaw plugins install git+https://github.com/jerryliang122/openclaw-qqbot.git#v1.0.0
+
+# 或源码安装
+git clone https://github.com/jerryliang122/openclaw-qqbot.git
+cd openclaw-qqbot && npm install && npm run build
+openclaw plugins install .
+```
+
+- 先确认 OpenClaw 框架 >= 2026.9.2（`openclaw --version`）
+- 按上表迁移配置项；旧 key 会被静默忽略（不再有迁移逻辑）
+- 群会话 lane 不受影响：session key 的 `:coalescing` 后缀保留，存量会话连续
+
+---
+
+## 发版操作手册
+
+1. 更新 `CHANGELOG.md` 新版本段落
+2. `package.json` 的 `version` 改为目标版本
+3. 提交并打 tag：`git tag v1.0.0 && git push origin main --tags`
+4. GitHub Actions（`.github/workflows/release.yml`）自动：校验 tag 与 package.json 一致 → typecheck / lint / build / 全量测试 → `npm pack` → 创建 GitHub Release 并附 tarball
+5. Release 发布即完成，无需发布 npm（本仓库不发布 npm）
+
+---
+
+<details>
+<summary><strong>上游历史版本记录（v2.1.0 及以前，来自 tencent-connect/openclaw-qqbot，仅供溯源）</strong></summary>
+
+# Changelog (upstream lineage)
 
 All notable changes to this project will be documented in this file.
 
@@ -15,8 +143,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - `src/adapter/media.ts` no longer throws at import time under ESM (tsx): the `createRequire` anchor is now resolved lazily (`__filename` under CJS bundles, cwd under ESM).
 
----
-
 ## [2.0.1] - 2026-08-09
 
 ### Improved
@@ -27,8 +153,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Fixed
 
 - Fixed the `/bot-upgrade` upgrade guide link.
-
----
 
 ## [2.0.0] - 2026-07-13
 
@@ -46,286 +170,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - `qqbot_channel_api` tool renamed to `qqbot_platform_api`.
 - Dependency upgrades: `@tencent-connect/qqbot-connector` 1.2.0, added `@tencent-connect/qqbot-nodejs ^1.0.3`.
 
-### Improved
-
-- Runtime contract pre-check at startup to detect missing APIs early.
-- Unified logging system (`PluginLogger`) with prefix levels.
-- Added Markdown table chunking and text sanitization unit tests.
-
----
-
-## [1.7.2] - 2026-06-05
-
-### Added
-
-- **Webhook Transport Mode**: Added HTTP webhook inbound transport alongside WebSocket as an alternative transport mode. Supports Ed25519 signature verification with automatic account routing for multi-account setups.
-- **Flexible Group @Trigger Rules**: New account-level `defaultRequireMention` field introduces a 4-tier priority chain — per-group > wildcard `*` > account-level > default — allowing groups to be configured as @-only or autonomous.
-- **`/bot-group-allways` Command**: Toggle group response mode at runtime (`on` / `off`). Changes are persisted to `openclaw.json` instantly; no gateway restart required.
-
-## [1.7.1] - 2026-04-10
-
-### Fixed
-
-- **Upgrade script adapted for OpenClaw 2026.4.9**:
-  - Fixed standalone plugin installation failure.
-  - Fixed compatibility issues between the standalone and built-in plugin.
-  - Added automatic channel config repair for `additional properties` validation errors.
-
-### ⚠️ OpenClaw 2026.4.5 Notice
-
-OpenClaw 2026.4.5 introduced strict validation for channel configurations. New config fields added by the standalone plugin — such as streaming output and group chat settings — are rejected as illegal properties, preventing the gateway from starting. The upgrade script now automatically backs up the original config and removes unrecognized fields to restore startup. If you need standalone-plugin-exclusive features like streaming output and group chat, downgrade OpenClaw to **2026.4.2 or earlier**.
-
-## [1.7.1] - 2026-04-03
-
-### Added
-
-- **Command Execution Approval**: Before the AI executes a command, an approval request with Inline Keyboard buttons (✅ Allow Once / ⭐ Always Allow / ❌ Deny) is sent via QQ message. Users can approve or deny by tapping a button. Supports both C2C and group chat scenarios.
-- **`/bot-approve` Command**: New slash command for managing approval configuration — supports `on` (allowlist mode), `off` (disable approval), `always` (strict mode), `reset` (restore defaults), and `status` (view current config).
-
-## [1.7.0] - 2026-04-02
-
-### Added
-
-- **Message Reference Improvements**: Supports parsing the new quoted-message field in QQ message events — quoted context now works across devices, enabling the AI to understand which message a user is replying to and deliver more contextually coherent responses.
-- **`qqbot-upgrade` Skill**: New guided upgrade Skill that supports natural-language version update requests; improved Skill upgrade interaction flow.
-
-### Fixed
-
-- **Windows file path encoding**: Fixed a path encoding issue on Windows that prevented files from being sent correctly.
-
-### Changed
-
-- **Upgrade script refactor v4**: Rebuilt the downgrade architecture for compatibility with OpenClaw 2026.3.31+, improving upgrade stability and reliability.
-
-### ⚠️ Important: Built-in Plugin Conflict in OpenClaw 2026.3.31
-
-Starting from OpenClaw 2026.3.31, a built-in QQBot plugin is included. Upgrading OpenClaw directly to the latest version without taking action may cause conflicts with this plugin, resulting in new features such as message reference parsing and large file uploads being unavailable.
-
-**Resolution (choose one):**
-
-**Option 1: Upgrade this plugin to the latest version** (recommended)
-
-This release includes built-in conflict handling and will automatically take priority after upgrade:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/tencent-connect/openclaw-qqbot/main/scripts/upgrade-via-npm.sh | bash
-```
-
-**Option 2: Disable the built-in plugin via config**
-
-Disable the OpenClaw built-in QQBot plugin with the following command:
-
-```bash
-openclaw config set plugins.entries.qqbot.enabled false
-```
-
-## [1.6.7] - 2026-03-30
-
-### Fixed
-
-- **Multi-account reminder delivery failure**: Fixed missing `accountId` in cron job delivery, causing reminders to fail sending through the correct bot account in multi-account setups. `accountId` is now required, using `getRequestAccountId() || "default"` to ensure it's never empty; delivery structure moved to job top level.
-- **Upgrade scripts & `/bot-upgrade` improvements**: Fixed `--version` argument parsing logic, improved version check flow; upgrade scripts (npm/source) enhanced for better compatibility.
-- **`postinstall-link-sdk` script optimization**: Improved robustness of the post-install SDK linking script.
-
-### Upgrade
-
-Run the following command to upgrade to the latest version:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/tencent-connect/openclaw-qqbot/main/scripts/upgrade-via-npm.sh | bash
-```
-
-> ⚠️ v1.6.6 and below do not support hot upgrade via `/bot-upgrade`. Please use the command above to upgrade.
-
-
-## [1.6.6] - 2026-03-26
-
-### Added
-
-- **Large file chunked upload**: New `chunked-upload.ts` module that automatically splits large files into parallel uploads with per-part retry, progress callback, and timeout control. Supports both C2C and group scenarios.
-- **`/bot-clear-storage` command**: New storage cleanup command for clearing plugin local cache data.
-- **SSRF guard module `ssrf-guard.ts`**: Standalone SSRF protection utility that performs DNS resolution and IP validation before downloading remote files, blocking internal/reserved network addresses to prevent malicious URLs from reaching internal services.
-
-### Changed
-
-- **Download directory isolated by account/conversation**: Attachment download path changed from a shared `~/.openclaw/media/qqbot/downloads/` to `downloads/{appId}/{peerId}/`, isolating files by account and conversation to prevent multi-account file overwrites.
-- **Attachment download failure messages improved**: Download failures now distinguish "timeout" vs. "failure", providing clearer context hints to the model.
-
-## [1.6.5] - 2026-03-24
-
-### OpenClaw 3.23 Compatibility
-
-OpenClaw 3.23 introduced strict config validation at CLI startup — any `openclaw` subcommand (including `plugins install`, `plugins update`, `gateway stop`) now validates the entire `openclaw.json` before execution. Since `channels.qqbot` is registered by this plugin (not a built-in channel id), running these commands when the plugin is not yet loaded causes `"Config invalid: unknown channel id: qqbot"` and the command fails entirely (chicken-and-egg problem).
-
-This release adapts all upgrade paths for 3.23+:
-
-- **Config stash/restore for CLI commands**: `upgrade-via-npm.sh` and `upgrade-via-source.sh` temporarily remove `channels.qqbot` from `openclaw.json` before running any openclaw CLI command, then restore it after completion.
-- **Gateway pre-stop before install**: `upgrade-via-source.sh` now stops the gateway before `plugins install` to prevent chokidar from triggering a restart on the intermediate config state (with `channels.qqbot` removed), which would also hit the validation error.
-
-### Fixed
-
-- **Startup greeting marker path**: Fixed marker directory to use `$CMD` variable instead of hardcoded path, supporting multi-CLI environments.
-
-### Changed
-
-- **Silence non-upgrade startup greeting**: Startup greeting is now suppressed unless triggered by a `/bot-upgrade` hot update, reducing noise during routine gateway restarts.
-
-## [1.6.4] - 2026-03-20
-
-### Added
-
-- **One-click hot upgrade `/bot-upgrade`**: Upgrade the plugin directly from private chat — no server login needed. Supports `--latest` (upgrade to latest), `--version X` (specific version), and `--force` (force reinstall). Version existence is verified against npm before proceeding.
-- **Channel API proxy tool `qqbot_channel_api`**: AI can call QQ Open Platform channel HTTP APIs directly with automatic Token authentication and SSRF protection. Supports guild/channel management, member queries, forum threads, announcements, schedules, and more.
-- **Credential backup protection**: New `credential-backup.ts` module auto-saves `appId`/`clientSecret` to a standalone file before hot upgrade. `isConfigured` now falls back to backup check — if config is lost but backup exists, the account still starts and credentials are auto-restored.
-- **Command usage help**: All slash commands support `?` suffix to show detailed usage (e.g. `/bot-upgrade ?`).
-
-### Changed
-
-- **Real-time version check**: `getUpdateInfo()` changed from synchronous cache to `async` live npm registry query — every `/bot-version` or `/bot-upgrade` call fetches the latest data.
-- **`/bot-logs` multi-source aggregation**: Long logs are auto-truncated with explanation.
-
-### Improved
-
-- **`switchPluginSourceToNpm` post-write validation**: Verifies `channels.qqbot` data integrity before writing back to `openclaw.json`, preventing race-condition credential loss.
-- **Upgrade scripts with credential backup**: `upgrade-via-npm.sh` and `upgrade-via-source.sh` now save credential snapshots before upgrading.
-
-## [1.6.3] - 2026-03-18
-
-### Changed
-
-- **Update checker: HTTPS-native with multi-registry fallback**: Replaced `npm view` CLI call with direct HTTPS requests to npm registry API; supports automatic fallback from npmjs.org to npmmirror.com, solving network issues in mainland China.
-- **Upgrade script multi-registry fallback**: `upgrade-via-npm.sh` now tries npmjs.org → npmmirror.com → default registry in sequence, improving upgrade reliability in restricted networks.
-
-## [1.6.2] - 2026-03-18
-
-### Changed
-
-- **Markdown-aware text chunking**: Replaced custom `chunkText` with SDK built-in `chunkMarkdownText`, supporting auto code-fence close/reopen, bracket awareness, etc.
-- **Enable block streaming**: Set `blockStreaming: true` — the framework now collects streamed responses and delivers via the `deliver` callback.
-- **Reduce text chunk limit**: `textChunkLimit` lowered from 20000 to 5000 for better message readability.
-- **Silent media errors**: Media send failures (image/voice/video/file) are now logged only; error messages are no longer surfaced to the user.
-
-### Improved
-
-- **Ref-index content untruncated**: Removed `MAX_CONTENT_LENGTH` cap when storing quoted-message content, preserving full message body in ref-index store.
-
-### Removed
-
-- `MSG` constants and `formatMediaErrorMessage` from `user-messages.ts` — plugin layer no longer generates user-facing error text.
-
-## [1.6.1] - 2026-03-18
-
-### Improved
-
-- **Upgrade script auto-restart**: `upgrade-via-npm.sh` now automatically restarts the gateway after upgrade to apply the new version immediately.
-- **Increase text chunk limit**: Raised `textChunkLimit` from 2000 to 20000, allowing longer messages to be sent without splitting.
-- **Remove proactive update push**: Removed the auto-push notification to admin when a new version is detected; version info is now only available passively via `/bot-version` and `/bot-upgrade` commands, reducing noise.
-
-### Removed
-
-- `onUpdateFound` callback and `formatUpdateNotice` helper from `update-checker.ts` — no longer needed after removing proactive push.
-
-## [1.6.0] - 2026-03-16
-
-### Added
-
-- **Slash command system**: `/bot-ping`, `/bot-version`, `/bot-help`, `/bot-upgrade`, `/bot-logs` — five plugin-level slash commands.
-- **Update checker**: Background npm version check with update status in `/bot-version` and upgrade guide in `/bot-upgrade`.
-- **Startup greeting**: Distinguish first install vs. restart with different greeting messages.
-- **Log download**: `/bot-logs` packages the last 2000 lines of logs and sends as a file.
-
-### Changed
-
-- **Unified rich media tag**: Replaced `<qqimg>`, `<qqvoice>`, `<qqfile>`, `<qqvideo>` with a single `<qqmedia>` tag — the system auto-detects media type by file extension.
-
-### Improved
-
-- **Greeting debounce**: Suppress duplicate greetings within 60s during rapid restarts (e.g. upgrades).
-- **Proactive message 48h filter**: Skip users inactive for 48h+ when sending startup greetings, reducing 500 errors.
-- **Token cache refresh threshold**: Changed from hardcoded 5-minute early refresh to `min(5min, remaining/3)`, fixing repeated token requests when API returns short-lived tokens.
-- **Streamlined context injection**: Reduced redundant context injected into OpenClaw, lowering token consumption.
-
-## [1.5.7] - 2026-03-12
-
-### Added
-
-- Add quoted-message context pipeline for QQ `REFIDX_*`: parse quote indices from inbound events, cache inbound/outbound message summaries, and inject quote body into agent context.
-- Add persistent quote index store (`~/.openclaw/qqbot/data/ref-index.jsonl`) with in-memory cache + JSONL append, restart recovery, 7-day TTL eviction, and compact.
-- Add structured quote attachment summaries (image/voice/video/file, local path/url, voice transcript source) for better reply grounding.
-
-### Improved
-
-- Bot replies now attach quote reference to the user's current message when available, improving threaded conversation readability in QQ.
-
-## [1.5.6] - 2026-03-10
-
-### Added
-
-- Add voice input summary log with STT/ASR/fallback source counters and ASR text preview for debugging voice pipeline.
-- Add `asr_refer_text` fallback support — when STT is not configured or fails, use QQ platform's built-in ASR text as low-confidence fallback.
-- Pass voice-related metadata (`QQVoiceAsrReferTexts`, `QQVoiceTranscriptSources`, `QQVoiceInputStrategy`, etc.) to agent context.
-- Add scheduled reminder (proactive message) section to README with demo screenshot.
-- Normalize `appId` parsing to support both numeric and string values across runtime and proactive scripts.
-
-### Fixed
-
-- Fix voice prompt hints to distinguish STT-configured vs. unconfigured states and add ASR fallback / voice forward guidance.
-
-## [1.5.5] - 2026-03-09
-
-### Added
-
-- Add `npm-upgrade.sh` script for npm-based plugin installation and upgrade.
-  - Supports `--tag` and `--version` options, defaults to `@alpha`.
-  - Handles channel config backup/restore, old plugin cleanup (including legacy variants like `qqbot`, `@sliverp/qqbot`), and gateway restart.
-  - Temporarily removes `channels.qqbot` before install to avoid `unknown channel id` validation error.
-
-### Fixed
-
-- Fix plugin id not matching package name, causing plugin load failure.
-- Fix `normalizeTarget` return type — now returns structured `{ok, to, error}` object.
-- Fix outdated repo URL references in `pull-latest.sh` and `upgrade.sh`.
-- Fix `proactive-api-server.ts` / `send-proactive.ts` hardcoded config file paths.
-- Fix `set-markdown.sh` `read` missing timeout causing hang in non-interactive environments.
-
-### Improved
-
-- Scripts now fully compatible with multiple CLIs (openclaw / clawdbot / moltbot) with auto-detection of config file paths.
-- `upgrade-and-run.sh` now shows clear prompt when AppID/Secret is missing on first run.
-- `upgrade-and-run.sh` now displays qqbot plugin version before and after upgrade.
-
-## [1.5.4] - 2026-03-08
-
-### Fixed
-
-- Fix Token collision in multi-account concurrent mode — refactored global Token cache from a single variable to a per-`appId` `Map`, resolving `11255 invalid request` errors when multiple bots run simultaneously.
-- Per-instance background Token refresh — `clearTokenCache()` and `stopBackgroundTokenRefresh()` now accept an `appId` parameter for independent per-account management.
-- Fix `openclaw message send` failing for non-default accounts — without `--account`, `accountId` always fell back to `"default"`, causing a 500 error when sending to an OpenID belonging to a different bot.
-
-### Added
-
-- Multi-account documentation — added "Multi-Account Setup" section to README.
-- Enhanced debug logging — `[qqbot:channel]` prefixed logs in `channel.ts`, covering account resolution, message sending, and gateway startup.
-- API log prefix — all API request logs now include `[qqbot-api:${appId}]` prefix for easier multi-instance debugging.
-
-## [1.5.3] - 2026-03-06
-
-### Fixed
-
-- Improved rich media tag parsing logic for higher recognition success rate.
-- Fixed file encoding issues and special path handling that prevented file sending.
-- Fixed intermittent message loss caused by duplicate message seq numbers.
-
-### Improved
-
-- Upgrade script now auto-backs up and restores qqbot channel config during upgrades.
-- Updated README with rich media usage instructions and plugin config/upgrade tutorial.
-
-## [1.5.2] - 2026-03-05
-
-### Added
-
-- Voice/file sending capability with TTS text-to-speech support.
-- Rich media enhancements: upload caching, video support, automatic retry on failure.
-- Markdown messages enabled by default.
-- Standalone upgrade script with user choice of foreground/background startup.
+</details>

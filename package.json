@@ -1,7 +1,7 @@
 {
   "name": "openclaw-qqbot",
-  "version": "2.1.0",
-  "description": "QQ Bot channel plugin for OpenClaw (forked version with enhanced features)",
+  "version": "1.0.0",
+  "description": "QQ Bot channel plugin for OpenClaw (independently maintained fork)",
   "private": true,
   "type": "module",
   "main": "dist/index.cjs",
@@ -12,13 +12,8 @@
       "require": "./dist/index.cjs"
     }
   },
-  "bin": {
-    "openclaw-qqbot": "./bin/qqbot-cli.js",
-    "qqbot": "./bin/qqbot-cli.js"
-  },
   "files": [
     "dist",
-    "bin",
     "src",
     "skills",
     "scripts",
@@ -42,7 +37,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "lint:runtime": "npx tsx src/runtime-adapter/lint-runtime-access.ts"
+    "lint:runtime": "npx tsx src/adapter/lint.ts"
   },
   "dependencies": {
     "@tencent-connect/qqbot-connector": "1.2.0",
@@ -52,7 +47,8 @@
     "@types/node": "^20.19.43",
     "openclaw": "2026.9.2",
     "tsup": "^8.5.1",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "tsx": "^4.23.13"
   },
   "peerDependencies": {
     "@tencent-connect/qqbot-connector": "1.2.0",
@@ -62,5 +58,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/jerryliang122/openclaw-qqbot.git"
+  },
+  "allowScripts": {
+    "esbuild@0.27.7": true,
+    "esbuild@0.28.2": true
   }
 }

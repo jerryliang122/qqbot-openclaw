@@ -4,15 +4,15 @@
 
 # QQ Bot Channel Plugin for OpenClaw
 
-**Forked version with framework-delegated group queueing, room-event ingestion for full-mode groups, and passive-first outbound delivery**
+**Independently maintained fork — framework-delegated group queueing, room-event ingestion for full-mode groups, and passive-first outbound delivery**
 
 **Connect your AI assistant to QQ — private chat, group chat, and rich media, all in one plugin.**
 
-### 🚀 Current Version: `v2.1.0`
+### 🚀 Current Version: `v1.0.0`
 
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![QQ Bot](https://img.shields.io/badge/QQ_Bot-API_v2-red)](https://bot.q.qq.com/wiki/)
-[![Platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://github.com/jerryliang122/openclaw-qqbot)
+[![Platform](https://img.shields.io/badge/OpenClaw-%3E%3D2026.9.2-orange)](https://github.com/jerryliang122/openclaw-qqbot)
 [![Node.js](https://img.shields.io/badge/Node.js->=18-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Fork](https://img.shields.io/badge/fork-enhanced-9cf)](https://github.com/jerryliang122/openclaw-qqbot)
@@ -21,9 +21,9 @@
 
 **[简体中文](README.zh.md) | English**
 
-> **Note**: This is a **forked version** with custom enhancements. For the official version, see [tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot).
+> This is an **independently maintained fork** with its own versioning (v1.x, decoupled from the upstream 2.x line). Upstream: [tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot).
 >
-> **Not published to npm** — install directly from GitHub or local source.
+> **Requirements**: OpenClaw `>= 2026.9.2` · **Not published to npm** — install directly from GitHub or local source. See [CHANGELOG](CHANGELOG.md) for differences vs the old version and the upgrade guide.
 
 Scan to join the QQ group chat
 
@@ -42,7 +42,7 @@ Scan to join the QQ group chat
 | 🔔 **Three Wake Modes** | @mention, name patterns (`mentionPatterns`, e.g. "沈处"), and quote-of-bot-message all trigger normal replies |
 | 📤 **Passive-First Outbound** | Every send prefers passive reply (msg_id) to conserve the 1000/day proactive budget; quota-aware fallback never hard-fails |
 | 🔒 **Multi-Scene** | C2C private chat, group chat (@mention / autonomous / room-event modes) |
-| 👥 **Group Fine-Tuning** | Per-group @trigger rules, tool policies, custom prompts, history modes, queueing strategy, room-event policy |
+| 👥 **Group Fine-Tuning** | Per-group @trigger rules, tool policies, custom prompts, history modes, queueing config, room-event policy |
 | 🌐 **Dual Transport** | WebSocket (default) or Webhook (HTTP callback) — switch via config |
 | 🖼️ **Rich Media** | Send & receive images, voice, video, and files |
 | 🎙️ **Voice (STT/TTS)** | Speech-to-text transcription & text-to-speech replies |
@@ -138,7 +138,7 @@ AI can send files directly, in any format.
 
 <img width="360" src="docs/images/file-send.jpg" alt="File Sending Demo" />
 
-Since v1.6.6, large file transfer is supported: images up to 20MB, videos up to 30MB, attachments up to 100MB, with a daily transfer limit of 2GB.
+Large file transfer is supported: images up to 20MB, videos up to 30MB, attachments up to 100MB, with a daily transfer limit of 2GB.
 
 <img width="360" src="docs/images/large-file-transfer.jpg" alt="Large File Transfer Demo" />
 
@@ -180,7 +180,7 @@ Measures end-to-end latency from QQ server push to plugin response, broken down 
 
 > **You**: `/bot-version`
 >
-> **QQBot**: 🦞 Framework: OpenClaw 2026.3.13 (61d171a) / 🤖 Plugin: v2.1.0 / 🌟 GitHub repo
+> **QQBot**: 🦞 Framework: OpenClaw 2026.9.2 / 🤖 Plugin: v1.0.0 / 🌟 GitHub repo
 
 Shows framework version, plugin version, and a direct link to the official repository.
 
@@ -198,7 +198,7 @@ Shows framework version, plugin version, and a direct link to the official repos
 
 > **You**: `/bot-upgrade`
 >
-> **QQBot**: 📌 Current: v2.0.0 / ✅ New version v2.1.0 available / Click button below to confirm
+> **QQBot**: 📌 Current: v1.0.0 / ✅ New version available / Click button below to confirm
 
 Credentials are automatically backed up before upgrade. Version existence is verified against npm before proceeding. Auto-recovery on failure.
 
@@ -297,7 +297,7 @@ Answers "why does this group have no context" diagnostics: the push mode is chos
 
 ### Step 2 — Install / Upgrade the Plugin
 
-> **Note**: This is a forked version, not published to npm. Install from GitHub.
+> **Note**: This fork is not published to npm. Install from GitHub. Requires OpenClaw >= 2026.9.2.
 
 **Option A: Install from GitHub (Recommended)**
 
@@ -305,8 +305,8 @@ Answers "why does this group have no context" diagnostics: the push mode is chos
 # Install directly from GitHub
 openclaw plugins install git+https://github.com/jerryliang122/openclaw-qqbot.git
 
-# Or install a specific branch/tag
-openclaw plugins install git+https://github.com/jerryliang122/openclaw-qqbot.git#refactor/channel-plugin-standard
+# Or install a specific release tag
+openclaw plugins install git+https://github.com/jerryliang122/openclaw-qqbot.git#v1.0.0
 ```
 
 **Option B: Install from Local Source**
@@ -325,8 +325,10 @@ openclaw plugins link .
 
 # Or install to OpenClaw (method 2: pack)
 npm pack
-openclaw plugins install ./openclaw-qqbot-2.1.0.tgz
+openclaw plugins install ./openclaw-qqbot-1.0.0.tgz
 ```
+
+**Upgrading from the old (upstream 2.x) version?** See the [CHANGELOG](CHANGELOG.md) — it lists every breaking change (removed config keys, env vars, and behaviors) and the migration table.
 
 **Option C: Configure Credentials**
 
@@ -554,7 +556,7 @@ Besides `requireMention`, each group supports these settings:
 | `historyLimit` | `number` | `20` | Cached group history message count (0 disables) |
 | `historyMode` | `"clear" \| "rolling"` | `"clear"` | `clear`: wipe history after each reply (legacy). `rolling`: bot outbounds are recorded too, and history is trimmed to after the bot's last message (AI sees what it last said) |
 | `unmentionedInbound` | `"user_request" \| "room_event"` | `"user_request"` | `room_event`: read all messages like a group member; un-@'d traffic becomes passive room events (see [Room Events](#room-events-for-full-mode-groups-unmentionedinbound--opt-in); requires full-push-mode group) |
-| `coalesce` | `object` | `{strategy: "framework", enabled: true, maxBuffer: 50}` | Group queueing config (see [Group Message Queueing](#group-message-queueing-configuration-coalesce--groupcoalesce)) |
+| `coalesce` | `object` | `{enabled: true}` | Group queueing config (see [Group Message Queueing](#group-message-queueing-configuration-coalesce--groupcoalesce)) |
 
 **Full example with multiple groups:**
 
@@ -668,16 +670,14 @@ Control how group messages are queued and merged when they arrive in quick succe
   "channels": {
     "qqbot": {
       "groupCoalesce": {
-        "strategy": "framework",
-        "enabled": true,
-        "maxBuffer": 50
+        "enabled": true
       },
       "accounts": {
         "default": {
           "groups": {
             "GROUP_123": {
               "coalesce": {
-                "maxBuffer": 100
+                "enabled": false
               }
             }
           }
@@ -690,9 +690,7 @@ Control how group messages are queued and merged when they arrive in quick succe
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `strategy` | `"framework" \| "plugin"` | `"framework"` | Queueing engine: `framework` delegates to the OpenClaw followup queue (recommended); `plugin` restores the legacy in-plugin busy-buffering coalescer (rollback switch) |
-| `enabled` | `boolean` | `true` | Under `framework` strategy: `true` → framework `collect` mode (queue + merge batches); `false` → `followup` mode (queue without merging — preserves the legacy "disable merging" intent while never interrupting active turns). Under `plugin` strategy: gates the plugin coalescer |
-| `maxBuffer` | `number` | `50` | Plugin-strategy buffer cap (ignored by the framework queue, which has its own cap + overflow summarizing) |
+| `enabled` | `boolean` | `true` | `true` → framework `collect` mode (queue + merge batches); `false` → `followup` mode (queue without merging — preserves the "disable merging" intent while never interrupting active turns). Queueing/merging is fully delegated to the OpenClaw followup queue |
 
 **Priority chain**: `groups.{groupId}.coalesce` > `groupCoalesce` (account-level) > defaults
 
@@ -805,16 +803,15 @@ The plugin processes messages through a carefully ordered middleware chain:
 9. **Rate Limiter** — Three-layer throttling (enabled by default, see `rateLimit`)
 10. **Slash Commands** — Intercepts `/bot-*` commands
 11. **Secret Capture** (c2c only) — One-shot env-var secret input interception
-12. **Message Coalescer** (groups, `strategy: "plugin"` only) — Legacy busy-buffering fallback
-13. **Typing Indicator** (C2C only) — Shows "typing..." status
-14. **Quote Reference** — Parses quoted message context
-15. **Attachment Processor** — Downloads/converts media
-16. **Envelope Formatter** — Builds final message body
+12. **Typing Indicator** (C2C only) — Shows "typing..." status
+13. **Quote Reference** — Parses quoted message context
+14. **Attachment Processor** — Downloads/converts media
+15. **Envelope Formatter** — Builds final message body
 
 **Key points**:
 
 - Inbound guard and history buffer run **before** mention gate → junk is dropped early, all real messages are cached
-- The coalescer only runs when `coalesce.strategy: "plugin"` — with the default `framework` strategy, messages dispatch immediately and the OpenClaw followup queue handles merging
+- Group messages dispatch immediately; the OpenClaw followup queue handles queueing/merging (`coalesce.enabled` selects `collect` vs `followup`)
 - Typing indicator only runs for **C2C** messages
 
 ---
@@ -886,6 +883,31 @@ STT supports two-level configuration with priority fallback:
 - Set `enabled: false` to disable (default: `true`)
 - When configured, AI can generate and send voice messages
 
+#### Streaming Replies — C2C private chat only
+
+The bot can stream its reply progressively (typewriter effect) via QQ's streaming API. Group chats do not support streaming (platform constraint). Disabled unless configured.
+
+```json
+{
+  "channels": {
+    "qqbot": {
+      "streaming": {
+        "mode": "partial",
+        "sendMode": "stream"
+      }
+    }
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `mode` | *(unset = off)* | `"partial"` enables streaming reception; `"off"` disables |
+| `sendMode` | `"stream"` | `"stream"` — QQ streaming printer (typewriter; the delivered prefix is immutable, tail rewrites are merged into appends). `"static"` — accumulate while the model generates, then send one complete message at the end (no typewriter) |
+
+- Streaming replies (`session.update` frames) still consume the passive-reply quota of the triggering message
+- On stream errors the controller falls back to a single static message automatically
+
 #### Typing Indicator — C2C private chat only
 
 After receiving a private message, the bot shows "typing…" and renews it periodically while the AI is processing.
@@ -912,7 +934,6 @@ After receiving a private message, the bot shows "typing…" and renews it perio
 
 ## 📚 Documentation & Links
 
-- [Upgrade Guide](docs/UPGRADE_GUIDE.md) — full upgrade paths and migration notes
 - [Command Reference](docs/commands.md) — OpenClaw CLI commands
 - [Changelog](CHANGELOG.md) — release notes
 
