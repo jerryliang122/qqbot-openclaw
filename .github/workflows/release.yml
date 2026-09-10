@@ -3,8 +3,12 @@ name: Release
 # 发版机制：CHANGELOG.md 增加版本段落 + package.json 改版本号 → 打 v* tag 推送。
 # 本 workflow 校验 tag 与 package.json 一致 → 全量检查 → 构建打包 → GitHub Release 附产物 → 发布 npm。
 #
-# npm 发布需要仓库配置 secret：NPM_TOKEN（npmjs.com → Access Tokens → 生成
-# Granular token， Packages 权限 Read and write；或经典 Automation token）。
+# npm 发布走 Trusted Publishing（OIDC，免 token）：
+#   npmjs.com → 包设置 → Trusted publishing → 关联 GitHub Actions
+#   （owner: jerryliang122, repo: qqbot-openclaw, workflow: release.yml）。
+# 要求 Node >= 22.14 / npm >= 11.5.1（本 workflow 用 Node 24）。
+# 注意：全新包无法用 OIDC 首发（npm 无 pending publisher），首发需手动
+# `npm publish` 一次；下方 publish 步骤对已存在的版本自动跳过。
 
 on:
   push:
@@ -12,6 +16,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write  # npm Trusted Publishing (OIDC)
 
 jobs:
   release:
@@ -24,7 +29,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24  # npm >= 11.5.1（OIDC trusted publishing 要求）
+          registry-url: https://registry.npmjs.org
           cache: npm
 
       - name: Verify tag matches package.json version
@@ -91,15 +97,23 @@ jobs:
           npm pack
           echo "TARBALL=$(ls jerryliang122-openclaw-qqbot-*.tgz | head -1)" >> "$GITHUB_ENV"
 
-      - name: Publish to npm
-        run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::error::secret NPM_TOKEN is not configured — add it in repo Settings → Secrets and variables → Actions. Get a token at https://www.npmjs.com/settings/<user>/tokens (Granular: packages read+write, or classic Automation)."
-            exit 1
-          fi
-          npm publish --access public
+      - name: Publish to npm (OIDC trusted publishing)
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PKG="$(node -p "require('./package.json').name")"
+          VER="$(node -p "require('./package.json').version")"
+          if npm view "$PKG@$VER" version >/dev/null 2>&1; then
+            echo "$PKG@$VER already on npm — skipping publish (bootstrap release published manually)"
+            exit 0
+          fi
+          # provenance 仅公开仓库可生成；私有仓库自动降级普通发布
+          if gh api "repos/${GITHUB_REPOSITORY}" --jq .private | grep -q true; then
+            echo "private repo — publishing without provenance"
+            npm publish
+          else
+            npm publish --provenance
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

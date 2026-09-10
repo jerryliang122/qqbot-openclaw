@@ -2,7 +2,7 @@
 
 本项目（GitHub 仓库 `jerryliang122/qqbot-openclaw`，npm 包 `@jerryliang122/openclaw-qqbot`）自 **v1.0.0** 起按自己的发版机制独立发版，版本号与上游旧版本（`tencent-connect/openclaw-qqbot` 2.x）**完全脱钩**：1.0.0 是本仓库独立维护后的第一个正式版本，其内容 = 上游 2.1.0 基础上的大量功能重构 + v1.0.0 的全面兼容性清理。
 
-- 发版流程：推送 `v*` tag → GitHub Actions 自动校验版本一致性、跑全量检查、构建产物 → **自动发布 npm**（`@jerryliang122/openclaw-qqbot`，需仓库 secret `NPM_TOKEN`）→ 创建 GitHub Release 并附 `npm pack` 产物
+- 发版流程：推送 `v*` tag → GitHub Actions 自动校验版本一致性、跑全量检查、构建产物 → **自动发布 npm**（`@jerryliang122/openclaw-qqbot`，OIDC Trusted Publishing 免 token）→ 创建 GitHub Release 并附 `npm pack` 产物
 - 版本规则：语义化版本（SemVer）。Major 位变更意味着存在 Breaking Change（配置格式 / 运行要求 / 公开 API）
 - 运行要求：**OpenClaw >= 2026.9.2**（peer 依赖硬性要求，见 package.json）
 
@@ -118,9 +118,14 @@ openclaw plugins install .
 1. 更新 `CHANGELOG.md` 新版本段落
 2. `package.json` 的 `version` 改为目标版本
 3. 提交并打 tag：`git tag v1.0.0 && git push origin main --tags`
-4. GitHub Actions（`.github/workflows/release.yml`）自动：校验 tag 与 package.json 一致 → typecheck / lint / build / 全量测试 → **`npm publish`（发布 `@jerryliang122/openclaw-qqbot`）** → `npm pack` → 创建 GitHub Release 并附 tarball
+4. GitHub Actions（`.github/workflows/release.yml`）自动：校验 tag 与 package.json 一致 → typecheck / lint / build / 全量测试 → **`npm publish`（发布 `@jerryliang122/openclaw-qqbot`，OIDC Trusted Publishing）** → `npm pack` → 创建 GitHub Release 并附 tarball
 
-**npm 发布前置（一次性配置）**：npmjs.com → 头像 → Access Tokens → Generate New Token → **Granular token**（Packages and scopes 权限 Read and write）或经典 **Automation** token → 复制后到 GitHub 仓库 Settings → Secrets and variables → Actions → New repository secret，名称 `NPM_TOKEN`，值为 token。未配置时发版 workflow 会在 publish 步骤明确报错。
+**npm 发布前置（一次性配置，OIDC 免 token）**：
+
+1. **首发引导**：npm 无 pending publisher 机制，全新包不能用 OIDC 首发——在已 `npm login` 的本机手动发布第一个版本一次（`npm run build && npm publish --access public`）。发版 workflow 检测到该版本已存在会自动跳过 publish、照常创建 GitHub Release。
+2. **关联 Trusted Publisher**：npmjs.com → 包 `@jerryliang122/openclaw-qqbot` → Settings → Trusted publishing → 添加 GitHub Actions：`jerryliang122` / `qqbot-openclaw` / workflow 文件名 `release.yml`（大小写敏感，可留空 Environment）。
+3. 之后所有版本由 CI 经 OIDC 自动发布，无需任何 npm token（建议随后在包设置中开启「Require 2FA and disallow tokens」彻底封死 token 发布）。
+   - 要求：Node ≥ 22.14 / npm ≥ 11.5.1（workflow 已用 Node 24）；`package.json` 的 `repository.url` 必须与 GitHub 仓库一致（已一致）。
 
 ---
 
