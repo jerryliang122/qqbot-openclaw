@@ -122,8 +122,13 @@ export async function handleInteraction(
       const requireMention = updatedCfg?.requireMention ?? true;
       const clawCfg = buildClawCfg(requireMention, [], resolveGroupPolicy(cfg, account.accountId));
       await acknowledgeInteraction(event.id, 0, { claw_cfg: clawCfg });
-    } catch {
-      try { await acknowledgeInteraction(event.id); } catch { /* ignore */ }
+    } catch (err) {
+      log.warn(`interaction update ack failed: ${err instanceof Error ? err.message : String(err)}`);
+      try {
+        await acknowledgeInteraction(event.id);
+      } catch (retryErr) {
+        log.debug(`interaction update ack retry failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
+      }
     }
     return;
   }
@@ -162,7 +167,11 @@ async function handleConfigQuery(
     await ack(event.id, 0, { claw_cfg: clawCfg });
   } catch (err) {
     log.warn(`interaction query failed: ${(err as Error)?.message ?? err}, ack without data`);
-    try { await ack(event.id); } catch { /* ignore */ }
+    try {
+      await ack(event.id);
+    } catch (retryErr) {
+      log.debug(`interaction query ack retry failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
+    }
   }
 }
 
@@ -193,7 +202,9 @@ async function handleApproval(
   log: PluginLogger,
   ack: (id: string) => Promise<void>,
 ): Promise<void> {
-  try { await ack(event.id); } catch { /* ignore */ }
+  try { await ack(event.id); } catch (err) {
+    log.debug(`[approval] initial ack failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   const buttonData = event.data?.resolved?.button_data;
   if (!buttonData?.startsWith('approve:')) return;
@@ -218,6 +229,10 @@ async function handleApproval(
     return;
   }
 
+  log.info(
+    `[approval] tap operator=${operatorId ?? 'unknown'} approvalId=${parsed.approvalId} kind=${parsed.approvalKind} decision=${parsed.decision} account=${account.accountId}`,
+  );
+
   try {
     const { resolveApprovalOverGateway } = await import('openclaw/plugin-sdk/approval-gateway-runtime');
     await resolveApprovalOverGateway({
@@ -228,6 +243,9 @@ async function handleApproval(
       senderId: operatorId,
       clientDisplayName: 'QQBot Approval Handler',
     });
+    log.info(
+      `[approval] resolved approvalId=${parsed.approvalId} decision=${parsed.decision} operator=${operatorId ?? 'unknown'}`,
+    );
   } catch (err) {
     log.error(`interaction approve error: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -242,7 +260,9 @@ async function handleQuestion(
   log: PluginLogger,
   ack: (id: string) => Promise<void>,
 ): Promise<void> {
-  try { await ack(event.id); } catch { /* ignore */ }
+  try { await ack(event.id); } catch (err) {
+    log.debug(`[question] initial ack failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   const buttonData = event.data?.resolved?.button_data;
   if (!buttonData) return;
@@ -270,7 +290,7 @@ async function handleQuestion(
       senderId: operatorId,
       clientDisplayName: 'QQBot question',
     });
-    log.debug(`[question] resolved questionId=${parsed.questionId} optionIndex=${parsed.optionIndex} status=${result.status}`);
+    log.info(`[question] resolved questionId=${parsed.questionId} optionIndex=${parsed.optionIndex} status=${result.status} operator=${operatorId ?? 'unknown'}`);
   } catch (err) {
     log.error(`[question] resolve error: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -308,7 +328,7 @@ async function handleMultiQuestionTap(
 
   if (tap.status === 'unknown' || tap.status === 'terminal') {
     log.info(`[question] multi tap ignored id=${parsed.questionId} status=${tap.status}`);
-    await sendMultiQuestionFeedback(event, account, '该问题已提交或已过期');
+    await sendMultiQuestionFeedback(event, account, '该问题已提交或已过期', log);
     return;
   }
   if (tap.status === 'resolving') {
@@ -322,6 +342,7 @@ async function handleMultiQuestionTap(
       event,
       account,
       `✅ 已记录 ${tap.answeredCount}/${tap.total}\n还剩：${pendingTitles.join('、')}`,
+      log,
     );
     return;
   }
@@ -363,7 +384,7 @@ async function sendMultiQuestionConfirmCard(
   if (!bot) {
     markMultiQuestionResolveFailed(questionId);
     log.error(`[question] confirm card send failed: bot unavailable id=${questionId}`);
-    await sendMultiQuestionFeedbackText(scope, peerId, account, '⚠️ 提交卡发送失败，请直接文字回复答案');
+    await sendMultiQuestionFeedbackText(scope, peerId, account, '⚠️ 提交卡发送失败，请直接文字回复答案', log);
     return;
   }
   try {
@@ -373,7 +394,7 @@ async function sendMultiQuestionConfirmCard(
   } catch (err) {
     markMultiQuestionResolveFailed(questionId);
     log.error(`[question] confirm card send error id=${questionId}: ${err instanceof Error ? err.message : String(err)}`);
-    await sendMultiQuestionFeedbackText(scope, peerId, account, '⚠️ 提交卡发送失败，请直接文字回复答案');
+    await sendMultiQuestionFeedbackText(scope, peerId, account, '⚠️ 提交卡发送失败，请直接文字回复答案', log);
   }
 }
 
@@ -382,11 +403,12 @@ async function sendMultiQuestionFeedback(
   event: InteractionEvent,
   account: ResolvedQQBotAccount,
   text: string,
+  log?: PluginLogger,
 ): Promise<void> {
   const scope = event.group_openid ? 'group' as const : 'c2c' as const;
   const targetId = event.group_openid ?? event.user_openid;
   if (!targetId) return;
-  await sendMultiQuestionFeedbackText(scope, targetId, account, text);
+  await sendMultiQuestionFeedbackText(scope, targetId, account, text, log);
 }
 
 async function sendMultiQuestionFeedbackText(
@@ -394,13 +416,15 @@ async function sendMultiQuestionFeedbackText(
   targetId: string,
   account: ResolvedQQBotAccount,
   text: string,
+  log?: PluginLogger,
 ): Promise<void> {
   const bot = tryGetBotForAccount(account.accountId);
   if (!bot) return;
   try {
     await bot.sendText({ scope, targetId }, text);
-  } catch {
-    // 主动消息可能触发平台限频；回执是锦上添花，吞掉即可
+  } catch (err) {
+    // 主动消息可能触发平台限频；回执是锦上添花，吞掉即可（仅 DEBUG 留痕）
+    log?.debug(`[question] feedback send failed scope=${scope}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
