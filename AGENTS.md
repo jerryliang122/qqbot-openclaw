@@ -50,7 +50,7 @@ src/
   outbound/             # send pipeline: text, media, TTS, streaming, cron, debounce
   middleware/           # access-control, attachment, policy-injector
   commands/             # /bot-* slash commands (registered via SDK middleware)
-  features/             # pairing, approval, ref-index, history, update-check, command-panel
+  features/             # pairing, approval, ref-index, history, command-panel
   adapter/              # contract probe, media, resolve, webhook, workspace
   setup/                # QR login (start/wait), account-key, finalize, surface wizard
   tools/                # platform.ts (qqbot_platform_api), remind.ts, secret-input.ts (qqbot_secret_input)
@@ -88,7 +88,6 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 
 - `qqbot-channel` — Guild/Channel API operations (notes/posts/schedules). Trigger: 用户提到「频道」「子频道」等.
 - `qqbot-remind` — `qqbot_remind` tool for cron-based proactive messages.
-- `qqbot-upgrade` — `/bot-upgrade` hot-update flow.
 
 These are loaded by the host AI; they guide behavior, not build steps.
 

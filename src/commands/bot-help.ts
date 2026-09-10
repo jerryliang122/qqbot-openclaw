@@ -6,7 +6,7 @@ const PLUGIN_VERSION = getPackageVersion();
 
 /** 群聊时隐藏的仅限私聊指令 */
 const GROUP_EXCLUDED = new Set([
-  'bot-upgrade', 'bot-clear-storage', 'bot-logs',
+  'bot-clear-storage', 'bot-logs',
   'bot-approve', 'bot-group-always', 'bot-group-allways', 'bot-streaming', 'bot-me',
 ]);
 
