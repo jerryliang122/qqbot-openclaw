@@ -36,7 +36,7 @@ const CMD_AUDIT_RAW_LIMIT = 80;
  * ctx.log 即网关注入 SDK 的 PluginLogger（带账号前缀与 request-context
  * 元数据）；warn/debug 在 SDK Logger 接口上是可选方法，须可选链调用。
  */
-function withAudit(cmd: SlashCommand): SlashCommand {
+export function withAudit(cmd: SlashCommand): SlashCommand {
   const name = Array.isArray(cmd.name) ? cmd.name.join('|') : cmd.name;
   const origHandler = cmd.handler;
   const origAuthorized = cmd.authorized;
