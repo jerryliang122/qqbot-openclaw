@@ -22,6 +22,17 @@ npx tsx tests/*.test.ts 2>&1 | tail   # rough "all" run (no shared runner)
 
 All tests use `node:assert` + a hand-rolled `test()` helper and run directly via `tsx`.
 
+## Git workflow（main 为保护分支）
+
+- **禁止直接 push 到 main**（GitHub branch protection）。任何开发——功能、修复、文档——一律走 `分支 + PR`：
+  1. 从最新 main 切分支，命名 `<type>/<短描述>`（如 `fix/room-event-echo`、`docs/agents-md`）
+  2. 提交信息遵循 Conventional Commits（`feat:` / `fix:` / `docs:` / `chore:` / `ci:` / `refactor:`，breaking change 加 `!`，如 `refactor!:`）——与仓库现有历史一致
+  3. push 分支、开 PR；CI（ci.yml，push + pull_request 双触发）必须全绿（typecheck / lint:runtime / build / 全量测试）
+  4. 合并后删除远端分支
+- **PR 提请前本地自检**：`npm run typecheck` + `npm run build` + 受影响测试（见 Verification）——先在本地失败，别烧 CI 额度
+- **发版不受分支保护影响**：release.yml 由 `v*` tag 触发，tag 打在已合并进 main 的提交上（`git tag v1.0.0 && git push origin v1.0.0`，branch protection 不拦 tag push）；完整流程见 CHANGELOG.md「发版操作手册」
+- **gh CLI 注意**：本仓库 git remote 走代理（github.jerryliang.win），gh 无法从 remote 推断仓库，PR/issue 操作需显式 `--repo jerryliang122/qqbot-openclaw`
+
 ## Architecture
 
 Entry: `index.ts` → re-exports `qqbotPlugin` from `src/channel.ts`. That file is the orchestrator; substantive logic lives in:
