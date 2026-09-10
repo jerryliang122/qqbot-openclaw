@@ -8,9 +8,9 @@
 
 ---
 
-## [Unreleased]
+## [1.0.1] - 2026-09-10
 
-### Breaking Changes
+### 移除的功能
 
 - **移除「命令自动更新插件」功能**：删除 `/bot-upgrade` 指令、npm 版本检查器（`src/features/update-checker.ts`）与 `qqbot-upgrade` 技能（原宿主 AI 自动执行 `openclaw plugins install` + `openclaw gateway restart`）。插件不再访问 npm registry，`/bot-version` 只显示当前已安装版本与框架版本。
   - 配置字段 `channels.qqbot.upgradeUrl` 一并移除；已配置该字段的用户无需操作，多余字段会被忽略（schema `additionalProperties: true`，不会报错）。
