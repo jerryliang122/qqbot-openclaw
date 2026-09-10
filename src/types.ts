@@ -164,11 +164,6 @@ export interface QQBotAccountConfig {
    */
   urlDirectUpload?: boolean;
   /**
-   * /bot-upgrade 指令返回的升级指引网址
-   * 默认: 本仓库 CHANGELOG（含各版本升级说明）
-   */
-  upgradeUrl?: string;
-  /**
    * 群消息是否默认需要 @机器人才响应（默认 true）
    * 优先级低于 groups.{groupId}.requireMention 和 groups."*".requireMention
    * 设为 false 时，所有群默认无需 @ 即触发回复（仍可被群级配置覆盖）

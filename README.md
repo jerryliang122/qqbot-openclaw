@@ -46,7 +46,6 @@ Scan to join the QQ group chat
 | 🌐 **Dual Transport** | WebSocket (default) or Webhook (HTTP callback) — switch via config |
 | 🖼️ **Rich Media** | Send & receive images, voice, video, and files |
 | 🎙️ **Voice (STT/TTS)** | Speech-to-text transcription & text-to-speech replies |
-| 🔄 **Update Check** | `/bot-upgrade` checks the npm registry for new versions and links the upgrade guide |
 | ⏰ **Scheduled Push** | Proactive message delivery via scheduled tasks |
 | 🔗 **URL Support** | Direct URL sending in private chat (no restrictions) |
 | ⌨️ **Typing Indicator** | "Bot is typing..." status shown in real-time |
@@ -194,16 +193,6 @@ Shows framework version, plugin version, and a direct link to the official repos
 
 <img width="360" src="docs/images/slash-help.jpg" alt="Help Demo" />
 
-#### `/bot-upgrade` — Version Check & Upgrade Guide
-
-> **You**: `/bot-upgrade`
->
-> **QQBot**: 📌 Current: v1.0.0 / 🆕 New version available / 📖 Upgrade guide link
-
-Checks the installed version against the npm registry (`@jerryliang122/openclaw-qqbot`) and returns a link to the upgrade guide (repo CHANGELOG by default; override with `channels.qqbot.upgradeUrl`). Actual upgrading is done on the host via `openclaw plugins install` — see [Getting Started](#-getting-started).
-
-<img width="360" src="docs/images/hot-update.jpg" alt="Upgrade Demo" />
-
 #### `/bot-logs` — Log Export
 
 > **You**: `/bot-logs`
@@ -218,9 +207,9 @@ Exports the last ~2000 lines of gateway logs as a file for quick troubleshooting
 
 All commands support a `?` suffix to show usage:
 
-> **You**: `/bot-upgrade ?`
+> **You**: `/bot-ping ?`
 >
-> **QQBot**: 📖 /bot-upgrade usage: …
+> **QQBot**: 📖 /bot-ping usage: …
 
 #### `/bot-approve` — Approval Configuration
 

@@ -11,7 +11,6 @@ import { botHelp } from './bot-help.js';
 import { botPing } from './bot-ping.js';
 import { botVersion } from './bot-version.js';
 import { botMe } from './bot-me.js';
-import { botUpgrade } from './bot-upgrade.js';
 import { botStreaming } from './bot-streaming.js';
 import { botClearStorage } from './bot-clear-storage.js';
 import { botLogs } from './bot-logs.js';
@@ -37,7 +36,6 @@ export function buildCommandList(account: ResolvedQQBotAccount, opts: CommandBui
     botPing(),
     botVersion(account),
     botMe(),
-    botUpgrade(account),
     botLogs(opts.getRuntime()),
     botStreaming(account, opts.getRuntime),
     botClearStorage(account),

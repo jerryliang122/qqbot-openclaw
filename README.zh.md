@@ -44,7 +44,6 @@
 | 🌐 **双传输模式** | WebSocket（默认）或 Webhook（HTTP 回调）— 配置切换 |
 | 🖼️ **富媒体消息** | 支持图片、语音、视频、文件的收发 |
 | 🎙️ **语音能力 (STT/TTS)** | 语音转文字自动转录 & 文字转语音回复 |
-| 🔄 **版本检查** | 私聊发送 `/bot-upgrade` 检查 npm 新版本并附升级指引 |
 | ⏰ **定时推送** | 支持定时任务触发后主动推送消息 |
 | 🔗 **URL 无限制** | 私聊可直接发送 URL |
 | ⌨️ **输入状态** | 实时显示"Bot 正在输入中…"状态 |
@@ -192,16 +191,6 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 <img width="360" src="docs/images/slash-help.jpg" alt="Help 演示" />
 
-#### `/bot-upgrade` — 版本检查与升级指引
-
-> **你**：`/bot-upgrade`
->
-> **QQBot**：📌当前版本 v1.0.0 / 🆕发现新版本 / 📖升级指引链接
-
-对比 npm registry（`@jerryliang122/openclaw-qqbot`）上的最新版本，并返回升级指引链接（默认指向仓库 CHANGELOG，可用 `channels.qqbot.upgradeUrl` 覆盖）。实际升级在主机上通过 `openclaw plugins install` 完成，见[快速开始](#-快速开始)。
-
-<img width="360" src="docs/images/hot-update.jpg" alt="升级检查演示" />
-
 #### `/bot-logs` — 日志导出
 
 > **你**：`/bot-logs`
@@ -216,9 +205,9 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 所有指令都支持 `?` 后缀查看用法说明：
 
-> **你**：`/bot-upgrade ?`
+> **你**：`/bot-ping ?`
 >
-> **QQBot**：📖 /bot-upgrade 用法：…
+> **QQBot**：📖 /bot-ping 用法：…
 
 #### `/bot-approve` — 审批配置管理
 

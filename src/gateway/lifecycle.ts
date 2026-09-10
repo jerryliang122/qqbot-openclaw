@@ -22,7 +22,6 @@ import { createPluginLogger } from '../utils/plugin-logger.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
 import { registerGateway, unregisterGateway, getGateway } from '../outbound/outbound-service.js';
 import { saveCredentialBackup, loadCredentialBackup } from '../features/credential-backup.js';
-import { triggerUpdateCheck } from '../features/update-checker.js';
 import { syncCommandPanels } from '../features/command-panel.js';
 import { CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY } from '../features/approval-capability.js';
 import { cleanupTypingByAccount } from '../typing-lifecycle.js';
@@ -111,16 +110,13 @@ async function initFeatures(
   ctx: StartAccountContext,
   log: PluginLogger,
 ): Promise<void> {
-  // 1. 版本更新检测（后台预热，fire-and-forget）
-  triggerUpdateCheck(log);
-
-  // 2. 注册 "approval.native" 运行时上下文。框架的 approval bootstrap 监听此上下文，
+  // 1. 注册 "approval.native" 运行时上下文。框架的 approval bootstrap 监听此上下文，
   //    据此为该账户自动 spawn native 审批 handler（消费 exec/plugin approval 事件，
   //    回调 qqbotPlugin.approvalCapability.nativeRuntime 的 availability/presentation/transport）。
   //    账户停止时 abortSignal 触发，上下文自动注销。
   registerApprovalNativeContext(account.accountId, ctx);
 
-  // 3. 指令面板同步：把 openclaw essential 原生指令注册到 QQ Bot 指令面板（/v2/panels）。
+  // 2. 指令面板同步：把 openclaw essential 原生指令注册到 QQ Bot 指令面板（/v2/panels）。
   //    每进程每账号仅一次；失败只记日志并由 once-guard 释放等待重连重试，不影响消息收发。
   syncCommandPanels(account, ctx.cfg, log).catch((e) => {
     log?.error(`[qqbot:${account.accountId}] command panel sync error: ${e}`);
