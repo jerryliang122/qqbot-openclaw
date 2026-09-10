@@ -33,6 +33,11 @@ import { DEFAULT_ACCOUNT_ID, resolveQQBotAccount } from "../config.js";
 import { tryGetBotForAccount } from "../bot-instance.js";
 import { getQQBotRuntime } from "../runtime.js";
 import { getAdapters } from "../adapter/resolve.js";
+import { createPluginLogger } from "../utils/plugin-logger.js";
+
+// deliverPending 由框架 approval-delivery-runtime 回调，无 logger 参数可传；
+// 审批卡投递的成功/失败此前只在失败时抛给框架，成功零痕迹
+const approvalLog = createPluginLogger({ prefix: "[approval]" });
 import type { InlineKeyboard, ResolvedQQBotAccount } from "../types.js";
 import {
   buildApprovalKeyboard,
@@ -193,6 +198,7 @@ const qqbotApprovalNativeRuntime = createChannelApprovalNativeRuntimeAdapter<
         accountId && accountId !== DEFAULT_ACCOUNT_ID ? accountId : DEFAULT_ACCOUNT_ID;
       const bot = tryGetBotForAccount(resolvedAccountId);
       if (!bot) {
+        approvalLog.error(`card deliver failed: bot unavailable account=${resolvedAccountId} target=${preparedTarget.type}:${preparedTarget.id}`);
         throw new Error(
           `QQ Bot gateway not running for account "${resolvedAccountId}" — cannot deliver approval`,
         );
@@ -202,12 +208,19 @@ const qqbotApprovalNativeRuntime = createChannelApprovalNativeRuntimeAdapter<
         scope: preparedTarget.type as "c2c" | "group",
         targetId: preparedTarget.id,
       };
-      const result = await bot.sendTextWithKeyboard(
-        replyTarget,
-        pendingPayload.text,
-        pendingPayload.keyboard as never,
-      );
-      const messageId = (result as { id?: string } | undefined)?.id;
+      let result: { id?: string } | undefined;
+      try {
+        result = await bot.sendTextWithKeyboard(
+          replyTarget,
+          pendingPayload.text,
+          pendingPayload.keyboard as never,
+        );
+      } catch (err) {
+        approvalLog.error(`card deliver failed: ${err instanceof Error ? err.message : String(err)}`, { account: resolvedAccountId, target: `${preparedTarget.type}:${preparedTarget.id}` });
+        throw err;
+      }
+      const messageId = result?.id;
+      approvalLog.info(`card delivered account=${resolvedAccountId} target=${preparedTarget.type}:${preparedTarget.id} msgId=${messageId ?? '-'}`);
       return {
         messageId,
         targetType: preparedTarget.type,
