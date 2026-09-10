@@ -86,6 +86,10 @@ async function main(): Promise<void> {
     // 这里我们测试清理函数不会抛出异常
     cleanupTypingByAccount('account1'); // 清理不存在的 session
     cleanupTypingByAccount('account3'); // 清理不存在的账户
+    
+    // 账户 2 的续期链也必须停掉：泄漏的 session 会把进程挂满
+    // 11 次 × 50s ≈ 9 分钟才自然耗尽（2026-09-10 CI 单文件 9m10s 的根因）
+    cleanupTypingByAccount('account2');
   });
 
   // 测试 3: 配额管理器原子操作
