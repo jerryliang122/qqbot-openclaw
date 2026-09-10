@@ -3,6 +3,10 @@ import type { SlashCommandHandlerContext } from '@tencent-connect/qqbot-nodejs';
 import type { PluginRuntime } from 'openclaw/plugin-sdk';
 import { getAdapters } from '../adapter/resolve.js';
 
+// 最小结构类型：同时兼容 PluginLogger 与 SDK MiddlewareContext 的 Logger
+// （后者的 warn/debug 是可选方法且无 child）——与 quota-manager 的 log 参数同款
+type WarnSink = { warn?: (msg: string, meta?: Record<string, unknown>) => void };
+
 /**
  * 命令授权检查（用于 SlashCommand.authorized 回调）。
  *
@@ -50,6 +54,7 @@ export async function updateAccountConfig(
   account: ResolvedQQBotAccount,
   getRuntime: () => PluginRuntime,
   updater: (accountConfig: Record<string, unknown>) => void,
+  log?: WarnSink,
 ): Promise<string | null> {
   const [err, result] = await resolvePersistFn(getRuntime);
   if (err || !result) return err;
@@ -72,6 +77,7 @@ export async function updateAccountConfig(
     });
     return null;
   } catch (e) {
+    log?.warn?.(`[cmd] account config persist failed: ${e instanceof Error ? e.message : String(e)}`, { accountId: account.accountId });
     return `⚠️ 配置修改失败：${e instanceof Error ? e.message : String(e)}`;
   }
 }
@@ -83,6 +89,7 @@ export async function updateAccountConfig(
 export async function updateGlobalConfig(
   getRuntime: () => PluginRuntime,
   updater: (cfg: any) => void,
+  log?: WarnSink,
 ): Promise<string | null> {
   const [err, result] = await resolvePersistFn(getRuntime);
   if (err || !result) return err;
@@ -91,6 +98,7 @@ export async function updateGlobalConfig(
     await result.persist(updater);
     return null;
   } catch (e) {
+    log?.warn?.(`[cmd] global config persist failed: ${e instanceof Error ? e.message : String(e)}`);
     return `⚠️ 配置修改失败：${e instanceof Error ? e.message : String(e)}`;
   }
 }

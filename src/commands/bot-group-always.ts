@@ -44,7 +44,7 @@ export function botGroupAlways(account: ResolvedQQBotAccount, getRuntime: () => 
 
       const error = await updateAccountConfig(account, getRuntime, (acfg) => {
         (acfg as any).defaultRequireMention = newRequireMention;
-      });
+      }, ctx.log);
       if (error) return error;
 
       // 更新内存中的配置
