@@ -117,7 +117,7 @@ openclaw plugins install .
 
 1. 更新 `CHANGELOG.md` 新版本段落
 2. `package.json` 的 `version` 改为目标版本
-3. 提交并打 tag：`git tag v1.0.0 && git push origin main --tags`
+3. 以上改动经 PR 合并进 main（**main 为保护分支，禁止直接 push**），然后在合并提交上打 tag：`git tag v1.0.0 && git push origin v1.0.0`（branch protection 不拦 tag push）
 4. GitHub Actions（`.github/workflows/release.yml`）自动：校验 tag 与 package.json 一致 → typecheck / lint / build / 全量测试 → **`npm publish`（发布 `@jerryliang122/openclaw-qqbot`，OIDC Trusted Publishing）** → `npm pack` → 创建 GitHub Release 并附 tarball
 
 **npm 发布前置（一次性配置，OIDC 免 token）**：
