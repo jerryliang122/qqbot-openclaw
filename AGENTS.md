@@ -31,6 +31,7 @@ All tests use `node:assert` + a hand-rolled `test()` helper and run directly via
   2. 提交信息遵循 Conventional Commits（`feat:` / `fix:` / `docs:` / `chore:` / `ci:` / `refactor:`，breaking change 加 `!`，如 `refactor!:`）——与仓库现有历史一致
   3. push 分支、开 PR；CI（ci.yml，push + pull_request 双触发）必须全绿（typecheck / lint:runtime / build / 全量测试）
   4. 合并后删除远端分支
+- **PR 不自动合并（2026-09-10 约定）**：CI 全绿 ≠ 已授权合并——review 与合并由仓库主人决定。开完 PR、CI 全绿后即停，把 PR 链接交回并等待主人亲自合并或明确授权；打 `v*` tag 发版等下游动作同样必须等合并完成且主人确认后再执行。
 - **PR 提请前本地自检（秒级）**：`npm run typecheck` + `npm run build`；**测试一律由 CI 执行**（本地全量太慢），PR 的 CI 全绿即测试通过——本地 `npx tsx tests/<file>.test.ts` 仅作单用例调试
 - **发版不受分支保护影响**：release.yml 由 `v*` tag 触发，tag 打在已合并进 main 的提交上（`git tag v1.0.0 && git push origin v1.0.0`，branch protection 不拦 tag push）；完整流程见 CHANGELOG.md「发版操作手册」
 - **gh CLI 注意**：本仓库 git remote 走代理（github.jerryliang.win），gh 无法从 remote 推断仓库，PR/issue 操作需显式 `--repo jerryliang122/qqbot-openclaw`
