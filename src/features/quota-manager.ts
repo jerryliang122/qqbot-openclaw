@@ -85,6 +85,7 @@ export function checkAndConsumePassiveReplyQuota(
   const { accountId, msgId, scope, log } = params;
 
   if (!msgId) {
+    log?.debug?.(`[${accountId}] passive quota check without msgId (proactive path) scope=${scope}`);
     return { canReply: false, rollback: () => {} };
   }
 
@@ -93,17 +94,19 @@ export function checkAndConsumePassiveReplyQuota(
   const ttl = QUOTA_LIMITS[scope].ttlMs;
 
   let cached = quotaCache.get(key);
-  
+
   // 检查过期：msg_id 过期后不能用于被动回复
   // 这是 QQ Bot 平台限制，API 会返回错误 40034128
   if (cached && now > cached.expiresAt) {
-    // msg_id 已过期，不能用于被动回复
+    // msg_id 已过期，不能用于被动回复（降级决策的日志在 adapter/gateway 层）
+    log?.debug?.(`[${accountId}] passive quota denied (expired): ${key}`);
     return { canReply: false, rollback: () => {} };
   }
 
   // 检查配额
   const limit = QUOTA_LIMITS[scope].count;
   if (cached && cached.count >= limit) {
+    log?.debug?.(`[${accountId}] passive quota denied (exhausted): ${key} count=${cached.count}/${limit}`);
     return { canReply: false, rollback: () => {} };
   }
 

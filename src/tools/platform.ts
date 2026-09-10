@@ -2,6 +2,11 @@ import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { listQQBotAccountIds } from '../config.js';
 import { getBotForAccount } from '../bot-instance.js';
 import { getRequestAccountId } from '../request-context.js';
+import { createPluginLogger } from '../utils/plugin-logger.js';
+
+// 工具 execute 无 logger 参数；request-context 活跃期间 enrichMeta
+// 自动带上 accountId/openId/messageId
+const toolLog = createPluginLogger({ prefix: '[tool:platform]' });
 
 // ========== JSON Schema ==========
 
@@ -111,6 +116,7 @@ export function registerPlatformTool(api: OpenClawPluginApi): void {
         try {
           const bot = getBotForAccount(accountId);
           const apiGateway = bot.api;
+          const startedAt = Date.now();
 
           let data: unknown;
           switch (method) {
@@ -131,10 +137,12 @@ export function registerPlatformTool(api: OpenClawPluginApi): void {
               break;
           }
 
+          toolLog.info(`${method} ${p.path} ok (${Date.now() - startedAt}ms)`, { accountId });
           return json(data);
         } catch (err: unknown) {
           const errMsg = err instanceof Error ? err.message : String(err);
           const apiErr = err as { httpStatus?: number; bizCode?: number; path?: string };
+          toolLog.warn(`${method} ${p.path} failed status=${apiErr.httpStatus ?? '?'} code=${apiErr.bizCode ?? '?'}: ${errMsg}`, { accountId });
           return json({
             error: errMsg,
             status: apiErr.httpStatus,
