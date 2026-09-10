@@ -8,6 +8,46 @@
 
 ---
 
+## [1.0.2] - 2026-09-10
+
+### 可观测性补全（日志全链路覆盖，PR #5）
+
+纯日志与防御性 catch，**无任何业务逻辑 / 中间件链 / 发送行为变化**。修复日志覆盖审计发现的系统性盲区——INFO 级别下插件工作状态全程可见：
+
+#### 出站链路
+
+- **出站成功统一 `[tx] sent` INFO**：在 `wrapBotSendForRefIndex` 包装层打点（kind/scope/target/msgId/passive/contentLen）——gateway 五个 send 方法与中间件 `bot.sendText` 直调的单一卡点，此前成功发送插件层零日志、只能靠 SDK 状态行倒推。
+- **框架契约出站路径接入 logger**（`[outbound]`）：框架直发 / `message` 工具 / cron announce 路径的配额降级 INFO 与回滚 DEBUG 此前因不传 log 是死代码；媒体消息配额降级补 INFO（此前完全无日志）。
+- `qqbot_secret_input` 工具：卡片发送失败 ERROR、pending 登记成功 INFO。
+
+#### 命令与交互审计
+
+- **`/bot-*` 命令执行审计**：全部 11 个内置命令每次调用打 `[cmd]` INFO（命令/执行者/scope/raw 截断 80 字符），越权尝试打 WARN——含 `/bot-clear-storage`（删存储）、`/bot-approve`（安全相关）；配置 persist 失败 WARN。
+- **审批交互留痕**：授权通过的按钮点击 `[approval] tap` INFO、resolve 成功 `[approval] resolved` INFO（此前仅越权 WARN / 失败 ERROR，合法成功的审批不留痕）；审批卡投递成功/失败日志。
+- 单问题 ask_user resolve 结果 DEBUG→INFO（与多问题流程对齐）；四处交互初始 ack 失败静默 catch 补 DEBUG。
+
+#### 静默吞错与裸 promise 加固
+
+- 配对审批 CLI（`approveViaCli`）：收集 stderr 尾部（≤500 字符），spawn 失败与非零退出打 WARN——区分「CLI 坏了」与「配对码无效」。
+- webhook ingress 管线动态 import 失败打 WARN（此前整条请求路径静默降级 handleSimple 无痕迹）。
+- access-control 配对挑战回复 / secret-capture 被动+主动回复失败由 `.catch(()=>{})` 改为 WARN。
+- **消除 unhandledRejection 风险**：debounce 定时器 flush、typing 续期定时器经 `.catch` 封口；`notifyOutboundMessageSent` 监听器逐个隔离（单个坏订阅方不再能炸掉发送成功路径）；history-store 异步 append 兜底。
+
+#### 低优先补全
+
+- 账号启动 INFO（accountId/appId/enabled/secretSource/transport——secret 只打来源不打值）。
+- webhook 每请求 DEBUG 访问日志；签名全不匹配 401 升 WARN（与管线路径对齐）。
+- `qqbot_platform_api` 工具每调用 INFO（method/path/耗时），失败 WARN（status/bizCode）。
+- quota-manager 拒绝路径（无 msgId/过期/耗尽）DEBUG 留痕；setup 手动绑定路径补 `rt.log`。
+
+#### 测试与不变项
+
+- 新增 `tests/command-audit.test.ts`（7 用例：注册完整 / 返回值透传 / INFO 字段 / raw 截断 / authorized 通过与拒绝 / SDK 可选方法形态 / 数组别名）。
+- **入站消息追踪维持 DEBUG 级**（设计决策不变）：INFO 级别下正常流量保持安静，只看异常与拦截（`[guard]`/`[rawEvent]`）。
+- `setup/login.ts` 的 QR 终端输出保留（用户界面非日志）；`ssrf-guard` 的 console.warn 保留（纯 util，caller 已有日志）。
+
+---
+
 ## [1.0.1] - 2026-09-10
 
 ### 移除的功能
