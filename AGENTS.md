@@ -22,7 +22,7 @@ npx tsx tests/*.test.ts 2>&1 | tail   # rough "all" run (no shared runner)
 
 All tests use `node:assert` + a hand-rolled `test()` helper and run directly via `tsx`.
 
-**全量测试是 CI 的职责**：ci.yml 在每次 push / PR 跑全部 33 个测试文件，本地不做全量跑（33 个 tsx 冷启动太慢）。本地只在调试单个用例时跑单文件（可选，非门禁）。
+**全量测试是 CI 的职责**：ci.yml 在每次 push / PR 跑全部 33 个测试文件，本地不做全量跑（33 个 tsx 冷启动太慢）。本地只在调试单个用例时跑单文件（可选，非门禁）。**覆盖率同样只在 CI 统计**：Test 步骤经 `NODE_V8_COVERAGE` 收集 V8 profile，Coverage report 步骤用 `c8`（`--all --include 'src/**' --include 'index.ts'`）聚合，逐文件表格 + 总百分比写入 Actions run 的 Step Summary——本地不要跑覆盖率。
 
 ## Git workflow（main 为保护分支）
 

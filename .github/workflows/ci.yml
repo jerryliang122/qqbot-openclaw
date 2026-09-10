@@ -36,6 +36,8 @@ jobs:
         run: npm run build
 
       - name: Test
+        env:
+          NODE_V8_COVERAGE: ${{ runner.temp }}/v8-coverage
         run: |
           status=0
           for f in tests/*.test.ts; do
@@ -47,3 +49,19 @@ jobs:
             echo "::endgroup::"
           done
           exit $status
+
+      - name: Coverage report
+        if: always()
+        env:
+          NODE_V8_COVERAGE: ${{ runner.temp }}/v8-coverage
+        run: |
+          echo "### 📊 Test coverage (src/** + index.ts)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          npx -y c8@10 report \
+            --temp-directory "$NODE_V8_COVERAGE" \
+            --all \
+            --include 'src/**' \
+            --include 'index.ts' \
+            --reporter=text --reporter=text-summary \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
