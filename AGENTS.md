@@ -22,6 +22,8 @@ npx tsx tests/*.test.ts 2>&1 | tail   # rough "all" run (no shared runner)
 
 All tests use `node:assert` + a hand-rolled `test()` helper and run directly via `tsx`.
 
+**全量测试是 CI 的职责**：ci.yml 在每次 push / PR 跑全部 33 个测试文件，本地不做全量跑（33 个 tsx 冷启动太慢）。本地只在调试单个用例时跑单文件（可选，非门禁）。
+
 ## Git workflow（main 为保护分支）
 
 - **禁止直接 push 到 main**（GitHub branch protection）。任何开发——功能、修复、文档——一律走 `分支 + PR`：
@@ -29,7 +31,7 @@ All tests use `node:assert` + a hand-rolled `test()` helper and run directly via
   2. 提交信息遵循 Conventional Commits（`feat:` / `fix:` / `docs:` / `chore:` / `ci:` / `refactor:`，breaking change 加 `!`，如 `refactor!:`）——与仓库现有历史一致
   3. push 分支、开 PR；CI（ci.yml，push + pull_request 双触发）必须全绿（typecheck / lint:runtime / build / 全量测试）
   4. 合并后删除远端分支
-- **PR 提请前本地自检**：`npm run typecheck` + `npm run build` + 受影响测试（见 Verification）——先在本地失败，别烧 CI 额度
+- **PR 提请前本地自检（秒级）**：`npm run typecheck` + `npm run build`；**测试一律由 CI 执行**（本地全量太慢），PR 的 CI 全绿即测试通过——本地 `npx tsx tests/<file>.test.ts` 仅作单用例调试
 - **发版不受分支保护影响**：release.yml 由 `v*` tag 触发，tag 打在已合并进 main 的提交上（`git tag v1.0.0 && git push origin v1.0.0`，branch protection 不拦 tag push）；完整流程见 CHANGELOG.md「发版操作手册」
 - **gh CLI 注意**：本仓库 git remote 走代理（github.jerryliang.win），gh 无法从 remote 推断仓库，PR/issue 操作需显式 `--repo jerryliang122/qqbot-openclaw`
 
@@ -92,15 +94,14 @@ These are loaded by the host AI; they guide behavior, not build steps.
 
 ## Verification
 
-Before claiming a change works:
+本地门禁只做秒级检查（2026-09-10 约定：全量测试太慢，一律交给 CI）：
 
 ```bash
 npm run typecheck                   # tsc --noEmit
 npm run build                       # ensure tsup post-build succeeds
-npx tsx tests/<affected>.test.ts    # run the relevant test file(s)
 ```
 
-For behavior changes in `src/gateway/`, `src/dispatch/`, or `src/outbound/`, at minimum run the matching `tests/*.test.ts` (e.g. `session-key.test.ts`, `body-assembler.test.ts`, `middleware-chain.test.ts`, `room-event.test.ts`, `dispatch-lifecycle.test.ts`).
+**测试由 CI 执行**：push 分支 / 开 PR 后，以 ci.yml 的全量测试结果为准。行为改动（尤其 `src/gateway/`、`src/dispatch/`、`src/outbound/`）在 PR 描述里注明重点看哪些测试文件（如 `session-key.test.ts`、`body-assembler.test.ts`、`middleware-chain.test.ts`、`room-event.test.ts`、`dispatch-lifecycle.test.ts`），CI 全量都会跑到。
 
 ## Misc
 
