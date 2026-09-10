@@ -105,7 +105,7 @@ export function botApprove(getRuntime: () => PluginRuntime): SlashCommand {
           cfg.tools.exec ??= {};
           cfg.tools.exec.security = preset.security;
           cfg.tools.exec.ask = preset.ask;
-        });
+        }, ctx.log);
         if (error) return error;
 
         if (arg === 'on') {
@@ -127,7 +127,7 @@ export function botApprove(getRuntime: () => PluginRuntime): SlashCommand {
             if (Object.keys(exec).length === 0) delete cfg.tools.exec;
             if (cfg.tools && Object.keys(cfg.tools).length === 0) delete cfg.tools;
           }
-        });
+        }, ctx.log);
         if (error) return error;
 
         return ['✅ 审批配置已重置', '', '已移除 tools.exec.security 和 tools.exec.ask', '框架将使用默认值（security=deny, ask=on-miss）', '', '如需开启命令执行，请使用 /bot-approve on'].join('\n');

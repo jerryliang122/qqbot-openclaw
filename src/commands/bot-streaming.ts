@@ -43,7 +43,7 @@ export function botStreaming(account: ResolvedQQBotAccount, getRuntime: () => Pl
 
       const error = await updateAccountConfig(account, getRuntime, (acfg) => {
         (acfg as any).streaming = { mode: targetEnabled ? 'partial' : 'off' };
-      });
+      }, ctx.log);
       if (error) return error;
 
       account.config.streaming = { mode: targetEnabled ? 'partial' : 'off' };
