@@ -28,6 +28,11 @@ import { isApprovalPayload } from './features/approval-utils.js';
 import { TEXT_CHUNK_LIMIT } from './constants.js';
 import { tryGetQQBotRuntime } from './runtime.js';
 import { getAdapters } from './adapter/resolve.js';
+import { createPluginLogger } from './utils/plugin-logger.js';
+
+// 契约入口（框架直发 / message 工具 / cron announce）无调用方 logger 可传，
+// 用模块级 logger 兜底——frameworkSink 每次调用时 resolve，register 早期自动降级 console
+const alog = createPluginLogger({ prefix: '[outbound]' });
 
 export type SendTextFn = (params: {
   to: string;
@@ -178,6 +183,8 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
       if (canReply && replyToId && result.error) {
         rollback();
         log?.debug?.(`[${resolvedAccountId}] rollback quota: send failed`);
+      } else if (!canReply) {
+        log?.info?.(`[${resolvedAccountId}] [quota] fallback to proactive media send: quota exhausted or no msgId`);
       }
 
       return result;
@@ -287,6 +294,7 @@ export function createQQBotChannelOutbound(params: QQBotOutboundAdapterParams = 
         accountId: ctx.accountId ?? undefined,
         replyToId: resolvePassiveFirstReplyToId(ctx.to, ctx.replyToId),
         account,
+        log: alog,
       });
       if (result.error) throw new Error(result.error);
       return { channel: 'qqbot', messageId: result.messageId ?? '' };
@@ -302,7 +310,8 @@ export function createQQBotChannelOutbound(params: QQBotOutboundAdapterParams = 
         accountId: resolvedAccountId,
         replyToId: resolvePassiveFirstReplyToId(ctx.to, ctx.replyToId),
         account,
-        agentId: resolveMCPAgentId(ctx.to, resolvedAccountId, ctx.cfg),
+        agentId: resolveMCPAgentId(ctx.to, resolvedAccountId, ctx.cfg, alog),
+        log: alog,
       });
       if (result.error) throw new Error(result.error);
       return { channel: 'qqbot', messageId: result.messageId ?? '' };

@@ -306,6 +306,25 @@ export class QQBotGateway {
     const { accountId, appId } = this.account;
     const senderName = this.account.config.name ?? appId;
 
+    // 出站成功的统一 INFO 痕迹：gateway 的 sendText/sendMedia/sendVoice/sendVideo/
+    // sendFile 与中间件对 bot.sendText 的直调全部落到这两个被包装的方法上。
+    // 此前成功发送在插件层零日志，只能靠 SDK 的 `<<< Status` 状态行倒推。
+    const MEDIA_KIND_BY_TYPE = new Map<number, string>([
+      [1, 'image'], [2, 'video'], [3, 'voice'], [4, 'file'],
+    ]);
+    const logTx = (
+      kind: string,
+      target: { scope?: string; targetId?: string; msgId?: string },
+      msg: { id?: string },
+      contentLen?: number,
+    ): void => {
+      this.log.info(
+        `[tx] sent kind=${kind} scope=${target.scope ?? '?'} target=${target.targetId ?? '?'}`
+        + ` msgId=${msg.id || '-'} passive=${target.msgId ? 'true' : 'false'}`
+        + (contentLen !== undefined ? ` contentLen=${contentLen}` : ''),
+      );
+    };
+
     const storeEntry = (msg: MessageResponse, content: string, target: { scope: string; targetId?: string }, mediaKind?: string): void => {
       // 出站 id 先登记回声表（不依赖 ext_info.ref_idx 是否返回），
       // 供 inboundGuard 识别平台回投的 bot 自身消息
@@ -352,6 +371,7 @@ export class QQBotGateway {
     const origSendText = this.bot.sendText.bind(this.bot);
     this.bot.sendText = async (target, text, ...rest) => {
       const result = await origSendText(target, text, ...rest);
+      logTx('text', target, result, text.length);
       storeEntry(result, text, target);
       return result;
     };
@@ -361,7 +381,10 @@ export class QQBotGateway {
     this.bot.sendMedia = async (params: any) => {
       const result = await origSendMedia(params);
       const msg = (result as any).message as MessageResponse | undefined;
-      if (msg) storeEntry(msg, '', params.target ?? { scope: '' }, params.mediaKind);
+      if (msg) {
+        logTx(MEDIA_KIND_BY_TYPE.get(params.fileType) ?? 'media', params.target ?? {}, msg);
+        storeEntry(msg, '', params.target ?? { scope: '' }, params.mediaKind);
+      }
       return result;
     };
 

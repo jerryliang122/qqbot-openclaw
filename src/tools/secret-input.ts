@@ -22,7 +22,12 @@ import {
 } from '../features/secret-input-store.js';
 import { getRequestAccountId, getRequestTarget } from '../request-context.js';
 import { parseTarget } from '../outbound/target.js';
+import { createPluginLogger } from '../utils/plugin-logger.js';
 import type { InlineKeyboard, KeyboardButton } from '../types.js';
+
+// 工具 execute 无 logger 参数可传；request-context 在工具执行期间处于活跃，
+// 模块级 logger 的 enrichMeta 会自动带上 accountId/openId/messageId
+const toolLog = createPluginLogger({ prefix: '[tool:secret-input]' });
 
 // ========== JSON Schema ==========
 
@@ -162,10 +167,13 @@ export function registerSecretInputTool(api: OpenClawPluginApi): void {
           );
         } catch (err) {
           cancelPendingSecretInput(accountId, parsed.targetId);
+          toolLog.error(`card send failed: ${err instanceof Error ? err.message : String(err)}`, { name, accountId });
           return json({
             error: `密钥输入卡片发送失败：${err instanceof Error ? err.message : String(err)}`,
           });
         }
+
+        toolLog.info(`card sent, pending registered name=${name} ttlMinutes=${DEFAULT_SECRET_INPUT_TTL_MS / 60_000}`);
 
         return json({
           ok: true,
