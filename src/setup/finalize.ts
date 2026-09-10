@@ -49,13 +49,14 @@ async function linkViaQrCode(cfg: OpenClawConfig, _accountId: string, prompter: 
   }
 }
 
-async function linkViaManual(cfg: OpenClawConfig, _accountId: string, prompter: Prompter): Promise<OpenClawConfig> {
+async function linkViaManual(cfg: OpenClawConfig, _accountId: string, prompter: Prompter, rt: Runtime): Promise<OpenClawConfig> {
   const appIdInput = await prompter.text({ message: '请输入 QQ Bot AppID', validate: (v) => v.trim() ? undefined : 'AppID 不能为空' });
   const secret = await prompter.text({ message: '请输入 QQ Bot AppSecret', validate: (v) => v.trim() ? undefined : 'AppSecret 不能为空' });
   const appId = appIdInput.trim();
   const key = resolveAccountKey(cfg, appId);
   let next = applyQQBotAccountConfig(cfg, key, { appId, clientSecret: secret.trim() });
   next = applyAccountDefaults(next, key);
+  rt.log(`手动绑定完成！账户: ${key} (AppID: ${appId})`);
   await prompter.note('✔ QQ Bot 配置完成！', 'QQ Bot');
   return next;
 }
@@ -82,7 +83,7 @@ export async function finalizeQQBotSetup(params: {
   if (mode === 'qr') {
     next = await linkViaQrCode(next, accountId, params.prompter, params.runtime);
   } else if (mode === 'manual') {
-    next = await linkViaManual(next, accountId, params.prompter);
+    next = await linkViaManual(next, accountId, params.prompter, params.runtime);
   } else if (!configured) {
     await params.prompter.note('您可以稍后运行以下命令重新配置：\n  openclaw channels add', 'QQ Bot');
   }

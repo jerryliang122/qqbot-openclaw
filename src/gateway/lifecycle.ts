@@ -73,6 +73,14 @@ export async function startAccountWithCredentialRecovery(ctx: StartAccountContex
     }
   }
 
+  // 账号启动留痕：哪个账号、以什么凭证来源、什么传输模式启动了
+  // （secret 只打来源不打值）——多账号排障时定位配置实际生效形态
+  log.info(
+    `account starting accountId=${account.accountId} appId=${account.appId || '(none)'}`
+    + ` enabled=${account.enabled ?? true} secretSource=${account.secretSource ?? '?'}`
+    + ` transport=${account.config.transport}${account.config.transport === 'webhook' ? ` path=${account.config.webhook?.path ?? '(default)'}` : ''}`,
+  );
+
   // 创建 gateway 实例并注册
   const gw = new QQBotGateway(account, runtime, log);
   registerGateway(account.accountId, gw);

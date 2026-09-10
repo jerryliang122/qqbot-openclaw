@@ -213,14 +213,20 @@ async function delegateToHandler(handler: WebhookRequestHandler, req: any, res: 
 async function handleSimple(req: any, res: any, path: string, log: PluginLogger) {
   try {
     const ct = String(req.headers['content-type'] ?? '');
-    if (!ct.includes('application/json')) { res.statusCode = 400; res.end(JSON.stringify({ error: 'unsupported content type' })); return; }
+    if (!ct.includes('application/json')) {
+      log.debug?.(`[webhook] simple ${req.method ?? '?'} ${path} -> 400 (unsupported content type)`);
+      res.statusCode = 400; res.end(JSON.stringify({ error: 'unsupported content type' })); return;
+    }
 
     const chunks: Buffer[] = [];
     let total = 0;
     for await (const chunk of req) {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       total += buf.length;
-      if (total > 1_048_576) { res.statusCode = 413; res.end(JSON.stringify({ error: 'too large' })); return; }
+      if (total > 1_048_576) {
+        log.debug?.(`[webhook] simple ${req.method ?? '?'} ${path} -> 413 (too large)`);
+        res.statusCode = 413; res.end(JSON.stringify({ error: 'too large' })); return;
+      }
       chunks.push(buf);
     }
     const rawBody = Buffer.concat(chunks);
@@ -228,12 +234,14 @@ async function handleSimple(req: any, res: any, path: string, log: PluginLogger)
     for (const entry of entries) {
       const resp = await entry.handler({ body: rawBody, headers: mapHeaders(req) });
       if (resp.status < 400) {
+        log.debug?.(`[webhook] simple ${req.method ?? '?'} ${path} -> ${resp.status} (account=${entry.accountId})`);
         res.statusCode = resp.status;
         if (resp.headers) for (const [k, v] of Object.entries(resp.headers)) res.setHeader(k, v as string);
         res.end(resp.body);
         return;
       }
     }
+    log.warn?.(`[webhook] simple ${req.method ?? '?'} ${path} -> 401 (no target matched signature)`);
     res.statusCode = 401; res.end(JSON.stringify({ error: 'invalid signature' }));
   } catch (err) {
     log.error(`Webhook simple handler error: ${(err as Error).message}`);
