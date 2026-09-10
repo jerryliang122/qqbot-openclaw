@@ -206,7 +206,7 @@ export async function dispatchToOpenClaw(
     ? new DeliverDebouncer(debounceConfig, async (targetId, mergedText) => {
         const result = await sendText({ to: targetId, text: mergedText, accountId: account.accountId, replyToId: envelope.messageId, account });
         trackOutbound(result, 'debounce');
-      })
+      }, dlog)
     : undefined;
 
   const deliverCtx: DeliverContext = {

@@ -69,6 +69,7 @@ export interface TypingParams {
   replyToId: string;
   log?: {
     debug?: (message: string) => void;
+    warn?: (message: string) => void;
   };
 }
 

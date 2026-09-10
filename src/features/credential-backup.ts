@@ -9,6 +9,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { getQQBotDataDir } from '../utils/platform.js';
+import { createPluginLogger } from '../utils/plugin-logger.js';
+
+const backupLog = createPluginLogger({ prefix: '[credential-backup]' });
 
 const BACKUP_DIR = 'credential-backup';
 const BACKUP_FILENAME = 'current.json';
@@ -44,8 +47,9 @@ export function saveCredentialBackup(accountId: string, appId: string, clientSec
     const tmpPath = backupPath + '.tmp';
     fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2) + '\n', 'utf8');
     fs.renameSync(tmpPath, backupPath);
-  } catch {
-    // 非关键操作，静默忽略
+  } catch (err) {
+    // 非关键操作，不中断启动；DEBUG 留痕（恢复失败路径在 lifecycle 已有 ERROR）
+    backupLog.debug(`save failed: ${err instanceof Error ? err.message : String(err)}`, { accountId });
   }
 }
 
@@ -60,7 +64,8 @@ export function loadCredentialBackup(accountId?: string): CredentialBackup | nul
       return readBackupFile(backupPath, accountId);
     }
     return null;
-  } catch {
+  } catch (err) {
+    backupLog.debug(`load failed: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
 }

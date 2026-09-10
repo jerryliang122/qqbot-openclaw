@@ -49,14 +49,16 @@ async function replyToUser(
       try {
         await ctx.bot.sendText(ctx.replyTarget, text);
         return;
-      } catch {
+      } catch (err) {
         rollback();
-        // 落到主动降级
+        ctx.log?.warn?.(`[secret] passive reply failed, falling back to proactive: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }
   const proactiveTarget = { scope: 'c2c' as const, targetId: ctx.message.senderId as string };
-  await ctx.bot.sendText(proactiveTarget, text).catch(() => {/* 尽力而为 */});
+  await ctx.bot.sendText(proactiveTarget, text).catch((err: unknown) => {
+    ctx.log?.warn?.(`[secret] proactive reply failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
 }
 
 function formatSetFailure(name: string, result: SecretsStoreSetResult): string {
