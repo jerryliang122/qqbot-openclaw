@@ -97,7 +97,12 @@ export function createPluginWebhookAdapter(params: {
 function createSharedHandler(path: string, log: PluginLogger) {
   return async (req: any, res: any) => {
     try {
-      const ingress = await import('openclaw/plugin-sdk/webhook-ingress').catch(() => null);
+      const ingress = await import('openclaw/plugin-sdk/webhook-ingress').catch((err) => {
+        // 管线缺失会让所有请求降级到 handleSimple（无签名匹配多账号路由），
+        // 此前完全无痕迹——至少留一条 WARN 说明降级发生及原因
+        log.warn?.(`[webhook] ingress pipeline unavailable, downgrading to simple handler: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      });
 
       if (!ingress?.withResolvedWebhookRequestPipeline) {
         await handleSimple(req, res, path, log);

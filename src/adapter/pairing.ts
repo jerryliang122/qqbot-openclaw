@@ -12,6 +12,9 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { resolveOpenClawCli } from '../features/secret-store-cli.js';
+import { createPluginLogger } from '../utils/plugin-logger.js';
+
+const pairingLog = createPluginLogger({ prefix: '[pairing]' });
 
 export interface PairingApi {
   readAllowFromStore: (params: { channel: string; accountId: string }) => Promise<string[]>;
@@ -64,6 +67,7 @@ export function getPairingApi(): PairingApi {
 }
 
 const APPROVE_TIMEOUT_MS = 30_000;
+const STDERR_TAIL_LIMIT = 500;
 
 async function approveViaCli(params: {
   channel: string;
@@ -82,13 +86,22 @@ async function approveViaCli(params: {
   ];
   return new Promise((resolve) => {
     const child = spawn(cli.cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    // 收集 stderr 尾部：spawn 失败/非零退出时区分「CLI 坏了」与「码无效」
+    let stderrTail = '';
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderrTail = (stderrTail + chunk.toString()).slice(-STDERR_TAIL_LIMIT);
+    });
     const timer = setTimeout(() => child.kill('SIGKILL'), APPROVE_TIMEOUT_MS);
-    child.on('error', () => {
+    child.on('error', (err) => {
       clearTimeout(timer);
+      pairingLog.warn(`approve CLI spawn failed: ${err.message}`, { cmd: cli.cmd });
       resolve({ approved: false });
     });
     child.on('close', (codeNum) => {
       clearTimeout(timer);
+      if (codeNum !== 0) {
+        pairingLog.warn(`approve CLI exited ${codeNum}`, { channel: params.channel, accountId: params.accountId, stderr: stderrTail || undefined });
+      }
       resolve({ approved: codeNum === 0 });
     });
   });

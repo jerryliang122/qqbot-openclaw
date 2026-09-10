@@ -59,14 +59,17 @@ export async function startTypingWithRenewal(
 
   log?.debug?.(`[${accountId}] typing started: ${sessionKey}`);
 
-  const timer = setTimeout(async () => {
-    await handleTypingRenewal({
+  const timer = setTimeout(() => {
+    // promise 被 setTimeout 回调丢弃，失败不就地捕获会成为 unhandledRejection
+    void handleTypingRenewal({
       sessionKey,
       accountId,
       to,
       replyToId,
       log,
       sendTyping,
+    }).catch((err: unknown) => {
+      log?.warn?.(`[${accountId}] typing renewal error: ${err instanceof Error ? err.message : String(err)}`);
     });
   }, TYPING_RENEWAL_MS);
 
@@ -120,8 +123,10 @@ async function handleTypingRenewal(
   state.renewalCount += 1;
   log?.debug?.(`[${accountId}] typing renewed #${state.renewalCount}: ${sessionKey}`);
 
-  state.timer = setTimeout(async () => {
-    await handleTypingRenewal(params);
+  state.timer = setTimeout(() => {
+    void handleTypingRenewal(params).catch((err: unknown) => {
+      log?.warn?.(`[${accountId}] typing renewal error: ${err instanceof Error ? err.message : String(err)}`);
+    });
   }, TYPING_RENEWAL_MS);
 
   activeTypingSessions.set(sessionKey, state);

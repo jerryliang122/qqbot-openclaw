@@ -116,7 +116,9 @@ async function checkPairingMode(
     ].join('\n');
 
     ctx.log?.info?.(`[access] pairing required for ${opts.senderId}`);
-    await ctx.bot.sendText(ctx.replyTarget, reply).catch(() => {/* ignore */});
+    await ctx.bot.sendText(ctx.replyTarget, reply).catch((err: unknown) => {
+      ctx.log?.warn?.(`[access] pairing challenge send failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
     ctx.stop('access:pairing_required');
   } catch (err) {
     ctx.log?.error?.(`[access] pairing error: ${(err as Error).message}`);

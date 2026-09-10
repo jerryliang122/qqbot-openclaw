@@ -40,7 +40,14 @@ export function recordOutboundToGroupHistory(
     timestamp: Date.now(),
     isBot: true,
   };
-  void _store?.append?.(historyGroupKey(accountId, groupOpenid), historyEntry, limit);
+  // append 可能返回 Promise（异步后端）；当前 MemoryHistoryStore 为同步，
+  // 但 rejected promise 若不捕获会成为 unhandledRejection——纯防御
+  const appended = _store?.append?.(historyGroupKey(accountId, groupOpenid), historyEntry, limit) as
+    | void
+    | Promise<void>;
+  if (appended && typeof (appended as Promise<void>).catch === 'function') {
+    (appended as Promise<void>).catch(() => {/* 历史缓冲是尽力而为，失败不影响主流程 */});
+  }
 }
 
 /**

@@ -43,9 +43,17 @@ export function subscribeOutboundMessage(
 
 /**
  * 消息发送成功后由出站层调用：通知该会话活跃的 typing 会话补发续期。
+ * 单个监听器抛错只跳过该监听器——此处位于网关发送成功路径上，
+ * 不能让一个坏的订阅方炸掉整条 send 链。
  */
 export function notifyOutboundMessageSent(accountId: string, scope: string, targetId: string): void {
   const set = listeners.get(key(accountId, scope, targetId));
   if (!set) return;
-  for (const listener of [...set]) listener();
+  for (const listener of [...set]) {
+    try {
+      listener();
+    } catch {
+      // 监听器自身的问题不应影响发送方与其他监听器
+    }
+  }
 }

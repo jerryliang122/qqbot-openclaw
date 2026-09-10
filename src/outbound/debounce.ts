@@ -13,6 +13,9 @@ const DEFAULT_WINDOW_MS = 1500;
 const DEFAULT_MAX_WAIT_MS = 8000;
 const DEFAULT_SEPARATOR = '\n\n---\n\n';
 
+// 最小结构类型：兼容 PluginLogger 与 SDK Logger（与 config-util 同款）
+type WarnSink = { warn?: (msg: string, meta?: Record<string, unknown>) => void };
+
 interface PendingDeliver {
   texts: string[];
   firstAt: number;
@@ -26,15 +29,18 @@ export class DeliverDebouncer {
   private readonly maxWaitMs: number;
   private readonly separator: string;
   private readonly flush: (targetId: string, mergedText: string) => Promise<void>;
+  private readonly log?: WarnSink;
 
   constructor(
     config: DeliverDebounceConfig | undefined,
     flush: (targetId: string, mergedText: string) => Promise<void>,
+    log?: WarnSink,
   ) {
     this.windowMs = config?.windowMs ?? DEFAULT_WINDOW_MS;
     this.maxWaitMs = config?.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
     this.separator = config?.separator ?? DEFAULT_SEPARATOR;
     this.flush = flush;
+    this.log = log;
   }
 
   get enabled(): boolean {
@@ -60,7 +66,7 @@ export class DeliverDebouncer {
       if (Date.now() - existing.firstAt >= this.maxWaitMs) {
         await this.doFlush(targetId);
       } else {
-        existing.timer = setTimeout(() => this.doFlush(targetId), this.windowMs);
+        existing.timer = setTimeout(() => this.scheduledFlush(targetId), this.windowMs);
       }
       return;
     }
@@ -70,10 +76,21 @@ export class DeliverDebouncer {
       const pending: PendingDeliver = {
         texts: [text],
         firstAt: Date.now(),
-        timer: setTimeout(() => this.doFlush(targetId), this.windowMs),
+        timer: setTimeout(() => this.scheduledFlush(targetId), this.windowMs),
         resolve,
       };
       this.pending.set(targetId, pending);
+    });
+  }
+
+  /**
+   * 定时器触发的 flush：promise 被 setTimeout 回调丢弃，失败若不就地
+   * 捕获会成为 unhandledRejection——记 WARN 封口（pending.resolve 在
+   * doFlush 的 finally 中仍会执行，入队方不会被悬挂）。
+   */
+  private scheduledFlush(targetId: string): void {
+    void this.doFlush(targetId).catch((err: unknown) => {
+      this.log?.warn?.(`[debounce] timer flush failed target=${targetId}: ${err instanceof Error ? err.message : String(err)}`);
     });
   }
 
