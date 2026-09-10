@@ -1,5 +1,5 @@
 /**
- * @tencent-connect/openclaw-qqbot
+ * @jerryliang122/openclaw-qqbot
  *
  * 独立版 QQ Bot 通道插件 — 基于 @tencent-connect/qqbot-nodejs SDK 重构。
  *
