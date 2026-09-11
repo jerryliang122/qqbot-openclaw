@@ -88,7 +88,6 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 ## Skills (under `/skills/`)
 
 - `qqbot-channel` — Guild/Channel API operations (notes/posts/schedules). Trigger: 用户提到「频道」「子频道」等.
-- `qqbot-remind` — `qqbot_remind` tool for cron-based proactive messages.
 
 These are loaded by the host AI; they guide behavior, not build steps.
 
