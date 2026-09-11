@@ -8,6 +8,14 @@
 
 ---
 
+## [1.0.3] - 2026-09-11
+
+### 移除的功能
+
+- **移除 `qqbot-remind` skill**（PR #7）：删除 `skills/qqbot-remind/` 目录（SKILL.md 引导文档存在问题，不再随 npm 包分发），`openclaw.plugin.json` 的 `skills` 清单同步移除注册。**`qqbot_remind` 工具本身保留**（`src/tools/remind.ts` 与 `contracts.tools` 注册不变），宿主 AI 仍可经工具描述直接发现与调用，仅少了引导文档；`qqbot-channel` skill 不受影响。已安装用户升级后该 skill 自动消失，无需任何配置迁移。
+
+---
+
 ## [1.0.2] - 2026-09-10
 
 ### 可观测性补全（日志全链路覆盖，PR #5）
