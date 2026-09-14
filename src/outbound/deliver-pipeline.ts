@@ -27,6 +27,11 @@ export interface DeliverPayload {
   mediaUrl?: string;
   mediaUrls?: string[];
   audioAsVoice?: boolean;
+  /**
+   * agent run 失败通知 payload（框架 markAgentRunFailureReplyPayload 必置 true）。
+   * 这类文本从未进入流式通道（模型死在半路），流式去重早退对它不适用。
+   */
+  isError?: boolean;
 }
 
 export interface DeliverInfo {

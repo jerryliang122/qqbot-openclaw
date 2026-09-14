@@ -356,6 +356,10 @@ export async function dispatchToOpenClaw(
       }
 
       // ── 2. 流式路径：流式已启动且未降级 -> 跳过静态发送 ──
+      // 例外：isError payload（agent run 失败通知）必须落到默认路径发出。
+      // 失败文案从未进入流式通道（模型死在半路），「final 已由流式发过」的
+      // 去重假设不成立——早退 return 会把通知吞掉，用户只见首分片后静默
+      // （issue #8：静态流式首分片 1062 字符已发，模型超时后无任何提示）。
       if (streamingController?.hasStarted && !streamingController?.shouldFallbackToStatic) {
         if (streamingController.isStaticSendMode) {
           // static 模式：flush 主路径由 onToolStart 驱动（工具开始前，绕开 SDK
@@ -370,8 +374,13 @@ export async function dispatchToOpenClaw(
           // stream 模式：tool/final 时收尾当前打字机流（原行为）
           await streamingController.finalize();
         }
-        if (!streamingController.shouldFallbackToStatic) return;
-        dlog?.warn(`streaming fallback to static`);
+        if (payload.isError === true) {
+          dlog?.info(`run-failure notice bypasses streaming dedup (kind=${kind ?? 'none'} textLen=${text.length})`);
+        } else if (!streamingController.shouldFallbackToStatic) {
+          return;
+        } else {
+          dlog?.warn(`streaming fallback to static`);
+        }
       }
 
       // ── 3. 文本去重：同文本已发过 -> 跳过 ──
