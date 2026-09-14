@@ -8,6 +8,14 @@
 
 ---
 
+## [1.0.4] - 2026-09-14
+
+### 修复
+
+- **流式会话中 agent run 失败不再静默**（issue #8，PR #9）：c2c 流式已启动且首分片已送达后模型失败（如空闲超时），框架经 deliver 回调投递的 `isError` 失败通知 payload 此前被 deliverHandler 的流式去重早退吞掉——「final 已由流式发过」的假设对失败文案不成立（它从未进入流式通道），用户只见首分片后静默，WebUI ⚠️ 是唯一失败信号；插件自身的 `FAILURE_FALLBACK` 兜底也不触发（dispatch 正常 resolve + 已有可见回复）。现 `payload.isError === true`（框架 `markAgentRunFailureReplyPayload` 必置）绕过去重早退、落到默认路径静态发出（stream 模式先收尾打字机流再发）；非 error payload 的去重行为不变。`mode:'partial'+sendMode:'static'`（生产形态）、`partial/stream`、`mode:'off'` 三种配置全覆盖，回归测试 `tests/dispatch-error-notify.test.ts`（5 用例）钉住。
+
+---
+
 ## [1.0.3] - 2026-09-11
 
 ### 移除的功能
