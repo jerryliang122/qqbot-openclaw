@@ -161,6 +161,19 @@ await test("静态: 空文本不发送内容，0 分片触发降级", async () =
   assert.strictEqual(ctrl.shouldFallbackToStatic, true, "0 分片应触发降级兜底");
 });
 
+await test("静态: markDeliveredExternally 阻止降级（ask_user 场景）", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  // 模型直接调 ask_user，无流式文本
+  ctrl.markDeliveredExternally();
+  assert.strictEqual(ctrl.shouldFallbackToStatic, false, "外部投递后不应降级");
+
+  await ctrl.finalize();
+  await flush();
+  assert.strictEqual(ctrl.currentPhase, "done", "应为 done 终态");
+  assert.strictEqual(staticSendCalls.length, 0, "ask_user 场景不触发 sendStatic");
+});
+
 await test("静态: onAssistantMessageStart 第一段开始时无内容可 flush（空跳过）", async () => {
   const ctrl = makeController({ sendMode: "static" });
 

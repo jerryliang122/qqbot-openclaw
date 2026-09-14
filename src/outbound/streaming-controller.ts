@@ -51,8 +51,14 @@ export class StreamingController {
   /** QQ 已接受的最新文本 — 单源真理 */
   private lastAcceptedFull = '';
 
-  /** 已成功发送的分片数（降级：=0 则走静态消息兜底） */
+  /** 已成功发送的分片数（降级：=0 且无外部投递则走静态消息兜底） */
   private sentChunkCount = 0;
+
+  /**
+   * 标记：内容已通过非流式通道成功投递（如 ask_user 按钮卡片）。
+   * 置 true 后 handleFinalize 不再走 fallback 路径，避免框架误报 outcome=error。
+   */
+  private _deliveredExternally = false;
 
   /** 同步标志：收到第一个 onPartialReply 即置 true（不等 async 完成） */
   private _hasStarted = false;
@@ -87,7 +93,15 @@ export class StreamingController {
   }
 
   get shouldFallbackToStatic(): boolean {
-    return this.isTerminal && this.sentChunkCount === 0;
+    return this.isTerminal && this.sentChunkCount === 0 && !this._deliveredExternally;
+  }
+
+  /**
+   * 告知控制器内容已通过外部通道投递（如 ask_user 卡片）。
+   * 后续 finalize() 不会走 fallback 路径，框架不会误报 outcome=error。
+   */
+  markDeliveredExternally(): void {
+    this._deliveredExternally = true;
   }
 
   // ── 入口 ──
@@ -212,6 +226,9 @@ export class StreamingController {
       } else if (this.sentChunkCount > 0 && this.lastAcceptedFull) {
         // 未提供 sendStatic → 降级标记，由上层兜底发送
         this.transition('failed', 'finalize:no_sendstatic');
+      } else if (this._deliveredExternally) {
+        // 内容已通过外部通道投递（如 ask_user 卡片），非失败
+        this.transition('done', 'finalize');
       } else {
         this.transition('done', 'finalize:fallback');
       }
@@ -227,8 +244,8 @@ export class StreamingController {
     }
 
     // 无会话 — 视有无下发决定终态
-    if (this.sentChunkCount > 0) {
-      this.transition('done', 'finalize:no_session');
+    if (this.sentChunkCount > 0 || this._deliveredExternally) {
+      this.transition('done', this.sentChunkCount > 0 ? 'finalize:no_session' : 'finalize');
     } else {
       this.transition('done', 'finalize:fallback');
     }

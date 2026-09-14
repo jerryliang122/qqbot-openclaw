@@ -118,6 +118,27 @@ await test("空文本被忽略，不启动会话", async () => {
   assert.ok(ctrl.shouldFallbackToStatic, "从未发片 → 降级标记");
 });
 
+await test("markDeliveredExternally 阻止 finalize:fallback（ask_user 场景）", async () => {
+  const { ctrl, sessions } = createController();
+  // 模型未流式输出任何文本，直接调用 ask_user 工具
+  assert.strictEqual(ctrl.hasStarted, false, "尚未启动");
+
+  // 无外部投递时，finalize 应走 fallback
+  const { ctrl: ctrl2 } = createController();
+  await ctrl2.finalize();
+  assert.strictEqual(ctrl2.currentPhase, "done");
+  assert.ok(ctrl2.shouldFallbackToStatic, "无外部投递 → 降级标记");
+
+  // 插件成功投递 ask_user 卡片后标记
+  ctrl.markDeliveredExternally();
+  assert.ok(!ctrl.shouldFallbackToStatic, "外部投递后不应降级");
+
+  await ctrl.finalize();
+  assert.strictEqual(ctrl.currentPhase, "done", "应为 done 终态");
+  assert.ok(!ctrl.shouldFallbackToStatic, "finalize 后仍不应降级");
+  assert.strictEqual(sessions.length, 0, "不应有流式会话");
+});
+
 await test("hasStarted 同步置位（不等异步发送）", async () => {
   const { ctrl } = createController();
   const p = ctrl.onPartialReply("第一段");
