@@ -298,6 +298,8 @@ export async function dispatchToOpenClaw(
             try {
               await bot.sendTextWithKeyboard(replyTarget, text, keyboard as never);
               outboundSendOk++;
+              // 标记流式控制器：内容已通过外部通道投递，finalize 不走 fallback
+              streamingController?.markDeliveredExternally();
               dlog?.debug(`[question] sent ask_user with keyboard questionId=${questionId} options=${optionValues.length}`);
               return;
             } catch (err) {
@@ -331,6 +333,8 @@ export async function dispatchToOpenClaw(
                 await bot.sendTextWithKeyboard(replyTarget, cardText, keyboard as never);
                 outboundSendOk++;
               }
+              // 标记流式控制器：内容已通过外部通道投递，finalize 不走 fallback
+              streamingController?.markDeliveredExternally();
               dlog?.debug(`[question] sent multi-question ask_user questionId=${questionId} questions=${questions.length}`);
               return;
             } catch (err) {
