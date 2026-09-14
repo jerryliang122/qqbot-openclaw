@@ -8,6 +8,14 @@
 
 ---
 
+## [1.0.5] - 2026-09-14
+
+### 修复
+
+- **ask_user 卡片投递后不再误报 "Agent run failed"**（issue #11，PR #12）：模型未流式输出文本直接调用 `ask_user` 工具时，卡片通过 `bot.sendTextWithKeyboard()` 成功投递给用户，但 `StreamingController` 的 `sentChunkCount` 仍为 0，turn 结束时 `finalize()` 走 `finalize:fallback` 路径，框架 `replyResolver` 将其解读为投递失败，Web UI 误显 "Agent run failed"。新增 `markDeliveredExternally()` 方法，插件在 ask_user 卡片发送成功后调用，`handleFinalize` 检测到外部投递后走 `finalize`（成功）而非 `finalize:fallback`（失败）。
+
+---
+
 ## [1.0.4] - 2026-09-14
 
 ### 修复
