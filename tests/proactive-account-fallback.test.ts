@@ -47,6 +47,7 @@ async function test(name: string, fn: () => Promise<void> | void) {
 const {
   resolveDefaultQQBotAccountId,
   resolveQQBotAccount,
+  listQQBotAccountIds,
 } = await import('../src/config.ts');
 const {
   registerGateway,
@@ -214,6 +215,36 @@ await test('B6: 回退发送的被动配额记在实际发送账号下（Sourcer
   clearQuotaCache();
 });
 
+await test('B7: unregisterGateway 所有权守卫——旧实例不得删掉新实例的替代网关（Sourcery 复审二轮 #2）', async () => {
+  cleanupRegistry();
+  const callsA: { sendText?: unknown[] } = { sendText: [] };
+  const callsB: { sendText?: unknown[] } = { sendText: [] };
+  const gwOld = makeFakeGateway(callsA);
+  const gwNew = makeFakeGateway(callsB);
+  registerGateway('acct', gwOld);
+  registerGateway('acct', gwNew); // 新模块实例注册替代网关（覆盖同一账号键）
+
+  // 旧实例延迟 stop：带自己的 gw 引用注销 → 不应删掉 gwNew
+  unregisterGateway('acct', gwOld);
+  const result = await sendText({
+    to: 'qqbot:c2c:user1',
+    text: 'still alive',
+    account: { accountId: 'acct' } as never,
+  });
+  assert.strictEqual(result.error, undefined, '替代网关应仍在注册表中');
+  assert.strictEqual(callsB.sendText?.length, 1, '应由新网关发送');
+
+  // 持有者自己注销 → 正常移除
+  unregisterGateway('acct', gwNew);
+  const after = await sendText({
+    to: 'qqbot:c2c:user1',
+    text: 'gone',
+    account: { accountId: 'acct' } as never,
+  });
+  assert.match(after.error ?? '', /not running/);
+  cleanupRegistry();
+});
+
 // ── Fix A: resolveDefaultQQBotAccountId 可运行性感知（配置残影硬化）──
 
 await test('A1: 顶层 default 完整（appId+secret）→ default（上报人配置形态，行为不变）', () => {
@@ -309,7 +340,7 @@ await test('A8: 残影场景下 resolveQQBotAccount(cfg, undefined) 与 defaultA
   );
 });
 
-await test('A9: 仅凭备份可恢复的命名账号（配置缺 appId）也会被选中（Sourcery 复审 #2）', async () => {
+await test('A9: 备份补 secret（appId 必须在配置内）——选中即可枚举启动（Sourcery 复审二轮 #1）', async () => {
   const backupFile = path.join(
     os.homedir(), '.openclaw', 'qqbot', 'data', 'credential-backup', 'current.json',
   );
@@ -319,23 +350,24 @@ await test('A9: 仅凭备份可恢复的命名账号（配置缺 appId）也会�
   }
   const { saveCredentialBackup } = await import('../src/features/credential-backup.ts');
   try {
-    saveCredentialBackup('live', 'BACKUP_APPID', 's');
+    saveCredentialBackup('live', 'LIVE', 's');
     const cfg = {
       channels: {
         qqbot: {
           appId: 'STALE',
           accounts: {
-            staleSibling: { appId: 'OLD' }, // 有 appId 无凭证 → 不可运行
-            live: {}, // 配置为空，仅凭备份可恢复（lifecycle 启动时会带回 appId+secret）
+            staleSibling: { appId: 'OLD' }, // 有 appId 无凭证且无备份 → 不可运行
+            live: { appId: 'LIVE' }, // appId 已声明（会被枚举启动），secret 由备份恢复
+            notListed: {}, // 无 appId：listQQBotAccountIds 不枚举 → 永不被启动 → 不可选
           },
         },
       },
     } as never;
-    assert.strictEqual(
-      resolveDefaultQQBotAccountId(cfg),
-      'live',
-      '备份可恢复账号应被选中，而非因 staleSibling 有 appId 而退回 default',
-    );
+    // 一致性前提：被选中的账号必须在框架的枚举/启动范围内
+    const listed = listQQBotAccountIds(cfg);
+    assert.ok(listed.includes('live'), 'live 应被枚举');
+    assert.ok(!listed.includes('notListed'), '无 appId 的账号不应被枚举');
+    assert.strictEqual(resolveDefaultQQBotAccountId(cfg), 'live');
   } finally {
     fs.rmSync(backupFile, { force: true });
   }

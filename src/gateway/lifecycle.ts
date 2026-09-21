@@ -184,7 +184,9 @@ export async function stopAccountGracefully(params: {
     }
   }
 
-  unregisterGateway(accountId);
+  // 3. 注销 gateway（带所有权守卫：只删本实例注册的同一个 gw，
+  //    防止延迟 stop 误删新模块实例已注册的替代网关）
+  unregisterGateway(accountId, gw);
 }
 
 /**
