@@ -30,12 +30,10 @@ import {
  */
 const GATEWAYS_REGISTRY_KEY = Symbol.for('openclaw-qqbot.gateways');
 
-interface QQBotGatewayRegistryGlobal {
-  [GATEWAYS_REGISTRY_KEY]?: Map<string, QQBotGateway>;
-}
-
+const globalRegistry = globalThis as unknown as Record<symbol, unknown>;
 const gateways: Map<string, QQBotGateway> =
-  ((globalThis as unknown as QQBotGatewayRegistryGlobal)[GATEWAYS_REGISTRY_KEY] ??= new Map());
+  (globalRegistry[GATEWAYS_REGISTRY_KEY] as Map<string, QQBotGateway> | undefined) ?? new Map();
+globalRegistry[GATEWAYS_REGISTRY_KEY] = gateways;
 
 // 契约入口（框架直发 / message 工具 / cron）无调用方 logger 可传，
 // 回退日志用模块级 logger 兜底（与 outbound-adapter.ts 的 alog 同模式）。
@@ -125,20 +123,34 @@ export function getRegisteredAccountIds(): string[] {
  *   不存在路由歧义；回退仅打一次 INFO 便于事后取证。
  * - 未命中且运行中账号为 0 或多个 → 返回 undefined 由调用方报错——
  *   OpenID 跨账号不通用，多账号下盲目回退会把消息发给错误的 bot。
+ *
+ * 返回 `accountId` 为**实际发送账号**（回退时 ≠ 请求键）：被动回复配额是
+ * 平台按「真实发送账号 × msg_id」计的，配额预留/回滚必须用 resolved.accountId
+ * 记账，否则会记到从未发送的账号下（绕过或误伤限额）。
  */
-export function resolveGatewayForSend(accountId: string): QQBotGateway | undefined {
+export interface ResolvedSendGateway {
+  gw: QQBotGateway;
+  /** 实际发送账号 ID（配额记账键） */
+  accountId: string;
+  /** 回退来源账号键（仅诊断；精确命中时无此字段） */
+  fallbackFrom?: string;
+}
+
+export function resolveGatewayForSend(accountId: string): ResolvedSendGateway | undefined {
   const gw = gateways.get(accountId);
-  if (gw) return gw;
+  if (gw) return { gw, accountId };
   const running = getRegisteredAccountIds();
   if (running.length === 1) {
     const soleAccountId = running[0];
+    const soleGw = gateways.get(soleAccountId);
+    if (!soleGw) return undefined;
     if (!gatewayFallbackLogged.has(accountId)) {
       gatewayFallbackLogged.add(accountId);
       logFallbackInfo(
         `account "${accountId}" not running; falling back to sole running account "${soleAccountId}"`,
       );
     }
-    return gateways.get(soleAccountId);
+    return { gw: soleGw, accountId: soleAccountId, fallbackFrom: accountId };
   }
   return undefined;
 }
@@ -178,17 +190,17 @@ export async function sendText(params: {
   quotaReserved?: boolean;
 }): Promise<SendResult> {
   const accountId = params.account.accountId;
-  const gw = resolveGatewayForSend(accountId);
-  if (!gw) return { error: notRunningError(accountId) };
+  const resolved = resolveGatewayForSend(accountId);
+  if (!resolved) return { error: notRunningError(accountId) };
   const target = parseTarget(params.to);
   const reservation = reservePassiveReply({
     replyToId: params.replyToId,
-    accountId,
+    accountId: resolved.accountId,
     scope: target.scope,
     quotaReserved: params.quotaReserved,
   });
   try {
-    const result = await gw.sendText(target, params.text, { msgId: reservation.msgId });
+    const result = await resolved.gw.sendText(target, params.text, { msgId: reservation.msgId });
     return { messageId: result.id };
   } catch (err: unknown) {
     reservation.rollback();
@@ -207,12 +219,12 @@ export async function sendMedia(params: {
   quotaReserved?: boolean;
 }): Promise<SendResult> {
   const accountId = params.account.accountId;
-  const gw = resolveGatewayForSend(accountId);
-  if (!gw) return { error: notRunningError(accountId) };
+  const resolved = resolveGatewayForSend(accountId);
+  if (!resolved) return { error: notRunningError(accountId) };
   const target = parseTarget(params.to);
   const reservation = reservePassiveReply({
     replyToId: params.replyToId,
-    accountId,
+    accountId: resolved.accountId,
     scope: target.scope,
     quotaReserved: params.quotaReserved,
   });
@@ -221,19 +233,19 @@ export async function sendMedia(params: {
     const msgId = reservation.msgId;
     if (kind === 'voice') {
       const source = resolveVoiceSource(params.mediaUrl);
-      const result = await gw.sendVoice(target, source, { text: params.text, msgId });
+      const result = await resolved.gw.sendVoice(target, source, { text: params.text, msgId });
       return { messageId: result.id };
     }
     if (kind === 'video') {
-      const result = await gw.sendVideo(target, params.mediaUrl, { text: params.text, msgId });
+      const result = await resolved.gw.sendVideo(target, params.mediaUrl, { text: params.text, msgId });
       return { messageId: result.id };
     }
     if (kind === 'file') {
-      const result = await gw.sendFile(target, params.mediaUrl, { text: params.text, msgId });
+      const result = await resolved.gw.sendFile(target, params.mediaUrl, { text: params.text, msgId });
       return { messageId: result.id };
     }
     const fileType = MEDIA_KIND_TO_FILE_TYPE[kind];
-    const result = await gw.sendMedia(target, params.mediaUrl, { text: params.text, msgId, fileType });
+    const result = await resolved.gw.sendMedia(target, params.mediaUrl, { text: params.text, msgId, fileType });
     return { messageId: result.id };
   } catch (err: unknown) {
     reservation.rollback();
@@ -250,17 +262,17 @@ export async function sendVoice(params: {
   quotaReserved?: boolean;
 }): Promise<SendResult> {
   const accountId = params.account.accountId;
-  const gw = resolveGatewayForSend(accountId);
-  if (!gw) return { error: notRunningError(accountId) };
+  const resolved = resolveGatewayForSend(accountId);
+  if (!resolved) return { error: notRunningError(accountId) };
   const target = parseTarget(params.to);
   const reservation = reservePassiveReply({
     replyToId: params.replyToId,
-    accountId,
+    accountId: resolved.accountId,
     scope: target.scope,
     quotaReserved: params.quotaReserved,
   });
   try {
-    const result = await gw.sendVoice(target, params.source, { msgId: reservation.msgId });
+    const result = await resolved.gw.sendVoice(target, params.source, { msgId: reservation.msgId });
     return { messageId: result.id };
   } catch (err: unknown) {
     reservation.rollback();
@@ -277,17 +289,17 @@ export async function sendVideo(params: {
   quotaReserved?: boolean;
 }): Promise<SendResult> {
   const accountId = params.account.accountId;
-  const gw = resolveGatewayForSend(accountId);
-  if (!gw) return { error: notRunningError(accountId) };
+  const resolved = resolveGatewayForSend(accountId);
+  if (!resolved) return { error: notRunningError(accountId) };
   const target = parseTarget(params.to);
   const reservation = reservePassiveReply({
     replyToId: params.replyToId,
-    accountId,
+    accountId: resolved.accountId,
     scope: target.scope,
     quotaReserved: params.quotaReserved,
   });
   try {
-    const result = await gw.sendVideo(target, params.videoUrl, { msgId: reservation.msgId });
+    const result = await resolved.gw.sendVideo(target, params.videoUrl, { msgId: reservation.msgId });
     return { messageId: result.id };
   } catch (err: unknown) {
     reservation.rollback();

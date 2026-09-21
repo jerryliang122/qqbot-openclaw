@@ -23,6 +23,7 @@
 
 import assert from 'node:assert';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -54,6 +55,7 @@ const {
   sendText,
 } = await import('../src/outbound/outbound-service.ts');
 const { sendMedia } = await import('../src/outbound/media-send.ts');
+const { clearQuotaCache } = await import('../src/features/quota-manager.ts');
 
 function cleanupRegistry() {
   for (const id of getRegisteredAccountIds()) unregisterGateway(id);
@@ -184,6 +186,34 @@ await test('B5: 零账号运行 → 错误保持原语义（无运行中列表�
   assert.strictEqual(result.error, 'Bot "default" not running');
 });
 
+await test('B6: 回退发送的被动配额记在实际发送账号下（Sourcery 复审：配额记账键）', async () => {
+  cleanupRegistry();
+  clearQuotaCache();
+  const calls: { sendText?: Array<{ opts?: { msgId?: string } }> } = { sendText: [] };
+  registerGateway('live', makeFakeGateway(calls as never));
+  // 同一 msg_id 连发 5 次：c2c 被动配额 4 次/msg。配额正确记在 'live' 下时，
+  // 前 4 次带 msgId（被动）、第 5 次耗尽降级主动（msgId undefined）；
+  // 若误记在请求键 "default" 下，'live' 的配额永不清耗，5 次全带 msgId。
+  for (let i = 0; i < 5; i++) {
+    const result = await sendText({
+      to: 'qqbot:c2c:user1',
+      text: `msg-${i}`,
+      replyToId: 'quota-key-1',
+      account: { accountId: 'default' } as never,
+    });
+    assert.strictEqual(result.error, undefined);
+  }
+  const msgIds = (calls.sendText ?? []).map((c) => c.opts?.msgId);
+  assert.strictEqual(
+    msgIds.filter(Boolean).length,
+    4,
+    `前 4 次应走被动通道: ${JSON.stringify(msgIds)}`,
+  );
+  assert.strictEqual(msgIds[4], undefined, '第 5 次应降级主动发送（无 msgId）');
+  cleanupRegistry();
+  clearQuotaCache();
+});
+
 // ── Fix A: resolveDefaultQQBotAccountId 可运行性感知（配置残影硬化）──
 
 await test('A1: 顶层 default 完整（appId+secret）→ default（上报人配置形态，行为不变）', () => {
@@ -277,6 +307,38 @@ await test('A8: 残影场景下 resolveQQBotAccount(cfg, undefined) 与 defaultA
     resolveDefaultQQBotAccountId(cfg),
     'resolveQQBotAccount(undefined) 与 defaultAccountId 必须解析到同一账号',
   );
+});
+
+await test('A9: 仅凭备份可恢复的命名账号（配置缺 appId）也会被选中（Sourcery 复审 #2）', async () => {
+  const backupFile = path.join(
+    os.homedir(), '.openclaw', 'qqbot', 'data', 'credential-backup', 'current.json',
+  );
+  if (fs.existsSync(backupFile)) {
+    console.log('  (本机已存在真实凭证备份，跳过写盘用例以免覆盖)');
+    return;
+  }
+  const { saveCredentialBackup } = await import('../src/features/credential-backup.ts');
+  try {
+    saveCredentialBackup('live', 'BACKUP_APPID', 's');
+    const cfg = {
+      channels: {
+        qqbot: {
+          appId: 'STALE',
+          accounts: {
+            staleSibling: { appId: 'OLD' }, // 有 appId 无凭证 → 不可运行
+            live: {}, // 配置为空，仅凭备份可恢复（lifecycle 启动时会带回 appId+secret）
+          },
+        },
+      },
+    } as never;
+    assert.strictEqual(
+      resolveDefaultQQBotAccountId(cfg),
+      'live',
+      '备份可恢复账号应被选中，而非因 staleSibling 有 appId 而退回 default',
+    );
+  } finally {
+    fs.rmSync(backupFile, { force: true });
+  }
 });
 
 // ── 汇总 ──
