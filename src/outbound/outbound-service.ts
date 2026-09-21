@@ -101,7 +101,16 @@ export function registerGateway(accountId: string, gw: QQBotGateway): void {
   gateways.set(accountId, gw);
 }
 
-export function unregisterGateway(accountId: string): void {
+export function unregisterGateway(accountId: string, expectGw?: QQBotGateway): void {
+  if (expectGw) {
+    // 所有权守卫（Sourcery 复审）：仅当注册表里持有的是**本实例注册的同一个
+    // gateway 对象**才注销——旧模块实例延迟执行的 stop 不得删掉新实例已经
+    // 注册的替代网关（共享注册表后，两个实例看到同一份 Map）。
+    if (gateways.get(accountId) !== expectGw) return;
+    gateways.delete(accountId);
+    clearQuotaCacheForAccount(accountId);
+    return;
+  }
   gateways.delete(accountId);
   clearQuotaCacheForAccount(accountId);
 }

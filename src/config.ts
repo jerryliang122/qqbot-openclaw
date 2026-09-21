@@ -250,9 +250,13 @@ export function listQQBotAccountIds(cfg: OpenClawConfig): string[] {
 }
 
 /**
- * 判断一个账号形状是否「可运行」：未被禁用，且要么配置内完整（appId + 任一
- * 凭证来源），要么存在凭证暂存备份（lifecycle 启动时会用备份同时恢复 appId
- * 与 secret——配置里缺 appId 不代表账号起不来）。
+ * 判断一个账号形状是否「可运行」：配置内声明了 appId、未被禁用，且任一
+ * 凭证来源可用（配置内 secret / secretFile / 环境变量 / 凭证暂存备份）。
+ *
+ * appId 必须来自配置——listQQBotAccountIds 只枚举配置里有 appId 的账号，
+ * 框架据此决定启动哪些账号；备份只能补 secret（appId 在、secret 丢的
+ * 恢复场景，lifecycle 启动时会用备份恢复），不能让一个未被枚举、根本
+ * 不会被启动的账号被选为默认（Sourcery 复审：选中≠可运行）。
  *
  * 用于默认账号解析——只看 appId 是否存在会把已登出（secret 被删、appId 残留）
  * 或停用的顶层账号当成默认账号，导致 message 工具等框架侧主动发送解析到
@@ -264,9 +268,9 @@ function accountShapeRunnable(params: {
   hasSecretSource: boolean;
   accountId: string;
 }): boolean {
-  if (!params.enabled) return false;
-  if (params.appId && params.hasSecretSource) return true;
-  // 凭证备份可恢复（带回 appId + secret），配置缺 appId/secret 也算可运行
+  if (!params.appId || !params.enabled) return false;
+  if (params.hasSecretSource) return true;
+  // 配置缺 secret 但备份可恢复（appId 已在配置内，账号会被枚举启动）
   try {
     return loadCredentialBackup(params.accountId) !== null;
   } catch {
