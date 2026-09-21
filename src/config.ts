@@ -1,5 +1,6 @@
 import type { ResolvedQQBotAccount, QQBotAccountConfig, ToolPolicy, GroupConfig, GroupCoalesceConfig } from "./types.js";
 import type { OpenClawConfig, GroupPolicy } from "openclaw/plugin-sdk";
+import { loadCredentialBackup } from "./features/credential-backup.js";
 
 // ============ Agent-aware mentionPatterns 解析 ============
 
@@ -249,21 +250,74 @@ export function listQQBotAccountIds(cfg: OpenClawConfig): string[] {
 }
 
 /**
+ * 判断一个账号形状是否「可运行」：有 appId、未被禁用、且存在任一凭证来源
+ * （配置内 secret / secretFile / 环境变量 / 凭证暂存备份）。
+ *
+ * 用于默认账号解析——只看 appId 是否存在会把已登出（secret 被删、appId 残留）
+ * 或停用的顶层账号当成默认账号，导致 message 工具等框架侧主动发送解析到
+ * 一个永远不会启动的账号（issue #15：Bot "default" not running）。
+ */
+function accountShapeRunnable(params: {
+  appId: string;
+  enabled: boolean;
+  hasSecretSource: boolean;
+  accountId: string;
+}): boolean {
+  if (!params.appId || !params.enabled) return false;
+  if (params.hasSecretSource) return true;
+  try {
+    return loadCredentialBackup(params.accountId) !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 获取默认账户 ID
+ *
+ * 优先返回「可运行」的账号：
+ *   1. 顶层 default 账号可运行（appId + 凭证来源 + enabled）→ default
+ *   2. 否则第一个可运行的命名账号（accounts.<id>）
+ *   3. 都不可运行 → 保持旧行为返回 default（错误信息指向配置根因）
  */
 export function resolveDefaultQQBotAccountId(cfg: OpenClawConfig): string {
   const qqbot = cfg.channels?.qqbot as QQBotChannelConfig | undefined;
-  // 如果有默认账户配置，返回 default
+
+  // 1. 如果默认账户可运行，返回 default
   if (qqbot?.appId || resolveQQBotEnvAppId()) {
-    return DEFAULT_ACCOUNT_ID;
+    const runnable = accountShapeRunnable({
+      appId: normalizeAppId(qqbot?.appId) || normalizeAppId(resolveQQBotEnvAppId()),
+      enabled: qqbot?.enabled !== false,
+      hasSecretSource: Boolean(
+        qqbot?.clientSecret
+        || qqbot?.clientSecretFile
+        || resolveQQBotEnvClientSecret(),
+      ),
+      accountId: DEFAULT_ACCOUNT_ID,
+    });
+    if (runnable) return DEFAULT_ACCOUNT_ID;
   }
-  // 否则返回第一个配置的账户
+
+  // 2. 否则返回第一个可运行的命名账户
   if (qqbot?.accounts) {
+    for (const [accountId, account] of Object.entries(qqbot.accounts)) {
+      if (!account) continue;
+      const runnable = accountShapeRunnable({
+        appId: normalizeAppId(account.appId),
+        enabled: account.enabled !== false,
+        hasSecretSource: Boolean(account.clientSecret || account.clientSecretFile),
+        accountId,
+      });
+      if (runnable) return accountId;
+    }
+    // 兼容旧形态：命名账号均无 appId（凭 backup 恢复）时保持原顺序返回第一个
     const ids = Object.keys(qqbot.accounts);
-    if (ids.length > 0) {
+    if (ids.length > 0 && ids.every((id) => !qqbot.accounts?.[id]?.appId)) {
       return ids[0];
     }
   }
+
+  // 3. 旧回退
   return DEFAULT_ACCOUNT_ID;
 }
 
