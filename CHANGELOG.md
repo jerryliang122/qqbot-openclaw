@@ -8,6 +8,24 @@
 
 ---
 
+## [1.0.6] - 2026-09-21
+
+### 修复
+
+- **`message` 工具主动发送不再报 `Bot "default" not running`**（issue #15，PR #17）：openclaw 框架的 `message` 工具在后台任务 / bootstrap 兜底注册表上下文会经 jiti 二次加载产生插件的**另一个模块实例**，旧实现的 gateway 注册表是模块级 `Map`——第二实例的注册表为空，`getGateway("default")` 恒 miss，所有框架侧主动发送（媒体尤甚）失败；而会话回复走同实例直连不受影响，表现为「文本正常流出、kind=image 从未出现、`[tx]` 网关日志零条目」。三层修复：
+  - **gateway 注册表桥接 `globalThis`**（`Symbol.for`，主修复）——所有模块实例共享同一份注册表，双实例场景下按 accountId 精确路由到真正运行的网关；
+  - **发送路径单账号回退**——gateway 查找 miss 且注册表恰有一个运行中账号时回退发送（打一次 INFO 便于取证）；0 个或多个运行中账号时不盲路由（OpenID 跨账号不通用），错误信息附运行中账号列表，多账号排障不再盲猜；
+  - **`resolveDefaultQQBotAccountId` 可运行性感知**——只在 default 账号「可运行」（配置内 appId + 任一凭证来源 + enabled）时返回 `default`，否则回落到第一个可运行的命名账号；凭证备份只补 secret 不补存在性（appId 必须在配置内，保证「被选中 ⇒ 可被枚举启动」的一致性）。完整顶层配置（常规单账号形态）行为不变。
+- **回退发送的被动配额按实际发送账号记账**（Sourcery 复审）：平台配额按「真实发送账号 × msg_id」计，回退场景此前记在请求键下会绕过或误伤限额；`resolveGatewayForSend` 现返回 `{gw, accountId, fallbackFrom}`，配额预留/回滚统一用实际发送账号。
+- **`unregisterGateway` 所有权守卫**（Sourcery 复审）：共享注册表后，旧模块实例延迟执行的 stop 不再可能删掉新实例已注册的替代网关（带 gateway 引用做身份比对；登出路径保持无条件删除）。
+
+### 加固
+
+- `outbound-service` 模块级 logger 改惰性创建——该模块处于 `bot-instance → outbound-service → plugin-logger → runtime → bot-instance` 循环依赖环上，顶层求值会在环半初始化状态下崩溃。
+- 新增 `tests/proactive-account-fallback.test.ts`（18 用例）：globalThis 桥存在性与 dist 产物读写契约（子进程验证）、单账号回退（文本+媒体）、多账号不盲路由、回退配额记账键（同 msg_id 第 5 次降级主动）、默认账号解析全形态、注销所有权守卫。
+
+---
+
 ## [1.0.5] - 2026-09-14
 
 ### 修复
