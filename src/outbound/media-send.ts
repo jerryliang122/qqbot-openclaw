@@ -20,7 +20,7 @@ import { tryGetQQBotRuntime } from '../runtime.js';
 import { getAdapters } from '../adapter/resolve.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
 import { validateRemoteUrl } from '../utils/ssrf-guard.js';
-import { getGateway } from './outbound-service.js';
+import { resolveGatewayForSend, notRunningError } from './outbound-service.js';
 import { parseTarget } from './target.js';
 import { checkAndConsumePassiveReplyQuota } from '../features/quota-manager.js';
 import {
@@ -158,10 +158,11 @@ export async function sendMedia(params: SendMediaParams): Promise<SendMediaResul
     ?? (params.mimeType ? inferMediaKindFromMime(params.mimeType) : undefined)
     ?? inferMediaKind(resolved.path);
 
-  // 3. 获取 gateway
-  const gw = getGateway(accountId);
+  // 3. 获取 gateway（带单账号回退：issue #15——message 工具主动发媒体时
+  //    请求键可能解析到未运行的 "default"，单账号部署回退到唯一运行中的网关）
+  const gw = resolveGatewayForSend(accountId);
   if (!gw) {
-    return { error: `Bot "${accountId}" not running` };
+    return { error: notRunningError(accountId) };
   }
 
   const target = parseTarget(params.to);
