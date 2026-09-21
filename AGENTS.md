@@ -24,6 +24,23 @@ All tests use `node:assert` + a hand-rolled `test()` helper and run directly via
 
 **全量测试是 CI 的职责**：ci.yml 在每次 push / PR 跑全部 33 个测试文件，本地不做全量跑（33 个 tsx 冷启动太慢）。本地只在调试单个用例时跑单文件（可选，非门禁）。**覆盖率同样只在 CI 统计**：Test 步骤经 `NODE_V8_COVERAGE` 收集 V8 profile，Coverage report 步骤用 `c8`（`--all --include 'src/**' --include 'index.ts'`）聚合，逐文件表格 + 总百分比写入 Actions run 的 Step Summary——本地不要跑覆盖率。
 
+## 环境搭建与隔离（新环境 bootstrap，2026-09-21 约定）
+
+新机器/新容器搭环境，与 CI 完全对齐（ci.yml：Node 24 + `npm install --no-fund --no-audit`）：
+
+```bash
+node --version                 # 期望 v24.x（tsup target node18 是产物目标，不限开发机版本）
+npm install --no-fund --no-audit
+npm run typecheck && npm run lint:runtime && npm run build   # 秒级自检，全绿即环境可用
+```
+
+**隔离规则**：
+
+- 依赖只装项目内 `node_modules/`，**禁止任何全局安装**（`npm i -g`、改全局 npm 配置）；构建/测试一律 `npm run <script>` 或 `npx`（自动走项目内 `node_modules/.bin`）。
+- **不要 `npm ci`**（fresh clone 一律 `npm install`，见下文 lockfile gotcha）。
+- **npm 11 `allowScripts` 拦截是预期状态、保持不放行**：install 时 npm 会警告 5 个包的 install 脚本不在 `package.json` `allowScripts` 白名单（`openclaw` pre/postinstall、`koffi`、`tree-sitter-bash`、`protobufjs`、`@google/genai`）。刻意如此：openclaw 的 postinstall 会往用户目录写 bundled plugins（破坏环境隔离），且 CI 同样不执行这些脚本、33 个测试照样全绿。白名单只保留 `esbuild`（tsup/tsx 的关键依赖，必须执行）——**不要 `npm install-scripts approve` 放行上述任何包**。
+- **lockfile 零 diff 预期**：`package.json` 未改动时 fresh install 后 `git diff package-lock.json` 应为空（lockfile 与 npm 11 + 主流镜像同步，cn 区域常用腾讯镜像 `https://mirrors.tencent.com/npm/`）；出现意外 diff 说明 npm 版本或 registry 漂移，先排查再继续——确属依赖变更产生的 diff 才随 PR 提交（lockfile 虽在 `.gitignore` 但实际被 git 跟踪）。
+
 ## Git workflow（main 为保护分支）
 
 - **禁止直接 push 到 main**（GitHub branch protection）。任何开发——功能、修复、文档——一律走 `分支 + PR`：
