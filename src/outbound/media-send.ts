@@ -159,18 +159,20 @@ export async function sendMedia(params: SendMediaParams): Promise<SendMediaResul
     ?? inferMediaKind(resolved.path);
 
   // 3. 获取 gateway（带单账号回退：issue #15——message 工具主动发媒体时
-  //    请求键可能解析到未运行的 "default"，单账号部署回退到唯一运行中的网关）
-  const gw = resolveGatewayForSend(accountId);
-  if (!gw) {
+  //    请求键可能解析到未运行的 "default"，单账号部署回退到唯一运行中的网关）。
+  //    配额记账用 resolved.accountId（实际发送账号），见 resolveGatewayForSend 注释。
+  const sendGateway = resolveGatewayForSend(accountId);
+  if (!sendGateway) {
     return { error: notRunningError(accountId) };
   }
+  const gw = sendGateway.gw;
 
   const target = parseTarget(params.to);
 
   const reservation = params.quotaReserved || !params.replyToId
     ? { canReply: Boolean(params.replyToId), rollback: () => {} }
     : checkAndConsumePassiveReplyQuota({
-        accountId,
+        accountId: sendGateway.accountId,
         msgId: params.replyToId,
         scope: target.scope,
         log,

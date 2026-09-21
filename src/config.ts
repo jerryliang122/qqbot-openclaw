@@ -250,8 +250,9 @@ export function listQQBotAccountIds(cfg: OpenClawConfig): string[] {
 }
 
 /**
- * 判断一个账号形状是否「可运行」：有 appId、未被禁用、且存在任一凭证来源
- * （配置内 secret / secretFile / 环境变量 / 凭证暂存备份）。
+ * 判断一个账号形状是否「可运行」：未被禁用，且要么配置内完整（appId + 任一
+ * 凭证来源），要么存在凭证暂存备份（lifecycle 启动时会用备份同时恢复 appId
+ * 与 secret——配置里缺 appId 不代表账号起不来）。
  *
  * 用于默认账号解析——只看 appId 是否存在会把已登出（secret 被删、appId 残留）
  * 或停用的顶层账号当成默认账号，导致 message 工具等框架侧主动发送解析到
@@ -263,8 +264,9 @@ function accountShapeRunnable(params: {
   hasSecretSource: boolean;
   accountId: string;
 }): boolean {
-  if (!params.appId || !params.enabled) return false;
-  if (params.hasSecretSource) return true;
+  if (!params.enabled) return false;
+  if (params.appId && params.hasSecretSource) return true;
+  // 凭证备份可恢复（带回 appId + secret），配置缺 appId/secret 也算可运行
   try {
     return loadCredentialBackup(params.accountId) !== null;
   } catch {
