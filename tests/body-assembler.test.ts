@@ -9,7 +9,7 @@
 import assert from 'node:assert';
 import { assembleBody } from '../src/dispatch/body-assembler.js';
 import type { VoiceTranscript } from '../src/utils/voice-text.js';
-import type { ProcessedAttachments } from '../src/gateway/attachment-middleware.js';
+import type { ProcessedAttachments } from '../src/middleware/attachment.js';
 
 // ── 测试基础设施 ──────────────────────────────────────────
 
@@ -373,12 +373,14 @@ function makeProcessed(input: {
   transcripts?: VoiceTranscript[];
   voiceText?: string;
   otherInfo?: string;
+  media?: ProcessedAttachments['media'];
 }): ProcessedAttachments {
   return {
     imageUrls: input.imageUrls ?? [],
     transcripts: input.transcripts ?? [],
     voiceText: input.voiceText ?? '',
     otherInfo: input.otherInfo ?? '',
+    media: input.media ?? [],
   };
 }
 
@@ -473,6 +475,99 @@ test('元素级 attachments：渲染为 [附件] 行', () => {
   const { agentBody } = assembleBody(ctx, msg as never, fakeAccount);
   assert.ok(agentBody.includes('[附件] image/jpeg: https://example.com/a.jpg'), agentBody);
   assert.ok(agentBody.includes('[消息内容] （无文本）'), agentBody);
+});
+
+// ── 纯媒体消息 · file_info 指针剥离 + <media:*> 占位（对齐 telegram） ──
+
+group('纯媒体消息 · #ROBOT 指针剥离与占位符');
+
+const TOKEN = '#ROBOT1.0_LScTg3Rg9-Jr2oatGqEaxL7oSo9ikSBoqCLoMeg2lP9lqca9oCVumTQWjNvRwNOSUFx.CHp6r3DhElTWXsBhdk2R.GZfB-G0nmkxlOOk8Uw!';
+
+test('纯图片消息：剥 token，body 渲染 <media:image>，- Images 元数据保留', () => {
+  const processed = makeProcessed({
+    imageUrls: ['/data/qqbot/downloads/img1.jpg'],
+    media: [{ kind: 'image', localPath: '/data/qqbot/downloads/img1.jpg', contentType: 'image/png', filename: 'img1.jpg' }],
+  });
+  const ctx = makeCtx({ sanitizedContent: TOKEN, kind: 'group', senderId: 'u1', senderName: 'Alice', state: { processedAttachments: processed } });
+  const msg = makeMsg({ rawContent: TOKEN, sanitizedContent: TOKEN, kind: 'group', senderId: 'u1', senderName: 'Alice' });
+  const { webBody, agentBody, rawBody } = assembleBody(ctx, msg, fakeAccount);
+  assert.strictEqual(webBody, '<media:image>', `webBody:\n${webBody}`);
+  assert.ok(agentBody.includes('[Alice (u1)] <media:image>'), `agentBody:\n${agentBody}`);
+  assert.ok(agentBody.includes('- Images: /data/qqbot/downloads/img1.jpg'), `agentBody:\n${agentBody}`);
+  assert.ok(!agentBody.includes('#ROBOT'), `agentBody 不应残留 file_info 指针:\n${agentBody}`);
+  // rawBody 保持原文（审计/命令解析）
+  assert.strictEqual(rawBody, TOKEN, rawBody);
+});
+
+test('多图：<media:image> (N images) 计数形态', () => {
+  const processed = makeProcessed({
+    imageUrls: ['/p/1.jpg', '/p/2.jpg'],
+    media: [
+      { kind: 'image', localPath: '/p/1.jpg', contentType: 'image/jpeg' },
+      { kind: 'image', localPath: '/p/2.jpg', contentType: 'image/jpeg' },
+    ],
+  });
+  const ctx = makeCtx({ sanitizedContent: TOKEN, state: { processedAttachments: processed } });
+  const msg = makeMsg({ rawContent: TOKEN, sanitizedContent: TOKEN });
+  const { webBody } = assembleBody(ctx, msg, fakeAccount);
+  assert.strictEqual(webBody, '<media:image> (2 images)', webBody);
+});
+
+test('图文混发：caption 保留、token 剥离、不加占位符（对齐 telegram caption 优先）', () => {
+  const processed = makeProcessed({
+    imageUrls: ['/p/1.jpg'],
+    media: [{ kind: 'image', localPath: '/p/1.jpg', contentType: 'image/jpeg' }],
+  });
+  const mixed = `看这张图 ${TOKEN}`;
+  const ctx = makeCtx({ sanitizedContent: mixed, state: { processedAttachments: processed } });
+  const msg = makeMsg({ rawContent: mixed, sanitizedContent: mixed });
+  const { webBody, agentBody } = assembleBody(ctx, msg, fakeAccount);
+  assert.strictEqual(webBody, '看这张图', `webBody:\n${webBody}`);
+  assert.ok(!agentBody.includes('#ROBOT'), `agentBody 不应残留指针:\n${agentBody}`);
+  assert.ok(!agentBody.includes('<media:image>'), `有 caption 时不应加占位符:\n${agentBody}`);
+});
+
+test('content 纯 token 且无附件：剥后为空，不崩不残留', () => {
+  const ctx = makeCtx({ sanitizedContent: TOKEN });
+  const msg = makeMsg({ rawContent: TOKEN, sanitizedContent: TOKEN });
+  const { webBody, agentBody } = assembleBody(ctx, msg, fakeAccount);
+  assert.strictEqual(webBody, '', `webBody:\n${webBody}`);
+  assert.strictEqual(agentBody, '', `agentBody:\n${agentBody}`);
+});
+
+test('语音消息带 token：voiceText 占位不受影响、不加媒体占位符', () => {
+  const processed = makeProcessed({
+    voiceText: '[Voice message - transcription unavailable]',
+    transcripts: [{ text: '[Voice message - transcription unavailable]', source: 'fallback' }],
+    media: [{ kind: 'audio', remoteUrl: 'https://x/v.silk', contentType: 'audio/wav' }],
+  });
+  const ctx = makeCtx({ sanitizedContent: TOKEN, state: { processedAttachments: processed } });
+  const msg = makeMsg({ rawContent: TOKEN, sanitizedContent: TOKEN });
+  const { webBody } = assembleBody(ctx, msg, fakeAccount);
+  assert.strictEqual(webBody, '[Voice message - transcription unavailable]', `webBody:\n${webBody}`);
+});
+
+test('quote.text 为 token：引用块走 Original content unavailable', () => {
+  const ctx = makeCtx({
+    sanitizedContent: '回复',
+    state: { quote: { refKey: 'r1', source: 'msg_elements', text: TOKEN } },
+  });
+  const msg = makeMsg({ sanitizedContent: '回复' });
+  const { agentBody } = assembleBody(ctx, msg, fakeAccount);
+  assert.ok(agentBody.includes('[Quoted message begins]\nOriginal content unavailable'), `agentBody:\n${agentBody}`);
+  assert.ok(!agentBody.includes('#ROBOT'), `agentBody 不应残留指针:\n${agentBody}`);
+});
+
+test('msg_elements：元素 content 为 token → （无文本）+ [附件] 行；纯 token 无附件元素不吞', () => {
+  const msg = makeElementsMsg([
+    { content: TOKEN, author: { username: '小明' }, attachments: [{ url: 'https://example.com/a.jpg', content_type: 'image/jpeg' }] },
+    { content: TOKEN, author: { username: '小红' } },
+  ]);
+  const ctx = makeCtx({ sanitizedContent: '看看图', kind: 'group', senderId: 'u1', senderName: 'Me' });
+  const { agentBody } = assembleBody(ctx, msg as never, fakeAccount);
+  assert.ok(agentBody.includes('[附件] image/jpeg: https://example.com/a.jpg'), agentBody);
+  assert.equal(agentBody.split('[消息内容] （无文本）').length - 1, 2, `两个元素都应渲染（无文本）占位:\n${agentBody}`);
+  assert.ok(!agentBody.includes('#ROBOT'), `agentBody 不应残留指针:\n${agentBody}`);
 });
 
 // ── 总结 ─────────────────────────────────────────────────
