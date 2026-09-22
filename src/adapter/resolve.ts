@@ -2,7 +2,7 @@
  * Runtime Adapters — 一次 resolve，全程复用。
  *
  * Capability Probe 模式：按候选 API 路径探测，选出第一个可用函数。
- * 构建基线为 openclaw 2026.9.2（peer >=2026.9.2），不再保留对更旧版本的回退。
+ * 构建基线为 openclaw 2026.9.1（peer >=2026.9.1），不再保留对更旧版本的回退。
  *
  * 调用方通过 `resolveRuntimeAdapters(runtime)` 获取适配层对象，
  * 后续所有 dispatch / channel 代码只使用 adapters 上的方法。
@@ -237,7 +237,7 @@ export async function persistAuthConfig(
   const config: Record<string, unknown> | undefined = runtime.config as any;
 
   if (typeof config?.mutateConfigFile !== 'function') {
-    throw new Error('persistAuthConfig: runtime.config.mutateConfigFile is unavailable (requires openclaw >= 2026.9.2)');
+    throw new Error('persistAuthConfig: runtime.config.mutateConfigFile is unavailable (requires openclaw >= 2026.9.1)');
   }
   await (config.mutateConfigFile as Function)({
     mutate: () => cfg,

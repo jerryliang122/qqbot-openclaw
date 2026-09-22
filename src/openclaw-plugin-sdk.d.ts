@@ -536,7 +536,7 @@ declare module "openclaw/plugin-sdk" {
 }
 
 // 2026.8.1-beta 起 openclaw 发布包明确排除该子路径的 .d.ts（files 列表
-// "!dist/plugin-sdk/text-utility-runtime.d.ts"），2026.9.2 仍未恢复，运行时导出仍在。
+// "!dist/plugin-sdk/text-utility-runtime.d.ts"），2026.9.1/2026.9.2 均未恢复，运行时导出仍在。
 // 仅声明本项目实际使用的函数（签名对齐 dist/utf16-slice-*.js）。
 declare module "openclaw/plugin-sdk/text-utility-runtime" {
   export function truncateUtf16Safe(input: string, maxLen: number): string;

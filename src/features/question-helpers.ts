@@ -74,7 +74,7 @@ let questionRuntimePromise: Promise<QuestionGatewayRuntime> | undefined;
 
 /**
  * question gateway runtime（openclaw/plugin-sdk/question-gateway-runtime，
- * 2026.8.1+ 稳定导出，peer 已要求 >=2026.9.2）。
+ * 2026.8.1+ 稳定导出，peer 已要求 >=2026.9.1）。
  */
 export function getQuestionGatewayRuntime(): Promise<QuestionGatewayRuntime> {
   questionRuntimePromise ??= import('openclaw/plugin-sdk/question-gateway-runtime')

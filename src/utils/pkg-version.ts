@@ -16,7 +16,7 @@ export function getPackageVersion(): string {
 }
 
 /**
- * OpenClaw 框架版本（PluginRuntime.version，peer >=2026.9.2 恒存在）。
+ * OpenClaw 框架版本（PluginRuntime.version，peer >=2026.9.1 恒存在）。
  */
 export function getOpenclawVersion(runtimeVersion?: string): string {
   return runtimeVersion && runtimeVersion !== 'unknown' ? runtimeVersion : 'unknown';

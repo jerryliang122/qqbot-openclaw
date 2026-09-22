@@ -12,7 +12,7 @@
 
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![QQ Bot](https://img.shields.io/badge/QQ_Bot-API_v2-red)](https://bot.q.qq.com/wiki/)
-[![Platform](https://img.shields.io/badge/OpenClaw-%3E%3D2026.9.2-orange)](https://github.com/jerryliang122/qqbot-openclaw)
+[![Platform](https://img.shields.io/badge/OpenClaw-%3E%3D2026.9.1-orange)](https://github.com/jerryliang122/qqbot-openclaw)
 [![Node.js](https://img.shields.io/badge/Node.js->=18-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Fork](https://img.shields.io/badge/fork-enhanced-9cf)](https://github.com/jerryliang122/qqbot-openclaw)
@@ -23,7 +23,7 @@
 
 > This is an **independently maintained fork** with its own versioning (v1.x, decoupled from the upstream 2.x line). Upstream: [tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot).
 >
-> **Requirements**: OpenClaw `>= 2026.9.2` · Published to npm as [`@jerryliang122/openclaw-qqbot`](https://www.npmjs.com/package/@jerryliang122/openclaw-qqbot). See [CHANGELOG](CHANGELOG.md) for differences vs the old version and the upgrade guide.
+> **Requirements**: OpenClaw `>= 2026.9.1` · Published to npm as [`@jerryliang122/openclaw-qqbot`](https://www.npmjs.com/package/@jerryliang122/openclaw-qqbot). See [CHANGELOG](CHANGELOG.md) for differences vs the old version and the upgrade guide.
 
 Scan to join the QQ group chat
 
@@ -179,7 +179,7 @@ Measures end-to-end latency from QQ server push to plugin response, broken down 
 
 > **You**: `/bot-version`
 >
-> **QQBot**: 🦞 Framework: OpenClaw 2026.9.2 / 🤖 Plugin: v1.0.0 / 🌟 GitHub repo
+> **QQBot**: 🦞 Framework: OpenClaw 2026.9.1 / 🤖 Plugin: v1.0.0 / 🌟 GitHub repo
 
 Shows framework version, plugin version, and a direct link to the official repository.
 
@@ -282,7 +282,7 @@ Answers "why does this group have no context" diagnostics: the push mode is chos
 
 ### Step 2 — Install / Upgrade the Plugin
 
-> **Note**: The unscoped npm name `openclaw-qqbot` belongs to the original upstream project — this fork publishes as the scoped package `@jerryliang122/openclaw-qqbot`. Requires OpenClaw >= 2026.9.2.
+> **Note**: The unscoped npm name `openclaw-qqbot` belongs to the original upstream project — this fork publishes as the scoped package `@jerryliang122/openclaw-qqbot`. Requires OpenClaw >= 2026.9.1.
 
 **Option A: Install from npm (Recommended)**
 

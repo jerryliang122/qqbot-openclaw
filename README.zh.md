@@ -10,14 +10,14 @@
 **让你的 AI 助手接入 QQ — 私聊、群聊、富媒体，一个插件全搞定。**
 
 > 本仓库为**独立维护的 fork**，自 v1.0.0 起独立发版（与上游 2.x 版本线完全脱钩）。
-> 运行要求：OpenClaw `>= 2026.9.2`；npm 包名 [`@jerryliang122/openclaw-qqbot`](https://www.npmjs.com/package/@jerryliang122/openclaw-qqbot)。
+> 运行要求：OpenClaw `>= 2026.9.1`；npm 包名 [`@jerryliang122/openclaw-qqbot`](https://www.npmjs.com/package/@jerryliang122/openclaw-qqbot)。
 > 与旧版本的差异及升级指南见 [CHANGELOG](CHANGELOG.md)。上游仓库：[tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot)。
 
 ### 🚀 当前版本： `v1.0.0`
 
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![QQ Bot](https://img.shields.io/badge/QQ_Bot-API_v2-red)](https://bot.q.qq.com/wiki/)
-[![Platform](https://img.shields.io/badge/OpenClaw-%3E%3D2026.9.2-orange)](https://github.com/jerryliang122/qqbot-openclaw)
+[![Platform](https://img.shields.io/badge/OpenClaw-%3E%3D2026.9.1-orange)](https://github.com/jerryliang122/qqbot-openclaw)
 [![Node.js](https://img.shields.io/badge/Node.js->=18-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 
@@ -177,7 +177,7 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 > **你**：`/bot-version`
 >
-> **QQBot**：🦞框架版本：OpenClaw 2026.9.2 / 🤖QQBot 插件版本：v1.0.0 / 🌟GitHub 仓库
+> **QQBot**：🦞框架版本：OpenClaw 2026.9.1 / 🤖QQBot 插件版本：v1.0.0 / 🌟GitHub 仓库
 
 一目了然查看框架版本、插件版本，并可直接跳转官方仓库。
 
@@ -282,7 +282,7 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 ### 第二步 — 安装 / 升级插件
 
-> 无 scope 的 npm 包名 `openclaw-qqbot` 属于上游原项目——本 fork 以 `@jerryliang122/openclaw-qqbot` 发布。要求 OpenClaw >= 2026.9.2。
+> 无 scope 的 npm 包名 `openclaw-qqbot` 属于上游原项目——本 fork 以 `@jerryliang122/openclaw-qqbot` 发布。要求 OpenClaw >= 2026.9.1。
 
 **方式 A：从 npm 安装（推荐）**
 
