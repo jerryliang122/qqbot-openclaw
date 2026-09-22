@@ -20,7 +20,7 @@ export interface OpenClawInboundMessage {
   messageId: string;
   content: string;
   history?: Array<{ role: string; content: string; senderId?: string; senderName?: string }>;
-  quote?: { content: string; senderId: string; attachments?: unknown[] };
+  quote?: { content: string; senderId: string; messageId?: string; attachments?: unknown[] };
   attachments?: unknown[];
   /** 入站图片 URL 列表（从附件中提取） */
   imageUrls?: string[];
@@ -44,7 +44,11 @@ function mapHistory(
 }
 
 /**
- * 将 ResolvedQuote 转换为 OpenClaw quote 格式
+ * 将 ResolvedQuote 转换为 OpenClaw quote 格式。
+ *
+ * messageId 为被引用消息的真实平台消息 ID：仅 ref-index store 命中
+ * （quote.source === 'store'，entry 存在）时可取；msg_elements 兜底
+ * 解析拿不到 id，保持 undefined —— 此时框架不渲染 reply_to_id。
  */
 function mapQuote(
   quote: ResolvedQuote | undefined,
@@ -53,6 +57,7 @@ function mapQuote(
   return {
     content: quote.text,
     senderId: quote.entry?.senderId ?? '',
+    messageId: quote.entry?.messageId,
     attachments: quote.attachments as unknown[],
   };
 }
