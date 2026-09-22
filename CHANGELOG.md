@@ -8,6 +8,14 @@
 
 ---
 
+## [1.0.8] - 2026-09-22
+
+### 兼容性
+
+- **构建基线与运行要求下调至 openclaw `2026.9.1`**（PR #22）：peer 范围从 `>=2026.9.2` 放宽为 `>=2026.9.1`——插件现可安装在 2026.9.1 网关上；devDependency 钉版同步降至 `2026.9.1`（typecheck 继续对最老支持面验证）。兼容性经两版已发布包逐项实测：2026.9.2 新增的 6 个 plugin-sdk 子路径（control-ui / feature-contract / feature-plugin / realtime-transcription-session / realtime-voice-provider / speech-provider）本插件均未使用；system-agent 审批面两版逐字一致（`ChannelApprovalKind`、`PendingApprovalView`、`resolveApprovalOverGateway` 双重载）；state DB schema 两版同为 `PRAGMA user_version = 15`，网关从 9.2 降回 9.1 打开现有 DB 不会被拒。**运行时行为零变化**（src 改动仅注释与错误文案），README 双语徽章与运行要求、AGENTS.md 基线段落同步更新。
+
+---
+
 ## [1.0.7] - 2026-09-22
 
 ### 修复
