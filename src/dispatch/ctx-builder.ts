@@ -89,7 +89,26 @@ export function buildCtxPayload(params: CtxPayloadParams): any {
     },
     reply: {
       to: envelope.targetId,
-      replyToId: envelope.messageId,
+      /**
+       * ReplyToId 契约语义 = 当前消息回复(引用)的那条消息的 ID —— 对齐
+       * telegram 原生通道（replyHead?.messageId ?? visibleReplyTarget?.id），
+       * 无引用时必须为 undefined。框架将其渲染为模型可见 Conversation info
+       * 的 reply_to_id 字段。
+       *
+       * 历史版本误填 envelope.messageId（消息自身 ID），导致每条消息都呈现
+       * message_id == reply_to_id —— 被上层 agent 的 AGENTS 规则判为「内部
+       * 回灌、非新指令」而拒绝响应（2026-09-22 事故）。
+       *
+       * QQ 被动回复锚点不依赖此字段：deliverCtx.replyToId / msgid-cache 兜底
+       * （resolvePassiveFirstReplyToId）/ attachMsgIdWithQuota 均独立取值，
+       * threading resolveReplyToMode='off' 阻断框架隐式回复线程。
+       *
+       * 防御守卫：即使上游异常传入当前消息 ID（自引用），也强制置空——
+       * 「reply_to_id == message_id」这一假回灌签名在任何路径都不允许再现。
+       */
+      replyToId: envelope.quote?.messageId && envelope.quote.messageId !== envelope.messageId
+        ? envelope.quote.messageId
+        : undefined,
       originatingTo: envelope.targetId,
     },
     access: {
@@ -100,8 +119,17 @@ export function buildCtxPayload(params: CtxPayloadParams): any {
       : undefined,
     media: mediaFacts.length > 0 ? mediaFacts : undefined,
     supplemental: {
+      // quote.id 同样必须是「被引用消息」的真实 ID（ref-index 命中时），
+      // 而非当前消息 ID——框架经 applySupplementalContext 映射为
+      // ctx.ReplyToId / "Reply target of current user message"。
       quote: envelope.quote
-        ? { id: envelope.messageId, body: envelope.quote.content, sender: envelope.quote.senderId }
+        ? {
+            ...(envelope.quote.messageId && envelope.quote.messageId !== envelope.messageId
+              ? { id: envelope.quote.messageId }
+              : {}),
+            body: envelope.quote.content,
+            sender: envelope.quote.senderId,
+          }
         : undefined,
       groupSystemPrompt: envelope.systemPrompt,
     },
