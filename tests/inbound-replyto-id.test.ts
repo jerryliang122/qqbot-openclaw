@@ -150,6 +150,10 @@ test('回归红线：replyToId 永远不等于当前消息 ID（假回灌签名�
   // envelope-builder 透传的是 entry.messageId。若有人回退为 envelope.messageId，
   // 上方「无引用消息」用例会先失败。
   assert.ok(payload.reply.replyToId === undefined || payload.reply.replyToId !== payload.messageId);
+  // supplemental.quote.id 同样映射为框架 ctx.ReplyToId（applySupplementalContext
+  // 在 reply.replyToId 未设置时生效）——单独回退该字段也会复活假回灌签名，
+  // 必须一并断言（Sourcery 评审意见）。
+  assert.equal(payload.supplemental.quote?.id, undefined);
 });
 
 // ── 汇总 ──────────────────────────────────────────────────
