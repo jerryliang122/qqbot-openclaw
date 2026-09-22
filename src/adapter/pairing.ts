@@ -3,7 +3,7 @@
  *
  * readAllowFromStore / issueChallenge / buildReply 直接来自稳定 subpath。
  *
- * approveCode 例外：`approveChannelPairingCode` 在 2026.9.2 未从任何
+ * approveCode 例外：`approveChannelPairingCode` 在 2026.9.1/2026.9.2 均未从任何
  * plugin-sdk subpath 导出（只存在于内部 pairing-store chunk 与
  * `openclaw pairing approve` CLI），走与网关同源的 CLI 执行
  * （见 secret-store-cli 的 resolveOpenClawCli 同源约束）。

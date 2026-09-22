@@ -4,7 +4,7 @@
 
 - 发版流程：推送 `v*` tag → GitHub Actions 自动校验版本一致性、跑全量检查、构建产物 → **自动发布 npm**（`@jerryliang122/openclaw-qqbot`，OIDC Trusted Publishing 免 token）→ 创建 GitHub Release 并附 `npm pack` 产物
 - 版本规则：语义化版本（SemVer）。Major 位变更意味着存在 Breaking Change（配置格式 / 运行要求 / 公开 API）
-- 运行要求：**OpenClaw >= 2026.9.2**（peer 依赖硬性要求，见 package.json）
+- 运行要求：**OpenClaw >= 2026.9.1**（peer 依赖硬性要求，见 package.json）
 
 ---
 

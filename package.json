@@ -48,14 +48,14 @@
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
-    "openclaw": "2026.9.2",
+    "openclaw": "2026.9.1",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "tsx": "^4.23.13"
   },
   "peerDependencies": {
     "@tencent-connect/qqbot-connector": "1.2.0",
-    "openclaw": ">=2026.9.2"
+    "openclaw": ">=2026.9.1"
   },
   "homepage": "https://github.com/jerryliang122/qqbot-openclaw",
   "repository": {

@@ -97,7 +97,7 @@ export async function dispatchToOpenClaw(
   dlog?.debug(`received sender=${envelope.senderId} scope=${envelope.chatScope} msgId=${envelope.messageId}`);
 
   if (!adapters.inboundRun || !adapters.dispatchReply) {
-    dlog?.error(`runtime adapter inboundRun/dispatchReply not available (openclaw=${adapters.version}, requires >=2026.9.2)`);
+    dlog?.error(`runtime adapter inboundRun/dispatchReply not available (openclaw=${adapters.version}, requires >=2026.9.1)`);
     return;
   }
 
