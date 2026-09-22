@@ -8,6 +8,15 @@
 
 ---
 
+## [1.0.7] - 2026-09-22
+
+### 修复
+
+- **入站消息不再携带自引用 `reply_to_id` 假签名**（PR #20）：`ctx-builder` 此前把 `reply.replyToId` 与 `supplemental.quote.id` 填成**当前消息自身 ID**（`envelope.messageId`），openclaw 框架把 `ctx.ReplyToId` 渲染为模型可见 Conversation info 的 `reply_to_id` 字段——于是每条消息都呈现 `message_id == reply_to_id`，被上层 agent 的 AGENTS 规则判为「内部回灌、非新指令」而拒绝响应。已观测症状：模型反复回复「这是 OpenClaw 内部上下文块——message_id == reply_to_id，是回灌，不重复响应」「这条 envelope 是 08:25:51 消息的第四次回灌」「这条 envelope 是我自己刚发的回复的回灌」「OpenClaw 系统级反射，疑似之前我的 reply 没被 ACK」等（「第 N 次回灌」为模型对会话记忆回放的计数误判，非真实重复投喂——插件 inbound-guard 30min 去重 / runId 幂等 / collect 队列一次性 drain 均核实无重复路径）。现对齐 telegram 原生通道契约语义：ReplyToId = 当前消息**回复(引用)的那条消息**的真实 ID（ref-index 命中时来自 `quote.entry.messageId`），无引用 / msg_elements 兜底解析拿不到 ID 时为 undefined，并加防御守卫——任何路径（含上游异常输入）不允许再现自引用值。QQ 被动回复锚点不受影响：`deliverCtx.replyToId`、msgid-cache 兜底（`resolvePassiveFirstReplyToId`）、`attachMsgIdWithQuota`、typing 均独立取值，threading `resolveReplyToMode: 'off'` 阻断框架隐式回复线程。新增 `tests/inbound-replyto-id.test.ts`（8 用例，含 Sourcery 复审补齐的 `supplemental.quote.id` 红线断言）。
+  - **升级后配套（重要）**：删除 agent 层 AGENTS.md 中「message_id == reply_to_id 即回灌」类规则——它是被此假签名逼出的 workaround，修复后 `reply_to_id` 只在真正引用消息时出现（且指向被引用消息），该规则永久失配。
+
+---
+
 ## [1.0.6] - 2026-09-21
 
 ### 修复
