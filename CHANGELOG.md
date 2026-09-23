@@ -8,6 +8,14 @@
 
 ---
 
+## [1.0.9] - 2026-09-23
+
+### 修复
+
+- **工具会话路由双层解析——修复延迟 turn 中 `qqbot_secret_input` 报「无法获取当前会话目标」**（PR #24）：三个 qqbot 工具（`qqbot_secret_input` / `qqbot_platform_api` / `qqbot_remind`）此前仅靠请求级 AsyncLocalStorage（`src/request-context.ts`，`handleMessage → dispatch` 异步子树内有效）解析当前会话目标。openclaw 框架经常把 agent turn **延迟到该子树之外**执行——活动 turn 之后排队的 followup / collect 批处理（群消息排队交给框架后的常态路径）、框架自有定时器驱动的队列 drain——此时工具执行处 ALS 为空，`qqbot_secret_input` 直接失败（2026-09-23 事故：LLM 调用工具保存 `OC_MIMO_BILLING` 报 `{"error": "无法获取当前会话目标，此工具仅支持在 QQ Bot 消息会话中使用"}`；空闲时立即执行的 turn ALS 恰好存活，故此前时好时坏）。修复：三个工具改用框架官方**工厂注册形式** `api.registerTool((ctx) => tool, { name })`——框架调用工厂时携带当次 run 的 `deliveryContext`（按当前 run 的 sessionCtx 派生的可信投递路由 `{channel:'qqbot', to, accountId}`，工具描述符缓存键含 deliveryContext 不会跨会话复用），新增 `src/tools/tool-session.ts` `resolveToolSessionRoute()` 双层解析：请求级 ALS 优先（逐消息精确），缺失时回退 run 级 deliveryContext，两者皆无（cron / 框架内部 run）返回可操作的明确报错。配套：secret-input 的 pending 改为登记在**实际发送账号**名下（`resolveGatewayForSend`，含单账号回退，与出站路径 issue #15 约定一致）——捕获中间件按其网关 accountId 查询 pending，键必须一致；**频道目标显式拒绝**（Sourcery 复审）：`parseTarget` 会把 `qqbot:channel:*` 归一化为 c2c，频道会话的延迟 turn 若不在 parseTarget 之前拦截会骗过「仅支持私聊」检查、把频道 ID 当 c2c openid 发卡，现 scope 从原始 route.target 显式判定，群/频道一律拒绝（`resolveToolSessionRoute` 保持接受 channel 路由——`qqbot_platform_api` 的频道 API 是合法用途）；`src/openclaw-plugin-sdk.d.ts` stub 补 `PluginToolFactoryContext` 与工厂版 `registerTool` 签名（真实 SDK 2026.9.1 已支持，stub 对齐）。新增 `tests/tool-session.test.ts`（12 用例：ALS 优先级、deliveryContext 回退复现延迟 turn 场景、群/频道目标拒绝、双缺失报错、工厂注册断言、remind 投递目标、pending 登记账号）。
+
+---
+
 ## [1.0.8] - 2026-09-22
 
 ### 兼容性
