@@ -78,6 +78,32 @@ declare module "openclaw/plugin-sdk" {
   }
 
   /**
+   * 工具工厂上下文（registerTool 工厂形式）
+   *
+   * 框架在装配当前 run 的工具面（或缓存描述符路径下的每次执行）时调用
+   * 工厂，ctx 携带 run 级会话信息——其中 deliveryContext 是框架按当前
+   * run 的 sessionCtx 派生的可信投递路由（2026-09-23 修复：延迟/排队
+   * turn 中 ALS 请求上下文失效时，工具由此回退解析会话目标）。
+   * 仅声明本项目实际使用的字段，其余字段经索引签名透传。
+   */
+  export interface PluginToolFactoryContext {
+    config?: OpenClawConfig;
+    runtimeConfig?: OpenClawConfig;
+    agentId?: string;
+    sessionKey?: string;
+    sessionId?: string;
+    messageChannel?: string;
+    agentAccountId?: string;
+    /** 可信投递路由：{ channel, to, accountId, threadId? } */
+    deliveryContext?: { channel?: string; to?: string; accountId?: string; threadId?: string };
+    /** 当前入站 turn 的平台原生会话 ID */
+    nativeChannelId?: string;
+    /** 当前入站 turn 的发送者 ID（运行时提供，非工具参数） */
+    requesterSenderId?: string;
+    [key: string]: unknown;
+  }
+
+  /**
    * Tool 注册选项
    */
   export interface ToolRegistrationOptions {
@@ -103,8 +129,18 @@ declare module "openclaw/plugin-sdk" {
     };
     /** 注册频道 */
     registerChannel<TAccount = unknown>(options: { plugin: ChannelPlugin<TAccount> }): void;
-    /** 注册工具 */
-    registerTool(tool: AnyAgentTool, opts?: ToolRegistrationOptions): void;
+    /**
+     * 注册工具。支持两种形式：
+     * - 静态定义（AnyAgentTool）
+     * - 工厂函数：每次工具装配/执行时由框架调用，ctx 携带 run 级
+     *   deliveryContext 等会话信息（推荐需要感知当前会话的工具使用）
+     */
+    registerTool(
+      tool:
+        | AnyAgentTool
+        | ((ctx: PluginToolFactoryContext) => AnyAgentTool | AnyAgentTool[] | null | undefined),
+      opts?: ToolRegistrationOptions,
+    ): void;
     /** 其他 API 方法 */
     [key: string]: unknown;
   }

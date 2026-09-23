@@ -1,5 +1,5 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { getRequestTarget, getRequestAccountId } from "../request-context.js";
+import { resolveToolSessionRoute, type ToolDeliveryContext } from "./tool-session.js";
 
 // ========== 类型定义 ==========
 
@@ -218,52 +218,62 @@ function formatDelay(ms: number): string {
 
 // ========== 注册入口 ==========
 
+// 工厂注册形式（2026-09-23 修复）：turn 被框架延迟/排队执行（ALS 失效）时，
+// 从 deliveryContext 回退解析投递目标（见 tool-session.ts）。
 export function registerRemindTool(api: OpenClawPluginApi): void {
   api.registerTool(
-    {
-      name: "qqbot_remind",
-      label: "QQBot 定时提醒",
-      description:
-        "创建、查询、删除 QQ 定时提醒。" +
-        "使用简单参数即可，无需手动构造 cron JSON。\n" +
-        "创建提醒：action=add, content=提醒内容, to=目标地址, time=时间\n" +
-        "查看提醒：action=list\n" +
-        "删除提醒：action=remove, jobId=任务ID（先 list 获取）\n" +
-        "时间格式示例：\"5m\"(5分钟后) \"1h\"(1小时后) \"0 8 * * *\"(每天8点)",
-      parameters: RemindSchema,
-      execute(_toolCallId, params) {
-        const p = params as RemindParams;
+    (factoryCtx) => {
+      const delivery = (factoryCtx as { deliveryContext?: ToolDeliveryContext }).deliveryContext;
+      return {
+        name: "qqbot_remind",
+        label: "QQBot 定时提醒",
+        description:
+          "创建、查询、删除 QQ 定时提醒。" +
+          "使用简单参数即可，无需手动构造 cron JSON。\n" +
+          "创建提醒：action=add, content=提醒内容, to=目标地址, time=时间\n" +
+          "查看提醒：action=list\n" +
+          "删除提醒：action=remove, jobId=任务ID（先 list 获取）\n" +
+          "时间格式示例：\"5m\"(5分钟后) \"1h\"(1小时后) \"0 8 * * *\"(每天8点)",
+        parameters: RemindSchema,
+        async execute(_toolCallId: string, params: unknown) {
+          const p = params as RemindParams;
 
-        // ===== list =====
-        if (p.action === "list") {
-          return json({
-            _instruction: "请立即使用 cron 工具执行以下参数",
-            cronParams: { action: "list" },
-          });
-        }
-
-        // ===== remove =====
-        if (p.action === "remove") {
-          if (!p.jobId) {
-            return json({ error: "action=remove 时 jobId 为必填参数。请先用 action=list 获取 jobId。" });
+          // ===== list =====
+          if (p.action === "list") {
+            return json({
+              _instruction: "请立即使用 cron 工具执行以下参数",
+              cronParams: { action: "list" },
+            });
           }
-          return json({
-            _instruction: "请立即使用 cron 工具执行以下参数",
-            cronParams: { action: "remove", jobId: p.jobId },
-          });
-        }
 
-        // ===== add =====
-        if (!p.content) {
-          return json({ error: "action=add 时 content（提醒内容）为必填参数" });
-        }
-        // 优先使用 AI 传入的 to，否则自动从请求级上下文获取（AsyncLocalStorage）
-        const resolvedTo = p.to || getRequestTarget();
-        if (!resolvedTo) {
-          return json({ error: "action=add 时无法确定投递目标地址。请稍后重试。" });
-        }
-        // 从请求上下文获取当前账户 ID（多账户场景），fallback 到 "default"
-        const resolvedAccountId = getRequestAccountId() || "default";
+          // ===== remove =====
+          if (p.action === "remove") {
+            if (!p.jobId) {
+              return json({ error: "action=remove 时 jobId 为必填参数。请先用 action=list 获取 jobId。" });
+            }
+            return json({
+              _instruction: "请立即使用 cron 工具执行以下参数",
+              cronParams: { action: "remove", jobId: p.jobId },
+            });
+          }
+
+          // ===== add =====
+          if (!p.content) {
+            return json({ error: "action=add 时 content（提醒内容）为必填参数" });
+          }
+          // 优先使用 AI 传入的 to；否则双层解析当前会话路由：
+          // ALS 请求级上下文优先，框架 run 级 deliveryContext 回退
+          const route = resolveToolSessionRoute(delivery);
+          const resolvedTo = p.to || route?.target;
+          if (!resolvedTo) {
+            return json({
+              error:
+                "action=add 时无法确定投递目标地址（当前 run 无 QQ 会话来源）。" +
+                '请显式传入 to（格式：qqbot:c2c:user_openid 或 qqbot:group:group_openid）后重试。',
+            });
+          }
+          // 账户 ID：会话路由优先，fallback 到 "default"
+          const resolvedAccountId = route?.accountId || "default";
         if (!p.time) {
           return json({ error: "action=add 时 time（时间）为必填参数。示例：\"5m\"、\"1h30m\"、\"0 8 * * *\"" });
         }
@@ -299,7 +309,8 @@ export function registerRemindTool(api: OpenClawPluginApi): void {
           cronParams: onceJob,
           summary: `⏰ ${formatDelay(delayMs)}后提醒: "${p.content}"`,
         });
-      },
+        },
+      };
     },
     { name: "qqbot_remind" },
   );
