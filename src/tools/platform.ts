@@ -1,8 +1,8 @@
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { listQQBotAccountIds } from '../config.js';
-import { getBotForAccount } from '../bot-instance.js';
-import { getRequestAccountId } from '../request-context.js';
+import { resolveGatewayForSend } from '../outbound/outbound-service.js';
 import { createPluginLogger } from '../utils/plugin-logger.js';
+import { resolveToolSessionRoute, type ToolDeliveryContext } from './tool-session.js';
 
 // 工具 execute 无 logger 参数；request-context 活跃期间 enrichMeta
 // 自动带上 accountId/openId/messageId
@@ -71,6 +71,8 @@ function validatePath(path: string): string | null {
  *  - 频道（Guild/Channel/Member/Announce/Forum/Schedule）→ 见 qqbot-channel skill
  *  - 群（Group/Member）→ 见 qqbot-group skill
  */
+// 工厂注册形式（2026-09-23 修复）：turn 被框架延迟/排队执行（ALS 失效）时，
+// 从 deliveryContext 回退解析账户（见 tool-session.ts）。
 export function registerPlatformTool(api: OpenClawPluginApi): void {
   const cfg = api.config;
   if (!cfg) return;
@@ -79,78 +81,90 @@ export function registerPlatformTool(api: OpenClawPluginApi): void {
   if (accountIds.length === 0) return;
 
   api.registerTool(
-    {
-      name: 'qqbot_platform_api',
-      label: 'QQBot Platform API Gateway',
-      description:
-        'QQ 开放平台统一 HTTP API 网关，自动填充鉴权 Token。' +
-        '常用接口速查：' +
-        '【频道】GET /users/@me/guilds | /guilds/{guild_id}/channels | /channels/{channel_id} | ' +
-        '【群】GET /v2/groups/{group_id}/bot_state | /v2/groups/{group_id}/members/{member_id} | /v2/groups/{group_id}/info。' +
-        '更多接口和参数详情请阅读 qqbot-channel 和 qqbot-group skill。',
-      parameters: PlatformApiSchema,
-      async execute(_toolCallId, params) {
-        const p = params as {
-          method: string;
-          path: string;
-          body?: Record<string, unknown>;
-          query?: Record<string, string>;
-        };
+    (factoryCtx) => {
+      const delivery = (factoryCtx as { deliveryContext?: ToolDeliveryContext }).deliveryContext;
+      return {
+        name: 'qqbot_platform_api',
+        label: 'QQBot Platform API Gateway',
+        description:
+          'QQ 开放平台统一 HTTP API 网关，自动填充鉴权 Token。' +
+          '常用接口速查：' +
+          '【频道】GET /users/@me/guilds | /guilds/{guild_id}/channels | /channels/{channel_id} | ' +
+          '【群】GET /v2/groups/{group_id}/bot_state | /v2/groups/{group_id}/members/{member_id} | /v2/groups/{group_id}/info。' +
+          '更多接口和参数详情请阅读 qqbot-channel 和 qqbot-group skill。',
+        parameters: PlatformApiSchema,
+        async execute(_toolCallId: string, params: unknown) {
+          const p = params as {
+            method: string;
+            path: string;
+            body?: Record<string, unknown>;
+            query?: Record<string, string>;
+          };
 
-        if (!p.method) return json({ error: 'method 为必填参数' });
-        if (!p.path) return json({ error: 'path 为必填参数' });
+          if (!p.method) return json({ error: 'method 为必填参数' });
+          if (!p.path) return json({ error: 'path 为必填参数' });
 
-        const method = p.method.toUpperCase();
-        if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-          return json({ error: `不支持的 HTTP 方法: ${method}` });
-        }
-
-        const pathError = validatePath(p.path);
-        if (pathError) return json({ error: pathError });
-
-        const accountId = getRequestAccountId();
-        if (!accountId) {
-          return json({ error: '无法获取当前请求的账号信息，此工具仅支持在消息会话中使用' });
-        }
-
-        try {
-          const bot = getBotForAccount(accountId);
-          const apiGateway = bot.api;
-          const startedAt = Date.now();
-
-          let data: unknown;
-          switch (method) {
-            case 'GET':
-              data = await apiGateway.get(p.path, p.query);
-              break;
-            case 'POST':
-              data = await apiGateway.post(p.path, p.body);
-              break;
-            case 'PUT':
-              data = await apiGateway.put(p.path, p.body);
-              break;
-            case 'PATCH':
-              data = await apiGateway.patch(p.path, p.body);
-              break;
-            case 'DELETE':
-              data = await apiGateway.delete(p.path);
-              break;
+          const method = p.method.toUpperCase();
+          if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+            return json({ error: `不支持的 HTTP 方法: ${method}` });
           }
 
-          toolLog.info(`${method} ${p.path} ok (${Date.now() - startedAt}ms)`, { accountId });
-          return json(data);
-        } catch (err: unknown) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          const apiErr = err as { httpStatus?: number; bizCode?: number; path?: string };
-          toolLog.warn(`${method} ${p.path} failed status=${apiErr.httpStatus ?? '?'} code=${apiErr.bizCode ?? '?'}: ${errMsg}`, { accountId });
-          return json({
-            error: errMsg,
-            status: apiErr.httpStatus,
-            code: apiErr.bizCode,
-            path: p.path,
-          });
-        }
-      },
+          const pathError = validatePath(p.path);
+          if (pathError) return json({ error: pathError });
+
+          // 会话路由：ALS 优先，deliveryContext 回退（延迟/排队 turn）
+          const route = resolveToolSessionRoute(delivery);
+          if (!route) {
+            return json({
+              error:
+                '当前运行没有 QQ 会话来源（可能由定时任务或框架内部触发的 run），' +
+                '无法确定调用哪个 QQ Bot 账户。请在 QQ 消息会话中使用本工具。',
+            });
+          }
+
+          try {
+            const resolvedGateway = resolveGatewayForSend(route.accountId ?? 'default');
+            if (!resolvedGateway) {
+              return json({ error: `账户 ${route.accountId ?? 'default'} 的 gateway 尚未启动` });
+            }
+            const bot = resolvedGateway.gw.bot;
+            const apiGateway = bot.api;
+            const startedAt = Date.now();
+
+            let data: unknown;
+            switch (method) {
+              case 'GET':
+                data = await apiGateway.get(p.path, p.query);
+                break;
+              case 'POST':
+                data = await apiGateway.post(p.path, p.body);
+                break;
+              case 'PUT':
+                data = await apiGateway.put(p.path, p.body);
+                break;
+              case 'PATCH':
+                data = await apiGateway.patch(p.path, p.body);
+                break;
+              case 'DELETE':
+                data = await apiGateway.delete(p.path);
+                break;
+            }
+
+            toolLog.info(`${method} ${p.path} ok (${Date.now() - startedAt}ms)`, { accountId: resolvedGateway.accountId });
+            return json(data);
+          } catch (err: unknown) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            const apiErr = err as { httpStatus?: number; bizCode?: number; path?: string };
+            toolLog.warn(`${method} ${p.path} failed status=${apiErr.httpStatus ?? '?'} code=${apiErr.bizCode ?? '?'}: ${errMsg}`, { accountId: route.accountId ?? 'default' });
+            return json({
+              error: errMsg,
+              status: apiErr.httpStatus,
+              code: apiErr.bizCode,
+              path: p.path,
+            });
+          }
+        },
+      };
     },
     { name: 'qqbot_platform_api' },
   );
