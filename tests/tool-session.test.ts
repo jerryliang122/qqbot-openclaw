@@ -113,6 +113,13 @@ const DELIVERY_GROUP: ToolDeliveryContext = {
   accountId: 'default',
 };
 
+/** 频道（Guild/Channel）目标：parseTarget 会把它归一化为 c2c，secret-input 必须在此之前拒绝 */
+const DELIVERY_CHANNEL: ToolDeliveryContext = {
+  channel: 'qqbot',
+  to: 'qqbot:channel:cccccccccccccccccccccccccccccccc',
+  accountId: 'default',
+};
+
 const OPENID = '0123456789abcdef0123456789abcdef';
 
 /** 注册一个 fake gateway（bot 提供 sendTextWithKeyboard / api 记录调用） */
@@ -221,6 +228,18 @@ async function main(): Promise<void> {
         `应提示仅支持私聊: ${JSON.stringify(details)}`,
       );
       assert.strictEqual(fx.sent.length, 1, '不应再发卡');
+    });
+
+    await test('频道目标 deliveryContext 拒绝（parseTarget 会把 channel 归一化为 c2c，不得骗过私聊检查）', async () => {
+      const channelTool = buildToolWithDelivery(registerSecretInputTool, DELIVERY_CHANNEL);
+      const result = await channelTool.execute('call-2b', { name: 'SOME_KEY' });
+      const details = result.details as { error?: string };
+      assert.ok(!(details as { ok?: boolean }).ok, '频道目标必须被拒绝');
+      assert.ok(
+        (details.error ?? '').includes('仅支持私聊'),
+        `应提示仅支持私聊: ${JSON.stringify(details)}`,
+      );
+      assert.strictEqual(fx.sent.length, 1, '不得向频道 ID 发卡');
     });
 
     await test('ALS 存在时优先使用 ALS 目标（不回归原路径）', async () => {

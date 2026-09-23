@@ -27,7 +27,7 @@ import {
   cancelPendingSecretInput,
   registerPendingSecretInput,
 } from '../features/secret-input-store.js';
-import { parseTarget } from '../outbound/target.js';
+import { parseTarget, QQBOT_PREFIX_RE } from '../outbound/target.js';
 import { createPluginLogger } from '../utils/plugin-logger.js';
 import { resolveToolSessionRoute, type ToolDeliveryContext } from './tool-session.js';
 import type { InlineKeyboard, KeyboardButton } from '../types.js';
@@ -152,12 +152,17 @@ export function registerSecretInputTool(api: OpenClawPluginApi): void {
                 '不要在无会话上下文的任务里调用本工具。',
             });
           }
+          // scope 必须在 parseTarget 之前显式判定：parseTarget 会把 channel:
+          // 归一化为 c2c（target.ts「channel 不被 SDK ChatScope 支持」），
+          // 频道会话若不在此拦截就会把频道 ID 当 c2c openid 发卡
+          // （Sourcery 复审，2026-09-23）
+          const scope = QQBOT_PREFIX_RE.exec(route.target)?.[1]?.toLowerCase();
           const parsed = parseTarget(route.target);
-          if (parsed.scope !== 'c2c' || !parsed.targetId) {
+          if (scope !== 'c2c' || !parsed.targetId) {
             return json({
               error:
                 `密钥输入卡片仅支持私聊（c2c）会话，当前目标 ${route.target} 不适用` +
-                '——密钥不应出现在群聊中。请引导用户在私聊中发起。',
+                '——密钥不应出现在群聊或频道中。请引导用户在私聊中发起。',
             });
           }
 
