@@ -24,6 +24,7 @@ import type {
 } from '@tencent-connect/qqbot-nodejs';
 import type { ResolvedQQBotAccount } from '../types.js';
 import type { ProcessedAttachments } from '../middleware/attachment.js';
+import { formatMediaPlaceholderText } from 'openclaw/plugin-sdk/channel-inbound';
 import { getAdapters } from '../adapter/resolve.js';
 
 // ── 协议常量 ─────────────────────────────
@@ -34,6 +35,18 @@ const REF_END = '[Reference message ends]';
 const HISTORY_BEGIN = '[Chat history begins]';
 const HISTORY_END = '[Chat history ends]';
 const CURRENT_MSG = '[Current message]';
+
+/**
+ * QQ 富媒体 file_info 指针（如 `#ROBOT1.0_LScTg3Rg9...!`）：
+ * 平台把图片/视频消息的媒体句柄放进 content 文本字段，对用户与模型均为无意义噪声。
+ * SDK contentSanitizer 不清洗（2026-09-21 核查 SDK dist 无处理逻辑），在此统一剥离。
+ */
+const RICH_MEDIA_FILE_INFO_RE = /#ROBOT\d+\.\d+[A-Za-z0-9_.+-]*!?/g;
+
+/** 剥离 content 中的富媒体 file_info 指针（幂等纯函数） */
+export function stripRichMediaFileTokens(text: string): string {
+  return text.replace(RICH_MEDIA_FILE_INFO_RE, '');
+}
 
 export interface AssembledBody {
   /** Web UI 展示用 body */
@@ -100,22 +113,31 @@ export function assembleBody(
 
 // ── 局部组装函数 ─────────────────────────────────────────────
 
-/** Layer 1：sanitized + 语音转录 + 附件描述 */
+/** Layer 1：sanitized（剥 file_info 指针）+ 语音转录 + 附件描述 + 纯媒体占位符 */
 function buildUserContent(sanitizedRaw: string, processed: ProcessedAttachments | undefined): string {
-  const sanitized = sanitizedRaw.trim();
+  const sanitized = stripRichMediaFileTokens(sanitizedRaw).trim();
   const voiceText = processed?.voiceText ?? '';
   const attachmentInfo = processed?.otherInfo ? `\n${processed.otherInfo}` : '';
 
   if (voiceText) {
     return (sanitized ? `${sanitized}\n${voiceText}` : voiceText) + attachmentInfo;
   }
-  return sanitized + attachmentInfo;
+  if (sanitized) {
+    return sanitized + attachmentInfo;
+  }
+
+  // 纯媒体消息（文本剥指针后为空且无语音转写）：渲染 core 占位符。
+  // 对齐 telegram 通道的 formatMediaPlaceholderText fallback——WebUI 会话记录、
+  // 历史缓冲、引用链均可见"<media:image>"，而不是裸 #ROBOT1.0_... 指针。
+  const placeholder = formatMediaPlaceholderText(processed?.media ?? []);
+  return placeholder ? placeholder + attachmentInfo : attachmentInfo.trim();
 }
 
 /** Layer 2：[Quoted message begins]…[Quoted message ends] */
 function buildQuotePart(quote: ResolvedQuote | undefined): string {
   if (!quote) return '';
-  const text = quote.text || 'Original content unavailable';
+  // 引用一条图片消息时 text 可能是 file_info 指针，剥后为空走统一 fallback
+  const text = stripRichMediaFileTokens(quote.text || '').trim() || 'Original content unavailable';
   return `${QUOTE_BEGIN}\n${text}\n${QUOTE_END}\n${CURRENT_MSG}\n`;
 }
 
@@ -200,9 +222,13 @@ function buildMsgElementsContext(msg: QQBotInboundMessage, skipFirstElement = fa
   for (let i = 0; i < elements.length; i++) {
     if (skipFirstElement && i === 0) continue;
     const el = elements[i]!;
-    const content = el.content?.trim();
+    // 元素 content 同样可能是 file_info 指针（最近N 记录里的图片消息），剥后空 → （无文本）；
+    // 但原始 content 非空（纯指针消息）时保留占位渲染，不整条吞掉
+    const rawContent = el.content ?? '';
+    const content = stripRichMediaFileTokens(rawContent).trim();
+    const hadRawContent = rawContent.trim().length > 0;
     const attachments = Array.isArray(el.attachments) ? el.attachments : [];
-    if (!content && attachments.length === 0) continue;
+    if (!content && attachments.length === 0 && !hadRawContent) continue;
     index += 1;
 
     // 平台已预渲染的多消息文本（如聊天记录转发）直接透传，避免二次包裹
