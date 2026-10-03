@@ -8,6 +8,14 @@
 
 ---
 
+## [Unreleased]
+
+### 变更（Breaking）
+
+- **语音转录迁移到框架音频理解管线，平台转写（asr_refer_text）转为默认兜底**：转录调用从插件自带的 OpenAI 兼容 HTTP fetch（`transcribeAudio`）改为框架官方 `openclaw/plugin-sdk/media-understanding-runtime` 的 `transcribeAudioFile`（2026.9.1 基线内即有此子路径，provider 注册表/附件缓存/SSRF 策略/错误语义由框架维护），STT 凭证只认框架级 `tools.media.audio.models`——与内置 Telegram 通道一致。**平台转写语义反转**：QQ 平台对语音消息自动 STT 并随事件 JSON 下发 `asr_refer_text`，现默认参与——框架 STT 未配置时**直接作为唯一来源**（无需下载、零外部调用），已配置时作为转录失败/为空的兜底；`channels.qqbot.stt.asrFallback: false` 恢复严格模式（所有场景丢弃平台转写，即 2026-08-17 起的旧行为）。**插件级 STT 凭证键 `provider`/`baseUrl`/`apiKey`/`model`（`channels.qqbot.stt`）废弃并被忽略**——检测到仍配置时打一次性 INFO 迁移提示，请把凭证迁移到 `tools.media.audio.models`（`enabled: false` / `asrFallback` 行为开关保留）。SILK→WAV 转码、`voice_wav_url` 优先下载、`sttDirectFormats`、`transcribed` media facts 语义均不变。`tests/voice-strict-mode.test.ts` 重写锁定新判定协议（22 用例：三态开关、框架配置探测、旧凭证检测、集成链路含下载失败兜底、`- ASR:` 行渲染）。
+
+---
+
 ## [1.0.9] - 2026-09-23
 
 ### 修复

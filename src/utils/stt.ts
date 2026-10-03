@@ -1,114 +1,83 @@
 /**
- * STT (Speech-to-Text) 语音转文字服务
+ * STT (Speech-to-Text) 语音转文字 — 框架音频理解管线
  *
- * 支持 OpenAI 兼容的 /audio/transcriptions 接口。
- * 配置优先级：
- *   1. channels.qqbot.stt（插件级）
- *   2. 框架级 audio model 配置
+ * 转录统一委托给 openclaw/plugin-sdk/media-understanding-runtime 的
+ * `transcribeAudioFile`（provider 注册表、附件缓存、SSRF 策略与错误语义
+ * 均由框架维护），插件不再自带 OpenAI 兼容 HTTP 调用；STT 凭证只认
+ * 框架级 `tools.media.audio.models` 配置（与内置 telegram 通道一致）。
+ *
+ * 平台转写（asr_refer_text）：QQ 平台对语音消息自动 STT 并随事件 JSON 下发。
+ * 默认策略——框架 STT 未配置时**直接采用平台转写**；已配置时平台转写作为
+ * 自有转录失败/为空的兜底。`channels.qqbot.stt.asrFallback: false` 可整体
+ * 禁用平台转写（严格模式，恢复 2026-08-17 的丢弃行为）。
  */
-import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { transcribeAudioFile } from 'openclaw/plugin-sdk/media-understanding-runtime';
 
-export interface STTConfig {
-  enabled: boolean;
-  baseUrl: string;
-  apiKey: string;
-  model: string;
-}
+type TranscribeParams = Parameters<typeof transcribeAudioFile>[0];
 
 /**
- * 平台转写（asr_refer_text）参与判定。
- * 仅当显式配置 channels.qqbot.stt.asrFallback: true 时保留平台转写；
- * 缺省、false 或 stt 块整体不存在时一律丢弃——包括 STT 未配置的场景
- * （此时语音消息落占位文本，而不是退回平台转写）。
- * 读取独立于 STT 凭证解析成败：stt 块无凭证但 asrFallback: true 仍生效。
+ * 平台转写（asr_refer_text）是否参与（独立于框架 STT 配置读取）。
+ * 默认 true；显式 `channels.qqbot.stt.asrFallback: false` 时关闭（严格模式）。
  */
 export function shouldUsePlatformAsr(cfg: Record<string, unknown>): boolean {
   const channels = asRecord(cfg.channels);
   const qqbot = asRecord(channels?.qqbot);
-  return asRecord(qqbot?.stt)?.asrFallback === true;
+  return asRecord(qqbot?.stt)?.asrFallback !== false;
 }
 
 /**
- * 从 OpenClaw 配置中解析 STT 设置
+ * 框架 STT（tools.media.audio）是否可用：
+ * - `channels.qqbot.stt.enabled === false` → 插件级显式关闭（只用平台转写）
+ * - `tools.media.audio.enabled === false` → 框架级关闭
+ * - `models` 为空 → 未配置
+ *
+ * 仅做存在性探测控制流程；provider 解析与实际调用由 transcribeAudioFile 完成。
  */
-export function resolveSTTConfig(cfg: Record<string, unknown>): STTConfig | null {
+export function isFrameworkSttConfigured(cfg: Record<string, unknown>): boolean {
   const channels = asRecord(cfg.channels);
   const qqbot = asRecord(channels?.qqbot);
-  const sttCfg = asRecord(qqbot?.stt);
-
-  // 显式禁用
-  if (sttCfg?.enabled === false) {
-    return null;
+  if (asRecord(qqbot?.stt)?.enabled === false) {
+    return false;
   }
-
-  const models = asRecord(cfg.models);
-  const providers = asRecord(models?.providers);
-
-  // 1. 插件级 STT 配置
-  if (sttCfg) {
-    const providerId = readString(sttCfg, 'provider') ?? 'openai';
-    const providerCfg = asRecord(providers?.[providerId]);
-    const baseUrl = readString(sttCfg, 'baseUrl') ?? readString(providerCfg, 'baseUrl');
-    const apiKey = readString(sttCfg, 'apiKey') ?? readString(providerCfg, 'apiKey');
-    const model = readString(sttCfg, 'model') ?? 'whisper-1';
-    if (baseUrl && apiKey) {
-      return { enabled: true, baseUrl: baseUrl.replace(/\/+$/, ''), apiKey, model };
-    }
-  }
-
-  // 2. 框架级 audio model fallback
   const tools = asRecord(cfg.tools);
   const media = asRecord(tools?.media);
   const audio = asRecord(media?.audio);
-  const audioModels = audio?.models;
-  const audioModelEntry = Array.isArray(audioModels) ? asRecord(audioModels[0]) : undefined;
-  if (audioModelEntry) {
-    const providerId = readString(audioModelEntry, 'provider') ?? 'openai';
-    const providerCfg = asRecord(providers?.[providerId]);
-    const baseUrl = readString(audioModelEntry, 'baseUrl') ?? readString(providerCfg, 'baseUrl');
-    const apiKey = readString(audioModelEntry, 'apiKey') ?? readString(providerCfg, 'apiKey');
-    const model = readString(audioModelEntry, 'model') ?? 'whisper-1';
-    if (baseUrl && apiKey) {
-      return { enabled: true, baseUrl: baseUrl.replace(/\/+$/, ''), apiKey, model };
-    }
+  if (!audio || audio.enabled === false) {
+    return false;
   }
-
-  return null;
+  return Array.isArray(audio.models) && audio.models.length > 0;
 }
 
 /**
- * 调用 STT 服务转录音频文件
+ * 检测已废弃的插件级 STT 凭证（channels.qqbot.stt.provider/baseUrl/apiKey/model）。
+ * 2026-10 起凭证统一走框架 `tools.media.audio.models`，旧键被忽略；
+ * 返回 true 时调用方打一次性迁移提示。
  */
-export async function transcribeAudio(
+export function hasLegacySttCredentials(cfg: Record<string, unknown>): boolean {
+  const channels = asRecord(cfg.channels);
+  const qqbot = asRecord(channels?.qqbot);
+  const stt = asRecord(qqbot?.stt);
+  if (!stt) return false;
+  return ['provider', 'baseUrl', 'apiKey', 'model'].some(
+    (key) => typeof stt[key] === 'string' && (stt[key] as string).trim().length > 0,
+  );
+}
+
+/**
+ * 经框架音频理解管线转录本地音频文件。
+ * 返回修剪后的转录文本；无文本返回 null。
+ * provider 缺失/调用失败会抛错，由调用方捕获后走平台转写兜底。
+ */
+export async function transcribeAudioViaFramework(
   audioPath: string,
   cfg: Record<string, unknown>,
 ): Promise<string | null> {
-  const sttCfg = resolveSTTConfig(cfg);
-  if (!sttCfg) {
-    return null;
-  }
-
-  const fileBuffer = fs.readFileSync(audioPath);
-  const fileName = sanitizeFileName(path.basename(audioPath));
-  const mime = guessMimeType(fileName);
-
-  const form = new FormData();
-  form.append('file', new Blob([fileBuffer], { type: mime }), fileName);
-  form.append('model', sttCfg.model);
-
-  const resp = await fetch(`${sttCfg.baseUrl}/audio/transcriptions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${sttCfg.apiKey}` },
-    body: form,
+  const result = await transcribeAudioFile({
+    filePath: audioPath,
+    cfg: cfg as unknown as TranscribeParams['cfg'],
+    mime: guessMimeType(audioPath),
   });
-
-  if (!resp.ok) {
-    const detail = await resp.text().catch(() => '');
-    throw new Error(`STT failed (HTTP ${resp.status}): ${detail.slice(0, 300)}`);
-  }
-
-  const result = (await resp.json()) as { text?: string };
   return result.text?.trim() || null;
 }
 
@@ -119,18 +88,6 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     return value as Record<string, unknown>;
   }
   return undefined;
-}
-
-function readString(obj: Record<string, unknown> | undefined, key: string): string | undefined {
-  const val = obj?.[key];
-  if (typeof val === 'string' && val.trim()) {
-    return val.trim();
-  }
-  return undefined;
-}
-
-function sanitizeFileName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]/g, '_');
 }
 
 function guessMimeType(fileName: string): string {
