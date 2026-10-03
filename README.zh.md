@@ -631,44 +631,31 @@ openclaw message send --channel "qqbot" \
 
 #### STT（语音转文字）— 自动转录用户发来的语音消息
 
-STT 支持两级配置，按优先级查找：
-
-| 优先级 | 配置路径 | 作用域 |
-|--------|----------|--------|
-| 1（highest） | `channels.qqbot.stt` | 插件专属 |
-| 2（fallback） | `tools.media.audio.models[0]` | 框架级 |
+转录统一走**框架音频理解管线**（`openclaw/plugin-sdk/media-understanding-runtime`），STT 凭证只认框架级配置（与内置 Telegram 通道一致）——插件不再自带 OpenAI 兼容 HTTP 调用：
 
 ```json
 {
-  "channels": {
-    "qqbot": {
-      "stt": {
-        "provider": "your-provider",
-        "model": "your-stt-model"
+  "tools": {
+    "media": {
+      "audio": {
+        "models": [{ "provider": "your-provider", "model": "your-stt-model" }]
       }
     }
   }
 }
 ```
 
-- `provider` — 引用 `models.providers` 中的 key，自动继承 `baseUrl` 和 `apiKey`
-- 设置 `enabled: false` 可禁用
-- 配置后，用户发来的语音消息会自动转换（SILK→WAV）并转录为文字
-- `asrFallback` — 平台转写（`asr_refer_text`）参与开关。**未显式设为 `true` 时，平台转写在所有场景下都被丢弃**：自有 STT 失败或返回空时不作兜底，STT 未配置时也不作为唯一来源（此时语音消息渲染为 `[Voice message - transcription unavailable]` 占位文本，音频 URL 仍通过 `- Voice:` 行引用）。该开关从 `channels.qqbot.stt.asrFallback` 读取，与 STT 凭证是否解析成功无关——仅写 `stt: { "asrFallback": true }` 即可恢复平台转写参与旧行为：
+语音消息处理顺序：
 
-```json
-{
-  "channels": {
-    "qqbot": {
-      "stt": {
-        "provider": "your-provider",
-        "model": "your-stt-model",
-        "asrFallback": true
-      }
-    }
-  }
-}
-```
+1. **框架 STT 已配置**（`tools.media.audio.models` 非空）→ 下载语音、转换（SILK→WAV）后经框架管线转录；转录失败或为空时兜底用平台转写。
+2. **框架 STT 未配置** → **直接采用 QQ 平台转写**（`asr_refer_text`，QQ 平台对语音消息自动 STT 并随事件 JSON 下发）作为唯一来源——无需下载、不发起任何外部调用。
+3. 两者都不可用 → 占位文本（`[Voice message - transcription unavailable]`），音频 URL 仍通过 `- Voice:` 行引用。
+
+`channels.qqbot.stt` 下仅保留行为开关：
+
+- `enabled: false` — 不调用外部 STT，语音只用平台转写（或无转写时占位文本）
+- `asrFallback: false` — 严格模式：所有场景丢弃平台转写（恢复 2026-10 之前的旧行为）
+- `provider` / `baseUrl` / `apiKey` / `model` — **已废弃并被忽略**（2026-10）；检测到仍配置时会打一次性迁移提示日志，请把凭证迁移到 `tools.media.audio.models`。
 
 #### TTS（文字转语音）— 机器人发送语音消息
 

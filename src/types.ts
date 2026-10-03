@@ -211,8 +211,9 @@ export interface QQBotAccountConfig {
     sendMode?: 'stream' | 'static';
   };
   /**
-   * STT (语音转文字) 配置
-   * 配置后，收到语音消息时会自动调用 STT 服务转录为文字
+   * STT (语音转文字) 行为开关
+   * 转录凭证统一走框架 tools.media.audio.models；
+   * 框架未配置时直接使用 QQ 平台转写（asr_refer_text）
    */
   stt?: STTChannelConfig;
   /**
@@ -301,17 +302,30 @@ export interface AudioFormatPolicy {
 
 /**
  * STT (语音转文字) 配置
+ *
+ * 2026-10 起转录统一走框架音频理解管线（tools.media.audio.models 凭证），
+ * 本块只保留行为开关；旧凭证键已废弃（检测到会打迁移提示日志）。
+ * 框架 STT 未配置时，QQ 平台转写（asr_refer_text）直接作为唯一来源。
  */
 export interface STTChannelConfig {
-  /** 是否启用 STT（默认 true，配置了 baseUrl+apiKey 即自动启用） */
+  /**
+   * 是否启用框架 STT 转录（默认 true）。
+   * false = 不调用外部 STT，语音只用平台转写（或无转写时占位文本）。
+   */
   enabled?: boolean;
-  /** STT 服务提供商 ID（对应 models.providers 中的 key，默认 "openai"） */
+  /**
+   * 平台转写（asr_refer_text）参与开关。默认参与：
+   * 框架 STT 未配置时直接作为唯一来源，STT 失败/为空时兜底。
+   * 设为 false 恢复严格模式——所有场景丢弃平台转写。
+   */
+  asrFallback?: boolean;
+  /** @deprecated 2026-10 起忽略——STT 凭证统一配置在框架 tools.media.audio.models */
   provider?: string;
-  /** STT API 地址（如 https://api.openai.com/v1） */
+  /** @deprecated 同上 */
   baseUrl?: string;
-  /** STT API 密钥 */
+  /** @deprecated 同上 */
   apiKey?: string;
-  /** STT 模型名称（默认 "whisper-1"） */
+  /** @deprecated 同上 */
   model?: string;
 }
 
