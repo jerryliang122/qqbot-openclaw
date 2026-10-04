@@ -102,7 +102,9 @@ interface DynCtxCase {
 
 const dynCtxCases: DynCtxCase[] = [
   {
-    name: 'STT 成功：- Voice 用 localPath，- ASR 用 asrReferText',
+    // 严格信框架（2026-10-04）：stt transcript 不再携带 asrReferText，
+    // - ASR 行只在平台转写即来源（source==='asr'）时渲染
+    name: 'STT 成功（严格信框架）：- Voice 用 localPath，无 - ASR 行',
     processed: makeProcessed({
       transcripts: [
         {
@@ -110,14 +112,13 @@ const dynCtxCases: DynCtxCase[] = [
           source: 'stt',
           localPath: '/tmp/a.wav',
           remoteUrl: 'https://x/a.silk',
-          asrReferText: '哈喽 world',
         },
       ],
     }),
     expectedContains: [
       '- Voice: /tmp/a.wav, https://x/a.silk',
-      '- ASR: 哈喽 world',
     ],
+    expectedNotContains: ['- ASR'],
   },
   {
     name: 'STT 未配置仅有 ASR：- Voice 仅 remoteUrl，- ASR 等于 text',
