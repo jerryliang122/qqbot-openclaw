@@ -8,6 +8,18 @@
 
 ---
 
+## [Unreleased]
+
+### 变更（Breaking）
+
+- **移除 `channels.qqbot.stt` 行为开关，语音转录硬编码为两分支（平台转写仅在框架 STT 未配置时使用）**：`asrFallback` 与 `enabled` 两个插件级开关删除，`channels.qqbot.stt` 整块不再有任何生效键——检测到任何键（凭证 4 键 + `enabled`/`asrFallback`）打一次性迁移提示（`hasLegacySttCredentials` 改名 `hasLegacySttConfig` 并把两个历史开关纳入检测）。新策略：**框架 STT 已配置**（`tools.media.models` 存在 `capabilities` 含 `"audio"` 的条目，且 `tools.media.audio.enabled !== false`）→ 下载（`voice_wav_url` 优先 / SILK→WAV）提交框架转录，**严格信框架**——转录失败/为空/下载失败一律 `[Voice message - transcription failed]` 占位、不回退平台转写；**未配置** → 平台转写 `asr_refer_text` 直接作为唯一来源（零下载零外部调用），无平台转写 → `[Voice message - transcription unavailable]` 占位。连带语义：stt/fallback transcript 不再携带 `asrReferText`，`- ASR:` 元数据行仅在平台转写即来源时渲染。
+
+### 修复
+
+- **框架 STT 配置探测路径错误（v2.0.0 引入）**：`isFrameworkSttConfigured` 读的是 `tools.media.audio.models`，但 openclaw 2026.9.1 schema 中该路径不存在（`audio` 块类型为 `Omit<…, "models">`、无 models 键；类型注释原文「Models live only in tools.media.models」）——探测恒为 false，「框架 STT 已配置 → 下载提交转录」分支自 v2.0.0 起为死代码，所有安装实际都在走平台转写。现改为规范路径 `tools.media.models` + 显式 `capabilities` 含 `"audio"` 过滤（与框架 entry-capabilities 匹配语义一致）；无标签条目有意不认——保守漏判只是降级走平台转写，误判在严格模式下会变成彻底无转写（无标签 provider 条目框架会从 provider 注册表推断能力，插件侧无法廉价复刻）。README 双语配置示例同步修正为规范路径（CLI 形态 + `capabilities: ["audio"]` 标签，并注明 provider 形态）。`tests/voice-strict-mode.test.ts` 重写更名为 `tests/voice-transcript.test.ts`（20 用例锁新协议：探测边界含旧错误路径、遗留键不影响、下载失败严格占位、`- ASR:` 行渲染）。
+
+---
+
 ## [2.0.0] - 2026-10-04
 
 ### 变更（Breaking）
