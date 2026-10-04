@@ -1,6 +1,6 @@
 {
   "name": "@jerryliang122/openclaw-qqbot",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "QQ Bot channel plugin for OpenClaw (independently maintained fork)",
   "publishConfig": {
     "access": "public",
