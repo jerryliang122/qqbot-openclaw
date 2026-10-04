@@ -631,31 +631,36 @@ openclaw message send --channel "qqbot" \
 
 #### STT（语音转文字）— 自动转录用户发来的语音消息
 
-转录统一走**框架音频理解管线**（`openclaw/plugin-sdk/media-understanding-runtime`），STT 凭证只认框架级配置（与内置 Telegram 通道一致）——插件不再自带 OpenAI 兼容 HTTP 调用：
+转录统一走**框架音频理解管线**（`openclaw/plugin-sdk/media-understanding-runtime`），STT 配置只认框架级 `tools.media.models`（与内置 Telegram 通道一致）——插件不再自带 OpenAI 兼容 HTTP 调用：
 
 ```json
 {
   "tools": {
     "media": {
-      "audio": {
-        "models": [{ "provider": "your-provider", "model": "your-stt-model" }]
-      }
+      "models": [
+        {
+          "type": "cli",
+          "command": "your-asr-cli",
+          "args": ["-m", "your-model", "{{AttachmentPath}}"],
+          "maxBytes": 52428800,
+          "timeoutSeconds": 120,
+          "capabilities": ["audio"]
+        }
+      ]
     }
   }
 }
 ```
 
-语音消息处理顺序：
+也支持 provider 形态（如 `{ "provider": "openai", "model": "whisper-1", "capabilities": ["audio"] }`）。**`capabilities` 必须包含 `"audio"`**——模型列表按能力标签选择，无标签条目不参与语音转录。
 
-1. **框架 STT 已配置**（`tools.media.audio.models` 非空）→ 下载语音、转换（SILK→WAV）后经框架管线转录；转录失败或为空时兜底用平台转写。
+语音消息处理顺序（2026-10 起硬编码，无插件级开关）：
+
+1. **框架 STT 已配置**（`tools.media.models` 存在 `capabilities` 含 `"audio"` 的条目）→ 下载语音、转换（SILK→WAV）后经框架管线转录；**严格信框架**——转录失败或为空时输出占位文本（`[Voice message - transcription failed]`），不回退平台转写。
 2. **框架 STT 未配置** → **直接采用 QQ 平台转写**（`asr_refer_text`，QQ 平台对语音消息自动 STT 并随事件 JSON 下发）作为唯一来源——无需下载、不发起任何外部调用。
-3. 两者都不可用 → 占位文本（`[Voice message - transcription unavailable]`），音频 URL 仍通过 `- Voice:` 行引用。
+3. 未配置且无平台转写 → 占位文本（`[Voice message - transcription unavailable]`），音频 URL 仍通过 `- Voice:` 行引用。
 
-`channels.qqbot.stt` 下仅保留行为开关：
-
-- `enabled: false` — 不调用外部 STT，语音只用平台转写（或无转写时占位文本）
-- `asrFallback: false` — 严格模式：所有场景丢弃平台转写（恢复 2026-10 之前的旧行为）
-- `provider` / `baseUrl` / `apiKey` / `model` — **已废弃并被忽略**（2026-10）；检测到仍配置时会打一次性迁移提示日志，请把凭证迁移到 `tools.media.audio.models`。
+`channels.qqbot.stt` 整块**已废弃并被忽略**（旧凭证键 + 历史 `enabled`/`asrFallback` 开关，2026-10-04 移除）；检测到任何键时会打一次性迁移提示日志。STT 启停只由框架配置控制——删掉 `tools.media.models` 的 audio 条目、或设 `tools.media.audio.enabled: false` 即关闭框架转录。
 
 #### TTS（文字转语音）— 机器人发送语音消息
 

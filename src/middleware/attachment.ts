@@ -15,7 +15,7 @@ import {
   isVoiceAttachment,
 } from '@tencent-connect/qqbot-nodejs/protocol';
 import type { MessageAttachment } from '../types.js';
-import { shouldUsePlatformAsr, isFrameworkSttConfigured, hasLegacySttCredentials, transcribeAudioViaFramework } from '../utils/stt.js';
+import { isFrameworkSttConfigured, hasLegacySttConfig, transcribeAudioViaFramework } from '../utils/stt.js';
 import { formatVoiceText, formatDuration, type VoiceTranscript, type TranscriptSource } from '../utils/voice-text.js';
 import { downloadRemoteMedia } from '../adapter/media.js';
 import { getAdapters } from '../adapter/resolve.js';
@@ -96,9 +96,8 @@ export async function processAttachments(
   cfg: Record<string, unknown>,
   log?: Log,
 ): Promise<ProcessedAttachments> {
-  const usePlatformAsr = shouldUsePlatformAsr(cfg);
   const sttConfigured = isFrameworkSttConfigured(cfg);
-  warnLegacySttCredentials(cfg, log);
+  warnLegacySttConfig(cfg, log);
   const audioPolicy = resolveAudioPolicy(cfg);
 
   const imageUrls: string[] = [];
@@ -121,7 +120,7 @@ export async function processAttachments(
     }
 
     if (isVoice) {
-      const transcript = await processVoiceAttachment(att, cfg, usePlatformAsr, sttConfigured, audioPolicy, log);
+      const transcript = await processVoiceAttachment(att, cfg, sttConfigured, audioPolicy, log);
       return { type: 'voice' as const, transcript };
     }
 
@@ -209,15 +208,15 @@ function kindFromContentType(contentType: string | undefined): InboundMediaEntry
 
 // ── 语音处理 ──
 
-/** 废弃插件级 STT 凭证的一次性迁移提示（每进程一条，避免每条语音刷屏） */
+/** 废弃 channels.qqbot.stt 配置块的一次性迁移提示（每进程一条，避免每条语音刷屏） */
 let legacySttWarned = false;
 
-function warnLegacySttCredentials(cfg: Record<string, unknown>, log?: Log): void {
-  if (!legacySttWarned && hasLegacySttCredentials(cfg)) {
+function warnLegacySttConfig(cfg: Record<string, unknown>, log?: Log): void {
+  if (!legacySttWarned && hasLegacySttConfig(cfg)) {
     legacySttWarned = true;
     log?.info(
-      'Voice: channels.qqbot.stt credentials (provider/baseUrl/apiKey/model) are deprecated and ignored; ' +
-        'configure tools.media.audio.models instead — platform asr_refer_text is used when framework STT is absent',
+      'Voice: channels.qqbot.stt is deprecated and ignored entirely (credentials + enabled/asrFallback); ' +
+        'configure an audio-capable tools.media.models entry for STT — platform asr_refer_text is used only when framework STT is absent',
     );
   }
 }
@@ -225,24 +224,17 @@ function warnLegacySttCredentials(cfg: Record<string, unknown>, log?: Log): void
 async function processVoiceAttachment(
   att: MessageAttachment,
   cfg: Record<string, unknown>,
-  usePlatformAsr: boolean,
   sttConfigured: boolean,
   audioPolicy: AudioPolicyResolved,
   log?: Log,
 ): Promise<VoiceTranscript> {
-  // 平台转写（asr_refer_text，QQ 平台自动 STT 随事件 JSON 下发）：
-  // 默认参与——框架 STT 未配置时直接作为唯一来源，STT 失败时兜底；
-  // 仅 asrFallback: false（严格模式）时在所有场景丢弃。
-  const rawAsrText = att.asr_refer_text?.trim() || undefined;
-  const asrReferText = usePlatformAsr ? rawAsrText : undefined;
   // 远端 URL 兜底：优先 wav_url，其次原始 url
   const remoteUrl = normalizeUrl(att.voice_wav_url) || normalizeUrl(att.url) || undefined;
 
-  // 框架 STT 未配置 → 平台转写直接作为 transcript（无下载、无外部调用）
+  // 框架 STT 未配置 → 平台转写（asr_refer_text，QQ 平台自动 STT 随事件
+  // JSON 下发）直接作为唯一来源（无下载、零外部调用）；无平台转写 → 占位。
   if (!sttConfigured) {
-    if (!usePlatformAsr && rawAsrText) {
-      log?.info(`Voice: framework STT not configured; platform asr_refer_text discarded (asrFallback: false)`);
-    }
+    const asrReferText = att.asr_refer_text?.trim() || undefined;
     if (asrReferText) {
       log?.debug?.(`Voice: using platform asr_refer_text (framework STT not configured)`);
       return { text: asrReferText, source: 'asr', asrReferText, remoteUrl };
@@ -250,11 +242,12 @@ async function processVoiceAttachment(
     return {
       text: '[Voice message - transcription unavailable]',
       source: 'fallback',
-      asrReferText,
       remoteUrl,
     };
   }
 
+  // 框架 STT 已配置 → 严格信框架：下载/转码后提交框架转录，
+  // 失败/为空/下载失败一律占位文本，不回退平台转写。
   let localPath: string | undefined;
   let duration: number | undefined;
 
@@ -298,16 +291,11 @@ async function processVoiceAttachment(
       const transcript = await transcribeAudioViaFramework(localPath, cfg);
       if (transcript) {
         log?.debug?.(`Voice STT (framework): ${transcript.slice(0, 80)}...`);
-        return { text: transcript, source: 'stt', duration, localPath, remoteUrl, asrReferText };
+        return { text: transcript, source: 'stt', duration, localPath, remoteUrl };
       }
     } catch (err) {
       log?.error(`Voice STT (framework) failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-  }
-
-  if (asrReferText) {
-    log?.debug?.(`Voice: falling back to platform asr_refer_text after framework STT failure`);
-    return { text: asrReferText, source: 'asr', duration, localPath, remoteUrl, asrReferText };
   }
 
   return {
@@ -316,7 +304,6 @@ async function processVoiceAttachment(
     duration,
     localPath,
     remoteUrl,
-    asrReferText,
   };
 }
 

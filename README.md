@@ -810,31 +810,36 @@ The plugin processes messages through a carefully ordered middleware chain:
 
 #### STT (Speech-to-Text) — Transcribe Incoming Voice Messages
 
-Transcription runs through the **framework audio-understanding pipeline** (`openclaw/plugin-sdk/media-understanding-runtime`), so STT credentials come from the framework-level config (same as the built-in Telegram channel) — the plugin no longer ships its own OpenAI-compatible HTTP call:
+Transcription runs through the **framework audio-understanding pipeline** (`openclaw/plugin-sdk/media-understanding-runtime`), so STT config comes from the framework-level `tools.media.models` (same as the built-in Telegram channel) — the plugin no longer ships its own OpenAI-compatible HTTP call:
 
 ```json
 {
   "tools": {
     "media": {
-      "audio": {
-        "models": [{ "provider": "your-provider", "model": "your-stt-model" }]
-      }
+      "models": [
+        {
+          "type": "cli",
+          "command": "your-asr-cli",
+          "args": ["-m", "your-model", "{{AttachmentPath}}"],
+          "maxBytes": 52428800,
+          "timeoutSeconds": 120,
+          "capabilities": ["audio"]
+        }
+      ]
     }
   }
 }
 ```
 
-Voice message handling order:
+A provider-form entry also works (e.g. `{ "provider": "openai", "model": "whisper-1", "capabilities": ["audio"] }`). **`capabilities` must include `"audio"`** — the shared model list is selected by capability tags; untagged entries never take part in voice transcription.
 
-1. **Framework STT configured** (`tools.media.audio.models` non-empty) → voice is downloaded, converted (SILK→WAV), and transcribed through the framework pipeline. On failure or empty transcript, falls back to the platform transcript.
+Voice message handling order (hardcoded since 2026-10; no plugin-level switches):
+
+1. **Framework STT configured** (a `tools.media.models` entry whose `capabilities` includes `"audio"`) → voice is downloaded, converted (SILK→WAV), and transcribed through the framework pipeline. **The framework is trusted strictly** — on failure or empty transcript a placeholder (`[Voice message - transcription failed]`) is emitted; there is **no** fallback to the platform transcript.
 2. **Framework STT not configured** → the **QQ platform transcript (`asr_refer_text`)** — QQ auto-STTs voice messages and ships the text in the event JSON — is used directly as the sole source, no download and no external call needed.
-3. Neither available → placeholder text (`[Voice message - transcription unavailable]`); the audio URL is still referenced via the `- Voice:` line.
+3. Not configured and no platform transcript → placeholder text (`[Voice message - transcription unavailable]`); the audio URL is still referenced via the `- Voice:` line.
 
-Plugin-level behavior switches under `channels.qqbot.stt`:
-
-- `enabled: false` — never call external STT; use only the platform transcript (or the placeholder)
-- `asrFallback: false` — strict mode: discard the platform transcript in **all** cases (restores the pre-2026-10 behavior)
-- `provider` / `baseUrl` / `apiKey` / `model` — **deprecated and ignored** (2026-10); a one-time migration notice is logged if still present. Move credentials to `tools.media.audio.models`.
+The whole `channels.qqbot.stt` block is **deprecated and ignored** (legacy credential keys plus the historical `enabled`/`asrFallback` switches, removed 2026-10-04); a one-time migration notice is logged if any key is present. STT is controlled solely by the framework config — remove the audio entry from `tools.media.models` (or set `tools.media.audio.enabled: false`) to disable framework transcription.
 
 #### TTS (Text-to-Speech) — Send Voice Messages
 

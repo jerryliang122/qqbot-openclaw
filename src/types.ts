@@ -211,9 +211,7 @@ export interface QQBotAccountConfig {
     sendMode?: 'stream' | 'static';
   };
   /**
-   * STT (语音转文字) 行为开关
-   * 转录凭证统一走框架 tools.media.audio.models；
-   * 框架未配置时直接使用 QQ 平台转写（asr_refer_text）
+   * STT (语音转文字) 历史遗留配置块（整块被忽略，详见 STTChannelConfig）
    */
   stt?: STTChannelConfig;
   /**
@@ -301,25 +299,15 @@ export interface AudioFormatPolicy {
 }
 
 /**
- * STT (语音转文字) 配置
+ * STT (语音转文字) 配置块——历史遗留形状
  *
- * 2026-10 起转录统一走框架音频理解管线（tools.media.audio.models 凭证），
- * 本块只保留行为开关；旧凭证键已废弃（检测到会打迁移提示日志）。
- * 框架 STT 未配置时，QQ 平台转写（asr_refer_text）直接作为唯一来源。
+ * 2026-10-04 起整块被忽略（含历史行为开关 enabled/asrFallback 与旧凭证
+ * 键）：STT 启停只由框架 `tools.media.models`（capabilities 含 "audio" 的
+ * 条目）+ `tools.media.audio.enabled` 控制。本接口仅为遗留检测
+ * （hasLegacySttConfig + 一次性迁移提示）保留键的类型形状。
  */
 export interface STTChannelConfig {
-  /**
-   * 是否启用框架 STT 转录（默认 true）。
-   * false = 不调用外部 STT，语音只用平台转写（或无转写时占位文本）。
-   */
-  enabled?: boolean;
-  /**
-   * 平台转写（asr_refer_text）参与开关。默认参与：
-   * 框架 STT 未配置时直接作为唯一来源，STT 失败/为空时兜底。
-   * 设为 false 恢复严格模式——所有场景丢弃平台转写。
-   */
-  asrFallback?: boolean;
-  /** @deprecated 2026-10 起忽略——STT 凭证统一配置在框架 tools.media.audio.models */
+  /** @deprecated 2026-10 起忽略——STT 配置统一走框架 tools.media.models */
   provider?: string;
   /** @deprecated 同上 */
   baseUrl?: string;

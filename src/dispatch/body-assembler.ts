@@ -164,10 +164,12 @@ function buildDynamicCtx(
     lines.push(`- Voice: ${voiceRefs.join(', ')}`);
   }
 
-  // ASR：source==='asr' 的 text，或任意 transcript 上的 asrReferText
+  // ASR：仅平台转写来源（source==='asr'）——严格信框架后 stt/fallback
+  // transcript 不再携带 asrReferText
   const asrTexts = unique(
     transcripts
-      .map((t) => (t.source === 'asr' ? t.text : t.asrReferText))
+      .filter((t) => t.source === 'asr')
+      .map((t) => t.text)
       .filter(isNonEmpty),
   );
   if (asrTexts.length > 0) {
