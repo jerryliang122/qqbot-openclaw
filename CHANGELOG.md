@@ -8,6 +8,28 @@
 
 ---
 
+## [2.2.0] - 2026-10-06
+
+> 版本号说明：含配置行为变更（工具策略来源从硬编码改为配置驱动），严格按 SemVer 应为 Major；因 `RESTRICTED_GROUP_TOOL_ALLOWLIST` 是代码内部常量而非用户配置，旧配置行为不变（无 tools 配置时走原 fallback），主人决定按 minor 处理。
+
+### 修复
+
+- **群配置大小写不敏感查找**（PR #30）：`lookupGroupEntry` 原来用 `Object.hasOwn(groups, groupOpenid)` 做精确匹配，框架传入的小写 session-key groupId 永远匹配不上用户配置的大写 openid，导致全部落到默认值 `restricted → { allow: [] }` → openclaw 9.6+ 把所有工具过滤 → room_event 群彻底沉默。改为精确命中 > lowercase 等值扫描。
+
+- **resolveMentionPatterns 兼容 agents.entries（现行形态）**（PR #30）：`findAgentEntry` 原来只读 `agents.list`（数组，旧形态），但配置用的是 `agents.entries`（对象，2026.9.x 现行）→ 称呼唤醒（`mentionPatterns`）永远解析为空 → room_event 群"沈处"等唤醒词失效，该回的也不回。改为 entries 优先、list 保底。
+
+- **RESTRICTED_GROUP_TOOL_ALLOWLIST 初始化含 message / cron / qqbot_remind**（PR #30）：插件首次返回非空白名单，保证旧配置升级后不会落到空名单导致群沉默。
+
+- **setGroupRequireMention 写入前先解析现有键**（PR #31）：交互面板修改 `requireMention` 时直接按事件原始大小写写 `groups[groupOpenid]`，若事件大小写与配置键不一致会制造同一群的第二个变体键，与读取侧精确优先语义冲突。现改为写入前先调用 `resolveGroupConfigKey` 找到现有键再原地更新。
+
+### 增强
+
+- **群工具策略改为配置驱动**（PR #31）：`resolveToolPolicy` 不再硬编码工具白名单，改为先检查用户是否在 `channels.qqbot.groups.<groupId>.tools` 中显式声明了工具列表——有则透传，无则按 `toolPolicy` 字符串 fallback：`full`→undefined，`none`→显式全禁，`restricted`→`RESTRICTED_DEFAULT_TOOLS` 兜底（message/web_search/web_fetch/x_search/session_status/heartbeat_respond/view_image/tts/cron/qqbot_remind）。用户可通过 `groups.<id>.tools.allow` 自定义白名单（支持 alsoAllow/deny 合并、toolsBySender 按发送者精细控制）。对齐 Telegram 的配置驱动模式，从根本上消除「插件替用户决定哪些工具安全」的评审争议。
+
+- **restricted 白名单移除隐私敏感工具**（PR #31）：移除 memory_search、memory_get、sessions、sessions_list、sessions_history、sessions_search、conversations_list、presence、get_goal、suggest_task、dismiss_task（跨会话数据读取/操作，群里被其他用户触发即为信息泄露）。配置驱动模式下，用户如需这些工具可在自己的 `tools.allow` 中显式声明。
+
+---
+
 ## [2.1.0] - 2026-10-04
 
 > 版本号说明：本版含配置键移除与失败路径行为变更，严格按 SemVer 应为 Major；因 `asrFallback`/`enabled` 仅存在于 v2.0.0（2026-10-04 当天发布，实际存活不足一天），主人决定按 minor 处理（2.1.0），视为"从未真正发布过的键"。
