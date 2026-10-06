@@ -176,6 +176,12 @@ export type ResolvedGroupConfig = Omit<Required<GroupConfig>, "prompt" | "coales
  * 沉默）。插件自身的 dispatch 路径用原始大写 openid，不受影响。
  *
  * 匹配顺序：精确命中 > lowercase 等值 > 无（落默认值）。"*" 不参与模糊匹配。
+ *
+ * 大小写变体键的语义：若配置同时存在同一群的大小写两个键（如线上应急的
+ * 大写+小写双键 toolPolicy），所有调用方对**任一形态 id** 的解析保持一致——
+ * 精确命中各自键、其余形态走 lowercase 等值扫描（取第一个等值键）。因此
+ * 双键**必须配相同值**（应急指南如此要求）；若配了冲突值，精确命中方与
+ * 模糊命中方可能拿到不同条目，属配置错误，此处不做静默合并。
  */
 function lookupGroupEntry(
   groups: Record<string, GroupConfig>,

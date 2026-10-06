@@ -80,9 +80,16 @@ export const qqbotThreadingAdapter = {
  * 现行语义（对齐最新 telegram 的群聊处理：群聊不收紧 conversation 级策略，
  * 群限制交给配置显式声明）：
  * - full → undefined（完全交给 agent 自身 tools.profile）
- * - restricted → 安全白名单（信息类/会话类/通道自有工具；**必须含 message**；
- *   不含 exec/process/文件写入/控制面）
+ * - restricted → 安全白名单（信息类/会话类工具；**必须含 message**；
+ *   不含 exec/process/文件写入/控制面/平台写操作——qqbot_platform_api
+ *   支持任意 method+path 的平台写请求，提示词诱导即可变更/删除平台资源，
+ *   不得进 restricted 白名单）
  * - none → { allow: [], deny: ['*'] }（管理员显式全禁，保持原义）
+ *
+ * ⚠️ 版本行为差异：openclaw ≤2026.9.5 不把本返回值应用到 run 工具集
+ * （旧 `restricted→{allow:[]}` 映射因此长期无害）。在那些版本上 restricted
+ * 群的工具集由 agent 自身 tools.profile 决定——这与升级前行为一致，不是
+ * 本映射引入的回归；真正的强制力从 2026.9.6 起生效。
  */
 const RESTRICTED_GROUP_TOOL_ALLOWLIST = [
   // room_event/群聊发言的结构性依赖，永远不允许被群策略过滤
@@ -108,8 +115,9 @@ const RESTRICTED_GROUP_TOOL_ALLOWLIST = [
   // 媒体消费/轻生成
   'view_image',
   'tts',
-  // qqbot 通道自有工具（平台 API + 定时提醒）
-  'qqbot_platform_api',
+  // 定时提醒（qqbot_remind 的实际执行依赖框架 cron 工具，必须一并放行，
+  // 否则提醒指令只会返回"用 cron 工具"的指引然后被策略拦下、空转）
+  'cron',
   'qqbot_remind',
 ] as const;
 
