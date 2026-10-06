@@ -97,8 +97,10 @@ await test('restricted（默认）→ 白名单必须包含 message（红线）'
   assert.ok(out, 'restricted 应返回白名单对象');
   assert.ok(out.allow.length > 0, '白名单不得为空（空 = 全禁止，事故根因）');
   assert.ok(out.allow.includes('message'), 'message 工具永远不得被群策略过滤');
-  assert.ok(out.allow.includes('qqbot_remind'), '通道自有工具应在白名单');
+  assert.ok(out.allow.includes('qqbot_remind'), '提醒工具应在白名单');
+  assert.ok(out.allow.includes('cron'), 'qqbot_remind 依赖 cron 工具执行，必须一并放行');
   assert.ok(!out.allow.includes('exec'), '执行类工具不得进 restricted 白名单');
+  assert.ok(!out.allow.includes('qqbot_platform_api'), '平台 API 支持任意写操作，不得进 restricted 白名单（Sourcery #1）');
 });
 
 await test('toolPolicy=none → 显式全禁（保持管理员语义）', () => {
