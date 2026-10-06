@@ -7,19 +7,44 @@ import { loadCredentialBackup } from "./features/credential-backup.js";
 type AgentEntry = { id?: string; groupChat?: { mentionPatterns?: string[]; historyLimit?: number } };
 
 /**
+ * 在配置中定位 agent 条目，兼容两种形态：
+ * - `agents.entries`（对象，键即 agent id）——openclaw 2026.9.x 现行形态
+ * - `agents.list`（数组，条目带 id 字段）——旧形态，保底兼容
+ *
+ * 2026-10-06 线上事故：只读 `agents.list` 时，entries 形态下 mentionPatterns
+ * 永远解析为空数组，room_event 群的称呼唤醒（如「沈处」）全部失效——
+ * 本应唤醒为 user_request 的消息被归为 room_event，回复权被压制成结构性沉默。
+ */
+function findAgentEntry(cfg: OpenClawConfig, agentId: string): AgentEntry | undefined {
+  const agents = (cfg as Record<string, unknown>).agents as
+    | { list?: AgentEntry[]; entries?: Record<string, AgentEntry> }
+    | undefined;
+  if (!agents) return undefined;
+  const trimmed = agentId.trim();
+  if (trimmed && agents.entries) {
+    const direct = agents.entries[trimmed];
+    if (direct) return direct;
+    const wanted = trimmed.toLowerCase();
+    for (const key of Object.keys(agents.entries)) {
+      if (key.trim().toLowerCase() === wanted) return agents.entries[key];
+    }
+  }
+  return agents.list?.find((a) => a.id?.trim().toLowerCase() === trimmed.toLowerCase());
+}
+
+/**
  * 解析 mentionPatterns（agent → global → 空数组）
  *
  * 优先级：
- *   1. agents.list[agentId].groupChat.mentionPatterns
+ *   1. agents.entries[agentId].groupChat.mentionPatterns（现行）
+ *      / agents.list[<id 条目>].groupChat.mentionPatterns（旧形态）
  *   2. messages.groupChat.mentionPatterns
  *   3. []
  */
 export function resolveMentionPatterns(cfg: OpenClawConfig, agentId?: string): string[] {
-  // 1. agent 级别
+  // 1. agent 级别（agents.entries 现行形态 / agents.list 旧形态）
   if (agentId) {
-    const agents = (cfg as Record<string, unknown>).agents as { list?: AgentEntry[] } | undefined;
-    const entry = agents?.list?.find((a) => a.id?.trim().toLowerCase() === agentId.trim().toLowerCase());
-    const agentGroupChat = entry?.groupChat;
+    const agentGroupChat = findAgentEntry(cfg, agentId)?.groupChat;
     if (agentGroupChat && Object.hasOwn(agentGroupChat, "mentionPatterns")) {
       return agentGroupChat.mentionPatterns ?? [];
     }
@@ -139,10 +164,36 @@ export type ResolvedGroupConfig = Omit<Required<GroupConfig>, "prompt" | "coales
   unmentionedInbound: 'user_request' | 'room_event';
 };
 
+/**
+ * 大小写不敏感的群配置查找（对齐框架 group-policy 的 resolveScopeKeyCaseInsensitive）。
+ *
+ * 背景（2026-10-06 线上事故）：框架回调 groups adapter 时传入的 groupId 派生自
+ * session key（约定小写，如 `agent:main:qqbot:group:faab4eef…`），而 QQ 群
+ * openid 原生大写、用户配置键通常也是大写。精确匹配会让 adapter 路径永远
+ * 查不到具体群配置，全部落到默认值——默认 toolPolicy=restricted 经 adapter
+ * 旧映射变成空允许清单，openclaw 2026.9.6+ 把它应用到 run 工具集后，
+ * qqbot 所有群的工具被清空（room_event 群因发言必须走 message 工具而彻底
+ * 沉默）。插件自身的 dispatch 路径用原始大写 openid，不受影响。
+ *
+ * 匹配顺序：精确命中 > lowercase 等值 > 无（落默认值）。"*" 不参与模糊匹配。
+ */
+function lookupGroupEntry(
+  groups: Record<string, GroupConfig>,
+  groupOpenid: string,
+): GroupConfig {
+  if (Object.hasOwn(groups, groupOpenid)) return groups[groupOpenid] ?? {};
+  const wanted = groupOpenid.trim().toLowerCase();
+  if (!wanted || wanted === "*") return {};
+  for (const key of Object.keys(groups)) {
+    if (key.trim().toLowerCase() === wanted) return groups[key] ?? {};
+  }
+  return {};
+}
+
 export function resolveGroupConfigFromAccount(account: ResolvedQQBotAccount, groupOpenid: string): ResolvedGroupConfig {
   const groups = account.config?.groups ?? {};
   const wildcardCfg = groups["*"] ?? {};
-  const specificCfg = groups[groupOpenid] ?? {};
+  const specificCfg = lookupGroupEntry(groups, groupOpenid);
   const accountDefaultRequireMention = account.config?.defaultRequireMention ?? DEFAULT_GROUP_CONFIG.requireMention;
   const accountDefaultCoalesce = account.config?.groupCoalesce ?? DEFAULT_GROUP_COALESCE_CONFIG;
 

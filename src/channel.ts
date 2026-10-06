@@ -67,9 +67,56 @@ export const qqbotThreadingAdapter = {
 };
 
 /**
+ * restricted 群的工具白名单。
+ *
+ * ⚠️ 红线（2026-10-06 线上事故，openclaw 9.5→9.7 升级后复发）：
+ * 2026.9.6+ 框架会把 groups.resolveToolPolicy 的返回值作为会话工具策略真正
+ * 应用到 run 的工具集——`{ allow: [] }`（空允许清单）= 什么都不允许，连
+ * message 工具都会被过滤掉。room_event 群的最终文本被结构性压制
+ * （message_tool_only），发言必须走 message 工具——工具没了 = 群彻底沉默。
+ * 旧框架（≤9.5）不把该返回值应用到 run 工具集，所以旧的
+ * `restricted → { allow: [] }` 映射当时无害、升级后致命。
+ *
+ * 现行语义（对齐最新 telegram 的群聊处理：群聊不收紧 conversation 级策略，
+ * 群限制交给配置显式声明）：
+ * - full → undefined（完全交给 agent 自身 tools.profile）
+ * - restricted → 安全白名单（信息类/会话类/通道自有工具；**必须含 message**；
+ *   不含 exec/process/文件写入/控制面）
+ * - none → { allow: [], deny: ['*'] }（管理员显式全禁，保持原义）
+ */
+const RESTRICTED_GROUP_TOOL_ALLOWLIST = [
+  // room_event/群聊发言的结构性依赖，永远不允许被群策略过滤
+  'message',
+  // 信息检索（只读）
+  'web_search',
+  'web_fetch',
+  'x_search',
+  'memory_search',
+  'memory_get',
+  // 会话/任务（只读或会话内操作）
+  'sessions',
+  'sessions_list',
+  'sessions_history',
+  'sessions_search',
+  'conversations_list',
+  'session_status',
+  'presence',
+  'heartbeat_respond',
+  'suggest_task',
+  'dismiss_task',
+  'get_goal',
+  // 媒体消费/轻生成
+  'view_image',
+  'tts',
+  // qqbot 通道自有工具（平台 API + 定时提醒）
+  'qqbot_platform_api',
+  'qqbot_remind',
+] as const;
+
+/**
  * QQBot Groups Adapter
  */
-const qqbotGroupsAdapter = {
+export const qqbotGroupsAdapter = {
   resolveRequireMention: ({ cfg, accountId, groupId }: {
     cfg: OpenClawConfig;
     accountId?: string | null;
@@ -88,7 +135,8 @@ const qqbotGroupsAdapter = {
     const policy = resolveToolPolicy(cfg, groupId, accountId ?? undefined);
     if (policy === 'full') return undefined;
     if (policy === 'none') return { allow: [], deny: ['*'] };
-    return { allow: [] };
+    // restricted（默认）：白名单放行，绝不返回空允许清单（见上方红线注释）
+    return { allow: [...RESTRICTED_GROUP_TOOL_ALLOWLIST] };
   },
 
   resolveGroupIntroHint: ({ cfg, accountId, groupId }: {
