@@ -77,15 +77,25 @@ await test('未知群仍落默认值（restricted / user_request）', () => {
   assert.equal(resolved.unmentionedInbound, 'user_request');
 });
 
-group('groups adapter 工具策略映射（9.6+ 契约）');
+group('groups adapter 工具策略映射（9.6+ 契约，2026-10-06 重构为委托框架）');
 
-await test('toolPolicy=full → undefined（交给 agent tools.profile）', () => {
+await test('toolPolicy=full + 无 tools 配置 → undefined（交给 agent tools.profile）', () => {
   const out = qqbotGroupsAdapter.resolveToolPolicy({
     cfg: baseCfg({ FAAB4EEF5082D84AF7FD258071719FB9: { toolPolicy: 'full' } }) as never,
     groupId: 'faab4eef5082d84af7fd258071719fb9',
     accountId: 'default',
   });
-  assert.equal(out, undefined);
+  assert.equal(out, undefined, 'full 组无 tools 配置时应返回 undefined，不限制工具');
+});
+
+await test('toolPolicy=full + 有 tools 配置 → 直接返回配置的工具策略', () => {
+  const out = qqbotGroupsAdapter.resolveToolPolicy({
+    cfg: { channels: { qqbot: { groups: { FAAB4EEF5082D84AF7FD258071719FB9: { toolPolicy: 'full', tools: { allow: ['message', 'web_search'] } } } } } } as never,
+    groupId: 'faab4eef5082d84af7fd258071719fb9',
+    accountId: 'default',
+  }) as { allow: string[] } | undefined;
+  assert.ok(out, '有 tools 配置时应返回工具策略对象');
+  assert.deepEqual(out.allow, ['message', 'web_search'], '工具列表来自用户配置，绕过 restricted 默认集');
 });
 
 await test('restricted（默认）→ 白名单必须包含 message（红线）', () => {
@@ -101,6 +111,16 @@ await test('restricted（默认）→ 白名单必须包含 message（红线）'
   assert.ok(out.allow.includes('cron'), 'qqbot_remind 依赖 cron 工具执行，必须一并放行');
   assert.ok(!out.allow.includes('exec'), '执行类工具不得进 restricted 白名单');
   assert.ok(!out.allow.includes('qqbot_platform_api'), '平台 API 支持任意写操作，不得进 restricted 白名单（Sourcery #1）');
+});
+
+await test('restricted + 有 tools 配置 → 走框架配置（委托路径）', () => {
+  const out = qqbotGroupsAdapter.resolveToolPolicy({
+    cfg: { channels: { qqbot: { groups: { FAAB4EEF5082D84AF7FD258071719FB9: { toolPolicy: 'restricted', tools: { allow: ['message', 'x_search'] } } } } } } as never,
+    groupId: 'faab4eef5082d84af7fd258071719fb9',
+    accountId: 'default',
+  }) as { allow: string[] } | undefined;
+  assert.ok(out, '有 tools 配置时应返回工具策略对象');
+  assert.deepEqual(out.allow, ['message', 'x_search'], '工具列表来自框架配置，绕过 restricted 默认集');
 });
 
 await test('toolPolicy=none → 显式全禁（保持管理员语义）', () => {
