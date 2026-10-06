@@ -91,32 +91,31 @@ export const qqbotThreadingAdapter = {
  * 群的工具集由 agent 自身 tools.profile 决定——这与升级前行为一致，不是
  * 本映射引入的回归；真正的强制力从 2026.9.6 起生效。
  */
+/**
+ * restricted 群的工具白名单（已移除隐私敏感工具，2026-10 初审补充调整）。
+ *
+ * 已排除（初审 #1：跨会话隐私泄露风险）：
+ * memory_search / memory_get ——读取他人 Memory 数据
+ * sessions / sessions_list / sessions_history / sessions_search ——读取他人会话记录
+ * conversations_list ——读取他人对话列表
+ * presence / get_goal / suggest_task / dismiss_task ——读取/操作他人运行时状态
+ *
+ * 保留：
+ * message ——群聊发言结构性依赖
+ * web_search / web_fetch / x_search ——只读信息检索
+ * session_status / heartbeat_respond ——会话内只读状态查询
+ * view_image / tts ——媒体消费/轻生成
+ * cron / qqbot_remind ——定时任务（remind 执行依赖 cron，二者必须同时放行）
+ */
 const RESTRICTED_GROUP_TOOL_ALLOWLIST = [
-  // room_event/群聊发言的结构性依赖，永远不允许被群策略过滤
   'message',
-  // 信息检索（只读）
   'web_search',
   'web_fetch',
   'x_search',
-  'memory_search',
-  'memory_get',
-  // 会话/任务（只读或会话内操作）
-  'sessions',
-  'sessions_list',
-  'sessions_history',
-  'sessions_search',
-  'conversations_list',
   'session_status',
-  'presence',
   'heartbeat_respond',
-  'suggest_task',
-  'dismiss_task',
-  'get_goal',
-  // 媒体消费/轻生成
   'view_image',
   'tts',
-  // 定时提醒（qqbot_remind 的实际执行依赖框架 cron 工具，必须一并放行，
-  // 否则提醒指令只会返回"用 cron 工具"的指引然后被策略拦下、空转）
   'cron',
   'qqbot_remind',
 ] as const;

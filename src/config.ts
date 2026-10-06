@@ -183,17 +183,30 @@ export type ResolvedGroupConfig = Omit<Required<GroupConfig>, "prompt" | "coales
  * 双键**必须配相同值**（应急指南如此要求）；若配了冲突值，精确命中方与
  * 模糊命中方可能拿到不同条目，属配置错误，此处不做静默合并。
  */
+/**
+ * 解析群配置的**现有键名**：精确命中 > lowercase 等值 > undefined。
+ *
+ * 供读取（lookupGroupEntry）与写入（setGroupRequireMention 等配置变更路径）
+ * 共用：写入方必须用它找到现有键再更新，避免按事件原始大小写直接写入
+ * 制造同一群的第二个大小写变体键（双键冲突会与 lookupGroupEntry 的
+ * 精确优先语义互相踩踏，Sourcery 二轮评审 #2）。
+ */
+export function resolveGroupConfigKey(
+  groups: Record<string, GroupConfig>,
+  groupOpenid: string,
+): string | undefined {
+  if (Object.hasOwn(groups, groupOpenid)) return groupOpenid;
+  const wanted = groupOpenid.trim().toLowerCase();
+  if (!wanted || wanted === "*") return undefined;
+  return Object.keys(groups).find((key) => key.trim().toLowerCase() === wanted);
+}
+
 function lookupGroupEntry(
   groups: Record<string, GroupConfig>,
   groupOpenid: string,
 ): GroupConfig {
-  if (Object.hasOwn(groups, groupOpenid)) return groups[groupOpenid] ?? {};
-  const wanted = groupOpenid.trim().toLowerCase();
-  if (!wanted || wanted === "*") return {};
-  for (const key of Object.keys(groups)) {
-    if (key.trim().toLowerCase() === wanted) return groups[key] ?? {};
-  }
-  return {};
+  const key = resolveGroupConfigKey(groups, groupOpenid);
+  return key ? (groups[key] ?? {}) : {};
 }
 
 export function resolveGroupConfigFromAccount(account: ResolvedQQBotAccount, groupOpenid: string): ResolvedGroupConfig {
