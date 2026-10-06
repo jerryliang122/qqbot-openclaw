@@ -30,7 +30,7 @@ import { recordKnownUser } from '../features/proactive.js';
 import { cacheMsgId } from '../features/msgid-cache.js';
 import { recordGroupEvent, getGroupModeFacts } from '../features/group-mode-store.js';
 import { getAdapters } from '../adapter/resolve.js';
-import { resolveGroupConfigFromAccount, resolveGroupPolicy, resolveMentionPatterns } from '../config.js';
+import { resolveGroupConfigFromAccount, resolveGroupConfigKey, resolveGroupPolicy, resolveMentionPatterns } from '../config.js';
 import { getPackageVersion } from '../utils/pkg-version.js';
 import { getOpenClawVersion, tryGetBotForAccount } from '../bot-instance.js';
 import type { ParsedMultiQuestionAction } from '../features/question-helpers.js';
@@ -475,6 +475,11 @@ function setGroupRequireMention(
     const groups = accountId !== 'default' && qqbot.accounts?.[accountId]
       ? (qqbot.accounts[accountId].groups = { ...qqbot.accounts[accountId].groups })
       : (qqbot.groups = { ...qqbot.groups });
-    groups[groupOpenid] = { ...groups[groupOpenid], requireMention };
+    // 写入前先解析现有键（精确 > lowercase 等值）：命中变体键则原地更新，
+    // 避免 @消息事件的大小写形态与配置键不一致时制造第二个变体键
+    // （双键会与读取侧 lookupGroupEntry 的精确优先语义互相踩踏，
+    // 且展开 groups[原始id] 会丢失原条目其余字段）
+    const targetKey = resolveGroupConfigKey(groups, groupOpenid) ?? groupOpenid;
+    groups[targetKey] = { ...groups[targetKey], requireMention };
   }) ?? Promise.resolve();
 }
