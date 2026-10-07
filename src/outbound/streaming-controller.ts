@@ -51,6 +51,13 @@ export class StreamingController {
   /** QQ 已接受的最新文本 — 单源真理 */
   private lastAcceptedFull = '';
 
+  /**
+   * 最后一次被流式通道承接（已下发或 static 模式已缓冲待发）的段落全文。
+   * 框架把 usage footer（/usage tokens|full）等追加在 final payload 文本尾部，
+   * 流式增量永不包含——此字段是 final 差量补发（computeUnsentRemainder）的基准。
+   */
+  private lastDeliveredSegmentText = '';
+
   /** 已成功发送的分片数（降级：=0 且无外部投递则走静态消息兜底） */
   private sentChunkCount = 0;
 
@@ -102,6 +109,37 @@ export class StreamingController {
    */
   markDeliveredExternally(): void {
     this._deliveredExternally = true;
+  }
+
+  /**
+   * 计算框架 final payload 文本中，流式通道尚未投递的尾部增量。
+   *
+   * 框架在模型输出完成后才把 usage footer（/usage tokens|full 的
+   * "Usage: X in / Y out · …" 行，或 /usage full 自定义模板渲染结果）追加到
+   * final payload 文本尾部（框架 appendUsageLine），onPartialReply 流式增量
+   * 永远不会包含它。QQ 流式已下发文本的前缀不可回改，只能把「多出来的尾巴」
+   * 作为新消息补发：
+   *   - final 与已流出段落一致 → ''（纯去重，维持现有行为）
+   *   - final 是已流出段落的扩展 → 扩展部分（典型即 usage footer）
+   *   - 多段 turn 且 final 含全部段落（A+B+C+footer）→ 定位最后一段之后的部分
+   *   - 完全不含已流出段落（模型重写）→ ''（维持现有 final 丢弃去重行为）
+   */
+  computeUnsentRemainder(finalText: string): string {
+    const tail = this.lastDeliveredSegmentText.trim();
+    if (!tail || !finalText) return '';
+    if (finalText === tail) return '';
+    if (finalText.startsWith(tail)) return finalText.slice(tail.length);
+    // 多段 turn：final 文本可能拼接了此前全部段落，已流出的是最后一段——
+    // 从最后一段的结束位置切出增量
+    const idx = finalText.lastIndexOf(tail);
+    if (idx !== -1 && idx + tail.length < finalText.length) {
+      return finalText.slice(idx + tail.length);
+    }
+    // 空白归一化兜底（流式文本与 final 文本的空白差异）
+    if (normalizeWs(finalText).startsWith(normalizeWs(tail))) {
+      return finalText.slice(tail.length);
+    }
+    return '';
   }
 
   // ── 入口 ──
@@ -188,6 +226,7 @@ export class StreamingController {
     if (this.isStaticMode) {
       this.deps.log?.info(`static new segment: lastAccepted=${this.lastAcceptedFull.length}→chunk=${text.length}`);
       this.lastAcceptedFull = text;
+      this.lastDeliveredSegmentText = text;
       this.sentChunkCount++;
       return;
     }
@@ -262,6 +301,7 @@ export class StreamingController {
         this.deps.log?.info(`static accumulate (firstChunk=${text.length})`);
       }
       this.lastAcceptedFull = text;
+      this.lastDeliveredSegmentText = text;
       this.sentChunkCount++;
       return;
     }
@@ -275,6 +315,7 @@ export class StreamingController {
     try {
       await this.session.update(text);
       this.lastAcceptedFull = text;
+      this.lastDeliveredSegmentText = text;
       this.sentChunkCount++;
     } catch (err) {
       this.deps.log?.error(`update failed (len=${text.length}): ${err instanceof Error ? err.message : String(err)}`);

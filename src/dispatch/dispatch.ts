@@ -252,6 +252,10 @@ export async function dispatchToOpenClaw(
 
   const deliveredMediaUrls = new Set<string>();
   const deliveredTexts = new Set<string>();
+  // 流式 turn 的 final payload 文本暂存：框架把 usage footer（/usage tokens|full）
+  // 等追加在 final 文本尾部（框架 appendUsageLine），流式增量永不包含——
+  // 收尾后按前缀差量补发未流出部分（见 dispatch 末尾 [stream-final] 段）
+  let pendingStreamFinalText: string | undefined;
   let deliverErrorCount = 0;
   // 出站发送成功/失败计数：deliver-pipeline 对 sendText {error} 只记日志不抛错，
   // 这里在 dispatch 拥有的发送闭包边界上统计，作为"用户是否收到可见回复"的判据。
@@ -381,6 +385,12 @@ export async function dispatchToOpenClaw(
         if (payload.isError === true) {
           dlog?.info(`run-failure notice bypasses streaming dedup (kind=${kind ?? 'none'} textLen=${text.length})`);
         } else if (!streamingController.shouldFallbackToStatic) {
+          // final 文本暂存：footer 等框架在模型输出后才追加的尾巴（如
+          // /usage tokens|full 的 Usage 行），流式增量永远收不到——
+          // 收尾后按前缀差量补发（见 dispatch 末尾 [stream-final] 段）
+          if (kind === 'final' && text) {
+            pendingStreamFinalText = text;
+          }
           return;
         } else {
           dlog?.warn(`streaming fallback to static`);
@@ -546,6 +556,21 @@ export async function dispatchToOpenClaw(
 
   if (streamingController && !streamingController.isTerminal) {
     await streamingController.finalize();
+  }
+
+  // ── 流式 final 差量补发（/usage tokens|full footer 等）──
+  // 框架在模型输出完成后才把 usage 行追加到 final payload 文本尾部（框架
+  // appendUsageLine）；telegram 用 final 文本整体收尾天然带上，QQ 流式已发
+  // 前缀不可回改 → 按前缀差量把未流出尾巴作为独立消息补发。放在 finalize
+  // 之后保证顺序（static 模式最后一段先落地，footer 随后）。
+  if (streamingController && pendingStreamFinalText !== undefined && !turnAbort.signal.aborted) {
+    const remainder = streamingController.computeUnsentRemainder(pendingStreamFinalText).trim();
+    if (remainder) {
+      dlog?.info(`[stream-final] appending unsent final tail chars=${remainder.length}`);
+      await deliverCtx.sendText(qualifiedTarget, remainder);
+    } else {
+      dlog?.debug?.(`[stream-final] final text fully covered by streamed content (chars=${pendingStreamFinalText.length})`);
+    }
   }
 
   if (debouncer) {
