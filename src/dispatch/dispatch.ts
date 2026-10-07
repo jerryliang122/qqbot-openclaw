@@ -375,8 +375,10 @@ export async function dispatchToOpenClaw(
         // complete 收尾；static → 并入待发缓冲，随 sendStatic 一条发出。
         // isError payload 走默认路径整段重发，不吸收（会与正文重复）。
         // 吸收不了的残余场景（终态 / stream 无会话 / static 缓冲已 flush）
-        // 由 dispatch 末尾 [stream-final] 段兜底单独补发。
-        if (kind === 'final' && text && payload.isError !== true) {
+        // 由 dispatch 末尾 [stream-final] 段兜底单独补发。已取消的 turn
+        // （合并 signal 中止）不吸收——取消的回复不应继续增长（finalize
+        // 仍会关闭会话，只是不再追加内容）。
+        if (kind === 'final' && text && payload.isError !== true && !combinedAbortSignal.aborted) {
           await streamingController.absorbFinalText(text);
         }
         if (streamingController.isStaticSendMode) {
