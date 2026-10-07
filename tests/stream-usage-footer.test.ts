@@ -178,7 +178,64 @@ await test('absorb: stream 模式尾巴并入当前会话（前缀增长），fi
   assert.strictEqual(ctrl.computeUnsentRemainder(`回答全文\n${FOOTER}`), '');
 });
 
-await test('absorb: static 缓冲已 flush 后尾巴独占缓冲（退化为单独一条）', async () => {
+await test('absorb: 回调入队后、执行前 signal 中止 → 不吸收（TOCTOU 重查）', async () => {
+  const updates: string[] = [];
+  const ctrl = new StreamingController({
+    gateway: { openStream: () => ({ update: async (t: string) => { updates.push(t); }, complete: async () => ({ id: 's', timestamp: 0 }) }) } as any,
+    target: { scope: 'c2c', targetId: 'u1', msgId: 'm1' } as any,
+    accountId: 'test',
+    replyToId: 'm1',
+    sendMode: 'stream',
+  });
+  await ctrl.onPartialReply('回答全文');
+  const ac = new AbortController();
+  // absorb 回调入队后、chain 消费前中止（dispatch 侧守卫已放行的竞态窗口）
+  const pending = ctrl.absorbFinalText(`回答全文\n${FOOTER}`, { signal: ac.signal });
+  ac.abort();
+  await pending;
+  await ctrl.finalize();
+  assert.deepStrictEqual(
+    updates,
+    ['回答全文'],
+    `已取消的回复不应吸收 footer，实际: ${JSON.stringify(updates)}`,
+  );
+  assert.strictEqual(ctrl.currentPhase, 'done');
+});
+
+await test('absorb: 流式段落带尾随空白 → 合并边界去重（无双空行）', async () => {
+  const updates: string[] = [];
+  const ctrl = new StreamingController({
+    gateway: { openStream: () => ({ update: async (t: string) => { updates.push(t); }, complete: async () => ({ id: 's', timestamp: 0 }) }) } as any,
+    target: { scope: 'c2c', targetId: 'u1', msgId: 'm1' } as any,
+    accountId: 'test',
+    replyToId: 'm1',
+    sendMode: 'stream',
+  });
+  // provider 末帧带尾随换行；final 文本已 trim、分隔符为单个 \n
+  await ctrl.onPartialReply('回答全文\n');
+  await ctrl.absorbFinalText(`回答全文\n${FOOTER}`);
+  await ctrl.finalize();
+  assert.strictEqual(
+    updates[updates.length - 1],
+    `回答全文\n${FOOTER}`,
+    `合并边界应去重空白（不得出现双空行），实际: ${JSON.stringify(updates[updates.length - 1])}`,
+  );
+});
+
+await test('absorb: static 缓冲带尾随空白 → 合并后一条消息无双空行', async () => {
+  const sentStatic: string[] = [];
+  const ctrl = makeController({ sendMode: 'static', sendStatic: async (t) => { sentStatic.push(t); } });
+  await ctrl.onPartialReply('段文本\n\n');
+  await ctrl.absorbFinalText(`段文本\n${FOOTER}`);
+  await ctrl.finalize();
+  assert.deepStrictEqual(
+    sentStatic,
+    [`段文本\n${FOOTER}`],
+    `static 合并应与 final 文本边界一致，实际: ${JSON.stringify(sentStatic)}`,
+  );
+});
+
+await test('absorb: static 缓冲已 flush 后尾巴独占缓冲（退化为单独一条，无前导空行）', async () => {
   const sentStatic: string[] = [];
   const ctrl = makeController({ sendMode: 'static', sendStatic: async (t) => { sentStatic.push(t); } });
   await ctrl.onPartialReply('段A文本');
@@ -187,7 +244,7 @@ await test('absorb: static 缓冲已 flush 后尾巴独占缓冲（退化为单�
   await ctrl.finalize();
   assert.strictEqual(sentStatic.length, 2);
   assert.strictEqual(sentStatic[0], '段A文本');
-  assert.ok(sentStatic[1]!.includes(FOOTER), `第二条应为 footer，实际: ${JSON.stringify(sentStatic[1])}`);
+  assert.strictEqual(sentStatic[1], FOOTER, `第二条应为 footer 本体（无前导空行），实际: ${JSON.stringify(sentStatic[1])}`);
 });
 
 // ============ Part 2: dispatch 层（真实 dispatchToOpenClaw） ============
