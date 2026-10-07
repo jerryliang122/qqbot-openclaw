@@ -455,6 +455,36 @@ await test('stream 模式: 请求级 signal 在 final 暂存后中止 → 不补
   );
 });
 
+await test('stream 模式: 请求级 signal 在 final 投递前中止 → 不吸收、流不增长', async () => {
+  const requestAbort = new AbortController();
+  const gw = await runDispatch({
+    streaming: { mode: 'stream' },
+    requestSignal: requestAbort.signal,
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '这是回答全文' });
+      // 合并 signal 先中止，框架仍投递非错误 final（竞态）——已取消的
+      // 回复不得继续增长：absorb 跳过，footer 不进流
+      requestAbort.abort();
+      await c.dispatcherOptions?.deliver?.(
+        { text: `这是回答全文\n${FOOTER}` },
+        { kind: 'final' },
+      );
+    },
+  });
+  assert.strictEqual(gw.streamCompletes.length, 1, '会话仍应收尾（关闭挂起流）');
+  const lastUpdate = gw.streamUpdates[gw.streamUpdates.length - 1];
+  assert.strictEqual(
+    lastUpdate,
+    '这是回答全文',
+    `已取消的 turn 流内容不应增长（不吸收 footer），实际: ${JSON.stringify(lastUpdate)}`,
+  );
+  assert.deepStrictEqual(
+    gw.sentTexts,
+    [],
+    `不应兜底补发，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
 await test('非流式: final 文本（含 footer）原样单条发送（回归保护）', async () => {
   const gw = await runDispatch({
     streaming: false,
