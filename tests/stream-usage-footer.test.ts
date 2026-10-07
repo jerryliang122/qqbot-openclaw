@@ -109,13 +109,43 @@ await test('stream: 未经流式（无基准）→ 空串', async () => {
   assert.strictEqual(ctrl.computeUnsentRemainder(`回答\n${FOOTER}`), '');
 });
 
-await test('stream: 空白差异容忍（归一化前缀匹配）', async () => {
+await test('stream: 空白差异容忍（归一化前缀匹配取原始偏移切片）', async () => {
   const ctrl = makeController({ sendMode: 'stream' });
-  await ctrl.onPartialReply('回答  结尾带空格 ');
+  // 流式文本中间双空格，final 文本单空格——tail.length 与匹配前缀的原始
+  // 长度不一致，必须按原始偏移切片（否则会截掉 footer 首字符）
+  await ctrl.onPartialReply('回答  继续');
   await ctrl.finalize();
-  // final 首尾被 trim，空白分布不同
-  const remainder = ctrl.computeUnsentRemainder(`回答 结尾带空格\n${FOOTER}`);
-  assert.ok(remainder.includes(FOOTER), `remainder 应包含 footer，实际: ${JSON.stringify(remainder)}`);
+  const remainder = ctrl.computeUnsentRemainder(`回答 继续\n${FOOTER}`);
+  assert.ok(
+    remainder.includes(FOOTER),
+    `remainder 应包含完整 footer，实际: ${JSON.stringify(remainder)}`,
+  );
+  assert.ok(
+    remainder.startsWith('\nUsage:'),
+    `切片应从匹配前缀的原始结束位置开始，实际: ${JSON.stringify(remainder)}`,
+  );
+});
+
+await test('stream: 旧段内嵌在重写文本中间（非行首边界）→ 空串（不误发）', async () => {
+  const ctrl = makeController({ sendMode: 'stream' });
+  await ctrl.onPartialReply('旧段结论');
+  await ctrl.finalize();
+  // 模型重写：旧段片段出现在行内（前一字符非换行），之后还有大段新文本——
+  // 不能把该位置之后的内容当增量发出
+  const rewritten = `新回答里内嵌 旧段结论 之后还有一大段没流出过的重写内容\n${FOOTER}`;
+  assert.strictEqual(ctrl.computeUnsentRemainder(rewritten), '', '内嵌匹配不应视为增量');
+});
+
+await test('stream: 旧段在行首边界命中（多段拼接形态）→ 正常切出 footer', async () => {
+  const ctrl = makeController({ sendMode: 'stream' });
+  await ctrl.onPartialReply('旧段结论');
+  await ctrl.finalize();
+  const composed = `前文段落\n旧段结论\n${FOOTER}`;
+  assert.strictEqual(
+    ctrl.computeUnsentRemainder(composed),
+    `\n${FOOTER}`,
+    '行首边界命中的多段拼接应正常切出 footer',
+  );
 });
 
 await test('static: flushSegment + finalize 后仍可计算差量', async () => {
@@ -164,21 +194,7 @@ function makeFakeRuntime(opts: { onInboundRun?: (params: any) => Promise<any> } 
   } as any;
 }
 
-function makeMsgAndCtx() {
-  const msg = {
-    kind: 'c2c',
-    messageId: `msg-${Math.random().toString(36).slice(2, 10)}`,
-    content: 'hello',
-    senderId: 'USER_123',
-    senderName: 'Tester',
-    attachments: [],
-    replyTarget: { scope: 'c2c', targetId: 'USER_123' },
-    timestamp: Date.now(),
-  } as any;
-  return { msg, ctx: { state: {}, message: { content: 'hello' }, signal: undefined } as any };
-}
-
-function installFakeGateway() {
+function installFakeGateway(opts: { failSendText?: boolean } = {}) {
   const sentTexts: string[] = [];
   const streamUpdates: string[] = [];
   // 注意：complete 次数用数组记录（原始类型 number 在闭包内自增不会
@@ -187,6 +203,7 @@ function installFakeGateway() {
   const gw = {
     sendText: async (_target: any, text: string) => {
       sentTexts.push(text);
+      if (opts.failSendText) throw new Error('QQ API unavailable');
       return { id: `out-${sentTexts.length}` };
     },
     sendMedia: async () => ({ id: 'media-out' }),
@@ -207,9 +224,27 @@ function installFakeGateway() {
 async function runDispatch(opts: {
   streaming: false | { mode: string; sendMode?: 'static' };
   simulate: (captured: CapturedDispatch) => Promise<void>;
+  /** 自定义请求级 signal（模拟用户取消 / SDK 超时中止） */
+  requestSignal?: AbortSignal;
+  /** gateway.sendText 失败策略：true = 每次都抛错 */
+  failSendText?: boolean;
 }) {
   _resetAdaptersCache();
-  const { msg, ctx } = makeMsgAndCtx();
+  const msg = {
+    kind: 'c2c',
+    messageId: `msg-${Math.random().toString(36).slice(2, 10)}`,
+    content: 'hello',
+    senderId: 'USER_123',
+    senderName: 'Tester',
+    attachments: [],
+    replyTarget: { scope: 'c2c', targetId: 'USER_123' },
+    timestamp: Date.now(),
+  } as any;
+  const ctx = {
+    state: {},
+    message: { content: 'hello' },
+    signal: opts.requestSignal,
+  } as any;
   let captured: CapturedDispatch = {};
 
   const runtime = makeFakeRuntime({
@@ -237,7 +272,7 @@ async function runDispatch(opts: {
     },
   } as any;
 
-  const gw = installFakeGateway();
+  const gw = installFakeGateway({ failSendText: opts.failSendText });
   await dispatchToOpenClaw(ctx, msg, account, runtime);
   return gw;
 }
@@ -311,6 +346,50 @@ await test('static 模式: 最后一段整段发出后补发 footer（顺序正�
     gw.sentTexts,
     ['这是回答全文', FOOTER],
     `应先整段发正文、再补发 footer，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
+await test('static 模式: 正文发送失败 → 不补发 footer（避免只见 footer 不见正文）', async () => {
+  const gw = await runDispatch({
+    streaming: { mode: 'stream', sendMode: 'static' },
+    failSendText: true,
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '这是回答全文' });
+      await c.dispatcherOptions?.deliver?.(
+        { text: `这是回答全文\n${FOOTER}` },
+        { kind: 'final' },
+      );
+    },
+  });
+  assert.strictEqual(gw.sentTexts.length, 1, '只应有正文这一次失败尝试');
+  assert.strictEqual(gw.sentTexts[0], '这是回答全文', '失败的是正文整段发送');
+  assert.ok(
+    !gw.sentTexts.some((t) => t.includes('Usage:')),
+    `正文失败后不应再发 footer，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
+await test('stream 模式: 请求级 signal 在 final 暂存后中止 → 不补发 footer', async () => {
+  const requestAbort = new AbortController();
+  const gw = await runDispatch({
+    streaming: { mode: 'stream' },
+    requestSignal: requestAbort.signal,
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '这是回答全文' });
+      await c.dispatcherOptions?.deliver?.(
+        { text: `这是回答全文\n${FOOTER}` },
+        { kind: 'final' },
+      );
+      // final 已暂存、流式已收尾之后，请求被取消（turnAbort 未触发）——
+      // 补发 guard 必须看合并信号，不能只看 turnAbort
+      requestAbort.abort();
+    },
+  });
+  assert.strictEqual(gw.streamCompletes.length, 1, '流式会话正常收尾');
+  assert.deepStrictEqual(
+    gw.sentTexts,
+    [],
+    `已取消的 turn 不应补发 footer，实际: ${JSON.stringify(gw.sentTexts)}`,
   );
 });
 
