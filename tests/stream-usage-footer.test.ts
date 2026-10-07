@@ -281,7 +281,7 @@ function makeFakeRuntime(opts: { onInboundRun?: (params: any) => Promise<any> } 
   } as any;
 }
 
-function installFakeGateway(opts: { failSendText?: boolean; failSecondUpdate?: boolean } = {}) {
+function installFakeGateway(opts: { failSendText?: boolean; failSecondUpdate?: 'definitive' | 'ambiguous' } = {}) {
   const sentTexts: string[] = [];
   const streamUpdates: string[] = [];
   // 注意：complete 次数用数组记录（原始类型 number 在闭包内自增不会
@@ -297,9 +297,13 @@ function installFakeGateway(opts: { failSendText?: boolean; failSecondUpdate?: b
     openStream: () => ({
       update: async (text: string) => {
         streamUpdates.push(text);
-        // 模拟正文首帧被接受后，footer 合并推送被平台拒绝（如合并文本超限）
         if (opts.failSecondUpdate && streamUpdates.length >= 2) {
-          throw new Error('update rejected: content too long');
+          if (opts.failSecondUpdate === 'definitive') {
+            // 平台明确拒绝（SDK ApiError 形态：httpStatus > 0）——update 确定未应用
+            throw Object.assign(new Error('API Error: content too long'), { httpStatus: 400, name: 'ApiError' });
+          }
+          // 网络层失败（httpStatus === 0 / 非结构化）——结果不明，可能已应用
+          throw new Error('Network error [stream/update]: fetch timeout');
         }
       },
       complete: async () => { streamCompletes.push(Date.now()); return { id: 'stream-done', timestamp: Date.now() }; },
@@ -321,8 +325,8 @@ async function runDispatch(opts: {
   requestSignal?: AbortSignal;
   /** gateway.sendText 失败策略：true = 每次都抛错 */
   failSendText?: boolean;
-  /** 流式 update 失败策略：true = 第二次起（footer 合并推送）被拒 */
-  failSecondUpdate?: boolean;
+  /** 流式 update 失败策略：'definitive' = 平台明确拒绝；'ambiguous' = 网络层结果不明 */
+  failSecondUpdate?: 'definitive' | 'ambiguous';
 }) {
   _resetAdaptersCache();
   const msg = {
@@ -550,10 +554,10 @@ await test('stream 模式: 请求级 signal 在 final 投递前中止 → 不吸
   );
 });
 
-await test('stream 模式: footer 吸收 update 被拒（正文已被接受）→ 兜底补发 footer', async () => {
+await test('stream 模式: footer 吸收 update 被平台明确拒绝 → 流照常收尾 + 兜底补发 footer', async () => {
   const gw = await runDispatch({
     streaming: { mode: 'stream' },
-    failSecondUpdate: true,
+    failSecondUpdate: 'definitive',
     simulate: async (c) => {
       await c.replyOptions?.onPartialReply?.({ text: '这是回答全文' });
       await c.dispatcherOptions?.deliver?.(
@@ -563,10 +567,39 @@ await test('stream 模式: footer 吸收 update 被拒（正文已被接受）�
     },
   });
   assert.strictEqual(gw.streamUpdates.length, 2, '正文首帧 + footer 合并推送各一次');
+  assert.strictEqual(
+    gw.streamCompletes.length,
+    1,
+    `已接受正文的流必须补发 DONE 收尾（防用户端悬挂），实际完成 ${gw.streamCompletes.length} 次`,
+  );
   assert.deepStrictEqual(
     gw.sentTexts,
     [FOOTER],
-    `正文已可见后 absorb 被拒 → footer 应走兜底补发，实际: ${JSON.stringify(gw.sentTexts)}`,
+    `明确拒绝（httpStatus>0）= footer 确定未进流 → 兜底补发，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
+await test('stream 模式: footer 吸收 update 网络层失败（结果不明）→ 流照常收尾、不兜底（防重复）', async () => {
+  const gw = await runDispatch({
+    streaming: { mode: 'stream' },
+    failSecondUpdate: 'ambiguous',
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '这是回答全文' });
+      await c.dispatcherOptions?.deliver?.(
+        { text: `这是回答全文\n${FOOTER}` },
+        { kind: 'final' },
+      );
+    },
+  });
+  assert.strictEqual(
+    gw.streamCompletes.length,
+    1,
+    `结果不明也必须收尾已接受的流，实际完成 ${gw.streamCompletes.length} 次`,
+  );
+  assert.deepStrictEqual(
+    gw.sentTexts,
+    [],
+    `结果不明（httpStatus=0，footer 可能已在流中）→ 抑制兜底防重复，实际: ${JSON.stringify(gw.sentTexts)}`,
   );
 });
 
@@ -623,6 +656,36 @@ await test('shouldSuppressFinalTailFallback 判定矩阵：仅「正文确定未
   await streamAfterAccept.abort('update_error');
   assert.strictEqual(streamAfterAccept.currentPhase, 'failed');
   assert.strictEqual(streamAfterAccept.shouldSuppressFinalTailFallback, false, 'stream 正文已可见后失败不应抑制');
+
+  // stream update 失败按错误形态分类（正文已被接受后失败）：明确拒绝
+  // （httpStatus>0）→ 不抑制；网络层结果不明（httpStatus=0）→ 抑制
+  // （footer 可能已在流中）。注：首帧即失败 = 正文未送达，无论形态都抑制。
+  const mkFailingAfterAccept = (err: unknown) => {
+    let calls = 0;
+    return new StreamingController({
+      gateway: {
+        openStream: () => ({
+          update: async () => { if (++calls > 1) throw err; },
+          complete: async () => ({ id: 's', timestamp: 0 }),
+        }),
+      } as any,
+      target: { scope: 'c2c', targetId: 'u1', msgId: 'm1' } as any,
+      accountId: 'test',
+      replyToId: 'm1',
+      sendMode: 'stream',
+    });
+  };
+  const definitive = mkFailingAfterAccept(Object.assign(new Error('API Error'), { httpStatus: 400, name: 'ApiError' }));
+  await definitive.onPartialReply('正');
+  await definitive.onPartialReply('正文'); // 第二帧 update 被平台明确拒绝
+  assert.strictEqual(definitive.currentPhase, 'failed');
+  assert.strictEqual(definitive.shouldSuppressFinalTailFallback, false, '正文已接受后明确拒绝（httpStatus>0）不应抑制');
+
+  const ambiguous = mkFailingAfterAccept(Object.assign(new Error('Network error'), { httpStatus: 0, name: 'ApiError' }));
+  await ambiguous.onPartialReply('正');
+  await ambiguous.onPartialReply('正文'); // 第二帧 update 网络层失败
+  assert.strictEqual(ambiguous.currentPhase, 'failed');
+  assert.strictEqual(ambiguous.shouldSuppressFinalTailFallback, true, '正文已接受后结果不明（httpStatus=0）应抑制');
 
   // 正常 done → 不抑制
   const done = makeController({ sendMode: 'stream' });
