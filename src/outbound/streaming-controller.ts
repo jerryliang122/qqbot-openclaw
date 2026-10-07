@@ -129,15 +129,20 @@ export class StreamingController {
     if (!tail || !finalText) return '';
     if (finalText === tail) return '';
     if (finalText.startsWith(tail)) return finalText.slice(tail.length);
-    // 多段 turn：final 文本可能拼接了此前全部段落，已流出的是最后一段——
-    // 从最后一段的结束位置切出增量
+    // 多段 turn：final 文本可能拼接了此前全部段落（A+B+C+footer），已流出的
+    // 是最后一段——仅在段落边界（串首或行首）命中才认定，避免旧段内嵌在
+    // 重写文本中间的伪匹配把未验证内容当增量发出
     const idx = finalText.lastIndexOf(tail);
-    if (idx !== -1 && idx + tail.length < finalText.length) {
+    if (idx !== -1 && idx + tail.length < finalText.length && (idx === 0 || finalText[idx - 1] === '\n')) {
       return finalText.slice(idx + tail.length);
     }
-    // 空白归一化兜底（流式文本与 final 文本的空白差异）
-    if (normalizeWs(finalText).startsWith(normalizeWs(tail))) {
-      return finalText.slice(tail.length);
+    // 空白归一化兜底（流式文本与 final 文本的空白差异）：按非空白 token 序列
+    // 验证并取匹配前缀的**原始结束偏移**切片——tail.length 与实际前缀的原始
+    // 长度可能不一致（空白数不同），直接按 tail.length 切会截断 footer 或
+    // 带入正文字符
+    const normalizedEnd = normalizedPrefixEnd(finalText, tail);
+    if (normalizedEnd > 0 && normalizedEnd < finalText.length) {
+      return finalText.slice(normalizedEnd);
     }
     return '';
   }
@@ -374,6 +379,26 @@ function longestCommonPrefix(a: string, b: string): number {
   let i = 0;
   while (i < a.length && i < b.length && a[i] === b[i]) i++;
   return i;
+}
+
+/**
+ * tail 以「非空白 token 序列一致、空白可有差异」的形式构成 finalText 的
+ * 前缀时，返回该前缀在 finalText 中的**原始结束偏移**（最后一个匹配 token
+ * 的末尾位置）；不构成前缀返回 -1。归一化前缀匹配的切片必须用这个偏移，
+ * 而不是 tail.length（两者空白长度可能不同）。
+ */
+function normalizedPrefixEnd(finalText: string, tail: string): number {
+  const tailTokens = tail.match(/\S+/g) ?? [];
+  if (tailTokens.length === 0) return -1;
+  let cursor = 0;
+  let end = -1;
+  for (const token of tailTokens) {
+    while (cursor < finalText.length && /\s/.test(finalText[cursor] ?? '')) cursor++;
+    if (!finalText.startsWith(token, cursor)) return -1;
+    cursor += token.length;
+    end = cursor;
+  }
+  return end;
 }
 
 // ── 入口判断 ──

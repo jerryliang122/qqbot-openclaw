@@ -563,7 +563,15 @@ export async function dispatchToOpenClaw(
   // appendUsageLine）；telegram 用 final 文本整体收尾天然带上，QQ 流式已发
   // 前缀不可回改 → 按前缀差量把未流出尾巴作为独立消息补发。放在 finalize
   // 之后保证顺序（static 模式最后一段先落地，footer 随后）。
-  if (streamingController && pendingStreamFinalText !== undefined && !turnAbort.signal.aborted) {
+  // 两类不补发：请求已取消（合并信号 = ctx.signal + turnAbort，任一中止
+  // 都不发已取消 turn 的 footer）；控制器 failed 终态（正文投递失败时单发
+  // footer 只会更怪——static 模式 sendStatic 失败即 failed）。
+  if (
+    streamingController
+    && pendingStreamFinalText !== undefined
+    && !combinedAbortSignal.aborted
+    && streamingController.currentPhase !== 'failed'
+  ) {
     const remainder = streamingController.computeUnsentRemainder(pendingStreamFinalText).trim();
     if (remainder) {
       dlog?.info(`[stream-final] appending unsent final tail chars=${remainder.length}`);
@@ -629,7 +637,10 @@ function createStreamingController(
     | undefined;
   const sendMode = streamingCfg?.sendMode === 'static' ? 'static' : 'stream';
 
-  // static 模式：finalize 收尾时用一条普通 sendText 发完整文本
+  // static 模式：finalize 收尾时用一条普通 sendText 发完整文本。
+  // 失败必须抛错——controller 的 completeSession/flushSegment 靠异常把
+  // 终态转为 failed（吞错会让它把失败的正文记为已投递，进而照常补发
+  // footer，用户只见 footer 不见正文）
   const sendStatic = sendMode === 'static'
     ? async (fullText: string) => {
         const result = await sendText({
@@ -640,7 +651,7 @@ function createStreamingController(
           account,
         });
         if (result.error) {
-          log?.error(`static sendText failed: ${result.error}`);
+          throw new Error(`static sendText failed: ${result.error}`);
         }
       }
     : undefined;
