@@ -104,6 +104,20 @@ export class StreamingController {
   }
 
   /**
+   * final 尾巴兜底补发的失败抑制判定。
+   *
+   * 失败终态并不总意味着「正文没送达」：static 模式 sendStatic 失败 =
+   * 正文整段未投递（footer 单发只会更怪，抑制）；stream 模式在已有分片被
+   * 平台接受之后失败（典型：absorb 的 footer 增长 update 被拒，如合并文本
+   * 超限）= 正文已可见，尾巴仍应走兜底补发，不能因 failed 一刀切丢弃。
+   */
+  get shouldSuppressFinalTailFallback(): boolean {
+    if (this.currentPhase !== 'failed') return false;
+    if (this.isStaticMode) return true;
+    return !this.hasSentChunks;
+  }
+
+  /**
    * 告知控制器内容已通过外部通道投递（如 ask_user 卡片）。
    * 后续 finalize() 不会走 fallback 路径，框架不会误报 outcome=error。
    */

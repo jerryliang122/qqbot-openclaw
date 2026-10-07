@@ -281,7 +281,7 @@ function makeFakeRuntime(opts: { onInboundRun?: (params: any) => Promise<any> } 
   } as any;
 }
 
-function installFakeGateway(opts: { failSendText?: boolean } = {}) {
+function installFakeGateway(opts: { failSendText?: boolean; failSecondUpdate?: boolean } = {}) {
   const sentTexts: string[] = [];
   const streamUpdates: string[] = [];
   // 注意：complete 次数用数组记录（原始类型 number 在闭包内自增不会
@@ -295,7 +295,13 @@ function installFakeGateway(opts: { failSendText?: boolean } = {}) {
     },
     sendMedia: async () => ({ id: 'media-out' }),
     openStream: () => ({
-      update: async (text: string) => { streamUpdates.push(text); },
+      update: async (text: string) => {
+        streamUpdates.push(text);
+        // 模拟正文首帧被接受后，footer 合并推送被平台拒绝（如合并文本超限）
+        if (opts.failSecondUpdate && streamUpdates.length >= 2) {
+          throw new Error('update rejected: content too long');
+        }
+      },
       complete: async () => { streamCompletes.push(Date.now()); return { id: 'stream-done', timestamp: Date.now() }; },
     }),
   } as any;
@@ -315,6 +321,8 @@ async function runDispatch(opts: {
   requestSignal?: AbortSignal;
   /** gateway.sendText 失败策略：true = 每次都抛错 */
   failSendText?: boolean;
+  /** 流式 update 失败策略：true = 第二次起（footer 合并推送）被拒 */
+  failSecondUpdate?: boolean;
 }) {
   _resetAdaptersCache();
   const msg = {
@@ -359,7 +367,7 @@ async function runDispatch(opts: {
     },
   } as any;
 
-  const gw = installFakeGateway({ failSendText: opts.failSendText });
+  const gw = installFakeGateway({ failSendText: opts.failSendText, failSecondUpdate: opts.failSecondUpdate });
   await dispatchToOpenClaw(ctx, msg, account, runtime);
   return gw;
 }
@@ -542,6 +550,26 @@ await test('stream 模式: 请求级 signal 在 final 投递前中止 → 不吸
   );
 });
 
+await test('stream 模式: footer 吸收 update 被拒（正文已被接受）→ 兜底补发 footer', async () => {
+  const gw = await runDispatch({
+    streaming: { mode: 'stream' },
+    failSecondUpdate: true,
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '这是回答全文' });
+      await c.dispatcherOptions?.deliver?.(
+        { text: `这是回答全文\n${FOOTER}` },
+        { kind: 'final' },
+      );
+    },
+  });
+  assert.strictEqual(gw.streamUpdates.length, 2, '正文首帧 + footer 合并推送各一次');
+  assert.deepStrictEqual(
+    gw.sentTexts,
+    [FOOTER],
+    `正文已可见后 absorb 被拒 → footer 应走兜底补发，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
 await test('非流式: final 文本（含 footer）原样单条发送（回归保护）', async () => {
   const gw = await runDispatch({
     streaming: false,
@@ -557,6 +585,50 @@ await test('非流式: final 文本（含 footer）原样单条发送（回归�
     [`这是回答全文\n${FOOTER}`],
     `非流式应整条原样发送（含 footer），实际: ${JSON.stringify(gw.sentTexts)}`,
   );
+});
+
+await test('shouldSuppressFinalTailFallback 判定矩阵：仅「正文确定未送达」才抑制', async () => {
+  // static 失败（sendStatic 抛错）→ 正文未投递 → 抑制
+  const staticFail = makeController({
+    sendMode: 'static',
+    sendStatic: async () => { throw new Error('send error'); },
+  });
+  await staticFail.onPartialReply('正文');
+  await staticFail.finalize();
+  assert.strictEqual(staticFail.currentPhase, 'failed');
+  assert.strictEqual(staticFail.shouldSuppressFinalTailFallback, true, 'static 失败应抑制');
+
+  // stream 失败但已有分片被接受（如 footer update 被拒）→ 正文可见 → 不抑制
+  const streamWithChunks = new StreamingController({
+    gateway: {
+      openStream: () => ({
+        update: async (_t: string) => { throw new Error('update rejected'); },
+        complete: async () => ({ id: 's', timestamp: 0 }),
+      }),
+    } as any,
+    target: { scope: 'c2c', targetId: 'u1', msgId: 'm1' } as any,
+    accountId: 'test',
+    replyToId: 'm1',
+    sendMode: 'stream',
+  });
+  // 先用一个成功的控制器推正文？构造更直接：update 永远失败 → 0 分片 → 抑制
+  await streamWithChunks.onPartialReply('正文');
+  assert.strictEqual(streamWithChunks.currentPhase, 'failed');
+  assert.strictEqual(streamWithChunks.shouldSuppressFinalTailFallback, true, 'stream 无已接受分片应抑制');
+
+  // stream 失败且正文已被接受 → 不抑制（本用例经 dispatch 层 failSecondUpdate 覆盖，
+  // 这里直接构造：成功推正文后手动 abort（failed）模拟吸收后失败）
+  const streamAfterAccept = makeController({ sendMode: 'stream' });
+  await streamAfterAccept.onPartialReply('正文');
+  await streamAfterAccept.abort('update_error');
+  assert.strictEqual(streamAfterAccept.currentPhase, 'failed');
+  assert.strictEqual(streamAfterAccept.shouldSuppressFinalTailFallback, false, 'stream 正文已可见后失败不应抑制');
+
+  // 正常 done → 不抑制
+  const done = makeController({ sendMode: 'stream' });
+  await done.onPartialReply('正文');
+  await done.finalize();
+  assert.strictEqual(done.shouldSuppressFinalTailFallback, false, 'done 不抑制');
 });
 
 // ============ 汇总 ============
