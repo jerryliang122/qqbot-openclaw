@@ -8,6 +8,18 @@
 
 ---
 
+## [2.2.1] - 2026-10-07
+
+### 修复
+
+- **c2c 流式下 `/usage` footer 丢失**（PR #33，2026-10-07 用户反馈）：框架 `/usage off|tokens|full` 的 usage 行（`Usage: X in / Y out · cache … `）由框架在**模型输出完成后**追加到 final payload 文本尾部，`onPartialReply` 流式增量永远不含它——非流式路径整段发送 final 文本天然带上，但 c2c 开启 `channels.qqbot.streaming` 后 dispatch 的流式分支丢弃 final payload（"已由流式发过"去重），footer 随之丢失（telegram 用 final 文本整体收尾所以正常显示）。修复：`StreamingController` 记录最后已流出段落全文（`lastDeliveredSegmentText`），dispatch 流式分支暂存 final 文本，收尾 finalize 后 `computeUnsentRemainder` 按前缀差量把未流出尾巴作为独立消息补发（`[stream-final]`）。评审收紧（Sourcery 4 条）：仅在行首/串首边界认定多段拼接命中（防旧段内嵌重写文本误发）；归一化空白匹配按 token 序列取**原始结束偏移**切片（防 footer 截断）；static 模式 `sendStatic` 失败改抛错对齐 controller 契约且 failed 终态不补发（防"只见 footer 不见正文"）；补发 guard 改用合并中止信号（ctx.signal 中止同样抑制）。room_event 群 final 本就不投递，不受影响。回归测试 `tests/stream-usage-footer.test.ts`（16 用例）。
+
+### 杂项
+
+- 补同步 `package-lock.json` 根部 version 字段（v2.2.0 发版时遗漏，元数据停在 2.1.0）。
+
+---
+
 ## [2.2.0] - 2026-10-06
 
 > 版本号说明：含配置行为变更（工具策略来源从硬编码改为配置驱动），严格按 SemVer 应为 Major；因 `RESTRICTED_GROUP_TOOL_ALLOWLIST` 是代码内部常量而非用户配置，旧配置行为不变（无 tools 配置时走原 fallback），主人决定按 minor 处理。
