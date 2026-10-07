@@ -206,6 +206,39 @@ export class StreamingController {
     this.transition('failed', `abort:${reason ?? 'manual'}`);
   }
 
+  /**
+   * 把框架 final payload 文本中未流出的尾巴（/usage tokens|full 的 footer
+   * 等）**并入当前流式通道**，使其与正文呈现为同一条消息——QQ 无消息
+   * 编辑 API，正文一旦发出不可追加（telegram 靠编辑最终消息实现同样效果）：
+   * - stream 模式：作为前缀增长推入当前流式会话（随 finalize 的 complete 收尾）；
+   * - static 模式：并入待发缓冲（随 finalize/flush 的 sendStatic 一条发出）；
+   *   缓冲为空（正文已 flush）时尾巴独占缓冲，退化为单独一条。
+   * 无尾巴 / 已终态 / stream 无会话时 no-op，残余场景由上层兜底单独补发。
+   * 并入后同步推进 lastDeliveredSegmentText（差量基准），避免上层重复补发。
+   */
+  absorbFinalText(finalText: string): Promise<void> {
+    this.chain = this.chain.then(async () => {
+      if (this.isTerminal) return;
+      const remainder = this.computeUnsentRemainder(finalText);
+      if (!remainder) return;
+      if (this.isStaticMode) {
+        this.lastAcceptedFull = this.lastAcceptedFull + remainder;
+        this.lastDeliveredSegmentText = this.lastAcceptedFull;
+        this.deps.log?.info(`absorb final tail into static buffer chars=${remainder.length}`);
+        return;
+      }
+      // stream：前缀增长推入当前会话；无会话（异常态）时留给上层兜底
+      if (this.session) {
+        await this.sendUpdate(this.lastAcceptedFull + remainder);
+        this.deps.log?.info(`absorb final tail into stream chars=${remainder.length}`);
+      }
+    }).catch((err) => {
+      this.deps.log?.error(`absorbFinalText error: ${err instanceof Error ? err.message : String(err)}`);
+      this.transition('failed', 'absorb_error');
+    });
+    return this.chain as Promise<void>;
+  }
+
   // ── 核心逻辑 ──
 
   private async handleChunk(text: string): Promise<void> {
