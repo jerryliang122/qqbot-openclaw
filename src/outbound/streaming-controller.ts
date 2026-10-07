@@ -52,6 +52,13 @@ export class StreamingController {
   private lastAcceptedFull = '';
 
   /**
+   * 最后一次流式 update 失败是否「结果不明」（网络层失败：超时/连接中断，
+   * 平台可能已应用该 update、仅 ack 丢失）。结果不明时不补发未流出尾巴，
+   * 防止与流内已存在的内容重复。
+   */
+  private lastUpdateFailureAmbiguous = false;
+
+  /**
    * 最后一次被流式通道承接（已下发或 static 模式已缓冲待发）的段落全文。
    * 框架把 usage footer（/usage tokens|full）等追加在 final payload 文本尾部，
    * 流式增量永不包含——此字段是 final 差量补发（computeUnsentRemainder）的基准。
@@ -113,6 +120,9 @@ export class StreamingController {
    */
   get shouldSuppressFinalTailFallback(): boolean {
     if (this.currentPhase !== 'failed') return false;
+    // stream 失败但「结果不明」（网络层失败，平台可能已应用最后的
+    // update——含 footer 合并推送）：补发可能与流内内容重复，宁缺毋滥
+    if (!this.isStaticMode && this.lastUpdateFailureAmbiguous) return true;
     if (this.isStaticMode) return true;
     return !this.hasSentChunks;
   }
@@ -377,7 +387,20 @@ export class StreamingController {
       this.sentChunkCount++;
     } catch (err) {
       this.deps.log?.error(`update failed (len=${text.length}): ${err instanceof Error ? err.message : String(err)}`);
-      this.session = null;
+      // 失败分类：SDK ApiError httpStatus>0 = 平台明确拒绝（update 确定未
+      // 应用）；httpStatus===0 / 非结构化错误 = 网络层失败，结果不明
+      // （平台可能已应用、仅 ack 丢失）——后者不得补发尾巴，防与流内
+      // 内容重复
+      this.lastUpdateFailureAmbiguous = isAmbiguousStreamUpdateFailure(err);
+      // 已有已接受文本的流必须收尾（发送 DONE 帧），否则用户端流式状态
+      // 永久悬挂（典型：footer 合并 update 被拒，正文已可见）。complete
+      // 失败只能容忍（连接已死的极端情形）。无已接受文本的空会话不收尾
+      // （避免平台侧落一条空消息）。
+      if (this.session && this.lastAcceptedFull) {
+        await this.completeSession('update_failed');
+      } else {
+        this.session = null;
+      }
       this.transition('failed', 'update_error');
     }
   }
@@ -432,6 +455,20 @@ function longestCommonPrefix(a: string, b: string): number {
   let i = 0;
   while (i < a.length && i < b.length && a[i] === b[i]) i++;
   return i;
+}
+
+/**
+ * 流式 update 失败是否「结果不明」。SDK 的 ApiError 带 httpStatus：
+ * httpStatus > 0 = 收到了平台明确响应（拒绝/业务错误），update 确定
+ * 未应用；httpStatus === 0 = 网络层失败（超时、连接中断），请求可能已
+ * 被平台应用、只是 ack 丢失。非结构化错误一律按结果不明处理（保守）。
+ */
+function isAmbiguousStreamUpdateFailure(err: unknown): boolean {
+  if (err && typeof err === 'object') {
+    const status = (err as { httpStatus?: unknown }).httpStatus;
+    if (typeof status === 'number') return status === 0;
+  }
+  return true;
 }
 
 /**
