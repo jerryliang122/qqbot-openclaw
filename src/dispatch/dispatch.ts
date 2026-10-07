@@ -379,7 +379,9 @@ export async function dispatchToOpenClaw(
         // （合并 signal 中止）不吸收——取消的回复不应继续增长（finalize
         // 仍会关闭会话，只是不再追加内容）。
         if (kind === 'final' && text && payload.isError !== true && !combinedAbortSignal.aborted) {
-          await streamingController.absorbFinalText(text);
+          // signal 同时传入：回调入队后、执行前的中止窗口（TOCTOU）在
+          // controller 内重查
+          await streamingController.absorbFinalText(text, { signal: combinedAbortSignal });
         }
         if (streamingController.isStaticSendMode) {
           // static 模式：flush 主路径由 onToolStart 驱动（工具开始前，绕开 SDK

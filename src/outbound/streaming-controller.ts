@@ -215,21 +215,27 @@ export class StreamingController {
    *   缓冲为空（正文已 flush）时尾巴独占缓冲，退化为单独一条。
    * 无尾巴 / 已终态 / stream 无会话时 no-op，残余场景由上层兜底单独补发。
    * 并入后同步推进 lastDeliveredSegmentText（差量基准），避免上层重复补发。
+   *
+   * opts.signal：合并中止信号。dispatch 侧调用点的守卫只覆盖调用时刻，
+   * 回调入队后、实际执行前仍可能中止（TOCTOU）——回调内重查，已取消的
+   * 回复不得继续增长。
    */
-  absorbFinalText(finalText: string): Promise<void> {
+  absorbFinalText(finalText: string, opts?: { signal?: AbortSignal }): Promise<void> {
+    const signal = opts?.signal;
     this.chain = this.chain.then(async () => {
       if (this.isTerminal) return;
+      if (signal?.aborted) return;
       const remainder = this.computeUnsentRemainder(finalText);
       if (!remainder) return;
       if (this.isStaticMode) {
-        this.lastAcceptedFull = this.lastAcceptedFull + remainder;
+        this.lastAcceptedFull = mergeSegmentBoundary(this.lastAcceptedFull, remainder);
         this.lastDeliveredSegmentText = this.lastAcceptedFull;
         this.deps.log?.info(`absorb final tail into static buffer chars=${remainder.length}`);
         return;
       }
       // stream：前缀增长推入当前会话；无会话（异常态）时留给上层兜底
       if (this.session) {
-        await this.sendUpdate(this.lastAcceptedFull + remainder);
+        await this.sendUpdate(mergeSegmentBoundary(this.lastAcceptedFull, remainder));
         this.deps.log?.info(`absorb final tail into stream chars=${remainder.length}`);
       }
     }).catch((err) => {
@@ -412,6 +418,20 @@ function longestCommonPrefix(a: string, b: string): number {
   let i = 0;
   while (i < a.length && i < b.length && a[i] === b[i]) i++;
   return i;
+}
+
+/**
+ * 合并已流出段落与未流出尾巴的边界：差量基准是 trim 后的段落文本，而
+ * 段落原文可能带尾随空白（provider 末帧常带 "\n"），直接拼接会与 final
+ * 文本（已 trim，分隔符是 appendUsageLine 的单个 "\n"）叠加出重复空行
+ * （如 "回答\n" + "\nUsage" → 双空行）。以 final 文本的边界为准：基座
+ * 右去空白后原样接尾巴；基座为空（正文已 flush 的 static 退化路径）时
+ * 去掉尾巴的前导空白，避免独立消息以空行开头。
+ */
+function mergeSegmentBoundary(base: string, remainder: string): string {
+  const trimmedBase = base.replace(/\s+$/, '');
+  if (!trimmedBase) return remainder.replace(/^\s+/, '');
+  return trimmedBase + remainder;
 }
 
 /**
