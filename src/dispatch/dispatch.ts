@@ -578,13 +578,15 @@ export async function dispatchToOpenClaw(
   // 前缀不可回改 → 按前缀差量把未流出尾巴作为独立消息补发。放在 finalize
   // 之后保证顺序（static 模式最后一段先落地，footer 随后）。
   // 两类不补发：请求已取消（合并信号 = ctx.signal + turnAbort，任一中止
-  // 都不发已取消 turn 的 footer）；控制器 failed 终态（正文投递失败时单发
-  // footer 只会更怪——static 模式 sendStatic 失败即 failed）。
+  // 都不发已取消 turn 的 footer）；正文确定未送达（shouldSuppressFinalTail-
+  // Fallback：static 模式 sendStatic 失败、或 stream 无任何已接受分片——
+  // stream 在正文已可见后 failed 的情形【如 absorb 的 footer update 被拒】
+  // 不抑制，footer 仍走兜底）。
   if (
     streamingController
     && pendingStreamFinalText !== undefined
     && !combinedAbortSignal.aborted
-    && streamingController.currentPhase !== 'failed'
+    && !streamingController.shouldSuppressFinalTailFallback
   ) {
     const remainder = streamingController.computeUnsentRemainder(pendingStreamFinalText).trim();
     if (remainder) {
