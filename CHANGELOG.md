@@ -8,6 +8,14 @@
 
 ---
 
+## [2.2.2] - 2026-10-07
+
+### 修复
+
+- **`/usage` footer 并入正文同一条消息**（PR #35，2.2.1 用户反馈单独成条）：v2.2.1 把 footer 作为独立消息补发（QQ 无消息编辑 API，正文发出后不可追加）；但 final payload 到达时流式会话尚未 complete，尾巴可以并入——新增 `StreamingController.absorbFinalText`：stream 模式在收尾前把未流出尾巴作为前缀增长推入当前会话（与普通 token 增长同形态，平台无感知，footer 直接显示在流式消息末尾）、static 模式拼进待发缓冲随 `sendStatic` 一条发出（顺带省一条独立 sendText 的被动配额槽）；合并经 `mergeSegmentBoundary` 对齐 final 文本的分隔边界（防双空行）。吸收不了的残余场景（终态/无会话/缓冲已 flush）由 `[stream-final]` 兜底单独补发。经 Sourcery 四轮评审加固（9 条意见全部闭环）：isError payload 不吸收；合并 signal 中止不吸收且**信号传入 absorb、入队回调内重查**（TOCTOU 窗口）——已取消的回复不得继续增长；兜底抑制精确化为 `shouldSuppressFinalTailFallback`（仅「正文确定未送达」或「结果不明」抑制：static sendStatic 失败 / stream 无已接受分片 / update 网络层失败（ApiError `httpStatus===0`，平台可能已应用仅 ack 丢失，防重复宁缺毋滥；`httpStatus>0` 明确拒绝则照常兜底））；stream update 失败时对已有已接受文本的会话补发 DONE 收尾（防用户端流式状态永久悬挂）。回归测试 `tests/stream-usage-footer.test.ts`（26 用例）。
+
+---
+
 ## [2.2.1] - 2026-10-07
 
 ### 修复
