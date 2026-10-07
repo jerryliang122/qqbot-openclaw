@@ -160,6 +160,36 @@ await test('static: flushSegment + finalize 后仍可计算差量', async () => 
   assert.strictEqual(ctrl.computeUnsentRemainder(`段B文本\n${FOOTER}`), `\n${FOOTER}`);
 });
 
+await test('absorb: stream 模式尾巴并入当前会话（前缀增长），finalize 一次收尾', async () => {
+  const updates: string[] = [];
+  const ctrl = new StreamingController({
+    gateway: { openStream: () => ({ update: async (t: string) => { updates.push(t); }, complete: async () => ({ id: 's', timestamp: 0 }) }) } as any,
+    target: { scope: 'c2c', targetId: 'u1', msgId: 'm1' } as any,
+    accountId: 'test',
+    replyToId: 'm1',
+    sendMode: 'stream',
+  });
+  await ctrl.onPartialReply('回答全文');
+  await ctrl.absorbFinalText(`回答全文\n${FOOTER}`);
+  await ctrl.finalize();
+  assert.deepStrictEqual(updates, ['回答全文', `回答全文\n${FOOTER}`], 'footer 应作为前缀增长推入同一条流');
+  assert.strictEqual(ctrl.currentPhase, 'done');
+  // 基准已推进——上层差量兜底不会再重复补发
+  assert.strictEqual(ctrl.computeUnsentRemainder(`回答全文\n${FOOTER}`), '');
+});
+
+await test('absorb: static 缓冲已 flush 后尾巴独占缓冲（退化为单独一条）', async () => {
+  const sentStatic: string[] = [];
+  const ctrl = makeController({ sendMode: 'static', sendStatic: async (t) => { sentStatic.push(t); } });
+  await ctrl.onPartialReply('段A文本');
+  await ctrl.flushSegment();
+  await ctrl.absorbFinalText(`段A文本\n${FOOTER}`);
+  await ctrl.finalize();
+  assert.strictEqual(sentStatic.length, 2);
+  assert.strictEqual(sentStatic[0], '段A文本');
+  assert.ok(sentStatic[1]!.includes(FOOTER), `第二条应为 footer，实际: ${JSON.stringify(sentStatic[1])}`);
+});
+
 // ============ Part 2: dispatch 层（真实 dispatchToOpenClaw） ============
 
 interface CapturedDispatch {
@@ -279,7 +309,7 @@ async function runDispatch(opts: {
 
 group('Part 2: dispatch 层（真实 dispatchToOpenClaw）');
 
-await test('stream 模式: final 含 footer → 流式发正文 + 补发 footer 独立消息', async () => {
+await test('stream 模式: final 含 footer → 尾巴并入流式会话，同一条消息收尾', async () => {
   const gw = await runDispatch({
     streaming: { mode: 'stream' },
     simulate: async (c) => {
@@ -292,15 +322,20 @@ await test('stream 模式: final 含 footer → 流式发正文 + 补发 footer 
     },
   });
   assert.strictEqual(gw.streamCompletes.length, 1, '流式会话应收尾一次');
-  assert.ok(gw.streamUpdates.length >= 1, '应有流式 update');
+  const lastUpdate = gw.streamUpdates[gw.streamUpdates.length - 1];
+  assert.strictEqual(
+    lastUpdate,
+    `这是回答全文\n${FOOTER}`,
+    `最后一次 update 应为正文+footer 全文（同一条消息），实际: ${JSON.stringify(lastUpdate)}`,
+  );
   assert.deepStrictEqual(
     gw.sentTexts,
-    [FOOTER],
-    `sendText 应仅补发 footer 一条，实际: ${JSON.stringify(gw.sentTexts)}`,
+    [],
+    `footer 已并入流式消息，不应再单独补发，实际: ${JSON.stringify(gw.sentTexts)}`,
   );
 });
 
-await test('stream 模式: 多段 turn → 正文两段流式 + footer 补发', async () => {
+await test('stream 模式: 多段 turn → footer 并入最后一段的流式会话', async () => {
   const gw = await runDispatch({
     streaming: { mode: 'stream' },
     simulate: async (c) => {
@@ -312,11 +347,13 @@ await test('stream 模式: 多段 turn → 正文两段流式 + footer 补发', 
       );
     },
   });
-  assert.deepStrictEqual(
-    gw.sentTexts,
-    [FOOTER],
-    `只应补发 footer，实际: ${JSON.stringify(gw.sentTexts)}`,
+  const lastUpdate = gw.streamUpdates[gw.streamUpdates.length - 1];
+  assert.strictEqual(
+    lastUpdate,
+    `第二段结论\n${FOOTER}`,
+    `footer 应并入最后一段的流式消息，实际: ${JSON.stringify(lastUpdate)}`,
   );
+  assert.deepStrictEqual(gw.sentTexts, [], '不应单独补发');
 });
 
 await test('stream 模式: final 与流出内容一致 → 不补发（无重复）', async () => {
@@ -330,7 +367,28 @@ await test('stream 模式: final 与流出内容一致 → 不补发（无重复
   assert.deepStrictEqual(gw.sentTexts, [], 'final 完全被流式覆盖时不应补发');
 });
 
-await test('static 模式: 最后一段整段发出后补发 footer（顺序正确）', async () => {
+await test('stream 模式: final 前已被 tool payload 收尾（终态）→ 兜底单独补发 footer', async () => {
+  const gw = await runDispatch({
+    streaming: { mode: 'stream' },
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '这是回答全文' });
+      // verbose 开启时框架会投递 tool payload → stream 模式收尾流（终态），
+      // 之后到达的 final 无法再并入 → 走 [stream-final] 兜底
+      await c.dispatcherOptions?.deliver?.({ text: '' }, { kind: 'tool' });
+      await c.dispatcherOptions?.deliver?.(
+        { text: `这是回答全文\n${FOOTER}` },
+        { kind: 'final' },
+      );
+    },
+  });
+  assert.deepStrictEqual(
+    gw.sentTexts,
+    [FOOTER],
+    `终态后无法并入，应兜底单独补发 footer，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
+await test('static 模式: footer 并入最后一段，整段一条消息发出', async () => {
   const gw = await runDispatch({
     streaming: { mode: 'stream', sendMode: 'static' },
     simulate: async (c) => {
@@ -344,8 +402,8 @@ await test('static 模式: 最后一段整段发出后补发 footer（顺序正�
   });
   assert.deepStrictEqual(
     gw.sentTexts,
-    ['这是回答全文', FOOTER],
-    `应先整段发正文、再补发 footer，实际: ${JSON.stringify(gw.sentTexts)}`,
+    [`这是回答全文\n${FOOTER}`],
+    `正文与 footer 应合成一条消息，实际: ${JSON.stringify(gw.sentTexts)}`,
   );
 });
 
@@ -361,11 +419,15 @@ await test('static 模式: 正文发送失败 → 不补发 footer（避免只�
       );
     },
   });
-  assert.strictEqual(gw.sentTexts.length, 1, '只应有正文这一次失败尝试');
-  assert.strictEqual(gw.sentTexts[0], '这是回答全文', '失败的是正文整段发送');
+  assert.strictEqual(gw.sentTexts.length, 1, '只应有合并正文+footer这一次失败尝试');
+  assert.strictEqual(
+    gw.sentTexts[0],
+    `这是回答全文\n${FOOTER}`,
+    '失败的是合并后的整段发送（absorb 已并入 footer）',
+  );
   assert.ok(
-    !gw.sentTexts.some((t) => t.includes('Usage:')),
-    `正文失败后不应再发 footer，实际: ${JSON.stringify(gw.sentTexts)}`,
+    !gw.sentTexts.slice(1).some((t) => t.includes('Usage:')),
+    `正文失败后不应再单独发 footer，实际: ${JSON.stringify(gw.sentTexts)}`,
   );
 });
 

@@ -369,6 +369,16 @@ export async function dispatchToOpenClaw(
       // 去重假设不成立——早退 return 会把通知吞掉，用户只见首分片后静默
       // （issue #8：静态流式首分片 1062 字符已发，模型超时后无任何提示）。
       if (streamingController?.hasStarted && !streamingController?.shouldFallbackToStatic) {
+        // final 的未流出尾巴（usage footer 等）先**并入流式通道**，与正文合成
+        // 同一条消息（QQ 无消息编辑 API，正文发出后不可追加；telegram 靠编辑
+        // 最终消息实现同样效果）：stream → 前缀增长推入当前流式会话，随
+        // complete 收尾；static → 并入待发缓冲，随 sendStatic 一条发出。
+        // isError payload 走默认路径整段重发，不吸收（会与正文重复）。
+        // 吸收不了的残余场景（终态 / stream 无会话 / static 缓冲已 flush）
+        // 由 dispatch 末尾 [stream-final] 段兜底单独补发。
+        if (kind === 'final' && text && payload.isError !== true) {
+          await streamingController.absorbFinalText(text);
+        }
         if (streamingController.isStaticSendMode) {
           // static 模式：flush 主路径由 onToolStart 驱动（工具开始前，绕开 SDK
           // block streaming 的 coalescer，避免 minChars=800/idleMs=1000 buffer 延迟）。
@@ -385,9 +395,9 @@ export async function dispatchToOpenClaw(
         if (payload.isError === true) {
           dlog?.info(`run-failure notice bypasses streaming dedup (kind=${kind ?? 'none'} textLen=${text.length})`);
         } else if (!streamingController.shouldFallbackToStatic) {
-          // final 文本暂存：footer 等框架在模型输出后才追加的尾巴（如
-          // /usage tokens|full 的 Usage 行），流式增量永远收不到——
-          // 收尾后按前缀差量补发（见 dispatch 末尾 [stream-final] 段）
+          // final 文本暂存：absorbFinalText 未能并入（终态 / stream 无会话 /
+          // static 缓冲已 flush 后重算仍有增量等）的残余场景，由 dispatch
+          // 末尾 [stream-final] 段按前缀差量兜底单独补发
           if (kind === 'final' && text) {
             pendingStreamFinalText = text;
           }
