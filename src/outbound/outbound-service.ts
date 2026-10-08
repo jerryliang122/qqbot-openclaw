@@ -197,6 +197,12 @@ export async function sendText(params: {
   replyToId?: string;
   account: ResolvedQQBotAccount;
   quotaReserved?: boolean;
+  /**
+   * 只走被动回复（progress card 等非正文消息用）：配额不可用时直接返回
+   * error（不调网关、不降级主动、不烧每日主动预算）。调用方收到该 error
+   * 应静默丢弃消息。
+   */
+  passiveOnly?: boolean;
 }): Promise<SendResult> {
   const accountId = params.account.accountId;
   const resolved = resolveGatewayForSend(accountId);
@@ -208,6 +214,11 @@ export async function sendText(params: {
     scope: target.scope,
     quotaReserved: params.quotaReserved,
   });
+  // passiveOnly：未占得被动槽（无 msg_id 可挂 / 配额耗尽 / TOCTOU 竞态）
+  // → 不发送。绝不落到主动通道。
+  if (params.passiveOnly && !reservation.msgId) {
+    return { error: 'passive-quota-exhausted' };
+  }
   try {
     const result = await resolved.gw.sendText(target, params.text, { msgId: reservation.msgId });
     return { messageId: result.id };

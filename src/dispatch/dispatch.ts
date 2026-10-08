@@ -22,6 +22,8 @@ import { buildCtxPayload } from './ctx-builder.js';
 
 import { DeliverDebouncer } from '../outbound/debounce.js';
 import { StreamingController, shouldUseStreaming } from '../outbound/streaming-controller.js';
+import { ProgressCardPublisher } from '../outbound/progress-card-publisher.js';
+import { getPassiveReplyQuotaRemaining } from '../features/quota-manager.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { clearGroupHistory, trimGroupHistoryAfterLastBot } from '../features/history-store.js';
 import {
@@ -35,7 +37,7 @@ import {
   getQuestionGatewayRuntime,
 } from '../features/question-helpers.js';
 import { tryGetBotForAccount } from '../bot-instance.js';
-import { resolveGroupConfigFromAccount, resolveMentionPatterns } from '../config.js';
+import { resolveGroupConfigFromAccount, resolveMentionPatterns, resolveProgressCardConfig } from '../config.js';
 import { detectWasMentioned } from '../utils/mention.js';
 
 /** 失败兜底文案（对齐 telegram：Something went wrong while processing your request.） */
@@ -285,6 +287,10 @@ export async function dispatchToOpenClaw(
       const hasMedia = !!(payload.mediaUrl || payload.mediaUrls?.length);
       dlog?.debug(`deliver kind=${kind ?? 'none'} textLen=${text.length} voice=${!!payload.audioAsVoice} media=${hasMedia}`);
 
+      // Progress card：正文级投递开始（final/媒体/ask_user/审批等；kind 'tool'
+      // 是 verbose 工具进度通知，不算）后停止卡片发布，避免「卡片晚于答案」
+      if (progressPublisher && kind !== 'tool') progressPublisher.stop(`deliver kind=${kind ?? 'none'}`);
+
       // ── 0. ask_user 按钮投递（优先于所有其他处理）──
       // 单问题单选场景：用 inline keyboard 替代纯文本
       const payloadWithChannelData = payload as DeliverPayload & { channelData?: unknown };
@@ -464,6 +470,37 @@ export async function dispatchToOpenClaw(
     ? combineAbortSignals(ctx.signal, turnAbort.signal)
     : ctx.signal;
 
+  // ── Progress Card（进度卡片）──
+  // agent 更新 progress_card 时把 checklist 快照作为独立 QQ 消息发送
+  // （QQ 无消息编辑 API，做不到 telegram 的单条 draft 反复编辑）。
+  // 启用条件：总开关 + scope 匹配（默认仅 c2c）+ 非 room_event（room_event
+  // 群框架本就不转发 plan 回调，这里是双保险）。卡片只走被动回复，
+  // 发送前探测剩余额度为最终回复保槽，绝不烧每日主动预算。
+  const progressCardConfig = resolveProgressCardConfig(account);
+  const progressCardScopeMatch = envelope.chatScope === 'group'
+    ? progressCardConfig.scope === 'group' || progressCardConfig.scope === 'both'
+    : progressCardConfig.scope === 'c2c' || progressCardConfig.scope === 'both';
+  const progressPublisher = progressCardConfig.enabled && progressCardScopeMatch && inboundEventKind !== 'room_event'
+    ? new ProgressCardPublisher({
+        config: progressCardConfig,
+        sendCard: (text) => sendText({
+          to: qualifiedTarget,
+          text,
+          accountId: account.accountId,
+          replyToId: envelope.messageId,
+          account,
+          passiveOnly: true,
+        }),
+        quotaRemaining: () => getPassiveReplyQuotaRemaining({
+          accountId: account.accountId,
+          msgId: envelope.messageId,
+          scope: envelope.chatScope === 'group' ? 'group' : 'c2c',
+        }),
+        signal: combinedAbortSignal,
+        log: log?.child('progress-card'),
+      })
+    : null;
+
   let dispatchError: unknown;
   const hadDispatchError = () => dispatchError !== undefined;
 
@@ -539,6 +576,27 @@ export async function dispatchToOpenClaw(
                         : undefined,
                     }
                   : {}),
+                ...(progressPublisher
+                  ? {
+                      // progress_card 卡片快照：每次步骤更新发一条独立消息
+                      // （渲染/节流/配额语义见 progress-card-publisher.ts 头注释）
+                      onPlanUpdate: async (p: {
+                        phase?: string;
+                        title?: string;
+                        explanation?: string;
+                        source?: string;
+                        steps?: Array<{ step?: unknown; status?: unknown }>;
+                      }) => {
+                        await progressPublisher.onPlanUpdate(p);
+                      },
+                      // 解锁 verbose 关闭时的 plan 回调转发（quiet channel-owned
+                      // progress 标志）。该标志本身不抑制任何框架行为——插件
+                      // 未注册 onApprovalEvent/onPatchSummary，解锁对其是 no-op；
+                      // 抑制框架默认计划状态消息的是另一个标志（刻意不传，
+                      // verbose 用户的工具进度状态消息现状保持不变）。
+                      suppressDefaultToolProgressMessages: true,
+                    }
+                  : {}),
               },
             });
           },
@@ -567,6 +625,9 @@ export async function dispatchToOpenClaw(
   } else if (envelope.chatScope === 'group') {
     clearGroupHistory(account.accountId, envelope.senderId);
   }
+
+  // Progress card：dispatch 收尾，停止发布（无定时器，纯状态关闭）
+  progressPublisher?.dispose();
 
   if (streamingController && !streamingController.isTerminal) {
     await streamingController.finalize();

@@ -58,6 +58,30 @@ export function checkPassiveReplyQuota(params: QuotaCheckParams): boolean {
 }
 
 /**
+ * 查询某 msg_id 的被动回复剩余额度（纯探测，不消耗配额）。
+ *
+ * progress card 等非正文消息发送前用：剩余额度不足时直接放弃发送，
+ * 为最终回复保留槽位。无缓存条目 = 全额度可用；msg_id 缺失/过期 = 0。
+ */
+export function getPassiveReplyQuotaRemaining(params: QuotaCheckParams): number {
+  const { accountId, msgId, scope } = params;
+
+  if (!msgId) {
+    return 0;
+  }
+
+  const key = `${accountId}:${scope}:${msgId}`;
+  const cached = quotaCache.get(key);
+  if (!cached) {
+    return QUOTA_LIMITS[scope].count;
+  }
+  if (Date.now() > cached.expiresAt) {
+    return 0;
+  }
+  return Math.max(0, QUOTA_LIMITS[scope].count - cached.count);
+}
+
+/**
  * 回滚被动回复配额（API 调用失败时使用）
  */
 export function rollbackPassiveReplyQuota(params: {

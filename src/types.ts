@@ -211,6 +211,22 @@ export interface QQBotAccountConfig {
     sendMode?: 'stream' | 'static';
   };
   /**
+   * Progress Card（进度卡片）配置
+   *
+   * openclaw 的 progress_card 工具维护会话级多步计划（≤50 步 checklist），
+   * agent 每次更新卡片时，插件在 QQ 聊天里发送一条 checklist 快照消息：
+   *   📋 进度 1/4
+   *   ✅ 分析现有包结构
+   *   ▸ pack 8.0(覆盖 8.0.tar, 沿用现有 logs.txt)
+   *   ▢ 运行回归测试
+   *   ▢ 清理临时文件
+   *
+   * QQ 无消息编辑 API（telegram 是同一条消息反复 edit），只能逐条发送快照；
+   * 卡片消息**只走被动回复**（配额不足即丢弃，绝不烧主动消息预算），
+   * 并为最终回复保留被动配额槽。
+   */
+  progressCard?: ProgressCardConfig;
+  /**
    * STT (语音转文字) 历史遗留配置块（整块被忽略，详见 STTChannelConfig）
    */
   stt?: STTChannelConfig;
@@ -245,6 +261,47 @@ export interface DeliverDebounceConfig {
    * 默认 "\n\n---\n\n"
    */
   separator?: string;
+}
+
+/**
+ * Progress Card（进度卡片）配置
+ *
+ * agent 调 progress_card 工具更新会话级计划卡片时，插件把 checklist 快照
+ * 作为独立 QQ 消息逐条发送（QQ 无消息编辑 API，做不到 telegram 的单条
+ * 反复编辑）。卡片消息只走被动回复，不烧主动预算。
+ */
+export interface ProgressCardConfig {
+  /**
+   * 总开关（默认 true；false = 整个功能关闭）
+   */
+  enabled?: boolean;
+  /**
+   * 生效范围（默认 'c2c'）：
+   * - 'c2c'   仅私聊发送卡片（默认——私聊被动配额 4 条/msg_id，60min 有效）
+   * - 'group' 仅群聊（群被动配额仅 5 条/msg_id、5min 有效，卡片极易挤占正文）
+   * - 'both'  私聊 + 群聊
+   */
+  scope?: 'c2c' | 'group' | 'both';
+  /**
+   * 两次卡片消息的最小间隔毫秒（默认 1500，防抖级——仅拦工具密集期的
+   * 连击，正常步骤节奏不受影响；agent 每次实际更新卡片都会触发）
+   */
+  minIntervalMs?: number;
+  /**
+   * 每个 turn 最多发送的卡片条数（默认 3，保险丝——c2c 被动硬上限 4 条
+   * /msg_id，配额探测 + reserveQuota 保证最终回复永远有槽）
+   */
+  maxPerTurn?: number;
+  /**
+   * checklist 最多渲染行数（默认 8；超出时压缩为 "✅ N/M done" 头 +
+   * 完成尾部 + 当前步 + 待办尾部，与 telegram 文本模式同源渲染器）
+   */
+  maxLines?: number;
+  /**
+   * 为最终回复保留的被动配额槽（默认 1）：发送卡片前若剩余槽位 ≤ 此值
+   * 则跳过，保证正文优先
+   */
+  reserveQuota?: number;
 }
 
 /**
