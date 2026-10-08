@@ -48,6 +48,7 @@ Scan to join the QQ group chat
 | 🎙️ **Voice (STT/TTS)** | Speech-to-text transcription & text-to-speech replies |
 | ⏰ **Scheduled Push** | Proactive message delivery via scheduled tasks |
 | 🔗 **URL Support** | Direct URL sending in private chat (no restrictions) |
+| 📋 **Progress Card** | The agent's `progress_card` checklist arrives in chat as snapshot messages (`📋 进度 1/4` + ✅/▸/▢ steps) — passive-only, quota-aware |
 | ⌨️ **Typing Indicator** | "Bot is typing..." status shown in real-time |
 | 📝 **Markdown** | Full Markdown formatting support |
 | 🛠️ **Commands** | Native OpenClaw command integration |
@@ -891,6 +892,52 @@ The bot can stream its reply progressively (typewriter effect) via QQ's streamin
 
 - Streaming replies (`session.update` frames) still consume the passive-reply quota of the triggering message
 - On stream errors the controller falls back to a single static message automatically
+
+#### Progress Card (进度卡片) — checklist snapshots in chat
+
+OpenClaw agents can maintain a session-level progress card (the `progress_card` tool: an ordered step checklist the agent rewrites as work proceeds). When the card is updated, the plugin sends a **checklist snapshot** as a standalone QQ message:
+
+```
+📋 进度 1/4
+✅ 分析现有包结构
+▸ pack 8.0(覆盖 8.0.tar, 沿用现有 logs.txt)
+▢ 运行回归测试
+▢ 清理临时文件
+```
+
+QQ has no message-editing API (Telegram renders the same feature by repeatedly editing one draft message), so each update arrives as a new message. Snapshots are **passive-only**: they reply to the triggering message and never burn the daily proactive budget — when the passive quota of the message is exhausted (or too low to keep a slot for the final reply), snapshots are simply dropped. Publishing also stops once the final answer starts delivering, so a card never lands after the answer.
+
+```json
+{
+  "channels": {
+    "qqbot": {
+      "progressCard": {
+        "enabled": true,
+        "scope": "c2c",
+        "minIntervalMs": 1500,
+        "maxPerTurn": 3,
+        "maxLines": 8,
+        "reserveQuota": 1
+      }
+    }
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `true` | Master switch — set `false` to turn the feature off entirely |
+| `scope` | `"c2c"` | Where snapshots are sent. `"c2c"` (default) private chats only; `"group"` / `"both"` opt groups in — group passive quota is only 5 replies per message per 5 min, so cards can crowd out the actual reply; tune `maxPerTurn`/`reserveQuota` accordingly |
+| `minIntervalMs` | `1500` | Debounce window between snapshots (only suppresses bursts when tools fire in quick succession; normal step updates pass) |
+| `maxPerTurn` | `3` | Fuse: max snapshots per turn. c2c passive quota is 4 per message, so the default keeps room for the final reply |
+| `maxLines` | `8` | Max checklist lines; longer plans compress to a `✅ N/M done` header + completed tail + active + pending tail (same shared renderer as Telegram's text-mode checklist) |
+| `reserveQuota` | `1` | Passive slots reserved for the final reply: a snapshot is dropped when remaining quota ≤ this value |
+
+Notes:
+
+- **Agent guidance**: on a channel-only Gateway (no Control UI / app paired) OpenClaw does not inject the progress-card reminder prompt. If you want the agent to actually maintain the card, tell it in your agent's `AGENTS.md`/`SOUL.md` (e.g. "在多步任务中用 progress_card 工具维护进度卡片").
+- **Groups**: restricted-tool groups include `progress_card` in the default allowlist; set `scope: "group"`/`"both"` to activate. `room_event` groups never receive cards (structural — no channel reply path).
+- **Verbose users**: if verbose progress is on, OpenClaw's own one-shot plan status notice may appear alongside the snapshots; consider disabling verbose when using this feature.
 
 #### Typing Indicator — C2C private chat only
 

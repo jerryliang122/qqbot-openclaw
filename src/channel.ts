@@ -112,6 +112,9 @@ const RESTRICTED_DEFAULT_TOOLS = [
   'tts',
   'cron',
   'qqbot_remind',
+  // progress_card：纯会话级状态工具（无副作用），restricted 群显式开
+  // progressCard.scope 后 agent 才能维护卡片（2026-10-08 进度卡片功能）
+  'progress_card',
 ] as const;
 
 /**
