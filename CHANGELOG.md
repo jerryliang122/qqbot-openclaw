@@ -8,6 +8,15 @@
 
 ---
 
+## [2.3.0] - 2026-10-08
+
+### 新增
+
+- **Progress Card（进度卡片）**（PR #37）：agent 的 `progress_card` 工具（会话级多步 checklist，整体替换式更新）每次成功更新时，插件把 checklist 快照作为**独立 QQ 消息**发送——QQ 无消息编辑 API（telegram 是同一条 draft 消息反复 edit；流式 update 只接受前缀增长，checklist 状态变化必然改行），只能逐条发。渲染复用框架共享渲染器 `formatPlanChecklistLines`（`openclaw/plugin-sdk/channel-message`，与 telegram 文本模式同源）：`📋 进度 N/M` 头 + `✅`/`▸`/`▢` 步骤行，超过 8 步自动压缩为 `✅ N/M done` 头 + 完成尾部 + 当前步 + 待办尾部。挂接 `replyOptions.onPlanUpdate`（telegram 同款契约）并传 `suppressDefaultToolProgressMessages: true` 解锁 verbose 关闭时的回调转发。**配额红线**：卡片只走被动回复——发送前 `getPassiveReplyQuotaRemaining`（quota-manager 新增纯探测）剩余 ≤ `reserveQuota`（默认 1，为最终回复保槽）即丢弃，探测账号经 `resolveQuotaAccountId`（含单账号回退，与 sendText 记账同键）；`sendText` 新增 `passiveOnly` 参数兜探测→发送竞态（配额不可用返回 `passive-quota-exhausted`，不降级主动——现有调用方不受影响），**绝不烧每日主动消息预算**。发送结果未知的失败（平台报错/网络异常）记为已发送防重发且计入 maxPerTurn；防抖窗口（1500ms）内跳过的最新快照由尾随定时器补发；deliverHandler 首个非 `tool` 投递（final/媒体/ask_user）即 `stop()` + `await drain()`——等 in-flight 发送落地再放行正文，卡片永不晚于答案；清卡重置去重状态。配置 `channels.qqbot.progressCard`（`enabled`/`scope`/`minIntervalMs`/`maxPerTurn`/`maxLines`/`reserveQuota`，c2c 默认启用、群显式 `scope: 'group'|'both'` 开启——群被动配额仅 5 条/5min）；room_event 群结构性无卡片（框架不转发 plan 回调）；restricted 群默认工具集加入 `progress_card`。注意：纯通道 Gateway 框架不注入 progress_card 使用提醒，要 agent 主动用卡需在其 AGENTS.md/SOUL.md 自行引导（README 已注明）。经 Sourcery 评审六条意见闭环（5 修 1 说明保留既有语义）。回归测试 `tests/progress-card.test.ts`（37 用例）。
+
+---
+
+
 ## [2.2.2] - 2026-10-07
 
 ### 修复
