@@ -170,6 +170,18 @@ export function notRunningError(accountId: string): string {
   return `Bot "${accountId}" not running${running.length ? ` (running accounts: ${running.join(', ')})` : ''}`;
 }
 
+/**
+ * 解析发送/配额记账实际使用的账号 ID（含单账号回退）。
+ *
+ * sendText 经 resolveGatewayForSend 预留配额时用的是**回退后**的
+ * resolved.accountId；进度卡片等发送前的配额探测必须用同一账号键，
+ * 否则回退场景下探测与记账错位（探测乐观、实际耗尽），卡片会吃掉
+ * 最终回复的被动配额槽。
+ */
+export function resolveQuotaAccountId(accountId: string): string {
+  return resolveGatewayForSend(accountId)?.accountId ?? accountId;
+}
+
 // ── 媒体类型映射 ──
 
 export type MediaKind = 'image' | 'voice' | 'video' | 'file';

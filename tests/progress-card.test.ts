@@ -247,14 +247,14 @@ await test('passive-quota-exhausted：静默丢弃、无重试、不影响后续
   assert.equal(h.sends.length, 1, '同状态重试成功发送');
 });
 
-await test('发送异常：丢弃该条卡片不抛错', async () => {
+await test('发送异常：丢弃该条卡片不抛错（结果未知，保守计数为已发送）', async () => {
   const publisher = new ProgressCardPublisher({
     config: { enabled: true, scope: 'c2c', minIntervalMs: 1500, maxPerTurn: 3, maxLines: 8, reserveQuota: 1 } as never,
     sendCard: async () => { throw new Error('QQ API unavailable'); },
     quotaRemaining: () => 4,
   });
   await assert.doesNotReject(publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A }));
-  assert.equal(publisher.sentCards, 0);
+  assert.equal(publisher.sentCards, 1, '结果未知 → 计入保险丝（宁可少发不可刷屏）');
 });
 
 await test('stop() 后 onPlanUpdate no-op', async () => {
@@ -286,6 +286,111 @@ await test('phase !== "update" 忽略', async () => {
   await h.publisher.onPlanUpdate({ steps: STEPS_A });
   await h.publisher.onPlanUpdate(undefined as never);
   assert.equal(h.sends.length, 0);
+});
+
+// ── 2b. 评审修复回归（Sourcery #37）──
+
+group('评审修复回归');
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+await test('清卡重置去重：恢复的同文本 checklist 会重新发布', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
+  assert.equal(h.sends.length, 1);
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [] }); // 清卡
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A }); // 恢复同文本
+  assert.equal(h.sends.length, 2, '恢复的卡片必须重新发布，不被去重挡住');
+});
+
+await test('防抖尾随补发：窗口内跳过的最新快照在窗口到期后发出', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 80 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_B }); // 窗口内 → pending
+  assert.equal(h.sends.length, 1, '窗口内不立即发');
+  await sleep(250); // 尾随定时器到期补发
+  assert.equal(h.sends.length, 2, '窗口到期后补发最新快照');
+  assert.ok(h.sends[1]!.includes('✅ pack 8.0'), '补发的是最新状态');
+});
+
+await test('防抖尾随补发：连续多次更新只补发最新一条', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 80 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
+  const c2 = STEPS_A.map((s, i) => (i === 0 ? { ...s, status: 'in_progress' as const } : s));
+  const c3 = STEPS_A.map((s, i) => (i < 1 ? { ...s, status: 'completed' as const } : i === 1 ? { ...s, status: 'in_progress' as const } : s));
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: c2 });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: c3 });
+  await sleep(250);
+  assert.equal(h.sends.length, 2, '只补发最新（c3），中间态 c2 不发');
+  assert.ok(h.sends[1]!.includes('▸ pack 8.0'), '补发的是 c3 状态');
+});
+
+await test('防抖尾随补发：stop 后不再补发', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 80 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_B }); // pending
+  h.publisher.stop('final delivery started');
+  await sleep(250);
+  assert.equal(h.sends.length, 1, 'stop 清掉尾随定时器，不补发');
+});
+
+await test('防抖尾随补发：dispose 后不再补发', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 80 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_B }); // pending
+  h.publisher.dispose();
+  await sleep(250);
+  assert.equal(h.sends.length, 1);
+});
+
+await test('通用发送错误防重发：同状态 update 不再重复（passive-quota 除外）', async () => {
+  const sends: string[] = [];
+  let failAll = true;
+  const publisher = new ProgressCardPublisher({
+    config: { enabled: true, scope: 'c2c', minIntervalMs: 0, maxPerTurn: 3, maxLines: 8, reserveQuota: 1 } as never,
+    sendCard: async (text: string) => {
+      if (failAll) return { error: 'HTTP 500 upstream' }; // 结果未知（可能已落地）
+      sends.push(text);
+      return {};
+    },
+    quotaRemaining: () => 4,
+  });
+  await publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
+  await publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A }); // 同状态重复
+  assert.equal(sends.length, 0, '防重：ack 丢失后同状态不再发');
+  failAll = false;
+  await publisher.onPlanUpdate({ phase: 'update', steps: STEPS_B }); // 新状态照常发
+  assert.equal(sends.length, 1);
+});
+
+await test('drain：等待 in-flight 发送落地（卡片先于答案完成）', async () => {
+  const sends: string[] = [];
+  let sendEntered: (() => void) | undefined;
+  let releaseSend: (() => void) | undefined;
+  const publisher = new ProgressCardPublisher({
+    config: { enabled: true, scope: 'c2c', minIntervalMs: 0, maxPerTurn: 3, maxLines: 8, reserveQuota: 1 } as never,
+    sendCard: async (text: string) => {
+      sendEntered?.();
+      await new Promise<void>((resolve) => { releaseSend = resolve; });
+      sends.push(text);
+      return {};
+    },
+    quotaRemaining: () => 4,
+  });
+  const pending = publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
+  // 等 sendCard 真正进入（已过 stop/abort/配额检查，正在 await 网络）
+  await new Promise<void>((resolve) => { sendEntered = resolve; });
+  // deliverHandler 语义：stop 后 drain 应等 in-flight 完成
+  publisher.stop('final delivery started');
+  const drained = publisher.drain();
+  let settled = false;
+  void drained.then(() => { settled = true; });
+  await sleep(30);
+  assert.equal(settled, false, 'in-flight 未完成时 drain 不得提前返回');
+  releaseSend!();
+  await Promise.all([pending, drained]);
+  assert.equal(sends.length, 1, 'in-flight 卡片最终落地（早于正文放行）');
+  assert.equal(settled, true);
 });
 
 // ── 3. 配置解析 ──
@@ -329,6 +434,19 @@ await test('非法数值钳制回默认（maxPerTurn 0.x 向下取整视为显�
 // ── 4. outbound sendText passiveOnly ──
 
 group('outbound passiveOnly');
+
+await test('resolveQuotaAccountId：与 sendText 记账同一账号（含单账号回退）', async () => {
+  const { resolveQuotaAccountId } = await import('../src/outbound/outbound-service.ts');
+  // 无网关：返回原 ID
+  assert.equal(resolveQuotaAccountId('pc-acct-none'), 'pc-acct-none');
+  // 单账号回退：请求不存在的账号 → 解析到唯一运行中账号（与 sendText 预留配额一致）
+  registerGateway('pc-acct-sole', {
+    sendText: async () => ({ id: 'x' }),
+    sendMedia: async () => ({ id: 'm' }),
+  } as never);
+  assert.equal(resolveQuotaAccountId('pc-acct-missing'), 'pc-acct-sole');
+  assert.equal(resolveQuotaAccountId('pc-acct-sole'), 'pc-acct-sole');
+});
 
 await test('配额耗尽 + passiveOnly → 返回 error 且不触达网关（不降级主动）', async () => {
   clearQuotaCache();

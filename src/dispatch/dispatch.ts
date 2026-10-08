@@ -15,7 +15,7 @@ import type { ResolvedQQBotAccount } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
 import { buildEnvelope } from './envelope-builder.js';
 import { assembleBody, type AssembledBody } from './body-assembler.js';
-import { sendText, getGateway } from '../outbound/outbound-service.js';
+import { sendText, getGateway, resolveQuotaAccountId } from '../outbound/outbound-service.js';
 import { sendMedia } from '../outbound/media-send.js';
 import { deliverReply, type DeliverPayload, type DeliverInfo, type DeliverContext } from '../outbound/deliver-pipeline.js';
 import { buildCtxPayload } from './ctx-builder.js';
@@ -288,8 +288,12 @@ export async function dispatchToOpenClaw(
       dlog?.debug(`deliver kind=${kind ?? 'none'} textLen=${text.length} voice=${!!payload.audioAsVoice} media=${hasMedia}`);
 
       // Progress card：正文级投递开始（final/媒体/ask_user/审批等；kind 'tool'
-      // 是 verbose 工具进度通知，不算）后停止卡片发布，避免「卡片晚于答案」
-      if (progressPublisher && kind !== 'tool') progressPublisher.stop(`deliver kind=${kind ?? 'none'}`);
+      // 是 verbose 工具进度通知，不算）后停止卡片发布，并等待 in-flight 的
+      // 卡片发送落地再放行正文——保证卡片永不晚于答案
+      if (progressPublisher && kind !== 'tool') {
+        progressPublisher.stop(`deliver kind=${kind ?? 'none'}`);
+        await progressPublisher.drain();
+      }
 
       // ── 0. ask_user 按钮投递（优先于所有其他处理）──
       // 单问题单选场景：用 inline keyboard 替代纯文本
@@ -492,7 +496,9 @@ export async function dispatchToOpenClaw(
           passiveOnly: true,
         }),
         quotaRemaining: () => getPassiveReplyQuotaRemaining({
-          accountId: account.accountId,
+          // 与 sendText 预留配额同一账号键（含单账号回退），否则回退场景下
+          // 探测与记账错位，卡片会吃掉最终回复的被动配额槽
+          accountId: resolveQuotaAccountId(account.accountId),
           msgId: envelope.messageId,
           scope: envelope.chatScope === 'group' ? 'group' : 'c2c',
         }),
