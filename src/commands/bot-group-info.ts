@@ -2,6 +2,7 @@ import type { SlashCommand, SlashCommandHandlerContext } from '@tencent-connect/
 import type { ResolvedQQBotAccount } from '../types.js';
 import { resolveGroupConfigFromAccount } from '../config.js';
 import { getGroupModeFacts } from '../features/group-mode-store.js';
+import { getPushAuthorizeFacts } from '../features/push-authorization-store.js';
 import { getProactiveUsage } from '../features/proactive-budget.js';
 
 /** /bot-group-info — 展示当前群的推送模式推断与生效配置（排障用） */
@@ -16,6 +17,7 @@ export function botGroupInfo(account: ResolvedQQBotAccount): SlashCommand {
       if (!groupOpenid) return '❌ 仅可在群聊中使用';
 
       const facts = getGroupModeFacts(account.accountId, groupOpenid);
+      const pushAuth = getPushAuthorizeFacts(account.accountId, groupOpenid);
       const cfg = resolveGroupConfigFromAccount(account, groupOpenid);
       const usage = getProactiveUsage(account.accountId);
 
@@ -29,11 +31,18 @@ export function botGroupInfo(account: ResolvedQQBotAccount): SlashCommand {
         ? '上下文证据：曾收到 msg_elements（最近消息记录/引用内容）'
         : '上下文证据：未收到过 msg_elements（纯 AT 模式或用户从未引用）';
 
+      // 平台不推送授权结果（开/关），只能展示「最近一次授权操作」供排障关联
+      // （群主动推送平台侧默认关闭；主动消息送不达时先看这里有没有事件）
+      const pushAuthLine = !pushAuth
+        ? '推送授权事件：未见（群主未动过推送开关，或平台未推送）'
+        : `推送授权事件：最近 ${new Date(pushAuth.updatedAt).toISOString()}（type=${pushAuth.lastEventType}，scope=${pushAuth.scope || '?'}，累计 ${pushAuth.eventCount} 次）`;
+
       return [
         `🤖 群信息（${groupOpenid.slice(0, 8)}…）`,
         '',
         modeLine,
         contextLine,
+        pushAuthLine,
         '',
         `requireMention：${cfg.requireMention ? '是（需 @ 才响应）' : '否（所有消息都响应）'}`,
         `未 @ 消息入站：${cfg.unmentionedInbound === 'room_event' ? '**room_event**（被动房间事件进框架，AI 只读、想发言走主动 message 工具）' : '拦截（只进历史，不上报）'}`,

@@ -485,12 +485,16 @@ export interface GroupMessageEvent {
 }
 
 /**
- * 按钮交互事件（INTERACTION_CREATE）
+ * 按钮交互事件（INTERACTION_CREATE，2026-07 官方扩容为统一「互动事件」）
  */
 export interface InteractionEvent {
   /** 事件 ID，用于回应交互（PUT /interactions/{id}） */
   id: string;
-  /** 事件类型：11=消息按钮 12=单聊快捷菜单 */
+  /**
+   * 互动类型：11=消息按钮 12=单聊快捷菜单（这两类需 ack）
+   * 13=消息反馈 14=清空会话 15=进出故事集 16=切换模型（QQ 官方智能体平台）
+   * 18=用户授权 19=群授权 20=群授权状态变更（主动推送授权，无需 ack）
+   */
   type: number;
   /** 场景：c2c / group / guild */
   scene?: string;
@@ -509,7 +513,10 @@ export interface InteractionEvent {
   /** 群内触发用户 openid（仅群聊场景） */
   group_member_openid?: string;
   version: number;
+  /** 机器人 AppID */
+  application_id?: string;
   data: {
+    /** 与外层 type 含义一致 */
     type: number;
     resolved: {
       /** 按钮 action.data 值 */
@@ -520,8 +527,18 @@ export interface InteractionEvent {
       user_id?: string;
       /** 自定义菜单 id（仅菜单场景） */
       feature_id?: string;
-      /** 操作的消息 id（仅频道场景） */
+      /** 操作的消息 id（频道场景为消息 OpenID；消息反馈场景为机器人消息 ID） */
       message_id?: string;
+      /** 反馈选项（type=13）：LIKE=点赞, UNLIKE=点踩 */
+      feedback_opt?: string;
+      /** 反馈选项是否选中（type=13） */
+      checked?: number;
+      /** 操作类型（type=15 故事集：ENTER_STORY/QUIT_STORY；type=16 切换模型） */
+      action?: string;
+      /** 消息场景信息（type=13） */
+      message_scene?: { ext?: string[] };
+      /** 授权数据（type=18/19/20） */
+      authorize_data?: InteractionAuthorizeData;
       /** 配置更新：群消息模式 "mention"=@机器人时激活 "always"=总是激活 */
       require_mention?: string;
       /** 配置更新：群消息策略 */
@@ -530,6 +547,17 @@ export interface InteractionEvent {
       mention_patterns?: string;
     };
   };
+}
+
+/**
+ * 主动推送授权数据（INTERACTION_CREATE type=18/19/20）。
+ * 注意：平台不携带授权结果（开/关），仅有操作场景与范围。
+ */
+export interface InteractionAuthorizeData {
+  /** 授权操作场景。setting=资料页设置, dialog=弹窗授权 */
+  opt_scene?: string;
+  /** 授权范围。c2c_push=C2C 主动消息推送, group_push=群主动消息推送 */
+  scope?: string;
 }
 
 // ---- Keyboard 类型 ----
