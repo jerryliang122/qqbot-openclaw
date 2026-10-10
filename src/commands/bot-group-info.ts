@@ -35,7 +35,7 @@ export function botGroupInfo(account: ResolvedQQBotAccount): SlashCommand {
       // （群主动推送平台侧默认关闭；主动消息送不达时先看这里有没有事件）
       const pushAuthLine = !pushAuth
         ? '推送授权事件：未见（群主未动过推送开关，或平台未推送）'
-        : `推送授权事件：最近 ${new Date(pushAuth.updatedAt).toISOString()}（type=${pushAuth.lastEventType}，scope=${pushAuth.scope || '?'}，累计 ${pushAuth.eventCount} 次）`;
+        : `推送授权事件：最近 ${new Date(pushAuth.lastEventAt ?? pushAuth.updatedAt).toISOString()}（type=${pushAuth.lastEventType}，scope=${pushAuth.scope || '?'}，累计 ${pushAuth.eventCount} 次）`;
 
       return [
         `🤖 群信息（${groupOpenid.slice(0, 8)}…）`,

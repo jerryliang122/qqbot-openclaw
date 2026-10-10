@@ -12,7 +12,7 @@
 
 ### 新增
 
-- **平台互动事件扩展类型观测**：官方 `INTERACTION_CREATE` 2026-07 扩容为统一「互动事件」（type 11–20），此前插件只认按钮（11/12）与配置面板（data.type 2001/2002），其余类型掉进 approval 分支被无意义 ack 后静默丢弃。现 `handleInteraction` 按外层 type 路由：仅 11/12 走按钮回调链（ack + question/approval）；13=消息反馈、14/15/16=QQ 官方智能体平台事件仅 INFO 留痕；18/19/20（用户/群主动推送授权）留痕并记入新增 `push-authorization-store`（内存、peer 维度、跨重启不保留）——平台事件不携带授权结果（开/关），存储只做「最近一次授权操作」的可观测记录；`/bot-group-info` 新增「推送授权事件」行，与主动消息用量排障关联（群主动推送平台侧默认关闭，群主不开开关主动消息送不达）。未来未知类型留痕不猜测、不 ack。类型层 `InteractionEvent` 注释与 resolved 字段对齐官方文档（`feedback_opt`/`checked`/`action`/`message_scene`/`authorize_data`/`application_id`）。回归测试 `tests/interaction-extended-types.test.ts`（11 用例）。
+- **平台互动事件扩展类型观测**：官方 `INTERACTION_CREATE` 2026-07 扩容为统一「互动事件」（type 11–20），此前插件只认按钮（11/12）与配置面板（data.type 2001/2002），其余类型掉进 approval 分支被无意义 ack 后静默丢弃。现 `handleInteraction` 按外层 type 路由：仅 11/12 走按钮回调链（ack + question/approval）；13=消息反馈、14/15/16=QQ 官方智能体平台事件仅 INFO 留痕；18/19/20（用户/群主动推送授权）留痕并记入新增 `push-authorization-store`（内存、peer 维度、跨重启不保留）——平台事件不携带授权结果（开/关），存储只做「最近一次授权操作」的可观测记录；`/bot-group-info` 新增「推送授权事件」行，与主动消息用量排障关联（群主动推送平台侧默认关闭，群主不开开关主动消息送不达）。未来未知类型留痕不猜测、不 ack。类型层 `InteractionEvent` 注释与 resolved 字段对齐官方文档（`feedback_opt`/`checked`/`action`/`message_scene`/`authorize_data`/`application_id`）。经 Sourcery 评审两条意见闭环：(1) 观测 INFO 日志中的 operator/peer/消息标识符截断为前 8 字符（`/bot-logs` 可导出日志给 c2c 用户，默认授权开放，不落完整他人标识符）；(2) 授权事件按事件自身时间戳防乱序——网关重连补发的旧事件仅累计计数，不回退最新事实（缺时间戳退化为到达顺序）。回归测试 `tests/interaction-extended-types.test.ts`（15 用例）。
 
 ---
 

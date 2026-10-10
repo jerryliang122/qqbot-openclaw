@@ -171,6 +171,62 @@ await test("缺 peer 定位（无 group/user openid）的授权事件：仅留�
   assert.ok(hasLog(entries, "info", "[push-auth]"), "仍留痕");
 });
 
+await test("乱序补发：旧时间戳事件不回退最新事实，仅累计计数（评审意见 2）", async () => {
+  _resetPushAuthorizeStore();
+  const { log } = makeLogger();
+  const { ack: ackFn, calls } = makeAck();
+  const newer = makeEvent(19, {
+    authorize_data: { opt_scene: "setting", scope: "group_push" },
+  }, { group_openid: "GROUP9", group_member_openid: "MEMBER9", timestamp: "2026-10-10T10:00:00+08:00" });
+  const older = makeEvent(20, {}, {
+    group_openid: "GROUP9", group_member_openid: "MEMBER9", timestamp: "2026-10-10T09:00:00+08:00",
+  });
+
+  await handleInteraction(newer, ACCOUNT, RUNTIME, log, ackFn);
+  await handleInteraction(older, ACCOUNT, RUNTIME, log, ackFn);
+
+  assert.strictEqual(calls.length, 0);
+  const facts = getPushAuthorizeFacts("default", "GROUP9");
+  assert.ok(facts);
+  assert.strictEqual(facts!.lastEventType, 19, "旧事件不覆盖最新类型");
+  assert.strictEqual(facts!.scope, "group_push", "旧事件不覆盖最新 scope");
+  assert.strictEqual(facts!.eventCount, 2, "计数含乱序补发");
+  assert.strictEqual(facts!.lastEventAt, Date.parse("2026-10-10T10:00:00+08:00"), "lastEventAt 保持较新事件时间");
+});
+
+await test("时序正常：新时间戳事件替换最新事实", async () => {
+  _resetPushAuthorizeStore();
+  const { log } = makeLogger();
+  const { ack: ackFn } = makeAck();
+  const t1 = makeEvent(19, { authorize_data: { scope: "group_push" } },
+    { group_openid: "GROUP8", timestamp: "2026-10-10T09:00:00+08:00" });
+  const t2 = makeEvent(20, { authorize_data: { scope: "group_push", opt_scene: "dialog" } },
+    { group_openid: "GROUP8", timestamp: "2026-10-10T11:00:00+08:00" });
+
+  await handleInteraction(t1, ACCOUNT, RUNTIME, log, ackFn);
+  await handleInteraction(t2, ACCOUNT, RUNTIME, log, ackFn);
+
+  const facts = getPushAuthorizeFacts("default", "GROUP8");
+  assert.strictEqual(facts!.lastEventType, 20);
+  assert.strictEqual(facts!.optScene, "dialog");
+  assert.strictEqual(facts!.lastEventAt, Date.parse("2026-10-10T11:00:00+08:00"));
+});
+
+await test("缺时间戳：按到达顺序应用（后者覆盖前者，lastEventAt 为 null）", async () => {
+  _resetPushAuthorizeStore();
+  const { log } = makeLogger();
+  const { ack: ackFn } = makeAck();
+  const e1 = makeEvent(19, { authorize_data: { scope: "group_push" } }, { group_openid: "GROUP7" });
+  const e2 = makeEvent(20, {}, { group_openid: "GROUP7" });
+
+  await handleInteraction(e1, ACCOUNT, RUNTIME, log, ackFn);
+  await handleInteraction(e2, ACCOUNT, RUNTIME, log, ackFn);
+
+  const facts = getPushAuthorizeFacts("default", "GROUP7");
+  assert.strictEqual(facts!.lastEventType, 20, "缺时间戳按到达顺序");
+  assert.strictEqual(facts!.lastEventAt, null);
+});
+
 // ======================================================================
 //  Part 2: 观测类事件（13/14/15/16）与未知类型
 // ======================================================================
@@ -206,6 +262,28 @@ await test("type=14/15/16 智能体平台事件：不 ack，仅留痕", async ()
   assert.ok(hasLog(entries, "info", "agent-platform event type=14"));
   assert.ok(hasLog(entries, "info", "ENTER_STORY"));
   assert.ok(hasLog(entries, "info", "agent-platform event type=16"));
+});
+
+await test("INFO 日志标识符截断：不落完整 openid/消息 ID（评审意见 1）", async () => {
+  const { log, entries } = makeLogger();
+  const { ack: ackFn } = makeAck();
+  const LONG_USER = "USER_OPENID_LONG_1234567890";
+  const LONG_MSG = "ROBOT_MSG_ID_LONG_12345";
+
+  const feedback = makeEvent(13, { feedback_opt: "LIKE", message_id: LONG_MSG },
+    { scene: "c2c", user_openid: LONG_USER });
+  await handleInteraction(feedback, ACCOUNT, RUNTIME, log, ackFn);
+
+  const pushAuth = makeEvent(19, { authorize_data: { scope: "group_push" } },
+    { group_openid: "GROUPOPENID_LONG_1", group_member_openid: "MEMBER_OPENID_LONG_1" });
+  await handleInteraction(pushAuth, ACCOUNT, RUNTIME, log, ackFn);
+
+  const dump = entries.map((e) => e.msg).join("\n");
+  assert.ok(dump.includes("operator=USER_OPE…"), "operator 截断为前 8 字符");
+  assert.ok(dump.includes("peer=GROUPOPE…"), "peer 截断");
+  assert.ok(!dump.includes(LONG_USER), "不落完整 openid");
+  assert.ok(!dump.includes(LONG_MSG), "不落完整消息 ID");
+  assert.ok(!dump.includes("MEMBER_OPENID_LONG_1"), "不落完整群成员 openid");
 });
 
 await test("未知类型（如 21）：留痕不猜测，不 ack，不进按钮链", async () => {
