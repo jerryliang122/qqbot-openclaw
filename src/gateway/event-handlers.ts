@@ -9,7 +9,7 @@
 
 import type { MiddlewareContext, QQBotInboundMessage, InteractionEvent } from '@tencent-connect/qqbot-nodejs';
 import type { PluginRuntime } from 'openclaw/plugin-sdk';
-import type { ResolvedQQBotAccount } from '../types.js';
+import type { ResolvedQQBotAccount, InteractionAuthorizeData } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
 import { dispatchToOpenClaw } from '../dispatch/index.js';
 import { runWithRequestContext } from '../request-context.js';
@@ -122,6 +122,7 @@ const INTERACTION_TYPE = {
 /**
  * SDK 类型尚未覆盖的 resolved 扩展字段（官方文档 InteractionResolved）。
  * 经 `as` 投影访问，SDK 升级补齐类型后可移除。
+ * authorize_data 引用公开类型 InteractionAuthorizeData，防两处定义漂移。
  */
 interface ExtendedInteractionResolved {
   /** 反馈选项（type=13）：LIKE=点赞, UNLIKE=点踩 */
@@ -133,7 +134,7 @@ interface ExtendedInteractionResolved {
   /** 消息场景信息（type=13） */
   message_scene?: { ext?: string[] };
   /** 授权数据（type=18/19/20） */
-  authorize_data?: { opt_scene?: string; scope?: string };
+  authorize_data?: InteractionAuthorizeData;
   /** 操作用户 ID（频道场景；SDK 类型已有，投影保持访问面一致） */
   user_id?: string;
   /** 操作的消息 ID（消息反馈场景为机器人消息 ID） */
