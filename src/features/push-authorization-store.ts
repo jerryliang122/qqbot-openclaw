@@ -13,7 +13,11 @@
  *
  * 乱序防护：网关重连可能补发旧事件（平台事件要求按 msg_seq 去重，但授权
  * 事件不带 seq），记录时携带事件自身时间戳——仅当事件比已存事实更新时才
- * 替换最新字段；缺时间戳时退化为按到达顺序（无法判定乱序）。
+ * 替换最新字段；缺时间戳时退化为按到达顺序（无法判定乱序），但保留已存
+ * 时间基准继续参与后续比较。
+ *
+ * 展示入口：/bot-group-info 仅展示群维度（group_openid）事实；c2c 维度
+ * （user_openid）事实目前仅日志排障可见，c2c 命令展示入口待后续补充。
  */
 
 /** 授权类互动事件类型（INTERACTION_CREATE 外层 type） */
@@ -49,7 +53,8 @@ function storeKey(accountId: string, peerOpenid: string): string {
  *
  * eventTimestampMs 为事件自身时间戳（RFC3339 解析）：
  * - 与已存事实均有时间戳且事件更旧（乱序补发）→ 只累计计数，不回退最新字段；
- * - 任一方缺时间戳 → 按到达顺序应用（无法判定乱序）。
+ * - 任一方缺时间戳 → 按到达顺序应用（无法判定乱序），但保留已存的
+ *   lastEventAt 作为排序基准（置 null 会永久关闭该 peer 的乱序保护）。
  */
 export function recordPushAuthorizeEvent(
   accountId: string,
@@ -74,7 +79,9 @@ export function recordPushAuthorizeEvent(
       prev.lastEventType = info.eventType;
       prev.scope = info.scope ?? '';
       prev.optScene = info.optScene ?? '';
-      prev.lastEventAt = eventTs;
+      // 缺时间戳的事件按到达顺序应用（无法判定乱序），但保留已存的排序基准
+      // 继续参与后续比较——置 null 会永久关闭该 peer 的乱序保护
+      prev.lastEventAt = eventTs ?? prev.lastEventAt;
       prev.updatedAt = now;
     }
     return { ...prev };

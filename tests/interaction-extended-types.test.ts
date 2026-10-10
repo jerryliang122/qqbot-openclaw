@@ -227,6 +227,32 @@ await test("缺时间戳：按到达顺序应用（后者覆盖前者，lastEven
   assert.strictEqual(facts!.lastEventAt, null);
 });
 
+await test("无时间戳事件不清空排序基准：后续旧事件仍被乱序拦截（终评意见 1）", async () => {
+  _resetPushAuthorizeStore();
+  const { log } = makeLogger();
+  const { ack: ackFn } = makeAck();
+  const t10 = makeEvent(19, { authorize_data: { scope: "group_push" } },
+    { group_openid: "GROUP6", timestamp: "2026-10-10T10:00:00+08:00" });
+  const noTs = makeEvent(20, { authorize_data: { scope: "c2c_push", opt_scene: "dialog" } },
+    { group_openid: "GROUP6" });
+  const older = makeEvent(18, {},
+    { group_openid: "GROUP6", timestamp: "2026-10-10T09:00:00+08:00" });
+
+  await handleInteraction(t10, ACCOUNT, RUNTIME, log, ackFn);
+  await handleInteraction(noTs, ACCOUNT, RUNTIME, log, ackFn);
+
+  const afterNoTs = getPushAuthorizeFacts("default", "GROUP6");
+  assert.strictEqual(afterNoTs!.lastEventType, 20, "无时间戳事件按到达顺序应用");
+  assert.strictEqual(afterNoTs!.lastEventAt, Date.parse("2026-10-10T10:00:00+08:00"),
+    "排序基准保留，不被无时间戳事件清空");
+
+  await handleInteraction(older, ACCOUNT, RUNTIME, log, ackFn);
+  const afterOlder = getPushAuthorizeFacts("default", "GROUP6");
+  assert.strictEqual(afterOlder!.lastEventType, 20, "旧事件被乱序拦截，不回退最新事实");
+  assert.strictEqual(afterOlder!.scope, "c2c_push", "最新 scope 保持");
+  assert.strictEqual(afterOlder!.eventCount, 3);
+});
+
 // ======================================================================
 //  Part 2: 观测类事件（13/14/15/16）与未知类型
 // ======================================================================
