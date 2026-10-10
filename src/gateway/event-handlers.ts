@@ -3,7 +3,8 @@
  *
  * 处理 SDK 的 message / interaction 事件：
  * - message: 中间件处理完毕后，将消息转发到 OpenClaw AI
- * - interaction: 配置更新 / 审批按钮 / ask_user 按钮
+ * - interaction: 配置更新 / 审批按钮 / ask_user 按钮 /
+ *   平台扩展互动类型观测（消息反馈、清空会话、主动推送授权等，2026-07 扩容）
  */
 
 import type { MiddlewareContext, QQBotInboundMessage, InteractionEvent } from '@tencent-connect/qqbot-nodejs';
@@ -29,6 +30,7 @@ import {
 import { recordKnownUser } from '../features/proactive.js';
 import { cacheMsgId } from '../features/msgid-cache.js';
 import { recordGroupEvent, getGroupModeFacts } from '../features/group-mode-store.js';
+import { recordPushAuthorizeEvent } from '../features/push-authorization-store.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { resolveGroupConfigFromAccount, resolveGroupConfigKey, resolveGroupPolicy, resolveMentionPatterns } from '../config.js';
 import { getPackageVersion } from '../utils/pkg-version.js';
@@ -101,6 +103,43 @@ export async function handleMessage(
 const INTERACTION_QUERY  = 2001;
 const INTERACTION_UPDATE = 2002;
 
+/**
+ * 官方 INTERACTION_CREATE 互动类型（外层 type 与 data.type 一致，2026-07 文档扩容）。
+ * 仅 11/12 是按钮/菜单回调（需要 ack + 走按钮处理链），13-20 为观测信号（无需 ack）。
+ */
+const INTERACTION_TYPE = {
+  INLINE_KEYBOARD: 11,        // 消息按钮回调（需 ack）
+  CALLBACK_COMMAND: 12,       // 单聊快捷菜单回调（需 ack）
+  MESSAGE_FEEDBACK: 13,       // 消息反馈（点赞/点踩）
+  CLEAR_SESSION: 14,          // 清空会话（QQ 官方智能体平台）
+  IN_OUT_STORY: 15,           // 进出故事集（QQ 官方智能体平台）
+  SWITCH_MODEL: 16,           // 切换模型（QQ 官方智能体平台）
+  USER_AUTHORIZE: 18,         // 用户主动推送授权
+  GROUP_AUTHORIZE: 19,        // 群主动推送授权
+  GROUP_AUTHORIZE_STATUS: 20, // 群授权状态变更
+} as const;
+
+/**
+ * SDK 类型尚未覆盖的 resolved 扩展字段（官方文档 InteractionResolved）。
+ * 经 `as` 投影访问，SDK 升级补齐类型后可移除。
+ */
+interface ExtendedInteractionResolved {
+  /** 反馈选项（type=13）：LIKE=点赞, UNLIKE=点踩 */
+  feedback_opt?: string;
+  /** 反馈选项是否选中（type=13） */
+  checked?: number;
+  /** 操作类型（type=15/16 智能体平台事件） */
+  action?: string;
+  /** 消息场景信息（type=13） */
+  message_scene?: { ext?: string[] };
+  /** 授权数据（type=18/19/20） */
+  authorize_data?: { opt_scene?: string; scope?: string };
+  /** 操作用户 ID（频道场景；SDK 类型已有，投影保持访问面一致） */
+  user_id?: string;
+  /** 操作的消息 ID（消息反馈场景为机器人消息 ID） */
+  message_id?: string;
+}
+
 export async function handleInteraction(
   event: InteractionEvent,
   account: ResolvedQQBotAccount,
@@ -133,6 +172,14 @@ export async function handleInteraction(
     return;
   }
 
+  // 平台扩展互动类型（反馈/会话/智能体平台/推送授权）：无需 ack，不进按钮回调链。
+  // 此前它们掉进 approval 分支被无意义 ack 后静默丢弃——授权事件与主动消息
+  // 预算直接相关（群推送平台侧默认关闭），排障需要留痕。
+  if (event.type !== INTERACTION_TYPE.INLINE_KEYBOARD && event.type !== INTERACTION_TYPE.CALLBACK_COMMAND) {
+    handlePlatformInteraction(event, account, log);
+    return;
+  }
+
   // question 按钮（ask_user，含单问题 qqbot:q: 与多问题 qqbot:qm:）优先于审批按钮
   const buttonData = event.data?.resolved?.button_data;
   if (buttonData?.startsWith('qqbot:q:') || buttonData?.startsWith('qqbot:qm:')) {
@@ -141,6 +188,55 @@ export async function handleInteraction(
   }
 
   await handleApproval(event, account, runtime, log, acknowledgeInteraction);
+}
+
+/**
+ * 平台扩展互动类型的观测处理（type 13-20 及未来新增）。
+ * 纯观测：留痕 + 授权事件入 store，不 ack（官方文档：仅 11/12 需要 ack），
+ * 不产生任何出站动作。
+ */
+function handlePlatformInteraction(
+  event: InteractionEvent,
+  account: ResolvedQQBotAccount,
+  log: PluginLogger,
+): void {
+  const resolved = (event.data?.resolved ?? {}) as ExtendedInteractionResolved;
+  const operator = event.group_member_openid
+    ?? event.user_openid
+    ?? resolved.user_id
+    ?? 'unknown';
+  const peerId = event.group_openid ?? event.user_openid ?? '';
+
+  switch (event.type) {
+    case INTERACTION_TYPE.MESSAGE_FEEDBACK:
+      log.info(`[interaction] feedback opt=${resolved.feedback_opt ?? '?'} checked=${resolved.checked ?? '?'} msg=${resolved.message_id ?? '?'} operator=${operator}`);
+      return;
+    case INTERACTION_TYPE.CLEAR_SESSION:
+    case INTERACTION_TYPE.IN_OUT_STORY:
+    case INTERACTION_TYPE.SWITCH_MODEL:
+      // QQ 官方「智能体」平台事件，自建 bot 正常收不到；留痕即可
+      log.info(`[interaction] agent-platform event type=${event.type} action=${resolved.action ?? '?'} operator=${operator}`);
+      return;
+    case INTERACTION_TYPE.USER_AUTHORIZE:
+    case INTERACTION_TYPE.GROUP_AUTHORIZE:
+    case INTERACTION_TYPE.GROUP_AUTHORIZE_STATUS: {
+      const authorize = resolved.authorize_data ?? {};
+      if (peerId) {
+        recordPushAuthorizeEvent(account.accountId, peerId, {
+          eventType: event.type,
+          scope: authorize.scope ?? '',
+          optScene: authorize.opt_scene ?? '',
+        });
+      }
+      log.info(
+        `[push-auth] type=${event.type} scene=${event.scene ?? '?'} peer=${peerId || '?'} scope=${authorize.scope ?? '?'} opt_scene=${authorize.opt_scene ?? '?'} operator=${operator}`,
+      );
+      return;
+    }
+    default:
+      // 未来新增类型：留痕不猜测语义，也不 ack
+      log.info(`[interaction] unhandled interaction type=${event.type} scene=${event.scene ?? '?'}`);
+  }
 }
 
 // ── Interaction 子处理 ──
