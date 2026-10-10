@@ -194,7 +194,16 @@ export async function handleInteraction(
  * 平台扩展互动类型的观测处理（type 13-20 及未来新增）。
  * 纯观测：留痕 + 授权事件入 store，不 ack（官方文档：仅 11/12 需要 ack），
  * 不产生任何出站动作。
+ *
+ * 日志中的标识符统一截断为前 8 字符（openid 32 位 hex，前缀已足够定位排障；
+ * 对齐 /bot-group-info 的展示惯例）——INFO 日志可被 /bot-logs 导出给 c2c
+ * 用户（默认 allowFrom 为空即开放），不落完整他人标识符。
  */
+function shortId(id: string | undefined): string {
+  if (!id) return '?';
+  return id.length > 8 ? `${id.slice(0, 8)}…` : id;
+}
+
 function handlePlatformInteraction(
   event: InteractionEvent,
   account: ResolvedQQBotAccount,
@@ -209,27 +218,29 @@ function handlePlatformInteraction(
 
   switch (event.type) {
     case INTERACTION_TYPE.MESSAGE_FEEDBACK:
-      log.info(`[interaction] feedback opt=${resolved.feedback_opt ?? '?'} checked=${resolved.checked ?? '?'} msg=${resolved.message_id ?? '?'} operator=${operator}`);
+      log.info(`[interaction] feedback opt=${resolved.feedback_opt ?? '?'} checked=${resolved.checked ?? '?'} msg=${shortId(resolved.message_id)} operator=${shortId(operator)}`);
       return;
     case INTERACTION_TYPE.CLEAR_SESSION:
     case INTERACTION_TYPE.IN_OUT_STORY:
     case INTERACTION_TYPE.SWITCH_MODEL:
       // QQ 官方「智能体」平台事件，自建 bot 正常收不到；留痕即可
-      log.info(`[interaction] agent-platform event type=${event.type} action=${resolved.action ?? '?'} operator=${operator}`);
+      log.info(`[interaction] agent-platform event type=${event.type} action=${resolved.action ?? '?'} operator=${shortId(operator)}`);
       return;
     case INTERACTION_TYPE.USER_AUTHORIZE:
     case INTERACTION_TYPE.GROUP_AUTHORIZE:
     case INTERACTION_TYPE.GROUP_AUTHORIZE_STATUS: {
       const authorize = resolved.authorize_data ?? {};
       if (peerId) {
+        const tsMs = event.timestamp ? Date.parse(event.timestamp) : NaN;
         recordPushAuthorizeEvent(account.accountId, peerId, {
           eventType: event.type,
           scope: authorize.scope ?? '',
           optScene: authorize.opt_scene ?? '',
+          eventTimestampMs: tsMs,
         });
       }
       log.info(
-        `[push-auth] type=${event.type} scene=${event.scene ?? '?'} peer=${peerId || '?'} scope=${authorize.scope ?? '?'} opt_scene=${authorize.opt_scene ?? '?'} operator=${operator}`,
+        `[push-auth] type=${event.type} scene=${event.scene ?? '?'} peer=${shortId(peerId)} scope=${authorize.scope ?? '?'} opt_scene=${authorize.opt_scene ?? '?'} operator=${shortId(operator)}`,
       );
       return;
     }
