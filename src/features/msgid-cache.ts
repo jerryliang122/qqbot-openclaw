@@ -106,24 +106,6 @@ export function evictMsgId(scope: string, targetId: string, msgId: string): void
   }
 }
 
-/**
- * @deprecated 只取最新一条且不看配额——无锚点路径请改用
- * selectMsgIdForPassiveReply（旧配额优先、配额感知）。保留仅供既有测试。
- */
-export function getCachedMsgId(scope: string, targetId: string): string | undefined {
-  const key = `${scope}:${targetId}`;
-  const list = cache.get(key);
-  if (!list || list.length === 0) return undefined;
-  const now = Date.now();
-  const ttl = ttlForScope(scope);
-  for (let i = list.length - 1; i >= 0; i--) {
-    if (now - list[i].timestamp < ttl) {
-      return list[i].msgId;
-    }
-  }
-  return undefined;
-}
-
 export function clearMsgIdCache(scope: string, targetId: string): void {
   cache.delete(`${scope}:${targetId}`);
 }

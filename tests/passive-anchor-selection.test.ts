@@ -289,6 +289,71 @@ await test('40034128（回复次数超限）同 class 兜底', async () => {
   assert.equal(recorded[0]!.kind, 'sendText', '应转主动重发');
 });
 
+// ── passiveOnly：死锚点不转主动重发（progress card 契约）──
+
+group('passiveOnly：死锚点不转主动重发');
+
+await test('passiveOnly 死锚点 → 原错误上抛、不重发、不计预算、锚点仍剔除', async () => {
+  clearQuotaCache();
+  seedAnchor('gw-po', 'PO_M');
+  _resetProactiveBudget();
+  const { gw, recorded } = makeGateway({
+    send: async () => { throw makeApiError(40034005); },
+  });
+  const before = getProactiveUsage('gwtest').count;
+  await assert.rejects(
+    () => gw.sendText(
+      { scope: 'c2c', targetId: 'gw-po' }, 'card snapshot',
+      { msgId: 'PO_M', msgSeq: 1, passiveOnly: true },
+    ),
+    /40034005/,
+    '应原错误上抛（上游按 passiveOnly 语义丢弃）',
+  );
+  assert.equal(recorded.length, 0, 'passiveOnly 不得转主动重发');
+  assert.equal(getProactiveUsage('gwtest').count, before, '不得计入每日主动预算');
+  assert.equal(
+    selectMsgIdForPassiveReply({ accountId: 'gwtest', scope: 'c2c', targetId: 'gw-po' }),
+    undefined,
+    '死锚点仍应剔除（防后续选取再撞）',
+  );
+  assert.equal(
+    getPassiveReplyQuotaRemaining({ accountId: 'gwtest', msgId: 'PO_M', scope: 'c2c' }),
+    0,
+    '死锚点配额应判死（dead 标记）',
+  );
+});
+
+await test('outbound sendText 把 passiveOnly 透传网关 opts（死锚点决策在网关）', async () => {
+  clearQuotaCache();
+  const { sendText: serviceSendText, registerGateway, unregisterGateway } =
+    await import('../src/outbound/outbound-service.ts');
+  const capturedOpts: Array<Record<string, unknown> | undefined> = [];
+  const gw: any = {
+    sendText: async (_t: unknown, _text: string, opts?: any) => {
+      capturedOpts.push(opts);
+      return { id: 'svc-ok', timestamp: Date.now() };
+    },
+  };
+  registerGateway('po-svc', gw);
+  try {
+    const result = await serviceSendText({
+      to: 'qqbot:c2c:po-u1',
+      text: 'card',
+      accountId: 'po-svc',
+      replyToId: 'SVC_M',
+      account: { accountId: 'po-svc' } as any,
+      passiveOnly: true,
+    });
+    assert.equal(result.messageId, 'svc-ok');
+    assert.equal(capturedOpts.length, 1);
+    assert.equal(capturedOpts[0]!.msgId, 'SVC_M');
+    assert.equal(capturedOpts[0]!.passiveOnly, true, 'passiveOnly 必须透传到网关');
+    assert.ok((capturedOpts[0]!.msgSeq as number) >= 1, '非 quotaReserved 路径由 service 预留时发号');
+  } finally {
+    unregisterGateway('po-svc', gw);
+  }
+});
+
 await test('重发再失败 → 抛出重发错误（不循环）', async () => {
   clearQuotaCache();
   seedAnchor('gw-dead3', 'DEAD_M3');

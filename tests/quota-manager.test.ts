@@ -211,6 +211,26 @@ await test('invalidateMsgIdQuota: 锚点判死后永不再可用', () => {
   assert.equal(getPassiveReplyQuotaRemaining({ accountId, msgId, scope: 'group' }), 0);
 });
 
+await test('invalidate 后 rollback 不得复活死锚点（dead 标记）', () => {
+  clearQuotaCache();
+  const accountId = 'test-account-dead-rb';
+  const msgId = 'test-msg-dead-rb';
+  // 模拟真实链路：adapter 消耗成功（拿到 rollback）→ 平台判死锚点 invalidate
+  // → 主动重发也失败 → 上游补偿 rollback()——不得把 count 减回 limit 以下
+  const { rollback } = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
+  invalidateMsgIdQuota({ accountId, msgId, scope: 'c2c' });
+  rollback();
+  rollbackPassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
+  assert.equal(
+    getPassiveReplyQuotaRemaining({ accountId, msgId, scope: 'c2c' }),
+    0,
+    '回滚后死锚点仍应无额度',
+  );
+  const again = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
+  assert.equal(again.canReply, false, '死锚点经回滚不得复活');
+  assert.equal(checkPassiveReplyQuota({ accountId, msgId, scope: 'c2c' }), false);
+});
+
 await test('getQuotaStats: 预注册的 count=0 条目不计入统计', () => {
   clearQuotaCache();
   const accountId = 'test-account-stats';

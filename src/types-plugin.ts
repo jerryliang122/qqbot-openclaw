@@ -43,11 +43,17 @@ export interface QQBotSessionRoute {
  * 每次消耗配额时 +1——QQ 平台「相同 msg_id + msg_seq 重复发送会失败」，
  * 同一 msg_id 的多次回复必须逐条区分。seq 单调递增、从不回滚
  * （浪费序号无害，精确重复才是平台硬错误）。
+ *
+ * `dead`：死锚点标记，平台 40034005/40034128 判死后由 invalidateMsgIdQuota
+ * 置位。置位后该 msg_id 永不再被消耗，rollback 也不得复活——否则上游发送
+ * 失败的补偿回滚会把 count 减回 limit 以下，死锚点被再次挂接、再吃一次
+ * 平台确定性拒绝。
  */
 export interface QuotaState {
   count: number;
   expiresAt: number;
   seq?: number;
+  dead?: boolean;
 }
 
 /**
