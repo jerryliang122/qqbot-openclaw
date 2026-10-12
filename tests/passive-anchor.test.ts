@@ -233,19 +233,30 @@ await test('msgid-cache TTL 必须严格小于 quota TTL（防 40034128 硬失�
   );
 });
 
-await test('缓存 TTL 留有余量（不贴平台边界）', () => {
-  const c2cMargin = QUOTA_LIMITS.c2c.ttlMs - _msgidCacheTtlMs.c2c;
+await test('群聊余量必须 ≥ 60 秒（TTL 从到达起算，扣入站网络延迟后仍为正）', () => {
   const groupMargin = QUOTA_LIMITS.group.ttlMs - _msgidCacheTtlMs.group;
-  assert.ok(c2cMargin >= 60 * 1000, `c2c 余量 ${c2cMargin}ms 应 ≥ 1 分钟`);
-  assert.ok(groupMargin >= 10 * 1000, `group 余量 ${groupMargin}ms 应 ≥ 10 秒`);
+  // TTL 锚点是「消息到达本进程」，平台锚点是「它自己的消息时间戳」，到达必然
+  // 更晚——真实余量 = 平台窗口 − (入站延迟 + TTL)。余量低于 60 秒时，WebSocket
+  // 重连补发 / 网关积压造成的几十秒抖动就可能把余量吃成负数，挂上过期 msg_id
+  // → 40034005 / 40034128 硬失败（无降级通道）。4.5 分钟只有 30 秒，故禁用。
+  assert.ok(
+    groupMargin >= 60 * 1000,
+    `群聊余量仅 ${groupMargin}ms，应 ≥ 60000ms（否则入站抖动即可击穿）`,
+  );
+});
+
+await test('c2c 余量 ≥ 1 分钟', () => {
+  const c2cMargin = QUOTA_LIMITS.c2c.ttlMs - _msgidCacheTtlMs.c2c;
+  assert.ok(c2cMargin >= 60 * 1000, `c2c 余量 ${c2cMargin}ms 应 ≥ 60000ms`);
 });
 
 // ── 5. c2c TTL 回归 ──
 
 group('5. c2c 缓存 TTL 回归');
 
-await test('c2c 缓存 TTL = 55 分钟（平台 60 分钟留 5 分钟余量）', () => {
+await test('c2c 缓存 TTL = 55 分钟 / 群 = 4 分钟', () => {
   assert.equal(_msgidCacheTtlMs.c2c, 55 * 60 * 1000);
+  assert.equal(_msgidCacheTtlMs.group, 4 * 60 * 1000);
 });
 
 await test('getCachedMsgId 语义不变（仍返回最新一条）', () => {

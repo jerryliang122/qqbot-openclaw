@@ -13,7 +13,7 @@
 ### 修复
 
 - **被动回复锚点轮转：最大化利用手上的 msg_id**（PR：fix/passive-msgid-rotation）：平台按「**每条用户消息独立计数**」（单聊 4 次/条、群 5 次/条），但插件此前只认**最新**一条 msg_id——它一耗尽就立即降级主动，用户此前发过的、更早的 msg_id 还带着未用完的配额被白白丢弃。触发场景正是长回复：openclaw 按 `TEXT_CHUNK_LIMIT`(5000) 把一条回复切成多块逐块发出，一轮 7~8 条出站很常见，再叠加媒体 / TTS / typing 续期 / progress card，单条用户消息的配额必然被打满。实测：用户连发 A/B/C 后，c2c 旧实现第 5 条出站即降主动，轮转后 **12 条全部走被动**（每条各 4 次），主动日预算零消耗。新增 `src/features/passive-anchor.ts` 的 `resolvePassiveAnchor()`，收敛全部三处配额决策点——outbound-adapter 的 `sendTextWithQuota`/`sendMediaWithQuota`（框架分块出站主路径）、outbound-service 的 `reservePassiveReply`、gateway 的 `attachMsgIdWithQuota`。轮转顺序为**新→旧**（同 TTL 下旧条目更早过期，优先用最新的可把更旧的额度留给后续出站）；候选去重、过期条目跳过、rollback 归还额度均已覆盖。平台侧次数/时效限制仍由 quota-manager 按每条 msg_id 独立严格记账，轮转不绕过任何单条限额。旋转发生与降级主动均打 INFO（`[quota] passive anchor rotated: X → Y`），便于事后取证。
-- **msgid-cache c2c TTL 与平台被动窗口对齐**：原值 c2c 30min **并非**与平台对齐——平台 C2C 被动窗口是 **60 分钟**（《发送单聊消息》页首 +《频率与时效规则》表：单聊 60 分钟 / 群 5 分钟），仓库文档长期误记为"已对齐"。排查中确认官方单聊页 `msg_id` 字段描述的"5 分钟内有效"是**模板串写**：群/单聊两页该句逐字相同、仅事件名不同，而群聊真实窗口恰为 5 分钟（两页"上次更新"时间戳仅差 2 秒，同批生成）。现改为 c2c **55min** / 群 **4.5min**，各留 5 分钟安全余量——宁可降级主动也不挂过期 msg_id 去撞平台 40034005 / 40034128 硬失败。⚠️ 新增不变量并由测试锁死：**msgid-cache TTL 必须严格小于 quota TTL**，否则 quota-manager 以「首次消费」为锚点的 `expiresAt` 会放行平台已过期的 msg_id。`QUOTA_LIMITS` 改为导出供断言使用。同步修正 README / CHANGELOG / AGENTS.md 中"已对齐"的错误表述。回归测试 `tests/passive-anchor.test.ts`（14 用例）。
+- **msgid-cache c2c TTL 与平台被动窗口对齐**：原值 c2c 30min **并非**与平台对齐——平台 C2C 被动窗口是 **60 分钟**（《发送单聊消息》页首 +《频率与时效规则》表：单聊 60 分钟 / 群 5 分钟），仓库文档长期误记为"已对齐"。排查中确认官方单聊页 `msg_id` 字段描述的"5 分钟内有效"是**模板串写**：群/单聊两页该句逐字相同、仅事件名不同，而群聊真实窗口恰为 5 分钟（两页"上次更新"时间戳仅差 2 秒，同批生成）。现改为 c2c **55min** / 群 **4min**——宁可降级主动也不挂过期 msg_id 去撞平台 40034005 / 40034128 硬失败。⚠️ **群聊只敢取 4 分钟**：缓存 TTL 从**消息到达本进程**起算（`cacheMsgId` 在入站处理器打点），平台从它自己的消息时间戳起算，真实余量 = 平台窗口 − (入站延迟 + TTL)；5 分钟窗口若取 4.5 分钟，余量仅 30 秒，**扣掉 WebSocket 重连补发 / 网关积压的几十秒抖动即为负**，届时会把平台已过期的 msg_id 判为可用。⚠️ 新增不变量并由测试锁死：**msgid-cache TTL 必须严格小于 quota TTL**，且**群聊余量必须 ≥ 60 秒**。`QUOTA_LIMITS` 改为导出供断言使用。同步修正 README / CHANGELOG / AGENTS.md 中"已对齐"的错误表述。回归测试 `tests/passive-anchor.test.ts`（14 用例）。
 
 ### 新增
 
@@ -230,7 +230,7 @@
 
 - **被动优先出站**：全链路 msg_id 优先，保护主动消息每日 1000 条预算。挂载 msg_id 前经 quota-manager **原子预检+扣减**（群 5 次/msg_id/5min，c2c 4 次/60min），配额耗尽自动降级主动发送，API 失败自动 rollback——彻底消除平台 40034128 硬失败无兜底的问题。
 - **主动预算计量**（`src/features/proactive-budget.ts`）：按账号按天计数、跨天重置、80% 告警，`/bot-group-info` 可查。
-- **msgid-cache**：c2c 55min / 群 4.5min（平台被动窗口为 c2c 60min / 群 5min，各留 5 分钟安全余量），静群（窗口内无消息）只能主动发送——平台约束。
+- **msgid-cache**：c2c 55min / 群 4min（平台被动窗口为 c2c 60min / 群 5min；TTL 从消息到达起算，余量需覆盖入站网络延迟），静群（窗口内无消息）只能主动发送——平台约束。
 - **typing 配额感知**：typing 通知与回复共享被动配额，耗尽自动降级主动；20s QPS 约束自动钳制；出站消息后 5s 自动续期。
 
 #### 可靠性与观测
