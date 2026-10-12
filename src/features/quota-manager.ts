@@ -92,6 +92,11 @@ export function checkPassiveReplyQuota(params: QuotaCheckParams): boolean {
       return false;
     }
 
+    // 死锚点（平台判死）等同耗尽
+    if (cached.dead) {
+      return false;
+    }
+
     const limit = QUOTA_LIMITS[scope].count;
     if (cached.count >= limit) {
       return false;
@@ -119,6 +124,9 @@ export function getPassiveReplyQuotaRemaining(params: QuotaCheckParams): number 
   if (!cached) {
     return QUOTA_LIMITS[scope].count;
   }
+  if (cached.dead) {
+    return 0;
+  }
   if (Date.now() > cached.expiresAt) {
     return 0;
   }
@@ -137,7 +145,7 @@ export function rollbackPassiveReplyQuota(params: {
   const key = `${accountId}:${scope}:${msgId}`;
 
   const cached = quotaCache.get(key);
-  if (cached && cached.count > 0) {
+  if (cached && !cached.dead && cached.count > 0) {
     cached.count -= 1;
     quotaCache.set(key, cached);
   }
@@ -174,10 +182,12 @@ export function checkAndConsumePassiveReplyQuota(
     return { canReply: false, seq: 0, rollback: () => {} };
   }
 
-  // 检查配额
+  // 检查配额（死锚点=平台已判死，等同耗尽且不可回滚复活）
   const limit = QUOTA_LIMITS[scope].count;
-  if (cached && cached.count >= limit) {
-    log?.debug?.(`[${accountId}] passive quota denied (exhausted): ${key} count=${cached.count}/${limit}`);
+  if (cached && (cached.dead || cached.count >= limit)) {
+    log?.debug?.(
+      `[${accountId}] passive quota denied (${cached.dead ? 'dead anchor' : 'exhausted'}): ${key} count=${cached.count}/${limit}`,
+    );
     return { canReply: false, seq: 0, rollback: () => {} };
   }
 
@@ -197,10 +207,11 @@ export function checkAndConsumePassiveReplyQuota(
 
   log?.debug?.(`[${accountId}] consumed passive quota: ${key} count=${cached.count} seq=${cached.seq}`);
 
-  // 返回回滚函数（只回滚 count，不回滚 seq）
+  // 返回回滚函数（只回滚 count，不回滚 seq；死锚点不回滚——invalidate
+  // 判死后 count 不得经回滚复活）
   const rollback = () => {
     const state = quotaCache.get(key);
-    if (state && state.count > 0) {
+    if (state && !state.dead && state.count > 0) {
       state.count -= 1;
       quotaCache.set(key, state);
     }
@@ -210,9 +221,10 @@ export function checkAndConsumePassiveReplyQuota(
 }
 
 /**
- * 将某 msg_id 配额标记为耗尽（count=limit）——平台 40034005（msg_id 已过期）/
- * 40034128（回复次数超限）判死后调用：该锚点永不再被选取/允许消耗；
- * 不删条目（保留 seq 与窗口现场便于排障）。
+ * 将某 msg_id 配额标记为死锚点（dead=true 且 count=limit）——平台
+ * 40034005（msg_id 已过期）/40034128（回复次数超限）判死后调用：该锚点
+ * 永不再被选取/允许消耗，rollback 也无法复活（防上游发送失败的补偿回滚
+ * 把 count 减回 limit 以下）；不删条目（保留 seq 与窗口现场便于排障）。
  */
 export function invalidateMsgIdQuota(params: {
   accountId: string;
@@ -223,6 +235,7 @@ export function invalidateMsgIdQuota(params: {
   const key = `${accountId}:${scope}:${msgId}`;
   const cached = quotaCache.get(key);
   if (!cached) return;
+  cached.dead = true;
   cached.count = QUOTA_LIMITS[scope].count;
   quotaCache.set(key, cached);
 }

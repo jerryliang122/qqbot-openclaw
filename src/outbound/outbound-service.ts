@@ -216,8 +216,9 @@ export async function sendText(params: {
   quotaReserved?: boolean;
   /**
    * 只走被动回复（progress card 等非正文消息用）：配额不可用时直接返回
-   * error（不调网关、不降级主动、不烧每日主动预算）。调用方收到该 error
-   * 应静默丢弃消息。
+   * error（不调网关、不降级主动、不烧每日主动预算）；锚点被平台确定性
+   * 拒绝（40034005/40034128）时网关剔除死锚点后原错误上抛、同样不转
+   * 主动重发。调用方收到 error 应静默丢弃消息。
    */
   passiveOnly?: boolean;
 }): Promise<SendResult> {
@@ -241,6 +242,9 @@ export async function sendText(params: {
     const result = await resolved.gw.sendText(target, params.text, {
       msgId: reservation.msgId,
       msgSeq: reservation.msgSeq,
+      // 死锚点被平台确定性拒绝时网关同样不得转主动重发（剔除锚点后
+      // 原错误上抛，本层 catch 返回 error、调用方丢弃）
+      passiveOnly: params.passiveOnly,
     });
     return { messageId: result.id };
   } catch (err: unknown) {

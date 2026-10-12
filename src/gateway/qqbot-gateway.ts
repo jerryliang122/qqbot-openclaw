@@ -42,6 +42,12 @@ export interface SendOptions {
   msgId?: string;
   /** 显式锚点链透传的被动回复序号（quotaReserved 链已在上游发号） */
   msgSeq?: number;
+  /**
+   * 只走被动（progress card 等非正文消息）：死锚点被平台确定性拒绝时
+   * 剔除锚点后**原错误上抛、不转主动重发**——上游按 passiveOnly 语义
+   * 丢弃（绝不烧每日主动预算）。无显式 msgId 时预留阶段已拦截，不会到网关。
+   */
+  passiveOnly?: boolean;
   text?: string;
 }
 
@@ -208,6 +214,7 @@ export class QQBotGateway {
         target,
         resolved,
         rollback,
+        passiveOnly: opts?.passiveOnly,
         retry: () =>
           withTimeout(
             this.bot.sendText({ scope: target.scope, targetId: target.targetId }, text),
@@ -246,6 +253,7 @@ export class QQBotGateway {
         target,
         resolved: resolvedTarget,
         rollback,
+        passiveOnly: opts?.passiveOnly,
         retry: () => send({ scope: target.scope, targetId: target.targetId }),
       });
       if (retried) {
@@ -288,6 +296,7 @@ export class QQBotGateway {
         target,
         resolved: resolvedTarget,
         rollback,
+        passiveOnly: opts?.passiveOnly,
         retry: () => send({ scope: target.scope, targetId: target.targetId }, 'sendVoice(proactive-retry)'),
       });
       if (retried) {
@@ -321,6 +330,7 @@ export class QQBotGateway {
         target,
         resolved: resolvedTarget,
         rollback,
+        passiveOnly: opts?.passiveOnly,
         retry: () => send({ scope: target.scope, targetId: target.targetId }, 'sendVideo(proactive-retry)'),
       });
       if (retried) {
@@ -354,6 +364,7 @@ export class QQBotGateway {
         target,
         resolved: resolvedTarget,
         rollback,
+        passiveOnly: opts?.passiveOnly,
         retry: () => send({ scope: target.scope, targetId: target.targetId }, 'sendFile(proactive-retry)'),
       });
       if (retried) {
@@ -558,6 +569,11 @@ export class QQBotGateway {
    * 抛出重发错误交上层既有处理（主动路径无 msg_id，不可能再触发同码）。
    * 网络/超时（httpStatus===0，结果不明，重发有重复风险）与其他业务码
    * （内容超长等，重发必然同错）不做兜底。
+   *
+   * passiveOnly（progress card 等非正文消息）：死锚点同样剔除（防后续
+   * 选取再撞），但**不转主动重发、不计每日预算**——原错误上抛，由上游
+   * 按「发送失败=丢弃」处理。注意此时直接 throw 而非 return null，跳过
+   * 调用方 catch 尾部的 rollback()（rollback 已在本方法内执行过一次）。
    */
   private async retryOnDeadAnchor<T>(
     err: unknown,
@@ -565,10 +581,11 @@ export class QQBotGateway {
       target: ReplyTarget;
       resolved: ReplyTarget;
       rollback: () => void;
+      passiveOnly?: boolean;
       retry: () => Promise<T>;
     },
   ): Promise<T | null> {
-    const { target, resolved, rollback, retry } = params;
+    const { target, resolved, rollback, passiveOnly, retry } = params;
     const anchorDead = err instanceof ApiError && ANCHOR_DEAD_CODES.has(err.bizCode ?? -1);
     if (!anchorDead || !resolved.msgId) return null;
 
@@ -579,6 +596,12 @@ export class QQBotGateway {
       msgId: resolved.msgId,
       scope: target.scope,
     });
+    if (passiveOnly) {
+      this.log.warn?.(
+        `[quota] passive anchor rejected by platform (code=${err.bizCode}) msgId=${resolved.msgId}; evicted, passiveOnly — dropping without proactive retry`,
+      );
+      throw err;
+    }
     this.log.warn?.(
       `[quota] passive anchor rejected by platform (code=${err.bizCode}) msgId=${resolved.msgId}; evicted, retrying proactively`,
     );
