@@ -208,11 +208,39 @@ await test('static 模式：首分片已送达，isError final payload 必须静
   assert.equal(sentTexts.length, 2, '应恰好两条：首分片（static flush）+ 失败通知');
 });
 
-await test('static 模式：非 error final payload 的流式去重早退保持不变', async () => {
+await test('static 模式：final 与已 flush 内容一致 → 不重复发送（流式去重早退保持不变）', async () => {
   _resetAdaptersCache();
   const { sentTexts } = installFakeGateway();
   const firstChunk = '这是已送达用户的首段回答。';
-  const finalText = '这是与流式内容一致的完整 final 文本，不应重复发送。';
+  // final 文本与已 flush 的首段完全一致 → 差量覆盖判定命中，纯去重不重发
+  const finalText = firstChunk;
+
+  await runDispatchWithPayloads({
+    account: makeAccount({ mode: 'partial', sendMode: 'static' }),
+    firstPartial: firstChunk,
+    flushFirstChunk: true,
+    payloads: [{ payload: { text: finalText }, info: { kind: 'final' } }],
+  });
+
+  assert.ok(
+    sentTexts.some((s) => s.text === firstChunk),
+    '首分片应已送达',
+  );
+  assert.equal(
+    sentTexts.length,
+    1,
+    `final 与已送达内容一致时不应有任何补发，实际发送: ${JSON.stringify(sentTexts.map((s) => s.text))}`,
+  );
+});
+
+await test('static 模式：final 与已 flush 段落无关（issue #44 形态）→ 整文补发不再静默丢失', async () => {
+  _resetAdaptersCache();
+  const { sentTexts } = installFakeGateway();
+  const firstChunk = '这是已送达用户的首段回答。';
+  // 末段 partial 从未到达、final 全文与最后已 flush 段落无任何前缀/包含关系
+  // ——issue #44 场景：旧语义按「流式去重」丢弃致最终正文静默丢失，
+  // 修复后应判定为从未投递的全新消息，随 finalize 补发。
+  const finalText = '这是末段才产出的完整总结正文，与首段无任何前缀关系。';
 
   await runDispatchWithPayloads({
     account: makeAccount({ mode: 'partial', sendMode: 'static' }),
@@ -226,8 +254,8 @@ await test('static 模式：非 error final payload 的流式去重早退保持�
     '首分片应已送达',
   );
   assert.ok(
-    !sentTexts.some((s) => s.text === finalText),
-    `非 error final 文本不应重复发送（流式去重早退），实际发送: ${JSON.stringify(sentTexts.map((s) => s.text))}`,
+    sentTexts.some((s) => s.text === finalText),
+    `无关 final 全文应补发（issue #44），实际发送: ${JSON.stringify(sentTexts.map((s) => s.text))}`,
   );
 });
 
