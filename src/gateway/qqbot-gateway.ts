@@ -27,9 +27,8 @@ import { getPersistedRefIndexStore } from '../features/ref-index-store.js';
 import { recordOutboundMessageId } from '../features/outbound-echo-store.js';
 import { recordOutboundToGroupHistory } from '../features/history-store.js';
 import { resolveGroupConfigFromAccount } from '../config.js';
-import { checkAndConsumePassiveReplyQuota } from '../features/quota-manager.js';
+import { resolvePassiveAnchor } from '../features/passive-anchor.js';
 import { recordProactiveSend } from '../features/proactive-budget.js';
-import { getCachedMsgId } from '../features/msgid-cache.js';
 import { notifyOutboundMessageSent } from '../features/typing-refresh.js';
 
 export interface GatewayCallbacks {
@@ -416,12 +415,13 @@ export class QQBotGateway {
   }
 
   /**
-   * 配额感知的 msg_id 挂接（被动优先）。
+   * 配额感知的 msg_id 挂接（被动优先 + 锚点轮转）。
    *
    * - 显式 msgId（opts.msgId）：上游 adapter 已做配额记账（quotaReserved），
    *   直接透传，不重复消费。
-   * - 无显式 msgId：尝试挂 msgid-cache 最新条目；挂接前经 quota-manager
-   *   原子预检+扣减——配额耗尽则不挂（降级主动，避免平台 40034128 硬失败），
+   * - 无显式 msgId：沿会话缓存新→旧轮转占配额（resolvePassiveAnchor）——
+   *   最新一条耗尽时继续用更旧的 msg_id，平台按「每条消息独立计数」，
+   *   更旧的配额不占白不占；全部候选都拿不到才降级主动。
    *   API 抛错时由调用方 rollback 释放已扣减的额度。
    */
   private attachMsgIdWithQuota(
@@ -431,20 +431,21 @@ export class QQBotGateway {
     if (opts?.msgId) {
       return { target: { ...target, msgId: opts.msgId }, rollback: () => {} };
     }
-    const cached = getCachedMsgId(target.scope, target.targetId);
-    if (!cached) return { target, rollback: () => {} };
 
-    const reservation = checkAndConsumePassiveReplyQuota({
+    const anchor = resolvePassiveAnchor({
       accountId: this.account.accountId,
-      msgId: cached,
       scope: target.scope,
+      targetId: target.targetId,
+      log: this.log,
     });
-    if (!reservation.canReply) {
+    if (!anchor.msgId) {
       // INFO：降级主动消耗每日预算，是出站行为的可观测分界点
-      this.log.info?.(`[quota] passive quota exhausted for msgId=${cached}; falling back to proactive send`);
+      this.log.info?.(
+        `[quota] no passive anchor available for ${target.scope}:${target.targetId}; falling back to proactive send`,
+      );
       return { target, rollback: () => {} };
     }
-    return { target: { ...target, msgId: cached }, rollback: reservation.rollback };
+    return { target: { ...target, msgId: anchor.msgId }, rollback: anchor.rollback };
   }
 }
 

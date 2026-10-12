@@ -745,7 +745,7 @@ Name-pattern false positives ("people talking *about* the bot") are handled grac
 
 QQ Bot proactive messages (sent without msg_id) have a daily budget (~1000/day). The plugin prefers passive replies (msg_id) everywhere:
 
-- Framework-provided `replyToId` is used when available; otherwise the freshest cached msg_id is attached (msgid-cache TTL matches the platform's passive window: 5min group / 30min c2c)
+- Framework-provided `replyToId` is used when available; otherwise the freshest cached msg_id is attached. When an anchor's quota is exhausted, the plugin **rotates to older cached msg_ids** (newest→oldest) before degrading to proactive — the platform counts quota per user message, so earlier messages still have unused slots (msgid-cache TTL: 55min c2c / 4.5min group, each with a safety margin under the platform's 60min / 5min passive window)
 - Attaching a msg_id is **quota-aware**: the passive quota (5 replies per msg_id per 5min in groups) is atomically checked and consumed before the send — when exhausted, the send gracefully degrades to proactive instead of failing with platform error 40034128
 - Residual proactive sends are counted per account per day (`/bot-group-info` shows usage; a warning is logged at 80% of the budget)
 - Quiet groups (no message within the passive window) can only be reached proactively — that's a platform constraint, not a bug

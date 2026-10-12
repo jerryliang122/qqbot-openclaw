@@ -13,7 +13,8 @@
  *   "Channel is unavailable: qqbot"。
  */
 
-import { checkAndConsumePassiveReplyQuota, checkPassiveReplyQuota, inferQQBotScope } from './features/quota-manager.js';
+import { checkPassiveReplyQuota, inferQQBotScope } from './features/quota-manager.js';
+import { resolvePassiveAnchor } from './features/passive-anchor.js';
 import type { PluginLogger } from './utils/plugin-logger.js';
 import type { ResolvedQQBotAccount } from './types.js';
 import type { SendMediaParams, SendMediaResult } from './outbound/media-send.js';
@@ -126,11 +127,12 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
       const scope = inferQQBotScope(to);
       const resolvedAccountId = accountId || account.accountId;
 
-      // 使用原子操作检查并消耗配额
-      const { canReply, rollback } = await checkAndConsumePassiveReplyQuota({
+      // 原子占用被动配额：首选当前消息的 msg_id，耗尽则沿缓存轮转
+      const anchor = resolvePassiveAnchor({
         accountId: resolvedAccountId,
-        msgId: replyToId,
         scope,
+        targetId: parseTarget(to).targetId,
+        preferredMsgId: replyToId,
         log,
       });
 
@@ -139,16 +141,16 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
         to,
         text,
         accountId: resolvedAccountId,
-        replyToId: canReply ? replyToId : undefined,
+        replyToId: anchor.msgId,
         account,
-        quotaReserved: canReply,
+        quotaReserved: Boolean(anchor.msgId),
       });
 
       // 发送失败时回滚配额
-      if (canReply && replyToId && result.error) {
-        rollback();
+      if (anchor.msgId && result.error) {
+        anchor.rollback();
         log?.debug?.(`[${resolvedAccountId}] rollback quota: send failed`);
-      } else if (!canReply) {
+      } else if (!anchor.msgId) {
         log?.info?.(`[${resolvedAccountId}] [quota] fallback to proactive send: quota exhausted or no msgId`);
       }
 
@@ -159,11 +161,12 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
       const scope = inferQQBotScope(to);
       const resolvedAccountId = accountId || account.accountId;
 
-      // 使用原子操作检查并消耗配额
-      const { canReply, rollback } = await checkAndConsumePassiveReplyQuota({
+      // 原子占用被动配额：首选当前消息的 msg_id，耗尽则沿缓存轮转
+      const anchor = resolvePassiveAnchor({
         accountId: resolvedAccountId,
-        msgId: replyToId,
         scope,
+        targetId: parseTarget(to).targetId,
+        preferredMsgId: replyToId,
         log,
       });
 
@@ -172,18 +175,18 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
         to,
         source,
         text,
-        replyToId: canReply ? replyToId : undefined,
+        replyToId: anchor.msgId,
         accountId: resolvedAccountId,
         agentId,
         log,
-        quotaReserved: canReply,
+        quotaReserved: Boolean(anchor.msgId),
       });
 
       // 发送失败时回滚配额
-      if (canReply && replyToId && result.error) {
-        rollback();
+      if (anchor.msgId && result.error) {
+        anchor.rollback();
         log?.debug?.(`[${resolvedAccountId}] rollback quota: send failed`);
-      } else if (!canReply) {
+      } else if (!anchor.msgId) {
         log?.info?.(`[${resolvedAccountId}] [quota] fallback to proactive media send: quota exhausted or no msgId`);
       }
 

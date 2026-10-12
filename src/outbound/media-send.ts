@@ -22,7 +22,7 @@ import type { PluginLogger } from '../utils/plugin-logger.js';
 import { validateRemoteUrl } from '../utils/ssrf-guard.js';
 import { resolveGatewayForSend, notRunningError } from './outbound-service.js';
 import { parseTarget } from './target.js';
-import { checkAndConsumePassiveReplyQuota } from '../features/quota-manager.js';
+import { resolvePassiveAnchor } from '../features/passive-anchor.js';
 import {
   isLocalFilePath,
   isDataUrl,
@@ -169,17 +169,20 @@ export async function sendMedia(params: SendMediaParams): Promise<SendMediaResul
 
   const target = parseTarget(params.to);
 
+  // 被动锚点：首选当前消息的 msg_id；次数用尽则沿缓存轮转到更旧的 msg_id
+  // （平台按每条消息独立计数，更旧的配额不占白不占）。
   const reservation = params.quotaReserved || !params.replyToId
-    ? { canReply: Boolean(params.replyToId), rollback: () => {} }
-    : checkAndConsumePassiveReplyQuota({
+    ? { msgId: params.replyToId, rollback: () => {} }
+    : resolvePassiveAnchor({
         accountId: sendGateway.accountId,
-        msgId: params.replyToId,
         scope: target.scope,
+        targetId: target.targetId,
+        preferredMsgId: params.replyToId,
         log,
       });
   const sendParams: SendMediaParams = {
     ...params,
-    replyToId: reservation.canReply ? params.replyToId : undefined,
+    replyToId: reservation.msgId,
   };
 
   // 4. 路由分发

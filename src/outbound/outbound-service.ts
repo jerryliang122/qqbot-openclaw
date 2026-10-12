@@ -15,6 +15,7 @@ import {
   clearQuotaCacheForAccount,
   rollbackPassiveReplyQuota,
 } from '../features/quota-manager.js';
+import { resolvePassiveAnchor } from '../features/passive-anchor.js';
 
 // ── Gateway 注册表（生命周期由 channel.ts 管理）──
 
@@ -62,21 +63,22 @@ function reservePassiveReply(params: {
   replyToId?: string;
   accountId: string;
   scope: 'c2c' | 'group';
+  targetId: string;
   quotaReserved?: boolean;
 }): { msgId?: string; rollback: () => void } {
   if (!params.replyToId) return { rollback: () => {} };
   if (params.quotaReserved) {
     return { msgId: params.replyToId, rollback: () => {} };
   }
-  const reservation = checkAndConsumePassiveReplyQuota({
+  // 首选当前消息的 msg_id；次数用尽则沿缓存轮转到更旧的 msg_id
+  // （平台按每条消息独立计数，更旧的配额不占白不占）。
+  const anchor = resolvePassiveAnchor({
     accountId: params.accountId,
-    msgId: params.replyToId,
     scope: params.scope,
+    targetId: params.targetId,
+    preferredMsgId: params.replyToId,
   });
-  return {
-    msgId: reservation.canReply ? params.replyToId : undefined,
-    rollback: reservation.canReply ? reservation.rollback : () => {},
-  };
+  return { msgId: anchor.msgId, rollback: anchor.rollback };
 }
 
 /**
@@ -224,6 +226,7 @@ export async function sendText(params: {
     replyToId: params.replyToId,
     accountId: resolved.accountId,
     scope: target.scope,
+    targetId: target.targetId,
     quotaReserved: params.quotaReserved,
   });
   // passiveOnly：未占得被动槽（无 msg_id 可挂 / 配额耗尽 / TOCTOU 竞态）
@@ -258,6 +261,7 @@ export async function sendMedia(params: {
     replyToId: params.replyToId,
     accountId: resolved.accountId,
     scope: target.scope,
+    targetId: target.targetId,
     quotaReserved: params.quotaReserved,
   });
   try {
@@ -301,6 +305,7 @@ export async function sendVoice(params: {
     replyToId: params.replyToId,
     accountId: resolved.accountId,
     scope: target.scope,
+    targetId: target.targetId,
     quotaReserved: params.quotaReserved,
   });
   try {
@@ -328,6 +333,7 @@ export async function sendVideo(params: {
     replyToId: params.replyToId,
     accountId: resolved.accountId,
     scope: target.scope,
+    targetId: target.targetId,
     quotaReserved: params.quotaReserved,
   });
   try {
@@ -350,6 +356,7 @@ export class OutboundService {
       replyToId: msgId,
       accountId: this.accountId,
       scope: target.scope,
+      targetId: target.targetId,
     });
     try {
       const result = await this.gw.sendText(target, text, { msgId: reservation.msgId });
@@ -366,6 +373,7 @@ export class OutboundService {
       replyToId: opts?.msgId,
       accountId: this.accountId,
       scope: target.scope,
+      targetId: target.targetId,
     });
     try {
       const kind = opts?.mediaKind ?? 'image';

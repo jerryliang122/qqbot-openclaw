@@ -20,10 +20,20 @@ import type { QuotaState, QuotaCheckParams } from '../types-plugin.js';
 const quotaCache = new Map<string, QuotaState>();
 const MAX_CACHE_SIZE = 10000;
 
-const QUOTA_LIMITS = {
+/**
+ * 平台被动回复限额（QQ 官方文档，2026-09-03 版）
+ *
+ * - 单聊(C2C)：被动有效期 60 分钟，每条用户消息最多回复 4 次
+ * - 群聊：被动有效期 5 分钟，每条用户消息最多回复 5 次
+ *
+ * ⚠️ 不变量：msgid-cache 的同名 TTL 必须**严格小于**这里的 ttlMs。
+ * 见 src/features/msgid-cache.ts 注释——否则以「首次消费」为锚点的
+ * expiresAt 会放行已过期 msg_id，撞平台 40034005 / 40034128 硬失败。
+ */
+export const QUOTA_LIMITS = {
   c2c: { count: 4, ttlMs: 60 * 60 * 1000 },
   group: { count: 5, ttlMs: 5 * 60 * 1000 },
-};
+} as const;
 
 /**
  * 检查被动回复配额（纯探测，不消耗配额）。
