@@ -127,16 +127,38 @@ for (const file of scannedFiles) {
   for (const m of src.matchAll(SPECIFIER)) {
     ensure(m[1], file);
   }
-  // 值导出名覆盖
+  // 具名导入分类（值 / 类型）。整条 `import type {…}` 与 clause 内 inline
+  // `type X` 都要落到 typeOnly——否则该字段永远是空的，展示失真且无从察觉。
   for (const m of src.matchAll(NAMED_IMPORT_STMT)) {
-    if (m[1]) continue; // import type / export type —— 不产生运行时依赖
-    for (let part of m[2].split(',')) {
-      part = part.trim().replace(/^type\s+/, '');
-      if (!part) continue;
-      const original = part.split(/\s+as\s+/)[0].trim();
-      if (original) record(m[3], original, /* typeOnly */ false, file);
+    const stmtTypeOnly = !!m[1];
+    for (const spec of parseNamedClause(m[2])) {
+      record(m[3], spec.name, stmtTypeOnly || spec.typeOnly, file);
     }
   }
+}
+
+/**
+ * 解析 `{ a, b as c, type D }` 具名子句，逐个判定值/类型。
+ *
+ * **必须逐项判 type，不能先剥再一律当值**：TS 允许 `import { fn, type Opts }`
+ * 这类 inline 写法，而且它是本仓库的主流风格（当前 src 下大量使用，只是恰好都
+ * 指向相对路径）。曾把 `type` 前缀剥掉后统一记为值导入——一旦有人写出
+ * `import { x, type Opts } from 'openclaw/plugin-sdk/y'`，Opts（接口）在运行时
+ * 不存在，守卫会红并报"缺少运行时值"，把人引去查一个并不存在的 SDK 缺陷。
+ *
+ * 抽成纯函数是为了让分类逻辑本身可被单测钉死，而不是只能靠真实源码形态触发。
+ */
+function parseNamedClause(clause: string): Array<{ name: string; typeOnly: boolean }> {
+  const out: Array<{ name: string; typeOnly: boolean }> = [];
+  for (let part of clause.split(',')) {
+    part = part.trim();
+    if (!part) continue;
+    const typeOnly = /^type\s+/.test(part);
+    const clean = part.replace(/^type\s+/, '').trim();
+    const name = clean.split(/\s+as\s+/)[0].trim();
+    if (name) out.push({ name, typeOnly });
+  }
+  return out;
 }
 
 // openclaw 未导出 "./package.json" 子路径，require 会抛
@@ -252,6 +274,44 @@ for (const rec of [...subpaths.values()].sort((a, b) => a.sub.localeCompare(b.su
     );
   });
 }
+
+await test('具名子句的值/类型分类正确（inline type 标记不得记为值导出）', () => {
+  const cases: Array<{ clause: string; expected: Array<[string, boolean]> }> = [
+    // 纯值
+    { clause: 'a, b', expected: [['a', false], ['b', false]] },
+    // 别名仍是值
+    { clause: 'resolveFoo as f', expected: [['resolveFoo', false]] },
+    // inline type —— 本仓库主流写法，曾被误判为值导出
+    { clause: 'resolveToolSessionRoute, type ToolDeliveryContext', expected: [
+      ['resolveToolSessionRoute', false],
+      ['ToolDeliveryContext', true],
+    ] },
+    // 多个 inline type
+    { clause: 'type A, type B, c', expected: [['A', true], ['B', true], ['c', false]] },
+    // 带别名的 inline type
+    { clause: 'type LongName as Short', expected: [['LongName', true]] },
+    // 空白与尾逗号
+    { clause: '  a ,  b , ', expected: [['a', false], ['b', false]] },
+  ];
+  for (const { clause, expected } of cases) {
+    const actual = parseNamedClause(clause).map((s) => [s.name, s.typeOnly] as [string, boolean]);
+    assert.deepEqual(
+      actual,
+      expected,
+      `分类错误于 {${clause}}：接口/类型在运行时不存在，若记为值导出会让守卫报出` +
+        `误导性的"缺少运行时值"，把排障引向并不存在的 SDK 缺陷。`,
+    );
+  }
+});
+
+await test('typeOnly 分类集合非空（防止整条 import type 被跳过、字段退化为死代码）', () => {
+  const withTypes = [...subpaths.values()].filter((r) => r.typeOnly.size > 0);
+  assert.ok(
+    withTypes.length > 0,
+    '没有任何子路径被记为类型导入——说明扫描器把整条 `import type {…}` 直接跳过了，' +
+      'typeOnly 已退化成死字段，用例标题里的类型计数会恒为 0 而无人察觉。',
+  );
+});
 
 /**
  * 守卫自身的覆盖度自检：这些子路径只经由「非常规形态」出现，
