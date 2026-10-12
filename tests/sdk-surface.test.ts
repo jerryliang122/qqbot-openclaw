@@ -71,35 +71,70 @@ type ImportRecord = { sub: string; names: Set<string>; typeOnly: Set<string>; fi
 
 const subpaths = new Map<string, ImportRecord>();
 
-function record(sub: string, name: string, typeOnly: boolean, file: string) {
+function ensure(sub: string, file: string): ImportRecord {
   let rec = subpaths.get(sub);
   if (!rec) {
     rec = { sub, names: new Set(), typeOnly: new Set(), files: new Set() };
     subpaths.set(sub, rec);
   }
   rec.files.add(file.replace(`${ROOT}/`, ''));
+  return rec;
+}
+
+/** 登记具名导入：typeOnly=false 记入值导出（运行时必须存在），否则记入类型导入（会被擦除） */
+function record(sub: string, name: string, typeOnly: boolean, file: string) {
+  const rec = ensure(sub, file);
   (typeOnly ? rec.typeOnly : rec.names).add(name);
 }
 
 /**
- * 以「分号锚定」的单条 import 语句为单位解析，避免跨语句贪婪匹配。
- * 覆盖 `import { a, b as c } from '...'` 与 `import type { ... } from '...'`，
- * 以及 specifier 级别的 `type X`。
+ * 子路径采集：**按引号字面量扫**，不解析 import 语句形态。
+ *
+ * 早期版本只匹配静态 `import {…} from '…'`，结果漏掉了三种同样承重的用法——
+ * 评审实测并确认过，这三处一旦被子路径删除打中，CI 照样全绿：
+ *   - `await import('…/approval-gateway-runtime')`  审批按钮 tap 核心路径
+ *     （event-handlers.ts）
+ *   - `import('…/question-gateway-runtime')`       ask_user 问题流
+ *     （question-helpers.ts）
+ *   - `getReq()('…/health')` / `getReq()('…/conversation-runtime')`
+ *     字面量惰性 require（workspace.ts / pairing.ts / media.ts）
+ *   - `export { … } from '…/setup-tools'`          转出形态（adapter/setup.ts）
+ *
+ * 形态会随代码演化增删，解析语句必然再次漏；引号字面量则是稳定的全集。
+ * 先剥掉注释，避免 JSDoc 里提到的子路径造成误报。
  */
-const IMPORT_STMT = /import\s+(type\s+)?\{([\s\S]*?)\}\s*from\s*['"](openclaw\/plugin-sdk\/[a-z0-9-]+)['"]\s*;/g;
+function stripComments(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
+
+const SPECIFIER = /['"](openclaw\/plugin-sdk\/[a-z0-9-]+)['"]/g;
+
+/**
+ * 静态具名导入的**值**导出名（用于名级断言）。
+ * 只认两种形态：静态 import 与 re-export，两者都是非 type 才算数——
+ * 动态 import() 与字面量 require() 没有可静态提取的名字，只做子路径级断言。
+ */
+const NAMED_IMPORT_STMT =
+  /(?:^|\n)\s*(?:import|export)\s+(type\s+)?\{([\s\S]*?)\}\s*from\s*['"](openclaw\/plugin-sdk\/[a-z0-9-]+)['"]/g;
 
 const scannedFiles = [...collectSourceFiles(join(ROOT, 'src')), join(ROOT, 'index.ts')];
+
 for (const file of scannedFiles) {
-  const src = readFileSync(file, 'utf8');
-  for (const m of src.matchAll(IMPORT_STMT)) {
-    const stmtTypeOnly = !!m[1];
+  const raw = readFileSync(file, 'utf8');
+  const src = stripComments(raw);
+
+  // 子路径全集（含动态 import / 字面量 require / re-export / 纯类型引用）
+  for (const m of src.matchAll(SPECIFIER)) {
+    ensure(m[1], file);
+  }
+  // 值导出名覆盖
+  for (const m of src.matchAll(NAMED_IMPORT_STMT)) {
+    if (m[1]) continue; // import type / export type —— 不产生运行时依赖
     for (let part of m[2].split(',')) {
-      part = part.trim();
+      part = part.trim().replace(/^type\s+/, '');
       if (!part) continue;
-      const isType = stmtTypeOnly || /^type\s+/.test(part);
-      const clean = part.replace(/^type\s+/, '').trim();
-      const original = clean.split(/\s+as\s+/)[0].trim();
-      if (original) record(m[3], original, isType, file);
+      const original = part.split(/\s+as\s+/)[0].trim();
+      if (original) record(m[3], original, /* typeOnly */ false, file);
     }
   }
 }
@@ -168,12 +203,27 @@ function probeRuntime(sub: string, names: string[]): { error?: string; missing: 
   return JSON.parse(out) as { error?: string; missing: string[] };
 }
 
-// ── 1 & 2. 子路径存在性 + 值导出存在性 ──
+/**
+ * 显式豁免清单：形如 { 'openclaw/plugin-sdk/x': '理由' }。
+ * 默认空——**不要靠"扫不到"来豁免**（那正是评审打回本测试的原因）。
+ *
+ * 特别说明 webhook-ingress：它在 adapter/webhook.ts 是 `await import(...).catch(...)`
+ * 降级用法，评审建议豁免。但我们**刻意不豁免**——子路径被删时 .catch 会把故障
+ * 吞成"webhook 入站功能静默失效"，比直接抛错更难发现；这恰恰是守卫最该管的场景。
+ * 已实测 9.1 上可正常 require（34 个导出），无豁免必要。
+ * 将来确有必要豁免时，在此登记并写明理由，让遗漏变成显式决定。
+ */
+const EXEMPT_SUBPATHS: Record<string, string> = {};
+
+// ── 1 & 2. 子路径存在性 + 运行时可 require + 值导出存在性 ──
 
 group('子路径与运行时导出');
 
 for (const rec of [...subpaths.values()].sort((a, b) => a.sub.localeCompare(b.sub))) {
+  const exemption = EXEMPT_SUBPATHS[rec.sub];
   await test(`${rec.sub}（${rec.names.size} 值 / ${rec.typeOnly.size} 类型）`, () => {
+    if (exemption) return;
+
     // exports map 的键是 "./plugin-sdk/x"，源码里的 specifier 是 "openclaw/plugin-sdk/x"
     const exportKey = `./${rec.sub.replace(/^openclaw\//, '')}`;
     assert.ok(
@@ -184,8 +234,9 @@ for (const rec of [...subpaths.values()].sort((a, b) => a.sub.localeCompare(b.su
         `node_modules/openclaw/package.json 的 exports），改 import 并确认新旧两版都可用。`,
     );
 
-    // 值导入必须真能在运行时取到（类型导入会被擦除，不参与 require）
-    if (rec.names.size === 0) return;
+    // 每个被引用的子路径都必须能被生产加载路径 require——
+    // 包括动态 import() 与字面量 require()：这两类没有可静态提取的导出名，
+    // 但子路径被删时同样炸（审批 tap 只留一行 error 日志、question 流 reject）。
     const probe = probeRuntime(rec.sub, [...rec.names]);
     assert.equal(
       probe.error,
@@ -201,6 +252,33 @@ for (const rec of [...subpaths.values()].sort((a, b) => a.sub.localeCompare(b.su
     );
   });
 }
+
+/**
+ * 守卫自身的覆盖度自检：这些子路径只经由「非常规形态」出现，
+ * 若扫描器哪天退化回只认静态 import，它们会悄悄脱管——这里把它们钉死。
+ */
+await test('扫描器覆盖非常规引用形态（动态 import / 字面量 require / re-export）', () => {
+  const mustCover = [
+    // await import(...)：审批按钮 tap 核心路径
+    'openclaw/plugin-sdk/approval-gateway-runtime',
+    // import(...) 缓存 promise：ask_user 问题流
+    'openclaw/plugin-sdk/question-gateway-runtime',
+    // getReq()('...') 字面量 require：workspace / pairing / media
+    'openclaw/plugin-sdk/health',
+    'openclaw/plugin-sdk/conversation-runtime',
+    'openclaw/plugin-sdk/media-runtime',
+    // export { ... } from '...'：adapter/setup.ts
+    'openclaw/plugin-sdk/setup-tools',
+    // 本次盯版的回归锁
+    'openclaw/plugin-sdk/channel-outbound',
+  ];
+  const missing = mustCover.filter((s) => !subpaths.has(s));
+  assert.deepEqual(
+    missing,
+    [],
+    `以下子路径未被扫描器采集，守卫会对其失效（多半是扫描器退化了）:\n    ${missing.join('\n    ')}`,
+  );
+});
 
 // ── 本次盯版的具体回归锁 ──
 
@@ -266,6 +344,43 @@ await test('dist/index.cjs 能被 Node 原生 CJS 加载器 require（SDK 解析
 
 group('ambient stub 新鲜度');
 
+/** openclaw 包根（不假设 node_modules 布局——symlink / pnpm hoist 都成立） */
+const OPENCLAW_ROOT = dirname(resolveOpenclawPackageJson());
+
+/**
+ * `openclaw/plugin-sdk/text-utility-runtime` → `text-utility-runtime`
+ *
+ * 注意必须剥掉**完整**前缀 `openclaw/plugin-sdk/`。评审打回过一次：这里原先写成
+ * `replace('openclaw/', '')` 得到 `plugin-sdk/text-utility-runtime`，再拼到已含
+ * `plugin-sdk` 的基准目录上 → `dist/plugin-sdk/plugin-sdk/....d.ts`，该路径永远不存在，
+ * 于是"stub 已过期"这条断言**永久空转**、永不报警。
+ */
+function sdkSubFromModuleName(modName: string): string {
+  const prefix = 'openclaw/plugin-sdk/';
+  assert.ok(
+    modName.startsWith(prefix),
+    `ambient stub 声明了预期外的模块 "${modName}"（只应处理 ${prefix}* 形式）`,
+  );
+  return modName.slice(prefix.length);
+}
+
+/** 子路径 → 包内 dist/plugin-sdk/<sub>.d.ts */
+function sdkDtsPath(sub: string): string {
+  return join(OPENCLAW_ROOT, 'dist', 'plugin-sdk', `${sub}.d.ts`);
+}
+
+/** 路径构造自检：用"确定存在 .d.ts"的子路径校准，杜绝再次拼错而永不复位 */
+await test('SDK .d.ts 路径构造自检（校准器，防止探测路径恒不存在）', () => {
+  // core 在 9.1 / 10.2 均发布正式 .d.ts，是可靠的校准锚点
+  const core = sdkDtsPath(sdkSubFromModuleName('openclaw/plugin-sdk/core'));
+  assert.ok(
+    existsSync(core),
+    `探测路径构造有误：${core.replace(`${OPENCLAW_ROOT}/`, 'openclaw/')} 不存在。` +
+      `\n    用一个确定有 .d.ts 的子路径（core）校准；若此用例失败，说明下面的` +
+      `\n    stub 新鲜度断言是空转的、永远不会报警。`,
+  );
+});
+
 await test('ambient stub 声明的模块在已安装 openclaw 中仍无官方 .d.ts', () => {
   const stubFile = join(ROOT, 'src/openclaw-plugin-sdk.d.ts');
   const stubSrc = readFileSync(stubFile, 'utf8');
@@ -278,8 +393,8 @@ await test('ambient stub 声明的模块在已安装 openclaw 中仍无官方 .d
 
   const nowShipped: string[] = [];
   for (const modName of shouldHaveTypes) {
-    const sub = modName.replace('openclaw/', '');
-    const dts = join(ROOT, 'node_modules/openclaw/dist/plugin-sdk', `${sub}.d.ts`);
+    const sub = sdkSubFromModuleName(modName);
+    const dts = sdkDtsPath(sub);
     try {
       readFileSync(dts);
       nowShipped.push(modName);
