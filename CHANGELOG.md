@@ -8,6 +8,14 @@
 
 ---
 
+## [Unreleased]
+
+### 修复
+
+- **static 流式模式下长回复的最终正文被静默丢弃（issue #44）**。配置 `channels.qqbot.streaming = { mode: "partial", sendMode: "static" }`，agent 长回复（600+ 字符）且中途调用工具时，QQ 侧只收到若干段碎片，**最终那段完整总结正文完全没送达，且全程无任何错误提示**。根因在 `computeUnsentRemainder()`：它以「最后一段已承接文本」为前缀基准计算 final payload 的未流出增量，而当 final 文本是**另一段从未流出过的内容**（末段一条 partial 都没到达）时，前缀 / 行首边界 / 空白归一化前缀全部失配，差量返回空串——于是「已被承接」与「从未承接」两种语义被折叠进同一个空串，控制器与 dispatch 的两层兜底同时空转；`handleFinalize()` 随后把空缓冲收尾记为 `done (finalize:fallback)`，终态是 `done` 又让失败兜底块不触发，正文就此静默消失。修复：把二值差量升级为**三态匹配**（新增 `FinalTextMatch` 与 `matchFinalText()`，判定规则与旧实现逐条一致，`computeUnsentRemainder()` 退化为薄封装、对外空串语义不变），并在 `absorbFinalText()` 增加补发分支——**static 模式下若当前缓冲为空（即本段一条 partial 都没流出）且 final 与已承接段完全无关，判定「本段从未承接」，立即用 `sendStatic` 把 final 文本整段补发一条**，同时推进差量账本使 dispatch 末尾的 `[stream-final]` 兜底自动归零（不会两层各发一遍）。补发前置四条件（static 通道可用 / 缓冲为空 / 至少已发一段 / 未走外部投递通道）全部成立才动手，因此 footer 合并、多段拼接增量、`ask_user` 外部投递等既有路径行为不变。**stream 模式有意不改**：「final 与流内内容无关」在 stream 下对应「模型重写」，流内内容已对用户可见，补发会造成重复，仅新增一条 INFO 留痕。issue 中建议的「把 `finalize:fallback` 改成 `failed` 让上层兜底」**经实测证伪且会更糟**：static 模式下 `shouldSuppressFinalTailFallback` 恒为 `true`，改成 `failed` 等于主动关闭唯一的那层兜底，正文照样发不出。可观测性同步补齐：终态原因新增 `finalize:rescued` 与静默的 `finalize:fallback` 区分开（后者不等于「正文已送达」），补发 / 丢弃各留 INFO 日志，dispatch 侧新增 `[stream-final] payload received chars=N`——没有这条即证明框架未投递 final 文本，属于另一类问题。回归测试 `tests/streaming-static.test.ts`（新增 12 例）与 `tests/stream-usage-footer.test.ts`（新增 Part 3 端到端 5 例）；`tests/dispatch-error-notify.test.ts` 的 fixture 一并修正——该用例注释写「final 与流式内容一致」，实际文本却与流内毫不相关，等于在断言本 bug 的丢失行为，现按其本意改为已流出段落的精确复现，继续守住 issue #8 的去重早退不变式。
+
+---
+
 ## [2.4.0] - 2026-10-12
 
 ### 修复

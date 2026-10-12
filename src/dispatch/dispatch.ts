@@ -389,6 +389,9 @@ export async function dispatchToOpenClaw(
         // （合并 signal 中止）不吸收——取消的回复不应继续增长（finalize
         // 仍会关闭会话，只是不再追加内容）。
         if (kind === 'final' && text && payload.isError !== true && !combinedAbortSignal.aborted) {
+          // 观测：framework 确实投递了带文本的 final payload（issue #44 排障的
+          // 决定性事实——没有这条说明问题不在差量对账，而在框架未投递 final）
+          dlog?.info(`[stream-final] payload received chars=${text.length}`);
           // signal 同时传入：回调入队后、执行前的中止窗口（TOCTOU）在
           // controller 内重查
           await streamingController.absorbFinalText(text, { signal: combinedAbortSignal });

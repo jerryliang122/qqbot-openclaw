@@ -423,6 +423,197 @@ await test("静态: sendStatic 抛错 → 标记 failed", async () => {
   assert.strictEqual(ctrl.currentPhase, "failed", "sendStatic 失败应标记 failed");
 });
 
+// ============ issue #44：static 模式 final 正文补发 ============
+
+console.log("\n=== 3. issue #44：final 正文未被承接时的整段补发 ===");
+
+await test("static: 末段无 partial → final 文本整段补发（issue #44 核心回归）", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  // 5 段工具前置文本，每段在工具边界 flush（issue 日志中的 5 条碎片）
+  for (const seg of ["segA", "segB", "segC", "segD", "segE"]) {
+    await ctrl.onPartialReply(seg);
+    await flush();
+    await ctrl.flushSegment();
+    await flush();
+  }
+  assert.strictEqual(staticSendCalls.length, 5, "5 段应已全部发出");
+
+  // 最终 600+ 字正文：框架没有送来任何 partial，只有 final payload 文本
+  const FINAL = "最终总结正文".repeat(60) + "。";
+  await ctrl.absorbFinalText(FINAL);
+  await flush();
+
+  assert.strictEqual(staticSendCalls.length, 6, "final 正文应被补发为第 6 条");
+  assert.strictEqual(
+    staticSendCalls[5],
+    FINAL,
+    `补发的应是 final 全文，实际: ${JSON.stringify(staticSendCalls[5]?.slice(0, 20))}`,
+  );
+  assert.strictEqual(
+    ctrl.computeUnsentRemainder(FINAL),
+    "",
+    "账本应随补发推进，上层差量兜底不得重复补发",
+  );
+});
+
+await test("static: 补发后 finalize 不重复发、终态原因可辨识", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  await ctrl.onPartialReply("segA");
+  await flush();
+  await ctrl.flushSegment();
+  await flush();
+
+  const FINAL = "最终正文".repeat(80);
+  await ctrl.absorbFinalText(FINAL);
+  await flush();
+  await ctrl.finalize();
+  await flush();
+
+  assert.strictEqual(staticSendCalls.length, 2, "补发后 finalize 不应再发一次");
+  assert.strictEqual(ctrl.currentPhase, "done", "应为 done");
+  assert.ok(
+    logs.some((l) => l.includes("rescued undelivered final text")),
+    "应留下补发 INFO 日志",
+  );
+  assert.ok(
+    logs.some((l) => l.includes("finalize:rescued")),
+    "终态原因应是 finalize:rescued 而非静默的 finalize:fallback",
+  );
+});
+
+await test("static: 补发 sendStatic 抛错 → failed（不吞错）", async () => {
+  let call = 0;
+  const ctrl = makeController({
+    sendMode: "static",
+    sendStatic: async () => {
+      call++;
+      // 第 1 次（flush 段A）成功，第 2 次（补发 final）失败
+      if (call >= 2) throw new Error("rescue send error");
+    },
+  });
+
+  await ctrl.onPartialReply("segA");
+  await flush();
+  await ctrl.flushSegment();
+  await flush();
+
+  await ctrl.absorbFinalText("最终正文".repeat(50));
+  await flush();
+
+  assert.strictEqual(ctrl.currentPhase, "failed", "补发失败应标记 failed");
+  assert.strictEqual(
+    ctrl.shouldSuppressFinalTailFallback,
+    true,
+    "static 失败=正文未送达，应抑制 footer 补发（不得只见尾巴不见正文）",
+  );
+});
+
+await test("static: final 是缓冲的扩展（footer）→ 仍走合并，不整段重发", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  await ctrl.onPartialReply("这是回答全文");
+  await flush();
+  await ctrl.absorbFinalText("这是回答全文\nUsage: 66k in / 9.8k out");
+  await flush();
+  await ctrl.finalize();
+  await flush();
+
+  assert.strictEqual(staticSendCalls.length, 1, "footer 应并入正文一条发出");
+  assert.strictEqual(
+    staticSendCalls[0],
+    "这是回答全文\nUsage: 66k in / 9.8k out",
+    "应合并为一条",
+  );
+});
+
+await test("static: final 是多段拼接形态 → 只切出未流出的末段增量", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  await ctrl.onPartialReply("段A文本");
+  await flush();
+  await ctrl.flushSegment();
+  await flush();
+  // 末段无 partial，但 final 文本里含最后一段的内容（多段拼接形态）
+  await ctrl.absorbFinalText("段A文本\n段B文本");
+  await flush();
+  await ctrl.finalize();
+  await flush();
+
+  assert.strictEqual(staticSendCalls.length, 2, "A 已发，B 应作为增量发出");
+  assert.strictEqual(staticSendCalls[1], "段B文本", "只应补出末段增量，不整段重发");
+});
+
+await test("static: 缓冲非空且 final 无关（模型重写）→ 维持丢弃", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  await ctrl.onPartialReply("正在生成的内容");
+  await flush();
+  // 缓冲非空说明本段已流出内容，final 与之无关属模型重写 → 维持现状不补发
+  await ctrl.absorbFinalText("完全不同的最终回答");
+  await flush();
+  await ctrl.finalize();
+  await flush();
+
+  assert.strictEqual(staticSendCalls.length, 1, "只应发出缓冲内容一次");
+  assert.strictEqual(staticSendCalls[0], "正在生成的内容", "不应补发被重写的 final");
+  assert.ok(
+    logs.some((l) => l.includes("rewritten mid-turn")),
+    "模型重写应留 INFO 日志便于排障",
+  );
+});
+
+await test("static: 已取消的 turn 不补发 final（signal 中止）", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  await ctrl.onPartialReply("segA");
+  await flush();
+  await ctrl.flushSegment();
+  await flush();
+
+  const ac = new AbortController();
+  const pending = ctrl.absorbFinalText("最终正文".repeat(50), { signal: ac.signal });
+  ac.abort();
+  await pending;
+  await flush();
+
+  assert.strictEqual(staticSendCalls.length, 1, "已取消的 turn 不得补发");
+});
+
+await test("static: final payload 幂等（框架重投同一文本不重复发）", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  await ctrl.onPartialReply("segA");
+  await flush();
+  await ctrl.flushSegment();
+  await flush();
+
+  const FINAL = "最终正文".repeat(50);
+  await ctrl.absorbFinalText(FINAL);
+  await flush();
+  await ctrl.absorbFinalText(FINAL);
+  await flush();
+
+  assert.strictEqual(staticSendCalls.length, 2, "同一 final 重投不应重复发送");
+});
+
+await test("static: final 只有空白 → 不补发（不白烧被动配额）", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  await ctrl.onPartialReply("segA");
+  await flush();
+  await ctrl.flushSegment();
+  await flush();
+
+  await ctrl.absorbFinalText("   \n  ");
+  await flush();
+  await ctrl.finalize();
+  await flush();
+
+  assert.strictEqual(staticSendCalls.length, 1, "空白 final 不应作为一条消息发出");
+});
+
 // ============ Stream 模式回归（默认行为不变） ============
 
 console.log("\n=== 2. Stream 模式回归（默认行为） ===");
@@ -452,6 +643,58 @@ await test("默认（无 sendMode）= stream 行为，向后兼容", async () =>
 
   assert.strictEqual(openStreamCalls, 1, "默认应为 stream 模式");
   assert.strictEqual(staticSendCalls.length, 0, "默认不应走静态");
+});
+
+await test("stream: final 与流内内容无关（模型重写）→ 维持丢弃 + INFO 留痕", async () => {
+  const ctrl = makeController({ sendMode: "stream" });
+
+  await ctrl.onPartialReply("原始回答");
+  await flush();
+  // dispatch 的真实顺序：absorb 先于 finalize（stream 模式在 deliver(final)
+  // 里先并入尾巴再收尾），此时控制器尚未终态
+  await ctrl.absorbFinalText("完全不同的最终回答");
+  await flush();
+  const updatesBefore = streamUpdates.length;
+  await ctrl.finalize();
+  await flush();
+
+  assert.strictEqual(
+    streamUpdates.length,
+    updatesBefore,
+    "stream 下补发会与流内已显示内容重复，维持丢弃",
+  );
+  assert.strictEqual(staticSendCalls.length, 0, "stream 模式不应调用 sendStatic");
+  assert.ok(
+    logs.some((l) => l.includes("final text unrelated to streamed content")),
+    "丢弃应留 INFO 日志便于排障",
+  );
+});
+
+await test("matchFinalText: 三态分类（identical / extension / unrelated）", async () => {
+  const ctrl = makeController({ sendMode: "stream" });
+  await ctrl.onPartialReply("已承接段落");
+  await flush();
+  await ctrl.finalize();
+  await flush();
+
+  assert.deepStrictEqual(
+    ctrl.matchFinalText("已承接段落"),
+    { kind: "identical" },
+    "与已承接一致 → identical",
+  );
+  assert.deepStrictEqual(
+    ctrl.matchFinalText("已承接段落\nUsage: 1 in / 2 out"),
+    { kind: "extension", remainder: "\nUsage: 1 in / 2 out" },
+    "已承接段的扩展 → extension",
+  );
+  assert.deepStrictEqual(
+    ctrl.matchFinalText("毫不相干的最终回答"),
+    { kind: "unrelated" },
+    "毫无关系 → unrelated（issue #44 的指纹）",
+  );
+  // 对外语义不变：非 extension 一律空串
+  assert.strictEqual(ctrl.computeUnsentRemainder("已承接段落"), "");
+  assert.strictEqual(ctrl.computeUnsentRemainder("毫不相干的最终回答"), "");
 });
 
 // ============ 汇总 ============

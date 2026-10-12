@@ -46,6 +46,9 @@ const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
 
 const FOOTER = 'Usage: 66k in / 9.8k out · cache 894k cached / 0 new';
 
+/** issue #44 场景：末段 600+ 字符总结正文（框架未送 partial，只有 final payload） */
+const FINAL_BODY = `${'最终总结正文。'.repeat(90)}\nEND`;
+
 // ============ Part 1: StreamingController.computeUnsentRemainder 单元 ============
 
 function makeController(opts: { sendMode?: 'stream' | 'static'; sendStatic?: (t: string) => Promise<void> }) {
@@ -692,6 +695,96 @@ await test('shouldSuppressFinalTailFallback 判定矩阵：仅「正文确定未
   await done.onPartialReply('正文');
   await done.finalize();
   assert.strictEqual(done.shouldSuppressFinalTailFallback, false, 'done 不抑制');
+});
+
+// ============ Part 3: issue #44 —— static 模式 final 正文静默丢失 ============
+
+group('Part 3: issue #44 static 模式 final 正文补发（端到端）');
+
+await test('static: 多段 flush 后末段无 partial → final 正文整段补发（issue #44 复现）', async () => {
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async (c) => {
+      // 5 段工具前置文本，每段在工具开始前 flush（dispatch 的 onToolStart 路径）
+      for (const seg of ['segA', 'segB', 'segC', 'segD', 'segE']) {
+        await c.replyOptions?.onPartialReply?.({ text: seg });
+        await c.replyOptions?.onToolStart?.();
+      }
+      // 最终 600+ 字正文：框架没有送来任何 partial，只有 final payload 文本
+      await c.dispatcherOptions?.deliver?.({ text: FINAL_BODY }, { kind: 'final' });
+    },
+  });
+  assert.strictEqual(gw.sentTexts.length, 6, `5 段碎片 + 1 条最终正文，实际 ${gw.sentTexts.length} 条`);
+  assert.strictEqual(
+    gw.sentTexts[5],
+    FINAL_BODY,
+    `最终正文应作为最后一条完整送达，实际长度 ${gw.sentTexts[5]?.length}`,
+  );
+  assert.ok(gw.sentTexts[5]!.length >= 600, '最终正文应完整无截断');
+});
+
+await test('static: 末段正常有 partial → 不产生额外消息（回归保护）', async () => {
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: 'segA' });
+      await c.replyOptions?.onToolStart?.();
+      await c.replyOptions?.onPartialReply?.({ text: '最终正文' });
+      await c.dispatcherOptions?.deliver?.({ text: `最终正文\n${FOOTER}` }, { kind: 'final' });
+    },
+  });
+  assert.strictEqual(gw.sentTexts.length, 2, `A 段 + 末段（含 footer）两条，不应有第三条，实际: ${JSON.stringify(gw.sentTexts.map((t) => t.length))}`);
+  assert.strictEqual(gw.sentTexts[1], `最终正文\n${FOOTER}`, 'footer 应并入末段');
+});
+
+await test('static: 补发后 dispatch 末尾差量兜底不重复补发（回归保护）', async () => {
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: 'segA' });
+      await c.replyOptions?.onToolStart?.();
+      await c.dispatcherOptions?.deliver?.({ text: FINAL_BODY }, { kind: 'final' });
+    },
+  });
+  assert.strictEqual(
+    gw.sentTexts.filter((t) => t === FINAL_BODY).length,
+    1,
+    `final 正文必须且只能出现一次（[stream-final] 兜底不得重复），实际: ${JSON.stringify(gw.sentTexts.map((t) => t.length))}`,
+  );
+});
+
+await test('static: 请求级 signal 中止的 turn 不补发 final', async () => {
+  const requestAbort = new AbortController();
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    requestSignal: requestAbort.signal,
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: 'segA' });
+      await c.replyOptions?.onToolStart?.();
+      requestAbort.abort();
+      await c.dispatcherOptions?.deliver?.({ text: FINAL_BODY }, { kind: 'final' });
+    },
+  });
+  assert.ok(
+    !gw.sentTexts.includes(FINAL_BODY),
+    `已取消的 turn 不得补发 final 正文，实际: ${JSON.stringify(gw.sentTexts.map((t) => t.length))}`,
+  );
+});
+
+await test('stream: final 与流内内容无关 → 维持丢弃（不因 #44 修复而行为变化）', async () => {
+  const gw = await runDispatch({
+    streaming: { mode: 'stream' },
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '原始回答' });
+      await c.dispatcherOptions?.deliver?.({ text: '完全不同的最终回答' }, { kind: 'final' });
+    },
+  });
+  assert.deepStrictEqual(
+    gw.sentTexts,
+    [],
+    'stream 模式维持「重写即丢弃」，不补发（避免与流内已显示内容重复）',
+  );
+  assert.strictEqual(gw.streamCompletes.length, 1, '流照常收尾');
 });
 
 // ============ 汇总 ============
