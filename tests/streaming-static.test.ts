@@ -522,6 +522,27 @@ await test("issue #44 守卫（PR #45 评审）: final 与最后已 flush 段落
   assert.strictEqual(ctrl.computeUnsentRemainder("段A 有连续空格\n和换行"), "");
 });
 
+await test("issue #44 守卫（PR #45 评审二轮）: 最后已 flush 段落带前导空白（markdown 缩进）→ 覆盖判定不失效", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  // 段B 是 markdown 缩进内容（列表续行/缩进代码块，AI 回复常见）；
+  // tail 已 trim，final 聚合形态中命中点前是缩进空格而非 \n——
+  // 边界判定须容忍前导空白，两种形态都不得落入 rescue 整文重发
+  await ctrl.onPartialReply("段A文本");
+  await ctrl.flushSegment();
+  await ctrl.onPartialReply("  - 段B列表续行");
+  await ctrl.flushSegment();
+  await flush();
+
+  // 全文聚合、末段无新增 → 已完全覆盖，空串
+  assert.strictEqual(ctrl.computeUnsentRemainder("段A文本\n  - 段B列表续行"), "");
+  // 缩进段之后还有增量（footer）→ 正常切出差量，不整文重发
+  assert.strictEqual(
+    ctrl.computeUnsentRemainder("段A文本\n  - 段B列表续行\nUsage: 1 in / 1 out"),
+    "\nUsage: 1 in / 1 out",
+  );
+});
+
 // ============ Stream 模式回归（默认行为不变） ============
 
 console.log("\n=== 2. Stream 模式回归（默认行为） ===");

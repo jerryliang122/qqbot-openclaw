@@ -161,13 +161,20 @@ export class StreamingController {
     if (finalText.startsWith(tail)) return finalText.slice(tail.length);
     // 多段 turn：final 文本可能拼接了此前全部段落（A+B+C+footer），已流出的
     // 是最后一段——仅在段落边界（串首或行首）命中才认定，避免旧段内嵌在
-    // 重写文本中间的伪匹配把未验证内容当增量发出。命中点**恰好结尾**
+    // 重写文本中间的伪匹配把未验证内容当增量发出。边界判定**容忍前导空白**
+    // （markdown 缩进/列表续行——tail 已 trim，final 聚合形态中该段落的
+    // 命中点前是缩进空格而非 \n；向前扫过 [ \t] 后仍须抵达 \n 或串首，
+    // 行内伪匹配——空白之前是非空白字符——依旧被拒）。命中点**恰好结尾**
     // （末段无新增内容，如 /usage off 下的全文聚合）→ 已完全覆盖，纯去重
     // 返回 ''——否则会被 static 差量兜底误判为未投递而整文重发（PR #45 评审）
     const idx = finalText.lastIndexOf(tail);
-    if (idx !== -1 && (idx === 0 || finalText[idx - 1] === '\n')) {
-      if (idx + tail.length === finalText.length) return '';
-      return finalText.slice(idx + tail.length);
+    if (idx !== -1) {
+      let boundary = idx;
+      while (boundary > 0 && (finalText[boundary - 1] === ' ' || finalText[boundary - 1] === '\t')) boundary--;
+      if (boundary === 0 || finalText[boundary - 1] === '\n') {
+        if (idx + tail.length === finalText.length) return '';
+        return finalText.slice(idx + tail.length);
+      }
     }
     // 空白归一化兜底（流式文本与 final 文本的空白差异）：按非空白 token 序列
     // 验证并取匹配前缀的**原始结束偏移**切片——tail.length 与实际前缀的原始
