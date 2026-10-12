@@ -161,20 +161,27 @@ export class StreamingController {
     if (finalText.startsWith(tail)) return finalText.slice(tail.length);
     // 多段 turn：final 文本可能拼接了此前全部段落（A+B+C+footer），已流出的
     // 是最后一段——仅在段落边界（串首或行首）命中才认定，避免旧段内嵌在
-    // 重写文本中间的伪匹配把未验证内容当增量发出
+    // 重写文本中间的伪匹配把未验证内容当增量发出。命中点**恰好结尾**
+    // （末段无新增内容，如 /usage off 下的全文聚合）→ 已完全覆盖，纯去重
+    // 返回 ''——否则会被 static 差量兜底误判为未投递而整文重发（PR #45 评审）
     const idx = finalText.lastIndexOf(tail);
-    if (idx !== -1 && idx + tail.length < finalText.length && (idx === 0 || finalText[idx - 1] === '\n')) {
+    if (idx !== -1 && (idx === 0 || finalText[idx - 1] === '\n')) {
+      if (idx + tail.length === finalText.length) return '';
       return finalText.slice(idx + tail.length);
     }
     // 空白归一化兜底（流式文本与 final 文本的空白差异）：按非空白 token 序列
     // 验证并取匹配前缀的**原始结束偏移**切片——tail.length 与实际前缀的原始
     // 长度可能不一致（空白数不同），直接按 tail.length 切会截断 footer 或
-    // 带入正文字符
+    // 带入正文字符。归一化前缀**覆盖全文**（final 与已流出段落仅空白差异）
+    // → 已完全覆盖，纯去重返回 ''，理由同上
     const normalizedEnd = normalizedPrefixEnd(finalText, tail);
-    if (normalizedEnd > 0 && normalizedEnd < finalText.length) {
+    if (normalizedEnd > 0) {
+      if (normalizedEnd === finalText.length) return '';
       return finalText.slice(normalizedEnd);
     }
-    // static 模式差量兜底（issue #44）：final 与基线无任何前缀/包含关系且
+    // static 模式差量兜底（issue #44）：final 与已流出内容无任何覆盖关系
+    // （前缀 / 行首边界包含 / 空白归一化前缀均不命中——含「恰以最后段落
+    // 结尾」「仅空白差异」两种已完全覆盖形态，它们已在上文先行去重）且
     // 当前缓冲为空 → 此前段落已全部 flush、末段 partial 从未到达，final 是
     // 一条从未投递过的全新消息（stream 模式此形态意味着模型重写、正文已可
     // 见，维持丢弃语义不变）。整文返回，交 absorbFinalText 并入缓冲随

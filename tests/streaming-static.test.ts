@@ -494,6 +494,34 @@ await test("issue #44 守卫: final 恰为最后已 flush 段落本身 → 空�
   assert.strictEqual(ctrl.computeUnsentRemainder("段A文本\nUsage: 1 in / 1 out"), "\nUsage: 1 in / 1 out");
 });
 
+await test("issue #44 守卫（PR #45 评审）: final 恰以最后已 flush 段落结尾（多段拼接、末段无增量）→ 空串，不整文重发", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  // 段A、段B 已分段发出；框架聚合全文且末段无新增内容（如 /usage off）
+  await ctrl.onPartialReply("段A文本");
+  await ctrl.flushSegment();
+  await ctrl.onPartialReply("段B文本");
+  await ctrl.flushSegment();
+  await flush();
+
+  // lastIndexOf(tail) 在行首边界命中段B 但命中点恰结尾——「已完全覆盖」，
+  // 不得落入 static final rescue 整文重发（用户会再收到一条 A+B 且多烧
+  // 一个被动配额槽）
+  assert.strictEqual(ctrl.computeUnsentRemainder("段A文本\n段B文本"), "");
+});
+
+await test("issue #44 守卫（PR #45 评审）: final 与最后已 flush 段落仅空白差异 → 空串，不整文重发", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  // 已发出段落带双空格/双换行；final 为其空白归一化形态——归一化前缀
+  // 覆盖全文 = 已完全覆盖，不得落入 rescue
+  await ctrl.onPartialReply("段A  有连续空格\n\n和换行");
+  await ctrl.flushSegment();
+  await flush();
+
+  assert.strictEqual(ctrl.computeUnsentRemainder("段A 有连续空格\n和换行"), "");
+});
+
 // ============ Stream 模式回归（默认行为不变） ============
 
 console.log("\n=== 2. Stream 模式回归（默认行为） ===");
