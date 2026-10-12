@@ -22,6 +22,20 @@ export type StreamingPhase = 'idle' | 'streaming' | 'done' | 'failed';
 
 export type StreamingSendMode = 'stream' | 'static';
 
+/**
+ * 框架 final payload 文本与「已承接段落」的匹配结果。
+ *
+ * 早先把「完全没有命中」与「已完全承接」都折叠成空串（issue #44 的根因）：
+ * 前者其实是**本段从未流出**，正文会静默丢失。区分成三态后，补发成为可能。
+ *   - identical：final 即已承接内容，纯去重（正常路径）
+ *   - extension：final 是已承接内容的扩展，增量即 remainder（典型即 usage footer）
+ *   - unrelated：final 与已承接内容毫无关系（static = 本段从未流出 / stream = 模型重写）
+ */
+export type FinalTextMatch =
+  | { kind: 'identical' }
+  | { kind: 'extension'; remainder: string }
+  | { kind: 'unrelated' };
+
 export interface StreamingControllerDeps {
   gateway: QQBotGateway;
   target: ReplyTarget;
@@ -73,6 +87,12 @@ export class StreamingController {
    * 置 true 后 handleFinalize 不再走 fallback 路径，避免框架误报 outcome=error。
    */
   private _deliveredExternally = false;
+
+  /**
+   * 标记：final payload 与已承接内容无关、且当前无待发缓冲时，已整段补发
+   * （issue #44 恢复路径）。仅用于把终态原因与静默的 finalize:fallback 区分开。
+   */
+  private _finalRescued = false;
 
   /** 同步标志：收到第一个 onPartialReply 即置 true（不等 async 完成） */
   private _hasStarted = false;
@@ -147,18 +167,32 @@ export class StreamingController {
    *   - final 是已流出段落的扩展 → 扩展部分（典型即 usage footer）
    *   - 多段 turn 且 final 含全部段落（A+B+C+footer）→ 定位最后一段之后的部分
    *   - 完全不含已流出段落（模型重写）→ ''（维持现有 final 丢弃去重行为）
+   *
+   * 匹配规则见 matchFinalText；本方法保留空串语义，仅把「无命中」折叠回 ''。
    */
   computeUnsentRemainder(finalText: string): string {
+    const match = this.matchFinalText(finalText);
+    return match.kind === 'extension' ? match.remainder : '';
+  }
+
+  /**
+   * final payload 文本与已承接段落的匹配判定（issue #44）。
+   *
+   * 判定规则与旧的 computeUnsentRemainder 逐条一致（identical → 前缀扩展 →
+   * 行首边界的 lastIndexOf → 空白归一化前缀），区别只在于把「什么都没匹配上」
+   * 显式标成 unrelated 而不是与「已完全承接」共用空串。
+   */
+  matchFinalText(finalText: string): FinalTextMatch {
     const tail = this.lastDeliveredSegmentText.trim();
-    if (!tail || !finalText) return '';
-    if (finalText === tail) return '';
-    if (finalText.startsWith(tail)) return finalText.slice(tail.length);
+    if (!tail || !finalText) return { kind: 'unrelated' };
+    if (finalText === tail) return { kind: 'identical' };
+    if (finalText.startsWith(tail)) return { kind: 'extension', remainder: finalText.slice(tail.length) };
     // 多段 turn：final 文本可能拼接了此前全部段落（A+B+C+footer），已流出的
     // 是最后一段——仅在段落边界（串首或行首）命中才认定，避免旧段内嵌在
     // 重写文本中间的伪匹配把未验证内容当增量发出
     const idx = finalText.lastIndexOf(tail);
     if (idx !== -1 && idx + tail.length < finalText.length && (idx === 0 || finalText[idx - 1] === '\n')) {
-      return finalText.slice(idx + tail.length);
+      return { kind: 'extension', remainder: finalText.slice(idx + tail.length) };
     }
     // 空白归一化兜底（流式文本与 final 文本的空白差异）：按非空白 token 序列
     // 验证并取匹配前缀的**原始结束偏移**切片——tail.length 与实际前缀的原始
@@ -166,9 +200,25 @@ export class StreamingController {
     // 带入正文字符
     const normalizedEnd = normalizedPrefixEnd(finalText, tail);
     if (normalizedEnd > 0 && normalizedEnd < finalText.length) {
-      return finalText.slice(normalizedEnd);
+      return { kind: 'extension', remainder: finalText.slice(normalizedEnd) };
     }
-    return '';
+    return { kind: 'unrelated' };
+  }
+
+  /**
+   * 是否可以把「与已承接内容无关」的 final 文本整段补发（issue #44）。
+   *
+   * 四条同时成立才动手：static 下发通道可用 / **当前缓冲为空**（= 本段一条
+   * partial 都没流出来，缓冲有内容说明本段已流出、final 与其无关属模型重写，
+   * 那是 stream 模式同款的有意丢弃语义）/ 至少已发出一段（否则 final 压根
+   * 不会走到流式分支）/ 未走外部投递通道。
+   */
+  private canRescueUndeliveredFinal(): boolean {
+    return this.isStaticMode
+      && !!this.deps.sendStatic
+      && !this.lastAcceptedFull
+      && this.sentChunkCount > 0
+      && !this._deliveredExternally;
   }
 
   // ── 入口 ──
@@ -240,6 +290,13 @@ export class StreamingController {
    * 无尾巴 / 已终态 / stream 无会话时 no-op，残余场景由上层兜底单独补发。
    * 并入后同步推进 lastDeliveredSegmentText（差量基准），避免上层重复补发。
    *
+   * **final 与已承接内容完全无关**时（matchFinalText → unrelated）分两种：
+   * - static 且当前缓冲为空 = 本段一条 partial 都没流出来（issue #44：
+   *   长回复 + 工具调用后，final 那 600+ 字正文既不进缓冲、差量又算不出，
+   *   正文被静默丢弃）→ 整段补发一条，并推进基准让上层兜底不重复补发；
+   * - static 缓冲非空 / stream 模式 = 模型重写，本段内容已可见，维持丢弃
+   *   （stream 下补发会与流内已显示内容重复），仅留 INFO 日志便于排障。
+   *
    * opts.signal：合并中止信号。dispatch 侧调用点的守卫只覆盖调用时刻，
    * 回调入队后、实际执行前仍可能中止（TOCTOU）——回调内重查，已取消的
    * 回复不得继续增长。
@@ -249,19 +306,56 @@ export class StreamingController {
     this.chain = this.chain.then(async () => {
       if (this.isTerminal) return;
       if (signal?.aborted) return;
-      const remainder = this.computeUnsentRemainder(finalText);
-      if (!remainder) return;
-      if (this.isStaticMode) {
-        this.lastAcceptedFull = mergeSegmentBoundary(this.lastAcceptedFull, remainder);
-        this.lastDeliveredSegmentText = this.lastAcceptedFull;
-        this.deps.log?.info(`absorb final tail into static buffer chars=${remainder.length}`);
+      const match = this.matchFinalText(finalText);
+      if (match.kind === 'identical') return;
+      if (match.kind === 'extension') {
+        if (this.isStaticMode) {
+          this.lastAcceptedFull = mergeSegmentBoundary(this.lastAcceptedFull, match.remainder);
+          this.lastDeliveredSegmentText = this.lastAcceptedFull;
+          this.deps.log?.info(`absorb final tail into static buffer chars=${match.remainder.length}`);
+          return;
+        }
+        // stream：前缀增长推入当前会话；无会话（异常态）时留给上层兜底
+        if (this.session) {
+          await this.sendUpdate(mergeSegmentBoundary(this.lastAcceptedFull, match.remainder));
+          this.deps.log?.info(`absorb final tail into stream chars=${match.remainder.length}`);
+        }
         return;
       }
-      // stream：前缀增长推入当前会话；无会话（异常态）时留给上层兜底
-      if (this.session) {
-        await this.sendUpdate(mergeSegmentBoundary(this.lastAcceptedFull, remainder));
-        this.deps.log?.info(`absorb final tail into stream chars=${remainder.length}`);
+      // unrelated：final 与已承接内容毫无关系
+      // 纯空白 final 直接忽略——那是一条空消息，白烧一条被动配额（dispatch 的
+      // [stream-final] 差量兜底同样对 remainder 做 trim，两者口径一致）
+      if (finalText.trim().length === 0) return;
+      if (this.canRescueUndeliveredFinal()) {
+        // issue #44 恢复路径：本段从未流出，整段补发。账本随之推进，上层
+        // [stream-final] 差量兜底自动归零，不会重复补发。
+        const sendStatic = this.deps.sendStatic;
+        if (!sendStatic) return;
+        try {
+          await sendStatic(finalText);
+        } catch (err) {
+          this.deps.log?.error(`final rescue send failed: ${err instanceof Error ? err.message : String(err)}`);
+          this.transition('failed', 'final_rescue_send_error');
+          return;
+        }
+        this.lastDeliveredSegmentText = finalText;
+        this.sentChunkCount++;
+        this._finalRescued = true;
+        this.deps.log?.info(
+          `rescued undelivered final text chars=${finalText.length} segments=${this.sentChunkCount}`,
+        );
+        return;
       }
+      if (this.isStaticMode) {
+        // 缓冲非空 = 本段已流出内容，final 与其无关属模型重写，维持丢弃
+        this.deps.log?.info(
+          `final text rewritten mid-turn (bufferChars=${this.lastAcceptedFull.length}), dropped finalChars=${finalText.length}`,
+        );
+        return;
+      }
+      this.deps.log?.info(
+        `stream: final text unrelated to streamed content, dropped finalChars=${finalText.length} (model rewrite)`,
+      );
     }).catch((err) => {
       this.deps.log?.error(`absorbFinalText error: ${err instanceof Error ? err.message : String(err)}`);
       this.transition('failed', 'absorb_error');
@@ -336,6 +430,10 @@ export class StreamingController {
       } else if (this._deliveredExternally) {
         // 内容已通过外部通道投递（如 ask_user 卡片），非失败
         this.transition('done', 'finalize');
+      } else if (this._finalRescued) {
+        // final 正文已由 absorbFinalText 整段补发（issue #44 恢复路径），
+        // 缓冲空是补发后重置的正常状态——不是「什么都没发」的降级
+        this.transition('done', 'finalize:rescued');
       } else {
         this.transition('done', 'finalize:fallback');
       }

@@ -212,7 +212,12 @@ await test('static 模式：非 error final payload 的流式去重早退保持�
   _resetAdaptersCache();
   const { sentTexts } = installFakeGateway();
   const firstChunk = '这是已送达用户的首段回答。';
-  const finalText = '这是与流式内容一致的完整 final 文本，不应重复发送。';
+  // fixture 修正（issue #44 修复后）：本用例要守的是「非 error final 仍走流式去重
+  // 早退」，final 文本必须是**已流出内容**才能真正走到去重分支。原 fixture 用的是
+  // 一段与流式内容毫不相干的文本（注释却写「与流式内容一致」），实际断言的其实是
+  // 「final 与流内无关时不得发送」——那正是 issue #44 认定的静默丢失行为。现按用例
+  // 本意改为已流出段落的精确复现（末段还有 footer 增量时由 absorb 并入缓冲）。
+  const finalText = firstChunk;
 
   await runDispatchWithPayloads({
     account: makeAccount({ mode: 'partial', sendMode: 'static' }),
@@ -221,13 +226,15 @@ await test('static 模式：非 error final payload 的流式去重早退保持�
     payloads: [{ payload: { text: finalText }, info: { kind: 'final' } }],
   });
 
-  assert.ok(
-    sentTexts.some((s) => s.text === firstChunk),
-    '首分片应已送达',
+  assert.equal(
+    sentTexts.length,
+    1,
+    `final 与已流出内容一致时应只有一条消息（去重早退），实际: ${JSON.stringify(sentTexts.map((s) => s.text))}`,
   );
-  assert.ok(
-    !sentTexts.some((s) => s.text === finalText),
-    `非 error final 文本不应重复发送（流式去重早退），实际发送: ${JSON.stringify(sentTexts.map((s) => s.text))}`,
+  assert.equal(
+    sentTexts[0]?.text,
+    firstChunk,
+    '唯一一条应是工具开始时 flush 的首段',
   );
 });
 
