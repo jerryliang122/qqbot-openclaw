@@ -65,6 +65,22 @@ export class StreamingController {
    */
   private lastDeliveredSegmentText = '';
 
+  /**
+   * 已实际投递的**各段**原文（按顺序）——差量覆盖判定的全集基准。
+   *
+   * 仅 static 模式填充（每次 sendStatic 成功后追加一段）：static 的分段由框架
+   * 回调显式驱动，每段都是一条独立消息，"用户已见文本"天然是插件自己的状态。
+   * stream 模式不分段——lastDeliveredSegmentText 本身就是整条已下发文本（持续
+   * 前缀增长），账本对它没有增量信息，故不记。
+   *
+   * 为什么需要全集（PR #45 评审 P1）：lastDeliveredSegmentText 只记**最后一段**，
+   * 覆盖判定因此隐含"final 聚合里最后一段必定落在行首"这一假设。工具前后同一行
+   * 续写（"先看结论：" + "方案 B 更优"）等形态下最后一段在行中间，行首边界判定
+   * 会把它当行内伪匹配拒掉、归一化前缀也不命中，最终误落 static rescue 把整篇
+   * final 重发一遍（重复消息 + 多烧一个被动配额槽）。全集按顺序定位可覆盖该形态。
+   */
+  private deliveredSegments: string[] = [];
+
   /** 已成功发送的分片数（降级：=0 且无外部投递则走静态消息兜底） */
   private sentChunkCount = 0;
 
@@ -146,7 +162,9 @@ export class StreamingController {
    *   - final 与已流出段落一致 → ''（纯去重，维持现有行为）
    *   - final 是已流出段落的扩展 → 扩展部分（典型即 usage footer）
    *   - 多段 turn 且 final 含全部段落（A+B+C+footer）→ 定位最后一段之后的部分
-   *   - 完全不含已流出段落（模型重写）→ ''（维持现有 final 丢弃去重行为）
+   *   - 已投递的**全部**段能在 final 中按顺序定位（含最后一段不在行首的形态，
+   *     见 deliveredSegments / unsentRemainderByLedger）→ 只取最后一段之后的增量
+   *   - 完全不含已投递内容（模型重写）→ ''（维持现有 final 丢弃去重行为）
    *   - static 模式例外：缓冲为空（末段 partial 从未到达、此前段落已全部
    *     flush）且 final 与最后已发段落无任何前缀/包含关系 → final 是一条
    *     从未投递过的全新消息而非「重写」，整文返回（issue #44：末段丢失
@@ -157,6 +175,12 @@ export class StreamingController {
   computeUnsentRemainder(finalText: string): string {
     const tail = this.lastDeliveredSegmentText.trim();
     if (!tail || !finalText) return '';
+    // 全集账本覆盖（PR #45 评审 P1，**首选**）：已投递的每一段能否在 final 中
+    // 按顺序定位。这比下面「拿最后一段当基准」的启发式更准——后者隐含「最后一段
+    // 必定落在行首」的假设，工具前后同一行续写等形态会失手并整文重发。
+    // 定位不到时返回 null，退回单段基准（stream 模式账本恒空 = 旧行为）。
+    const ledgerRemainder = this.unsentRemainderByLedger(finalText);
+    if (ledgerRemainder !== null) return ledgerRemainder;
     if (finalText === tail) return '';
     if (finalText.startsWith(tail)) return finalText.slice(tail.length);
     // 多段 turn：final 文本可能拼接了此前全部段落（A+B+C+footer），已流出的
@@ -203,6 +227,39 @@ export class StreamingController {
     return '';
   }
 
+  /**
+   * 全集账本覆盖判定（computeUnsentRemainder 的首选路径）：已投递的各段能否在
+   * finalText 中**按顺序**逐段定位。
+   *
+   * 全部定位到 → final 是这些段的聚合，返回最后一段之后的增量（末尾即空串，
+   * 表示已完全覆盖）；定位不到 → 不是聚合，返回 null，由调用方退回单段基准的
+   * 启发式（stream 模式账本恒空，等价于旧行为）。
+   *
+   * 两处安全约束：
+   * - **首段必须落在 0**：首段之前若还有 final 自己的内容，说明这部分用户从未
+   *   见过，不敢认定已覆盖（宁可退回旧路径冒重复风险，也不能静默丢内容——
+   *   issue #44 的教训）。
+   * - **逐段按上一结束位置向后查找**：相邻两段文本完全相同时（模型连说两句一样
+   *   的短句）必须落到第二处，否则会重复匹配第一处、把第二处当增量误发。
+   */
+  private unsentRemainderByLedger(finalText: string): string | null {
+    let cursor = 0;
+    let end = -1;
+    let isFirst = true;
+    for (const raw of this.deliveredSegments) {
+      const segment = raw.trim();
+      if (!segment) continue;
+      const at = finalText.indexOf(segment, cursor);
+      if (at === -1) return null;
+      if (isFirst && at !== 0) return null;
+      isFirst = false;
+      end = at + segment.length;
+      cursor = end;
+    }
+    if (end < 0) return null; // 账本为空（stream 模式不填充 / 无已投递段）
+    return finalText.slice(end);
+  }
+
   // ── 入口 ──
 
   onPartialReply(text: string): Promise<void> {
@@ -235,6 +292,8 @@ export class StreamingController {
         this.deps.log?.info(`flush segment chars=${this.lastAcceptedFull.length}`);
         try {
           await this.deps.sendStatic(this.lastAcceptedFull);
+          // 记入送达账本：这一段确实发出去了，之后的差量覆盖判定按全集定位
+          this.deliveredSegments.push(this.lastAcceptedFull);
         } catch (err) {
           this.deps.log?.error(`flushSegment send failed: ${err instanceof Error ? err.message : String(err)}`);
           this.transition('failed', 'flush_send_error');
@@ -452,6 +511,7 @@ export class StreamingController {
         this.deps.log?.info(`static send (sent=${this.sentChunkCount} chars=${this.lastAcceptedFull.length} reason=${reason ?? 'done'})`);
         try {
           await this.deps.sendStatic(this.lastAcceptedFull);
+          this.deliveredSegments.push(this.lastAcceptedFull);
         } catch (err) {
           this.deps.log?.error(`static send failed: ${err instanceof Error ? err.message : String(err)}`);
           this.transition('failed', 'static_send_error');

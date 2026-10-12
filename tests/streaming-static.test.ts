@@ -543,6 +543,74 @@ await test("issue #44 守卫（PR #45 评审二轮）: 最后已 flush 段落带
   );
 });
 
+// ============ 送达账本（PR #45 评审 P1：末段位于行中间） ============
+
+console.log("\n=== 1c. 送达账本：末段不在行首的聚合形态 ===");
+
+await test("账本: 工具前后同一行续写（末段在 final 行中间）+ footer → 只切出 footer", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  // 模型前段以「：」收尾即调用工具，工具后继续同一行——final 聚合里末段的前一个
+  // 字符是非空白，行首边界判定必然把它当行内伪匹配拒掉。修复前：整篇 final 被
+  // 当作从未投递的全新消息整文重发（重复消息 + 多烧一个被动配额槽）。
+  await ctrl.onPartialReply("先看结论：");
+  await ctrl.flushSegment();
+  await ctrl.onPartialReply("方案 B 更优，因为成本更低");
+  await ctrl.flushSegment();
+  await flush();
+
+  assert.strictEqual(
+    ctrl.computeUnsentRemainder("先看结论：方案 B 更优，因为成本更低\nUsage: 100 in / 50 out"),
+    "\nUsage: 100 in / 50 out",
+    "只应切出末段之后的增量（footer），不得整文重发",
+  );
+});
+
+await test("账本: 同一形态但末段恰在 final 结尾（/usage off）→ 空串，不整文重发", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  await ctrl.onPartialReply("先看结论：");
+  await ctrl.flushSegment();
+  await ctrl.onPartialReply("方案 B 更优");
+  await ctrl.flushSegment();
+  await flush();
+
+  assert.strictEqual(
+    ctrl.computeUnsentRemainder("先看结论：方案 B 更优"),
+    "",
+    "末段之后无任何内容 = 已完全覆盖",
+  );
+});
+
+await test("账本: 末段确实不在 final 中（真·重写）→ 仍走 rescue 整文，issue #44 修复不回退", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  await ctrl.onPartialReply("先看结论：");
+  await ctrl.flushSegment();
+  await flush();
+
+  const FINAL = "重新梳理一遍：应当先做容量评估，再决定是否扩容。".repeat(10);
+  assert.strictEqual(
+    ctrl.computeUnsentRemainder(FINAL),
+    FINAL,
+    "已投递段全部不在 final 中 → 判定为从未投递的新消息，整文补发",
+  );
+});
+
+await test("账本: 相邻两段文本相同 → 逐段按结束位置向后定位，不得重复匹配第一处", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  await ctrl.onPartialReply("好的");
+  await ctrl.flushSegment();
+  await ctrl.onPartialReply("好的");
+  await ctrl.flushSegment();
+  await flush();
+
+  // 两处「好的」都已在 final 中且末段之后无内容 → 已完全覆盖。
+  // 若按起点而非结束位置查找，第二段会重复匹配第一处、把第二处当增量误发。
+  assert.strictEqual(ctrl.computeUnsentRemainder("好的，好的"), "");
+});
+
 // ============ Stream 模式回归（默认行为不变） ============
 
 console.log("\n=== 2. Stream 模式回归（默认行为） ===");

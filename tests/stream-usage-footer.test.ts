@@ -530,6 +530,52 @@ await test('static 模式: issue #44 末段 partial 从未到达 → final 全�
   );
 });
 
+await test('static 模式: 末段在 final 中位于行中间（工具前后同一行续写）→ 只补 footer，不整文重发', async () => {
+  // PR #45 评审 P1：模型前段以「：」收尾即调用工具，工具后继续同一行，final
+  // 聚合里最后一段的前一个字符是非空白——行首边界判定把它当行内伪匹配拒掉、
+  // 归一化前缀也不命中，于是误落 static rescue 把**整篇 final** 当从未投递的
+  // 新消息重发（用户收到重复的 A+B 正文，且多烧一个被动配额槽）。
+  // 送达账本按全集顺序定位后，只切出末段之后的 footer。
+  const FINAL = `先看结论：方案 B 更优，因为成本更低\n${FOOTER}`;
+  const gw = await runDispatch({
+    streaming: { mode: 'stream', sendMode: 'static' },
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '先看结论：' });
+      await c.replyOptions?.onToolStart?.();
+      await c.replyOptions?.onPartialReply?.({ text: '方案 B 更优，因为成本更低' });
+      await c.replyOptions?.onToolStart?.();
+      // 末段后无新文本：框架投递全文聚合 + footer
+      await c.dispatcherOptions?.deliver?.({ text: FINAL }, { kind: 'final' });
+    },
+  });
+  assert.deepStrictEqual(
+    gw.sentTexts,
+    ['先看结论：', '方案 B 更优，因为成本更低', FOOTER],
+    `末段之后的 footer 应单独补发，正文不得重发，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
+await test('static 模式: 末段被模型重写（不在 final 中逐字出现）→ 仍整文补发（守卫不回退）', async () => {
+  // 账本的「定位不到 → 返回 null」是 issue #44 修复的前提：真·重写时新措辞
+  // 确实从未送达，必须走 rescue 整文补发，否则退回静默丢失。
+  const FINAL = '结论如下：方案 B 的成本最低。\nUsage: 1 in / 1 out';
+  const gw = await runDispatch({
+    streaming: { mode: 'stream', sendMode: 'static' },
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '结论如下' });
+      await c.replyOptions?.onToolStart?.();
+      await c.replyOptions?.onPartialReply?.({ text: '：方案 B 更优' });
+      await c.replyOptions?.onToolStart?.();
+      await c.dispatcherOptions?.deliver?.({ text: FINAL }, { kind: 'final' });
+    },
+  });
+  assert.deepStrictEqual(
+    gw.sentTexts,
+    ['结论如下', '：方案 B 更优', FINAL],
+    `末段不在 final 中 → 应整文补发，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
 await test('stream 模式: 请求级 signal 在 final 暂存后中止 → 不补发 footer', async () => {
   const requestAbort = new AbortController();
   const gw = await runDispatch({
