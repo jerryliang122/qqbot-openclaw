@@ -56,17 +56,19 @@ const gatewayFallbackLogged = new Set<string>();
 
 /**
  * 为一次实际 API 调用预留被动回复配额。
- * quotaReserved=true 表示上层 adapter 已经原子预留，避免同一发送重复计数。
+ * quotaReserved=true 表示上层 adapter 已经原子预留（并已发号 msg_seq），
+ * 避免同一发送重复计数。
  */
 function reservePassiveReply(params: {
   replyToId?: string;
+  msgSeq?: number;
   accountId: string;
   scope: 'c2c' | 'group';
   quotaReserved?: boolean;
-}): { msgId?: string; rollback: () => void } {
+}): { msgId?: string; msgSeq?: number; rollback: () => void } {
   if (!params.replyToId) return { rollback: () => {} };
   if (params.quotaReserved) {
-    return { msgId: params.replyToId, rollback: () => {} };
+    return { msgId: params.replyToId, msgSeq: params.msgSeq, rollback: () => {} };
   }
   const reservation = checkAndConsumePassiveReplyQuota({
     accountId: params.accountId,
@@ -75,6 +77,7 @@ function reservePassiveReply(params: {
   });
   return {
     msgId: reservation.canReply ? params.replyToId : undefined,
+    msgSeq: reservation.canReply ? reservation.seq : undefined,
     rollback: reservation.canReply ? reservation.rollback : () => {},
   };
 }
@@ -207,6 +210,8 @@ export async function sendText(params: {
   text: string;
   accountId?: string;
   replyToId?: string;
+  /** 显式锚点已发号的被动回复序号（quotaReserved 链透传） */
+  msgSeq?: number;
   account: ResolvedQQBotAccount;
   quotaReserved?: boolean;
   /**
@@ -222,6 +227,7 @@ export async function sendText(params: {
   const target = parseTarget(params.to);
   const reservation = reservePassiveReply({
     replyToId: params.replyToId,
+    msgSeq: params.msgSeq,
     accountId: resolved.accountId,
     scope: target.scope,
     quotaReserved: params.quotaReserved,
@@ -232,7 +238,10 @@ export async function sendText(params: {
     return { error: 'passive-quota-exhausted' };
   }
   try {
-    const result = await resolved.gw.sendText(target, params.text, { msgId: reservation.msgId });
+    const result = await resolved.gw.sendText(target, params.text, {
+      msgId: reservation.msgId,
+      msgSeq: reservation.msgSeq,
+    });
     return { messageId: result.id };
   } catch (err: unknown) {
     reservation.rollback();
@@ -352,7 +361,10 @@ export class OutboundService {
       scope: target.scope,
     });
     try {
-      const result = await this.gw.sendText(target, text, { msgId: reservation.msgId });
+      const result = await this.gw.sendText(target, text, {
+        msgId: reservation.msgId,
+        msgSeq: reservation.msgSeq,
+      });
       return { messageId: result.id };
     } catch (err: unknown) {
       reservation.rollback();

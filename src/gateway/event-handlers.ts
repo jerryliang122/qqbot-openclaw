@@ -71,7 +71,13 @@ export async function handleMessage(
       }
     }
 
-    cacheMsgId(scope, msg.replyTarget.targetId, msg.messageId);
+    // 被动锚点登记：时钟用平台事件 timestamp（免疫本地时钟偏差），
+    // 缺失/不可解析时回退本地时钟；同时预注册配额窗口（receivedAt 起算）
+    const platformTsMs = Date.parse(msg.timestamp);
+    cacheMsgId(scope, msg.replyTarget.targetId, msg.messageId, {
+      accountId: account.accountId,
+      receivedAt: Number.isNaN(platformTsMs) ? Date.now() : platformTsMs,
+    });
 
     recordKnownUser({
       type: scope === 'group' ? 'group' : 'c2c',
