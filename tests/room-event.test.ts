@@ -150,6 +150,11 @@ function installRealGatewayMethods(account: any) {
   gw.textTimeout = 5_000;
   gw.mediaTimeout = 5_000;
   gw.bot = {
+    // 被动文本路径（显式 msg_seq）：网关带 msgId 时走 bot.send
+    send: async (opts: any) => {
+      sends.push({ target: opts.target, opts: { msgSeq: opts.extra?.msg_seq } });
+      return { id: `out-${sends.length}`, timestamp: Date.now() };
+    },
     sendText: async (target: any, _text: string) => {
       sends.push({ target, opts: undefined });
       // target.msgId 由 attachMsgIdWithQuota 决定，记录最终形态

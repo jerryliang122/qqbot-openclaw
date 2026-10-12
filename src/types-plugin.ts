@@ -38,10 +38,16 @@ export interface QQBotSessionRoute {
 
 /**
  * 配额状态
+ *
+ * `seq`：该 msg_id 已发号到的被动回复序号（msg_seq）最大值，从 0 起、
+ * 每次消耗配额时 +1——QQ 平台「相同 msg_id + msg_seq 重复发送会失败」，
+ * 同一 msg_id 的多次回复必须逐条区分。seq 单调递增、从不回滚
+ * （浪费序号无害，精确重复才是平台硬错误）。
  */
 export interface QuotaState {
   count: number;
   expiresAt: number;
+  seq?: number;
 }
 
 /**

@@ -5,9 +5,11 @@
  *
  * 两层结构：
  * - createQQBotOutboundAdapter —— 内部配额包装（sendTextWithQuota / sendMediaWithQuota），
- *   供中间件/流式路径使用；
+ *   供中间件/流式路径使用（显式锚点在此消耗配额并经 quotaReserved 链下传 msgSeq）；
  * - createQQBotChannelOutbound —— 框架 ChannelOutboundAdapter 契约入口
- *   （sendText / sendMedia / chunker / sanitizeText 等）。
+ *   （sendText / sendMedia / chunker / sanitizeText 等）。无显式 ctx.replyToId
+ *   时不再做缓存兜底选取——被动锚点的选取（旧配额优先）/消耗/发号统一
+ *   收敛到网关 attachMsgIdWithQuota 单点。
  *   openclaw 的 channel-selection 通过 outbound.sendText（或 message.send.text /
  *   deliveryMode === "gateway"）判定通道可用，缺失会导致
  *   "Channel is unavailable: qqbot"。
@@ -21,7 +23,6 @@ import type { SendResult } from './outbound/outbound-service.js';
 import type { OpenClawConfig } from 'openclaw/plugin-sdk';
 import { resolveQQBotAccount } from './config.js';
 import { parseTarget } from './outbound/target.js';
-import { getCachedMsgId } from './features/msgid-cache.js';
 import { sanitizeQQBotText } from './outbound/sanitize.js';
 import { chunkQQBotMarkdown } from './outbound/chunker.js';
 import { isApprovalPayload } from './features/approval-utils.js';
@@ -39,6 +40,8 @@ export type SendTextFn = (params: {
   text: string;
   accountId?: string;
   replyToId?: string;
+  /** 显式锚点已发号的被动回复序号（quotaReserved 链透传到网关） */
+  msgSeq?: number;
   account: ResolvedQQBotAccount;
   quotaReserved?: boolean;
 }) => Promise<SendResult>;
@@ -126,8 +129,8 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
       const scope = inferQQBotScope(to);
       const resolvedAccountId = accountId || account.accountId;
 
-      // 使用原子操作检查并消耗配额
-      const { canReply, rollback } = await checkAndConsumePassiveReplyQuota({
+      // 使用原子操作检查并消耗配额（同时发号 msg_seq）
+      const { canReply, seq, rollback } = await checkAndConsumePassiveReplyQuota({
         accountId: resolvedAccountId,
         msgId: replyToId,
         scope,
@@ -140,6 +143,7 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
         text,
         accountId: resolvedAccountId,
         replyToId: canReply ? replyToId : undefined,
+        msgSeq: canReply ? seq : undefined,
         account,
         quotaReserved: canReply,
       });
@@ -257,19 +261,14 @@ function resolveMCPAgentId(
 }
 
 /**
- * 被动优先的 replyToId 解析：框架未显式给 replyToId 时（message 工具 / 框架
- * 直发路径），从 msgid-cache 取该会话最新未过期 msg_id，让发送走配额感知的
- * 被动通道（保每日主动预算）。无缓存（静群超 TTL）→ undefined → 主动发送。
+ * 显式锚点透传：框架给的 ctx.replyToId（turn 回复锚点）原样透传。
+ *
+ * 无显式锚点时（message 工具 / 框架直发路径）返回 undefined——被动锚点的
+ * 选取（旧配额优先）、配额消耗与 msg_seq 发号统一收敛到网关
+ * attachMsgIdWithQuota 单点完成（账号键含单账号回退，与记账一致）。
  */
-function resolvePassiveFirstReplyToId(to: string, explicitReplyToId?: string | null): string | undefined {
-  if (explicitReplyToId) return explicitReplyToId;
-  try {
-    const { scope, targetId } = parseTarget(to);
-    if (!targetId) return undefined;
-    return getCachedMsgId(scope, targetId);
-  } catch {
-    return undefined;
-  }
+function resolveExplicitReplyToId(explicitReplyToId?: string | null): string | undefined {
+  return explicitReplyToId ?? undefined;
 }
 
 /**
@@ -292,7 +291,7 @@ export function createQQBotChannelOutbound(params: QQBotOutboundAdapterParams = 
         to: ctx.to,
         text: ctx.text ?? '',
         accountId: ctx.accountId ?? undefined,
-        replyToId: resolvePassiveFirstReplyToId(ctx.to, ctx.replyToId),
+        replyToId: resolveExplicitReplyToId(ctx.replyToId),
         account,
         log: alog,
       });
@@ -308,7 +307,7 @@ export function createQQBotChannelOutbound(params: QQBotOutboundAdapterParams = 
         source: ctx.mediaUrl ?? '',
         text: ctx.text,
         accountId: resolvedAccountId,
-        replyToId: resolvePassiveFirstReplyToId(ctx.to, ctx.replyToId),
+        replyToId: resolveExplicitReplyToId(ctx.replyToId),
         account,
         agentId: resolveMCPAgentId(ctx.to, resolvedAccountId, ctx.cfg, alog),
         log: alog,

@@ -3,6 +3,7 @@
  */
 import {
   QQBot,
+  ApiError,
   FileKVStore,
   kvSessionPersistence,
   MediaFileType,
@@ -27,9 +28,9 @@ import { getPersistedRefIndexStore } from '../features/ref-index-store.js';
 import { recordOutboundMessageId } from '../features/outbound-echo-store.js';
 import { recordOutboundToGroupHistory } from '../features/history-store.js';
 import { resolveGroupConfigFromAccount } from '../config.js';
-import { checkAndConsumePassiveReplyQuota } from '../features/quota-manager.js';
+import { checkAndConsumePassiveReplyQuota, invalidateMsgIdQuota } from '../features/quota-manager.js';
 import { recordProactiveSend } from '../features/proactive-budget.js';
-import { getCachedMsgId } from '../features/msgid-cache.js';
+import { selectMsgIdForPassiveReply, evictMsgId } from '../features/msgid-cache.js';
 import { notifyOutboundMessageSent } from '../features/typing-refresh.js';
 
 export interface GatewayCallbacks {
@@ -39,8 +40,20 @@ export interface GatewayCallbacks {
 
 export interface SendOptions {
   msgId?: string;
+  /** 显式锚点链透传的被动回复序号（quotaReserved 链已在上游发号） */
+  msgSeq?: number;
   text?: string;
 }
+
+/**
+ * 「锚点失效」平台业务码集合——均为**确定性拒绝**（内容未投递，主动重发
+ * 无重复风险），触发死锚点剔除 + 同内容转主动重发一次：
+ * - 40034005：回复消息 msg_id 已过期
+ * - 40034128：回复次数超限（本仓库历史事故记载的硬失败码）
+ * 线上发现其他确定性未投递的平台码加入本集合即可。网络/超时
+ * （httpStatus===0，结果不明）与其他业务码不重发。
+ */
+const ANCHOR_DEAD_CODES = new Set<number>([40034005, 40034128]);
 
 // ── 超时常量 ──
 
@@ -169,16 +182,42 @@ export class QQBotGateway {
   }
 
   async sendText(target: ReplyTarget, text: string, opts?: SendOptions): Promise<MessageResponse> {
-    const { target: resolved, rollback } = this.attachMsgIdWithQuota(target, opts);
+    const { target: resolved, msgSeq, rollback } = this.attachMsgIdWithQuota(target, opts);
     if (!resolved.msgId) recordProactiveSend(this.account.accountId);
     try {
       const result = await withTimeout(
-        this.bot.sendText(resolved, text),
+        resolved.msgId
+          // 被动文本：显式 msg_seq（插件自持单调计数器，替代 SDK 准随机注入）。
+          // 等价性：markdownSupport（插件配置默认 true）时传 markdown 字段
+          // （msg_type=2），否则 content（msg_type=0）——与 bot.sendText 的
+          // buildMessageBody 分支一致；extra.msg_seq 先于 SDK 自动注入合入 body
+          ? this.bot.send({
+              target: resolved,
+              ...(this.account.markdownSupport
+                ? { markdown: { content: text } }
+                : { content: text }),
+              extra: { msg_seq: msgSeq },
+            })
+          : this.bot.sendText(resolved, text),
         this.textTimeout, 'sendText',
       );
       this.notifyTypingRefresh(target);
       return result;
     } catch (err) {
+      const retried = await this.retryOnDeadAnchor(err, {
+        target,
+        resolved,
+        rollback,
+        retry: () =>
+          withTimeout(
+            this.bot.sendText({ scope: target.scope, targetId: target.targetId }, text),
+            this.textTimeout, 'sendText(proactive-retry)',
+          ),
+      });
+      if (retried) {
+        this.notifyTypingRefresh(target);
+        return retried;
+      }
       rollback();
       throw err;
     }
@@ -193,14 +232,26 @@ export class QQBotGateway {
     if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
     const fileType = opts?.fileType ?? MediaFileType.IMAGE;
     const sourceOpts = resolveMediaSource(source);
-    try {
-      const result = await withTimeout(
-        this.bot.sendMedia({ target: resolvedTarget, fileType, ...sourceOpts, content: opts?.text }),
+    const send = (dst: ReplyTarget) =>
+      withTimeout(
+        this.bot.sendMedia({ target: dst, fileType, ...sourceOpts, content: opts?.text }),
         this.mediaTimeout, 'sendMedia',
       );
+    try {
+      const result = await send(resolvedTarget);
       this.notifyTypingRefresh(target);
       return result.message ?? { id: '', timestamp: Date.now() };
     } catch (err) {
+      const retried = await this.retryOnDeadAnchor(err, {
+        target,
+        resolved: resolvedTarget,
+        rollback,
+        retry: () => send({ scope: target.scope, targetId: target.targetId }),
+      });
+      if (retried) {
+        this.notifyTypingRefresh(target);
+        return retried.message ?? { id: '', timestamp: Date.now() };
+      }
       rollback();
       throw err;
     }
@@ -214,28 +265,35 @@ export class QQBotGateway {
     const { target: resolvedTarget, rollback } = this.attachMsgIdWithQuota(target, opts);
     if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
 
-    const send = (params: Record<string, unknown>, label: string) =>
+    const send = (dst: ReplyTarget, label: string) =>
       withTimeout(
         this.bot.sendMedia({
-          target: resolvedTarget,
+          target: dst,
           fileType: MediaFileType.VOICE,
-          ...params,
+          ...(source.base64
+            ? { fileData: source.base64 }
+            : source.localPath
+              ? { localPath: source.localPath }
+              : { url: source.url! }),
           content: opts?.text,
         } as any),
         this.mediaTimeout, label,
       );
     try {
-      let result: { message?: MessageResponse };
-      if (source.base64) {
-        result = await send({ fileData: source.base64 }, 'sendVoice(base64)');
-      } else if (source.localPath) {
-        result = await send({ localPath: source.localPath }, 'sendVoice(path)');
-      } else {
-        result = await send({ url: source.url! }, 'sendVoice(url)');
-      }
+      const result = await send(resolvedTarget, 'sendVoice');
       this.notifyTypingRefresh(target);
       return result.message ?? { id: '', timestamp: Date.now() };
     } catch (err) {
+      const retried = await this.retryOnDeadAnchor(err, {
+        target,
+        resolved: resolvedTarget,
+        rollback,
+        retry: () => send({ scope: target.scope, targetId: target.targetId }, 'sendVoice(proactive-retry)'),
+      });
+      if (retried) {
+        this.notifyTypingRefresh(target);
+        return retried.message ?? { id: '', timestamp: Date.now() };
+      }
       rollback();
       throw err;
     }
@@ -249,14 +307,26 @@ export class QQBotGateway {
     const { target: resolvedTarget, rollback } = this.attachMsgIdWithQuota(target, opts);
     if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
     const sourceOpts = resolveMediaSource(source);
-    try {
-      const result = await withTimeout(
-        this.bot.sendMedia({ target: resolvedTarget, fileType: MediaFileType.VIDEO, ...sourceOpts, content: opts?.text }),
-        this.mediaTimeout, 'sendVideo',
+    const send = (dst: ReplyTarget, label: string) =>
+      withTimeout(
+        this.bot.sendMedia({ target: dst, fileType: MediaFileType.VIDEO, ...sourceOpts, content: opts?.text }),
+        this.mediaTimeout, label,
       );
+    try {
+      const result = await send(resolvedTarget, 'sendVideo');
       this.notifyTypingRefresh(target);
       return result.message ?? { id: '', timestamp: Date.now() };
     } catch (err) {
+      const retried = await this.retryOnDeadAnchor(err, {
+        target,
+        resolved: resolvedTarget,
+        rollback,
+        retry: () => send({ scope: target.scope, targetId: target.targetId }, 'sendVideo(proactive-retry)'),
+      });
+      if (retried) {
+        this.notifyTypingRefresh(target);
+        return retried.message ?? { id: '', timestamp: Date.now() };
+      }
       rollback();
       throw err;
     }
@@ -270,14 +340,26 @@ export class QQBotGateway {
     const { target: resolvedTarget, rollback } = this.attachMsgIdWithQuota(target, opts);
     if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
     const sourceOpts = resolveMediaSource(source);
-    try {
-      const result = await withTimeout(
-        this.bot.sendMedia({ target: resolvedTarget, fileType: MediaFileType.FILE, ...sourceOpts, fileName: opts?.fileName, content: opts?.text }),
-        this.mediaTimeout, 'sendFile',
+    const send = (dst: ReplyTarget, label: string) =>
+      withTimeout(
+        this.bot.sendMedia({ target: dst, fileType: MediaFileType.FILE, ...sourceOpts, fileName: opts?.fileName, content: opts?.text }),
+        this.mediaTimeout, label,
       );
+    try {
+      const result = await send(resolvedTarget, 'sendFile');
       this.notifyTypingRefresh(target);
       return result.message ?? { id: '', timestamp: Date.now() };
     } catch (err) {
+      const retried = await this.retryOnDeadAnchor(err, {
+        target,
+        resolved: resolvedTarget,
+        rollback,
+        retry: () => send({ scope: target.scope, targetId: target.targetId }, 'sendFile(proactive-retry)'),
+      });
+      if (retried) {
+        this.notifyTypingRefresh(target);
+        return retried.message ?? { id: '', timestamp: Date.now() };
+      }
       rollback();
       throw err;
     }
@@ -376,6 +458,20 @@ export class QQBotGateway {
       return result;
     };
 
+    // send（显式 msg_seq 的被动文本路径）→ 与 sendText 同等对待：
+    // 不包装会丢失 [tx] 日志、回声登记与 ref-index 记录。
+    // 仅处理文本形态（content/markdown）；其他形态（media 等）直接透传。
+    const origSend = this.bot.send.bind(this.bot);
+    this.bot.send = async (opts) => {
+      const result = await origSend(opts);
+      if (opts.content !== undefined || opts.markdown) {
+        const textContent = opts.content ?? opts.markdown?.content ?? '';
+        logTx('text', opts.target, result, textContent.length);
+        storeEntry(result, textContent, opts.target);
+      }
+      return result;
+    };
+
     // sendMedia → ext_info 在 result.message 里
     const origSendMedia = this.bot.sendMedia.bind(this.bot);
     this.bot.sendMedia = async (params: any) => {
@@ -416,35 +512,78 @@ export class QQBotGateway {
   }
 
   /**
-   * 配额感知的 msg_id 挂接（被动优先）。
+   * 配额感知的 msg_id 挂接（被动优先，旧配额优先选取）。
    *
-   * - 显式 msgId（opts.msgId）：上游 adapter 已做配额记账（quotaReserved），
-   *   直接透传，不重复消费。
-   * - 无显式 msgId：尝试挂 msgid-cache 最新条目；挂接前经 quota-manager
-   *   原子预检+扣减——配额耗尽则不挂（降级主动，避免平台 40034128 硬失败），
-   *   API 抛错时由调用方 rollback 释放已扣减的额度。
+   * - 显式 msgId（opts.msgId）：上游 adapter/service 已做配额记账与发号
+   *   （quotaReserved 链），直接透传（msgSeq 一并透传），不重复消费。
+   * - 无显式 msgId：selectMsgIdForPassiveReply 按接收时间从旧到新选第一条
+   *   「平台窗口未过期 且 剩余额度 > 0」的候选（旧配额先用先耗尽，为最新
+   *   消息保留完整额度）；选中后原子消耗并发号 msg_seq。
+   * - 无候选/配额耗尽：不挂（降级主动）；API 抛错时由调用方 rollback
+   *   释放已扣减的额度。
    */
   private attachMsgIdWithQuota(
     target: ReplyTarget,
     opts?: SendOptions,
-  ): { target: ReplyTarget; rollback: () => void } {
+  ): { target: ReplyTarget; msgSeq?: number; rollback: () => void } {
     if (opts?.msgId) {
-      return { target: { ...target, msgId: opts.msgId }, rollback: () => {} };
+      return { target: { ...target, msgId: opts.msgId }, msgSeq: opts.msgSeq, rollback: () => {} };
     }
-    const cached = getCachedMsgId(target.scope, target.targetId);
-    if (!cached) return { target, rollback: () => {} };
+    const candidate = selectMsgIdForPassiveReply({
+      accountId: this.account.accountId,
+      scope: target.scope,
+      targetId: target.targetId,
+    });
+    if (!candidate) return { target, rollback: () => {} };
 
     const reservation = checkAndConsumePassiveReplyQuota({
       accountId: this.account.accountId,
-      msgId: cached,
+      msgId: candidate,
       scope: target.scope,
     });
     if (!reservation.canReply) {
       // INFO：降级主动消耗每日预算，是出站行为的可观测分界点
-      this.log.info?.(`[quota] passive quota exhausted for msgId=${cached}; falling back to proactive send`);
+      this.log.info?.(`[quota] passive quota exhausted for msgId=${candidate}; falling back to proactive send`);
       return { target, rollback: () => {} };
     }
-    return { target: { ...target, msgId: cached }, rollback: reservation.rollback };
+    return { target: { ...target, msgId: candidate }, msgSeq: reservation.seq, rollback: reservation.rollback };
+  }
+
+  /**
+   * 锚点失效兜底：被动发送被平台以 40034005（msg_id 已过期）/40034128
+   * （回复次数超限）**确定性拒绝**（内容未投递）时——剔除死锚点、回滚配额
+   * 计数、同内容转主动重发一次（烧每日预算，记账）。
+   *
+   * 返回 null 表示非兜底场景（调用方 rollback 后照常上抛）；重发失败直接
+   * 抛出重发错误交上层既有处理（主动路径无 msg_id，不可能再触发同码）。
+   * 网络/超时（httpStatus===0，结果不明，重发有重复风险）与其他业务码
+   * （内容超长等，重发必然同错）不做兜底。
+   */
+  private async retryOnDeadAnchor<T>(
+    err: unknown,
+    params: {
+      target: ReplyTarget;
+      resolved: ReplyTarget;
+      rollback: () => void;
+      retry: () => Promise<T>;
+    },
+  ): Promise<T | null> {
+    const { target, resolved, rollback, retry } = params;
+    const anchorDead = err instanceof ApiError && ANCHOR_DEAD_CODES.has(err.bizCode ?? -1);
+    if (!anchorDead || !resolved.msgId) return null;
+
+    rollback();
+    evictMsgId(target.scope, target.targetId, resolved.msgId);
+    invalidateMsgIdQuota({
+      accountId: this.account.accountId,
+      msgId: resolved.msgId,
+      scope: target.scope,
+    });
+    this.log.warn?.(
+      `[quota] passive anchor rejected by platform (code=${err.bizCode}) msgId=${resolved.msgId}; evicted, retrying proactively`,
+    );
+    recordProactiveSend(this.account.accountId);
+    return retry();
   }
 }
 
