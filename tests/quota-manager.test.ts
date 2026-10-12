@@ -243,4 +243,73 @@ await test('getQuotaStats: 预注册的 count=0 条目不计入统计', () => {
   assert.equal(stats.totalUsage, 1);
 });
 
+// ── 容量控制（过期清扫优先 + LRU 触达）与诚实重建 ──
+
+await test('容量控制：超限先清扫过期条目，早期活跃窗口不被 FIFO 淘汰', () => {
+  clearQuotaCache();
+  const accountId = 'test-account-evict';
+  // 活跃锚点 L：先登记、先消耗一次（count=1，剩余 3）
+  registerMsgIdWindow({ accountId, msgId: 'LIVE', scope: 'c2c', receivedAt: Date.now() });
+  const c1 = checkAndConsumePassiveReplyQuota({ accountId, msgId: 'LIVE', scope: 'c2c' });
+  assert.equal(c1.canReply, true);
+
+  // 涌入大量「已过期」条目（receivedAt = 61min 前）——只做 FIFO 会把
+  // 插入序最老的 LIVE 淘汰掉；过期清扫优先应保住它
+  const old = Date.now() - PLATFORM_PASSIVE_WINDOW.c2c - 60_000;
+  for (let i = 0; i < 10_060; i++) {
+    registerMsgIdWindow({ accountId, msgId: `EXP_${i}`, scope: 'c2c', receivedAt: old });
+  }
+
+  // 判别：条目若被淘汰，探测会按「无条目=满额」返回 4；存活则 count 保留、剩余 3
+  const remaining = getPassiveReplyQuotaRemaining({ accountId, msgId: 'LIVE', scope: 'c2c' });
+  assert.equal(remaining, 3, '活跃锚点应经清扫存活（count 保留）');
+
+  // 过期条目应已被清扫而非堆积
+  const cache = __test_getQuotaCache();
+  assert.ok(cache.size < 10_060, `过期条目应被清扫而非保留（实际 size=${cache.size}）`);
+});
+
+await test('LRU 触达：消耗把条目沉到插入序队尾', () => {
+  clearQuotaCache();
+  const accountId = 'test-account-lru';
+  registerMsgIdWindow({ accountId, msgId: 'LRU_A', scope: 'c2c', receivedAt: Date.now() });
+  registerMsgIdWindow({ accountId, msgId: 'LRU_B', scope: 'c2c', receivedAt: Date.now() });
+
+  // Map.set 不改变既有 key 的插入序；消耗（触达）应把 A 沉到队尾
+  checkAndConsumePassiveReplyQuota({ accountId, msgId: 'LRU_A', scope: 'c2c' });
+  getPassiveReplyQuotaRemaining({ accountId, msgId: 'LRU_A', scope: 'c2c' });
+
+  const keys = [...__test_getQuotaCache().keys()];
+  assert.equal(keys[0], `${accountId}:c2c:LRU_B`, '未触达的 B 应在队首');
+  assert.equal(keys[keys.length - 1], `${accountId}:c2c:LRU_A`, '触达过的 A 应沉到队尾');
+});
+
+await test('诚实重建：条目缺失时按 receivedAt 重建窗口（非当下起算）', () => {
+  clearQuotaCache();
+  const accountId = 'test-account-rebuild';
+
+  // 条目缺失 + receivedAt 已超窗口（61min 前）→ 拒绝，而非 now+60min 放行
+  const denied = checkAndConsumePassiveReplyQuota({
+    accountId,
+    msgId: 'RB_OLD',
+    scope: 'c2c',
+    receivedAt: Date.now() - PLATFORM_PASSIVE_WINDOW.c2c - 60_000,
+  });
+  assert.equal(denied.canReply, false, 'receivedAt 超窗口应拒绝（诚实重建）');
+
+  // 条目缺失 + receivedAt 在窗口内（5min 前）→ 允许
+  const allowed = checkAndConsumePassiveReplyQuota({
+    accountId,
+    msgId: 'RB_FRESH',
+    scope: 'c2c',
+    receivedAt: Date.now() - 5 * 60_000,
+  });
+  assert.equal(allowed.canReply, true);
+  assert.equal(allowed.seq, 1);
+
+  // 无 receivedAt（调用方无从得知接收时间）→ 旧兜底 now+TTL 放行
+  const legacy = checkAndConsumePassiveReplyQuota({ accountId, msgId: 'RB_LEGACY', scope: 'c2c' });
+  assert.equal(legacy.canReply, true);
+});
+
 console.log('All quota manager tests passed');

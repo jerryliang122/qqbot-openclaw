@@ -7,7 +7,9 @@
  * 重要说明：
  * - QQ Bot 平台的 msg_id 有时效性限制（C2C: 60分钟，Group: 5分钟）
  * - 过期窗口以**平台事件 timestamp**（消息产生时刻）起算——入站登记时经
- *   registerMsgIdWindow 预注册（幂等），免疫本地时钟与平台时钟的偏差
+ *   registerMsgIdWindow 预注册（幂等）。窗口起点锚定平台时间、不再随
+ *   「首次消耗时刻」漂移；但比对仍用本地时钟——本地与平台若有偏差 Δ，
+ *   判定会等量放宽/收紧 Δ（并非与本地时钟无关）
  * - 过期后的 msg_id 不能再用于被动回复（API 会返回错误 40034128/40034005）
  * - 这是平台限制，不是"配额恢复"
  * - 因此 checkPassiveReplyQuota 在 msg_id 过期时返回 false，而非重置配额
@@ -26,6 +28,35 @@ const QUOTA_LIMITS = {
   c2c: { count: 4, ttlMs: 60 * 60 * 1000 },
   group: { count: 5, ttlMs: 5 * 60 * 1000 },
 };
+
+/**
+ * 容量控制：超限时**先清扫过期条目**（窗口已过的普通条目与 dead 锚点），
+ * 仍超限才按插入序 FIFO 淘汰存活条目。
+ *
+ * 只做 FIFO 的问题：预注册让每条入站消息都占一个条目，而 Map.set 不改变
+ * 既有 key 的插入序——稳态下 FIFO 淘汰的恰是「最旧、窗口未过」的活跃锚点
+ * （恰是旧配额优先策略要用的），被淘汰后消耗侧会按 now+TTL 重建窗口，
+ * 起点被静默搬到当下、超出平台窗口 → 40034005。过期清扫优先 + 访问触达
+ * （touchCacheEntry）让活跃条目沉到队尾，把淘汰压力集中到真正无价值的
+ * 死条目上。
+ */
+function enforceCacheCapacity(now: number): void {
+  if (quotaCache.size <= MAX_CACHE_SIZE) return;
+  for (const [key, state] of quotaCache) {
+    if (now > state.expiresAt) quotaCache.delete(key);
+  }
+  while (quotaCache.size > MAX_CACHE_SIZE) {
+    const oldestKey = quotaCache.keys().next().value;
+    if (!oldestKey) break;
+    quotaCache.delete(oldestKey);
+  }
+}
+
+/** LRU 触达：delete+重插把条目沉到插入序队尾（活跃锚点不被 FIFO 优先淘汰） */
+function touchCacheEntry(key: string, entry: QuotaState): void {
+  quotaCache.delete(key);
+  quotaCache.set(key, entry);
+}
 
 /**
  * 平台被动回复窗口（自消息接收时刻起算）——与 msgid-cache 的候选 TTL 判定
@@ -60,13 +91,8 @@ export function registerMsgIdWindow(params: {
     expiresAt: receivedAt + QUOTA_LIMITS[scope].ttlMs,
   });
 
-  // 缓存大小控制
-  if (quotaCache.size > MAX_CACHE_SIZE) {
-    const oldestKey = quotaCache.keys().next().value;
-    if (oldestKey) {
-      quotaCache.delete(oldestKey);
-    }
-  }
+  // 缓存大小控制：过期清扫优先，FIFO 兜底（见 enforceCacheCapacity）
+  enforceCacheCapacity(Date.now());
 }
 
 /**
@@ -101,6 +127,9 @@ export function checkPassiveReplyQuota(params: QuotaCheckParams): boolean {
     if (cached.count >= limit) {
       return false;
     }
+
+    // LRU 触达：被探测的活跃锚点沉到队尾
+    touchCacheEntry(key, cached);
   }
 
   return true;
@@ -130,6 +159,8 @@ export function getPassiveReplyQuotaRemaining(params: QuotaCheckParams): number 
   if (Date.now() > cached.expiresAt) {
     return 0;
   }
+  // LRU 触达：被探测的活跃锚点沉到队尾（死/过期条目不触达，留给容量清扫）
+  touchCacheEntry(key, cached);
   return Math.max(0, QUOTA_LIMITS[scope].count - cached.count);
 }
 
@@ -147,7 +178,7 @@ export function rollbackPassiveReplyQuota(params: {
   const cached = quotaCache.get(key);
   if (cached && !cached.dead && cached.count > 0) {
     cached.count -= 1;
-    quotaCache.set(key, cached);
+    touchCacheEntry(key, cached);
   }
 }
 
@@ -159,9 +190,19 @@ export function rollbackPassiveReplyQuota(params: {
  * 无害，相同 msg_id+msg_seq 精确重复才是平台硬错误）。
  */
 export function checkAndConsumePassiveReplyQuota(
-  params: QuotaCheckParams & { log?: { debug?: (message: string) => void } },
+  params: QuotaCheckParams & {
+    log?: { debug?: (message: string) => void };
+    /**
+     * 该 msg_id 的接收时刻（msgid-cache 登记的平台事件时间）。条目缺失
+     * （被容量控制淘汰等）重建窗口时以此为起点——**诚实重建**：窗口仍是
+     * 「接收时刻 + 平台窗口」，不再无声以当下起算（那会超出平台窗口，
+     * 平台 40034005 拒绝）。缺省时保留旧兜底 now+TTL（调用方无从得知
+     * 接收时间的场景），并打 DEBUG 留痕。
+     */
+    receivedAt?: number;
+  },
 ): { canReply: boolean; seq: number; rollback: () => void } {
-  const { accountId, msgId, scope, log } = params;
+  const { accountId, msgId, scope, log, receivedAt } = params;
 
   if (!msgId) {
     log?.debug?.(`[${accountId}] passive quota check without msgId (proactive path) scope=${scope}`);
@@ -191,19 +232,31 @@ export function checkAndConsumePassiveReplyQuota(
     return { canReply: false, seq: 0, rollback: () => {} };
   }
 
-  // 原子消耗 + 发号
-  cached = cached || { count: 0, seq: 0, expiresAt: now + ttl };
+  // 条目缺失（容量淘汰/未预注册）时重建窗口：有 receivedAt 用真实接收时刻
+  // （诚实重建），否则旧兜底 now+TTL——非无声，DEBUG 留痕。重建出的窗口
+  // 同样要过校验：接收时刻起算已超窗的（如条目被淘汰后残留的旧锚点）
+  // 直接拒绝，不得以「当下起算」放行。注意重建会把 seq 归零（锚点失效
+  // 兜底自愈，见 AGENTS.md「出站被动优先」）
+  if (!cached) {
+    const expiresAt = (receivedAt ?? now) + ttl;
+    if (now > expiresAt) {
+      log?.debug?.(
+        `[${accountId}] passive quota denied (expired by receivedAt rebuild): ${key}`,
+      );
+      return { canReply: false, seq: 0, rollback: () => {} };
+    }
+    cached = { count: 0, seq: 0, expiresAt };
+    log?.debug?.(
+      `[${accountId}] quota entry missing, rebuilding window: ${key} from=${receivedAt ? 'receivedAt' : 'now(legacy)'}`,
+    );
+  }
   cached.count += 1;
   cached.seq = (cached.seq ?? 0) + 1;
-  quotaCache.set(key, cached);
+  // LRU 触达：消耗中的锚点沉到队尾，不被容量控制优先淘汰
+  touchCacheEntry(key, cached);
 
-  // 缓存大小控制
-  if (quotaCache.size > MAX_CACHE_SIZE) {
-    const oldestKey = quotaCache.keys().next().value;
-    if (oldestKey) {
-      quotaCache.delete(oldestKey);
-    }
-  }
+  // 缓存大小控制：过期清扫优先，FIFO 兜底
+  enforceCacheCapacity(now);
 
   log?.debug?.(`[${accountId}] consumed passive quota: ${key} count=${cached.count} seq=${cached.seq}`);
 
@@ -213,7 +266,7 @@ export function checkAndConsumePassiveReplyQuota(
     const state = quotaCache.get(key);
     if (state && !state.dead && state.count > 0) {
       state.count -= 1;
-      quotaCache.set(key, state);
+      touchCacheEntry(key, state);
     }
   };
 

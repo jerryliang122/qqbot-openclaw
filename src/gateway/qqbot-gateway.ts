@@ -30,7 +30,7 @@ import { recordOutboundToGroupHistory } from '../features/history-store.js';
 import { resolveGroupConfigFromAccount } from '../config.js';
 import { checkAndConsumePassiveReplyQuota, invalidateMsgIdQuota } from '../features/quota-manager.js';
 import { recordProactiveSend } from '../features/proactive-budget.js';
-import { selectMsgIdForPassiveReply, evictMsgId } from '../features/msgid-cache.js';
+import { selectMsgIdForPassiveReply, evictMsgId, peekMsgIdReceivedAt } from '../features/msgid-cache.js';
 import { notifyOutboundMessageSent } from '../features/typing-refresh.js';
 
 export interface GatewayCallbacks {
@@ -551,6 +551,8 @@ export class QQBotGateway {
       accountId: this.account.accountId,
       msgId: candidate,
       scope: target.scope,
+      // 诚实重建：配额条目被容量控制淘汰时按真实接收时刻重建窗口
+      receivedAt: peekMsgIdReceivedAt(target.scope, target.targetId, candidate),
     });
     if (!reservation.canReply) {
       // INFO：降级主动消耗每日预算，是出站行为的可观测分界点

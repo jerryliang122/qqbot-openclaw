@@ -16,6 +16,7 @@
  */
 
 import { checkAndConsumePassiveReplyQuota, checkPassiveReplyQuota, inferQQBotScope } from './features/quota-manager.js';
+import { peekMsgIdReceivedAt } from './features/msgid-cache.js';
 import type { PluginLogger } from './utils/plugin-logger.js';
 import type { ResolvedQQBotAccount } from './types.js';
 import type { SendMediaParams, SendMediaResult } from './outbound/media-send.js';
@@ -129,12 +130,14 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
       const scope = inferQQBotScope(to);
       const resolvedAccountId = accountId || account.accountId;
 
-      // 使用原子操作检查并消耗配额（同时发号 msg_seq）
+      // 使用原子操作检查并消耗配额（同时发号 msg_seq；条目缺失时按
+      // msgid-cache 登记的真实接收时刻诚实重建窗口）
       const { canReply, seq, rollback } = await checkAndConsumePassiveReplyQuota({
         accountId: resolvedAccountId,
         msgId: replyToId,
         scope,
         log,
+        receivedAt: peekReceivedAtFor(scope, to, replyToId),
       });
 
       const sendTextFn = injectedSendText || await getSendText();
@@ -163,12 +166,14 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
       const scope = inferQQBotScope(to);
       const resolvedAccountId = accountId || account.accountId;
 
-      // 使用原子操作检查并消耗配额
+      // 使用原子操作检查并消耗配额（条目缺失时按 msgid-cache 登记的
+      // 真实接收时刻诚实重建窗口）
       const { canReply, rollback } = await checkAndConsumePassiveReplyQuota({
         accountId: resolvedAccountId,
         msgId: replyToId,
         scope,
         log,
+        receivedAt: peekReceivedAtFor(scope, to, replyToId),
       });
 
       const sendMediaFn = injectedSendMedia || await getSendMedia();
@@ -269,6 +274,22 @@ function resolveMCPAgentId(
  */
 function resolveExplicitReplyToId(explicitReplyToId?: string | null): string | undefined {
   return explicitReplyToId ?? undefined;
+}
+
+/**
+ * 为显式锚点消耗查接收时刻（诚实重建用）：msgid-cache 里有登记则返回
+ * 平台事件时间；未登记（旁路 msgId/测试注入）返回 undefined，消耗侧退回
+ * now+TTL 旧兜底并打 DEBUG。
+ */
+function peekReceivedAtFor(scope: 'c2c' | 'group', to: string, msgId?: string | null): number | undefined {
+  if (!msgId) return undefined;
+  try {
+    const { targetId } = parseTarget(to);
+    if (!targetId) return undefined;
+    return peekMsgIdReceivedAt(scope, targetId, msgId);
+  } catch {
+    return undefined;
+  }
 }
 
 /**

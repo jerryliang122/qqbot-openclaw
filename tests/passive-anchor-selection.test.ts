@@ -461,4 +461,34 @@ await test('sendTextWithQuota：无锚点 → 不再查 msgid-cache（replyToId=
   assert.equal(captured.quotaReserved, false);
 });
 
+// ── 诚实重建（容量淘汰后的选取路径）──
+
+group('诚实重建：配额条目被淘汰后按真实接收时间重建窗口');
+
+await test('选取路径：条目缺失时窗口按 receivedAt 重建（网关 peek 接线）', async () => {
+  clearQuotaCache();
+  // 候选 59min 龄（c2c 窗口 60min 内）——模拟配额条目被容量控制淘汰
+  seedAnchor('gw-rb', 'RB_M', 59 * 60_000);
+  const { __test_getQuotaCache } = await import('../src/features/quota-manager.ts');
+  __test_getQuotaCache().delete(`gwtest:c2c:RB_M`);
+  assert.equal(__test_getQuotaCache().has(`gwtest:c2c:RB_M`), false, '前提：条目已缺失');
+
+  const { gw, recorded } = makeGateway({});
+  await gw.sendText({ scope: 'c2c', targetId: 'gw-rb' }, 'rebuild-test');
+  // receivedAt=59min 前 → 重建窗口 59min+60min，仍在窗口内 → 被动放行
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0]!.kind, 'send');
+  assert.equal(recorded[0]!.target.msgId, 'RB_M', '诚实重建窗口内应正常锚定');
+
+  // 若为旧式 now+TTL 重建，expiresAt 会落在「此刻+60min」；诚实重建下
+  // 应锚定真实接收时刻（59min 前 + 60min ≈ 此刻+1min）
+  const entry = __test_getQuotaCache().get(`gwtest:c2c:RB_M`);
+  assert.ok(entry, '消耗后条目应存在');
+  const now = Date.now();
+  assert.ok(
+    entry!.expiresAt > now && entry!.expiresAt <= now + 2 * 60_000,
+    `重建窗口应锚定真实接收时刻（receivedAt+60min≈此刻+1min），实际 expiresAt 距今 ${((entry!.expiresAt - now) / 60000).toFixed(1)}min`,
+  );
+});
+
 console.log('All passive anchor selection tests passed');

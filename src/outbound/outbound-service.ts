@@ -15,6 +15,7 @@ import {
   clearQuotaCacheForAccount,
   rollbackPassiveReplyQuota,
 } from '../features/quota-manager.js';
+import { peekMsgIdReceivedAt } from '../features/msgid-cache.js';
 
 // ── Gateway 注册表（生命周期由 channel.ts 管理）──
 
@@ -64,6 +65,7 @@ function reservePassiveReply(params: {
   msgSeq?: number;
   accountId: string;
   scope: 'c2c' | 'group';
+  targetId?: string;
   quotaReserved?: boolean;
 }): { msgId?: string; msgSeq?: number; rollback: () => void } {
   if (!params.replyToId) return { rollback: () => {} };
@@ -74,6 +76,11 @@ function reservePassiveReply(params: {
     accountId: params.accountId,
     msgId: params.replyToId,
     scope: params.scope,
+    // 诚实重建：配额条目被容量控制淘汰时按 msgid-cache 登记的真实接收
+    // 时刻重建窗口（缺失时退回 now+TTL 旧兜底）
+    ...(params.targetId
+      ? { receivedAt: peekMsgIdReceivedAt(params.scope, params.targetId, params.replyToId) }
+      : {}),
   });
   return {
     msgId: reservation.canReply ? params.replyToId : undefined,
@@ -231,6 +238,7 @@ export async function sendText(params: {
     msgSeq: params.msgSeq,
     accountId: resolved.accountId,
     scope: target.scope,
+    targetId: target.targetId,
     quotaReserved: params.quotaReserved,
   });
   // passiveOnly：未占得被动槽（无 msg_id 可挂 / 配额耗尽 / TOCTOU 竞态）
@@ -271,6 +279,7 @@ export async function sendMedia(params: {
     replyToId: params.replyToId,
     accountId: resolved.accountId,
     scope: target.scope,
+    targetId: target.targetId,
     quotaReserved: params.quotaReserved,
   });
   try {
@@ -314,6 +323,7 @@ export async function sendVoice(params: {
     replyToId: params.replyToId,
     accountId: resolved.accountId,
     scope: target.scope,
+    targetId: target.targetId,
     quotaReserved: params.quotaReserved,
   });
   try {
@@ -341,6 +351,7 @@ export async function sendVideo(params: {
     replyToId: params.replyToId,
     accountId: resolved.accountId,
     scope: target.scope,
+    targetId: target.targetId,
     quotaReserved: params.quotaReserved,
   });
   try {
@@ -363,6 +374,7 @@ export class OutboundService {
       replyToId: msgId,
       accountId: this.accountId,
       scope: target.scope,
+      targetId: target.targetId,
     });
     try {
       const result = await this.gw.sendText(target, text, {
@@ -382,6 +394,7 @@ export class OutboundService {
       replyToId: opts?.msgId,
       accountId: this.accountId,
       scope: target.scope,
+      targetId: target.targetId,
     });
     try {
       const kind = opts?.mediaKind ?? 'image';

@@ -6,7 +6,8 @@
  *
  * 时钟：条目 timestamp 存**平台事件时间**（Date.parse(平台事件 timestamp)，
  * 缺失时回退本地时钟），TTL 判定与 quota-manager 的配额窗口共用
- * PLATFORM_PASSIVE_WINDOW——两层窗口同源，免疫本地时钟偏差。
+ * PLATFORM_PASSIVE_WINDOW——两层窗口同源同起点；比对仍用本地时钟
+ * （本地与平台若有偏差 Δ，判定会等量放宽/收紧 Δ）。
  */
 
 import {
@@ -104,6 +105,17 @@ export function evictMsgId(scope: string, targetId: string, msgId: string): void
     if (list.length === 0) cache.delete(key);
     else cache.set(key, list);
   }
+}
+
+/**
+ * 查询某 msgId 的登记接收时间（原始 timestamp，不做 TTL 过滤）——
+ * 配额条目缺失（容量淘汰等）重建窗口时用：窗口起点取真实接收时刻
+ * 而非当下（诚实重建，防重建窗口超出平台窗口）。
+ */
+export function peekMsgIdReceivedAt(scope: string, targetId: string, msgId: string): number | undefined {
+  const list = cache.get(`${scope}:${targetId}`);
+  if (!list) return undefined;
+  return list.find((e) => e.msgId === msgId)?.timestamp;
 }
 
 export function clearMsgIdCache(scope: string, targetId: string): void {
