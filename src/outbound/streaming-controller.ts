@@ -147,6 +147,12 @@ export class StreamingController {
    *   - final 是已流出段落的扩展 → 扩展部分（典型即 usage footer）
    *   - 多段 turn 且 final 含全部段落（A+B+C+footer）→ 定位最后一段之后的部分
    *   - 完全不含已流出段落（模型重写）→ ''（维持现有 final 丢弃去重行为）
+   *   - static 模式例外：缓冲为空（末段 partial 从未到达、此前段落已全部
+   *     flush）且 final 与最后已发段落无任何前缀/包含关系 → final 是一条
+   *     从未投递过的全新消息而非「重写」，整文返回（issue #44：末段丢失
+   *     曾致最终正文静默丢失——absorb 差量空转 + finalize:fallback 标 done，
+   *     上层全部兜底被"已由流式覆盖"的误判掐死）。由 absorbFinalText 并入
+   *     缓冲、随 finalize 的 sendStatic 补发。
    */
   computeUnsentRemainder(finalText: string): string {
     const tail = this.lastDeliveredSegmentText.trim();
@@ -167,6 +173,18 @@ export class StreamingController {
     const normalizedEnd = normalizedPrefixEnd(finalText, tail);
     if (normalizedEnd > 0 && normalizedEnd < finalText.length) {
       return finalText.slice(normalizedEnd);
+    }
+    // static 模式差量兜底（issue #44）：final 与基线无任何前缀/包含关系且
+    // 当前缓冲为空 → 此前段落已全部 flush、末段 partial 从未到达，final 是
+    // 一条从未投递过的全新消息（stream 模式此形态意味着模型重写、正文已可
+    // 见，维持丢弃语义不变）。整文返回，交 absorbFinalText 并入缓冲随
+    // finalize 补发。缓冲非空时不适用——缓冲内容本身就是待发正文，final
+    // 无关只说明是重写/另文，不能重复投递。
+    if (this.isStaticMode && !this.lastAcceptedFull) {
+      this.deps.log?.info(
+        `static final rescue: final text (chars=${finalText.length}) not covered by any delivered segment — treating as fully unsent`,
+      );
+      return finalText;
     }
     return '';
   }
@@ -250,7 +268,15 @@ export class StreamingController {
       if (this.isTerminal) return;
       if (signal?.aborted) return;
       const remainder = this.computeUnsentRemainder(finalText);
-      if (!remainder) return;
+      if (!remainder) {
+        // issue #44 教训：空差量两种成因天差地别——「final 已被流式覆盖」（正常
+        // 去重）与「final 与基线无关且无 pending 内容」（丢失去重的前兆），
+        // 静默 no-op 会让后者完全不可见，必须留痕
+        this.deps.log?.debug?.(
+          `absorb no-op: no unsent remainder (finalLen=${finalText.length} bufferedLen=${this.lastAcceptedFull.length} mode=${this.isStaticMode ? 'static' : 'stream'})`,
+        );
+        return;
+      }
       if (this.isStaticMode) {
         this.lastAcceptedFull = mergeSegmentBoundary(this.lastAcceptedFull, remainder);
         this.lastDeliveredSegmentText = this.lastAcceptedFull;

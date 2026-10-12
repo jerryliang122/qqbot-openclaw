@@ -500,6 +500,36 @@ await test('static 模式: 正文发送失败 → 不补发 footer（避免只�
   );
 });
 
+await test('static 模式: issue #44 末段 partial 从未到达 → final 全文随 finalize 补发，不再静默丢失', async () => {
+  // 精确重演 issue #44 时间线：多段推理（onToolStart flush 分段）后，
+  // 末段 600+ 字符总结的 partial 事件从未经 onPartialReply 到达（openclaw
+  // 2026.10.2 实测，成因在框架侧），最终正文只随 deliver(kind=final) 投递。
+  // 修复前：absorb 差量基准是最后已 flush 的上一段（与 final 无前缀关系→
+  // 空转）、finalize 落入 finalize:fallback 标 done、[stream-final] 差量
+  // 重算仍空 → 正文静默丢失（QQ API 全 200、零错误）。
+  const FINAL_BODY = '这是最终总结正文';
+  const FINAL = `${FINAL_BODY}${'，结论性内容'.repeat(60)}\n${FOOTER}`;
+  const gw = await runDispatch({
+    streaming: { mode: 'stream', sendMode: 'static' },
+    simulate: async (c) => {
+      // 段A：累积两帧 → 工具开始（onToolStart 回调）flush
+      await c.replyOptions?.onPartialReply?.({ text: '段A开头' });
+      await c.replyOptions?.onPartialReply?.({ text: '段A完整文本' });
+      await c.replyOptions?.onToolStart?.();
+      // 段B：累积 → 工具开始 flush
+      await c.replyOptions?.onPartialReply?.({ text: '段B文本' });
+      await c.replyOptions?.onToolStart?.();
+      // 末段：partial 从未到达（issue 观测条件），框架只投递 final 全文
+      await c.dispatcherOptions?.deliver?.({ text: FINAL }, { kind: 'final' });
+    },
+  });
+  assert.deepStrictEqual(
+    gw.sentTexts,
+    ['段A完整文本', '段B文本', FINAL],
+    `末段全文应随 finalize 补发（含 footer 一条发出），实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
 await test('stream 模式: 请求级 signal 在 final 暂存后中止 → 不补发 footer', async () => {
   const requestAbort = new AbortController();
   const gw = await runDispatch({

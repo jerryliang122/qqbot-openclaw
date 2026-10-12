@@ -423,6 +423,77 @@ await test("静态: sendStatic 抛错 → 标记 failed", async () => {
   assert.strictEqual(ctrl.currentPhase, "failed", "sendStatic 失败应标记 failed");
 });
 
+// ============ issue #44：末段 partial 从未到达 ============
+
+console.log("\n=== 1b. issue #44：末段 partial 从未到达（static 最终正文静默丢失） ===");
+
+await test("issue #44: 多段 flush 后末段从未进缓冲 — absorb 整文并入，finalize 补发不丢失", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  // 段A 累积（前缀增长）→ flush；段B 累积 → flush
+  // 末段的 partial 从未到达（issue 观测条件：日志 static accumulate /
+  // static new segment 全缺，最终正文只随 deliver(kind=final) 到达）
+  await ctrl.onPartialReply("段A开始");
+  await ctrl.onPartialReply("段A完整文本");
+  await ctrl.flushSegment();
+  await ctrl.onPartialReply("段B文本");
+  await ctrl.flushSegment();
+  await flush();
+  assert.deepStrictEqual(staticSendCalls, ["段A完整文本", "段B文本"]);
+
+  // deliver(kind=final) 携带末段全文（与段B无任何前缀/包含关系）
+  const FINAL = "这是最终总结正文".repeat(60); // 600+ 字符
+  await ctrl.absorbFinalText(FINAL);
+  await flush();
+  assert.strictEqual(staticSendCalls.length, 2, "absorb 阶段只并入缓冲不发送");
+  assert.ok(
+    logs.some((l) => l.includes("static final rescue")),
+    "差量兜底命中时应打 rescue 日志（可观测性）",
+  );
+
+  // dispatch 收尾 finalize → 末段全文作为最后一条消息补发
+  await ctrl.finalize();
+  assert.deepStrictEqual(
+    staticSendCalls,
+    ["段A完整文本", "段B文本", FINAL],
+    "末段全文应在 finalize 补发，不再静默丢失",
+  );
+  assert.strictEqual(ctrl.currentPhase, "done");
+
+  // finalize 已发全文 → [stream-final] 重算差量为空（防双发）
+  assert.strictEqual(ctrl.computeUnsentRemainder(FINAL), "");
+});
+
+await test("issue #44 守卫: 缓冲非空时 final 与其无关 → 不整文补发（防重复投递）", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  // 缓冲里有未 flush 的正文（将由 finalize 正常发送）→ final 与其无关
+  // 不能判定为「全文未投递」——缓冲内容本身就是待发正文
+  await ctrl.onPartialReply("待发段文本");
+  await flush();
+  assert.strictEqual(ctrl.computeUnsentRemainder("完全无关的 final 文本"), "");
+});
+
+await test("issue #44 守卫: stream 模式 final 与流出内容无关 → 维持空串语义（不整文补发）", async () => {
+  const ctrl = makeController({ sendMode: "stream" });
+
+  await ctrl.onPartialReply("已流出正文");
+  await flush();
+  // stream 模式此形态 = 模型重写，正文已在流中可见 → 维持丢弃语义
+  assert.strictEqual(ctrl.computeUnsentRemainder("完全无关的 final 文本"), "");
+});
+
+await test("issue #44 守卫: final 恰为最后已 flush 段落本身 → 空串（正常去重不受兜底影响）", async () => {
+  const ctrl = makeController({ sendMode: "static" });
+
+  await ctrl.onPartialReply("段A文本");
+  await ctrl.flushSegment();
+  await flush();
+  // trailing tool 后无新文本：final = 已 flush 的段A 本身（或其 + footer）
+  assert.strictEqual(ctrl.computeUnsentRemainder("段A文本"), "");
+  assert.strictEqual(ctrl.computeUnsentRemainder("段A文本\nUsage: 1 in / 1 out"), "\nUsage: 1 in / 1 out");
+});
+
 // ============ Stream 模式回归（默认行为不变） ============
 
 console.log("\n=== 2. Stream 模式回归（默认行为） ===");
