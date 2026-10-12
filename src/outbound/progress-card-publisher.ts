@@ -35,7 +35,7 @@
  * 内部 promise chain 保证卡片串行。
  */
 
-import { formatPlanChecklistLines } from 'openclaw/plugin-sdk/channel-message';
+import { formatPlanChecklistLines } from 'openclaw/plugin-sdk/channel-outbound';
 import type { ProgressCardConfig } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
 
