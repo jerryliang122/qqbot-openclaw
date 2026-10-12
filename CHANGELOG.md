@@ -8,13 +8,22 @@
 
 ---
 
-## [Unreleased]
+## [2.4.0] - 2026-10-12
 
 ### 修复
 
 - **openclaw 2026.10.2 盯版：SDK 子路径被删致插件加载失败**。openclaw `2026.10.2` **整体移除了 9 个 `openclaw/plugin-sdk` 子路径**（`channel-message`、`channel-lifecycle`、`channel-reply-pipeline`、`command-auth`、`config-runtime`、`discord`、`infra-runtime`、`telegram-account`）。本插件实际命中的**只有 `channel-message`**——progress card 渲染器 `formatPlanChecklistLines` 的唯一来源。该子路径被删时 `.d.ts` 一并消失，tsc 只报"找不到模块"，但**真正的后果是 `dist/index.cjs` 在加载期直接抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`，整个插件所有功能全灭**（不是某个功能降级）。修复：把该 import 迁到 `openclaw/plugin-sdk/channel-outbound`——**9.1 与 10.2 都在**，`formatPlanChecklistLines` 签名两版一致（10.2 仅将 `plain` 选项标注 `@deprecated`，本插件未传该选项），故**基线钉版 2026.9.1 与 peer 范围 `>=2026.9.1` 均无需改动**，对老版本用户零影响。同批复核确认未受影响：其余 8 个被删子路径与 approval 侧被删的 `matchesApprovalRequestSessionFilter` / `resolveApprovalRequestAccountId` / `resolveApprovalRequestChannelAccountId` / `createChannelApprovalForwardingEvaluator` 本插件均未引用；`ChannelApprovalKind`（两版均含 `"system-agent"`）、`replyOptions` 的 `onPlanUpdate` / `suppressDefaultToolProgressMessages` / `allowProgressCallbacksWhenSourceDeliverySuppressed` / `queueModeOverride` / `sourceReplyDeliveryMode`、`room_event` + `message_tool_only`、`resolveToolPolicy`、`appendUsageLine` 在 10.2 原样存在。10.2 新增的 `ChannelGatewayAdapterV2` / `ChannelGatewayContextV2` 是**可选的 gateway V2 契约**（`ChannelPluginForGatewayVersion` 按 `GatewayVersion extends 1|2 = 1` 分派），插件未声明 `apiVersion` 仍走 V1，无需跟进。10.2 与基线 9.1 双跑 typecheck / lint:runtime / build / 全量测试全绿。
 
 ### 新增
+
+- **被动回复配额锚点改造：旧配额优先消耗 + 平台时钟窗口 + msg_seq 显式发号 + 锚点失效兜底**（含两轮评审闭环）。出站被动锚点的选取/消耗/发号统一收敛到网关 `attachMsgIdWithQuota` 单点（此前 adapter 侧另有缓存兜底，两处口径可能不一致）：
+  - **选取策略**：无显式锚点的出站从「只取最新 msg_id」改为**旧配额先用先耗尽**（`selectMsgIdForPassiveReply` 按接收时间旧→新，跳过窗口已过/额度耗尽候选）——为最新消息保留完整额度做它自己 turn 的回复锚点，**节省每日主动发送预算**。
+  - **过期窗口对齐平台时钟**：入站登记时以**平台事件 timestamp**（`Date.parse`，NaN 回退本地时钟）幂等预注册配额窗口，替代旧「首次消耗时刻起算」的错误算法（真实过期时间是锚点**接收时刻**起算，不是消耗时刻）；msgid-cache 的 c2c TTL 30→60min，与配额层共用 `PLATFORM_PASSIVE_WINDOW`。
+  - **msg_seq 显式单调发号**：替代 SDK 的准随机注入（可产生 0，且同 msg_id 下存在碰撞），插件自持 per-(account,msgId) 计数器从 1 起、经 `bot.send` 的 `extra.msg_seq` 显式下发，失败只回滚 count 不回退 seq。
+  - **锚点失效兜底**：被动发送被平台 **40034005（msg_id 已过期）/ 40034128（回复次数超限）** 确定性拒绝时，剔除死锚点 + 回滚配额 + **同内容转主动重发一次**（此前这类失败会直接硬失败、无兜底，重复发锚点极易触发超限）；网络错（结果不明）与其他业务码不重发以免重复。
+  - **评审闭环一**：progress card 等 `passiveOnly` 发送的死锚点**不转主动重发**（原错误上抛、不计每日预算——卡片绝不烧主动预算）；死锚点置 `dead` 标记防回滚复活（主动重发也失败时补偿回滚不得把 count 减回 limit 以下、死锚点被再次挂接）。
+  - **评审闭环二**：配额缓存容量控制从纯 FIFO 改为**先清扫过期条目（含窗口已过的死锚点）、仍超限才 FIFO**，并让消耗/探测触达把活跃条目沉到队尾（LRU）——旧纯 FIFO 在稳态下淘汰的恰是「最旧且窗口未过」的活跃锚点（即旧配额优先要用的），淘汰后窗口被静默搬到当下 → 平台 40034005 → 烧每日主动预算；条目重建改用 msgid-cache 登记的**真实接收时刻**（诚实重建）而非 now+TTL。
+  - 已知残余：媒体路径（SDK `sendMedia`）与 typing（SDK `sendInputNotify`）无 seq 透传位，仍走准随机 seq，单次碰撞概率约 4/65536，失败回滚可自愈；排障时勿按「seq 已完全受控」推断。回归测试 `tests/quota-manager.test.ts`、`tests/passive-anchor-selection.test.ts`。
 
 - **SDK 依赖面守卫测试**（`tests/sdk-surface.test.ts`，盯版常态化）：把「插件引用的 `openclaw/plugin-sdk/*` 依赖面」固化为可执行断言，让**下一次**子路径消失在 CI 就红，而不是发版后炸。扫描 `src/**/*.ts` + `index.ts` 的全部 SDK 引用 → 断言每个子路径都在已安装包的 `exports` 内 → 用**裸 node 子进程**断言每个子路径都能 require 出来、且静态具名导入的值导出确实存在 → 额外断言 `dist/index.cjs` 能被 Node 原生 CJS 加载器 require（复刻生产加载路径）；并守住两条既有约定：ambient stub（`src/openclaw-plugin-sdk.d.ts`）声明的模块必须**确实仍无官方 `.d.ts`**（包一旦补上，ambient `declare module` 会遮蔽真实类型，typecheck 等于没验证），以及 devDependency 钉版必须精确钉在 peer 范围允许的最低版本。**扫描按引号字面量取子路径全集，不解析 import 语句形态**——初版只匹配静态 `import {…} from`，漏掉了四种同样承重的用法，评审实测确认下一版本子路径删除仍会全绿放行：`await import('…/approval-gateway-runtime')`（审批按钮 tap 核心路径）、`import('…/question-gateway-runtime')`（ask_user 问题流）、`getReq()('…/health')` 这类字面量惰性 require（workspace / pairing / media）、`export {…} from '…/setup-tools'`（adapter/setup.ts）；形态会随代码演化增删，解析语句必然再次漏，引号字面量才是稳定全集。**豁免必须显式登记**（`EXEMPT_SUBPATHS`，默认空）：`webhook-ingress` 虽在 adapter/webhook.ts 是 `.catch()` 降级用法，但刻意不豁免——子路径被删时 `.catch` 会把故障吞成"webhook 入站静默失效"，比直接抛错更难发现，这正是守卫最该管的场景。另有两处**防守卫自身失效**的自检：ambient stub 的 `.d.ts` 探测路径用"确定存在的 core 子路径"校准（初版路径拼接多了一层 `plugin-sdk/`，探测目标恒不存在，断言永久空转永不报警），以及扫描器覆盖度自检把六条非常规形态引用的子路径钉死（扫描器一旦退化回只认静态 import 立即报错）。**具名子句的值/类型分类也必须逐项判**：`import { fn, type Opts } from '…'` 的 inline `type` 标记若被剥掉后一律当值导出，接口在运行时不存在会让守卫误报"缺少运行时值"，把人引去查一个并不存在的 SDK 缺陷——而 inline `type` 是本仓库主流写法（当前 SDK 引用恰好都没用它，属侥幸）；该分类已抽成纯函数并用合成用例单测钉死，同时保留整条 `import type` 的类型计数（否则 `typeOnly` 退化为死字段、用例标题里的类型数恒为 0 而无人察觉）。**运行时断言必须放子进程**是本测试的另一处关键设计：openclaw 是 ESM 包、部分依赖（如 `unicorn-magic`）exports 只有 `import` 条件没有 `require` 条件，而 tsx 会 patch `Module._resolveFilename`，在 tsx 进程内直接 require 这些子路径会误报 `No exports main defined in unicorn-magic`——那是加载器差异、不是插件缺陷，误判会让人去改本来没坏的代码。
 
