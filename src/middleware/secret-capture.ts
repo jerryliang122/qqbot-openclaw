@@ -104,7 +104,7 @@ export function secretCapture(params: SecretCaptureParams): Middleware {
     }
 
     // 红线：多问题 ask_user 进行中 → 其答案/确认卡消息优先，绝不拦截
-    if (findPendingMultiQuestionByConversation('c2c', senderId)) {
+    if (findPendingMultiQuestionByConversation(accountId, 'c2c', senderId)) {
       await next();
       return;
     }

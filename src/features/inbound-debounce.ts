@@ -27,7 +27,8 @@
  *   命令标记（rawBody 拼接后可能不以 '/' 开头），必须原样直发；
  * - 多问题 ask_user 的 keyed 答案文本（"1: 3\n2: 1"）：合并会改写答案
  *   文本，框架 keyed 文本认领失败 → 挂起的 ask_user 永远等不到答案；
- *   按 findPendingMultiQuestionByConversation('c2c', peer) 识别。
+ *   按 findPendingMultiQuestionByConversation(accountId, 'c2c', peer) 识别
+ *   （会话键含账号维度——openid 是 per-account 的，跨账号不共享 pending）。
  *
  * 合并语义（onFlush 多条时）：
  * - 先按平台事件 timestamp 稳定排序（中间件链并发执行，附件下载慢的
@@ -150,8 +151,10 @@ function shouldDebounceC2CItem(item: C2CInboundDebounceItem): boolean {
   // 斜杠命令：合并会破坏命令标记（rawBody 拼接后可能不以 '/' 开头）
   if (text.startsWith('/')) return false;
 
-  // 多问题 ask_user 的 keyed 答案文本：合并会改写答案、认领失败
-  if (findPendingMultiQuestionByConversation('c2c', item.msg.replyTarget.targetId)) {
+  // 多问题 ask_user 的 keyed 答案文本：合并会改写答案、认领失败。
+  // 会话键含 accountId（openid 是 per-account 的，跨账号同 targetId
+  // 不共享 pending 记录）
+  if (findPendingMultiQuestionByConversation(item.account.accountId, 'c2c', item.msg.replyTarget.targetId)) {
     return false;
   }
 
