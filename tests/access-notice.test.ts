@@ -30,6 +30,8 @@ process.env.HOME = fakeHome;
 const {
   ACCESS_NOTICE_COOLDOWN_MS,
   ACCESS_NOTICE_DAILY_CAP,
+  ACCESS_NOTICE_SEND_TIMEOUT_MS,
+  NoticeSendTimeoutError,
   _resetAccessNotice,
   buildAccessNoticeText,
   isMessageAddressedToBot,
@@ -67,17 +69,24 @@ await test('c2c 文案带出用户自己的 OpenID 与配置位置', () => {
   assert.ok(text.includes('dmPolicy'), '应给出免手工改配置的替代路径');
 });
 
-await test('非 default 账号提示 accounts.<id> 层级（配错层级是常见误配）', () => {
+await test('非 default 账号：准确路径是 accounts.<id>，不是顶层键', () => {
   const text = buildAccessNoticeText({ scope: 'c2c', id: 'X', accountId: 'bot2' });
-  assert.ok(text.includes('channels.qqbot.accounts.bot2.allowFrom'));
-  assert.ok(!text.includes('accounts.default'));
+  assert.ok(text.includes('channels.qqbot.accounts.bot2.allowFrom'), '主路径必须是账号自己的键');
+  assert.ok(!text.includes('`channels.qqbot.allowFrom`'), '顶层键属于 default 账号，指错地方会让人白改');
 });
 
-await test('群文案带出 groupOpenid 与 groupAllowFrom / groupPolicy', () => {
-  const text = buildAccessNoticeText({ scope: 'group', id: 'GRP_OPENID_ZZ', accountId: 'default' });
-  assert.ok(text.includes('GRP_OPENID_ZZ'));
+await test('群提示不得出现真实 accountId（公开广播给全体成员）', () => {
+  const text = buildAccessNoticeText({ scope: 'group', id: 'G', accountId: 'secret-bot-name' });
+  assert.ok(!text.includes('secret-bot-name'), '群成员不应看到内部账号名');
+  assert.ok(text.includes('accounts.<accountId>'), '改给泛化指引，账号所有者知道是哪一层');
   assert.ok(text.includes('channels.qqbot.groupAllowFrom'));
-  assert.ok(text.includes('groupPolicy'), '应提示可放行所有群');
+});
+
+await test('default 账号不出现 accounts 提示', () => {
+  const c2c = buildAccessNoticeText({ scope: 'c2c', id: 'X', accountId: 'default' });
+  assert.ok(!c2c.includes('accounts.'));
+  const grp = buildAccessNoticeText({ scope: 'group', id: 'G', accountId: 'default' });
+  assert.ok(!grp.includes('accounts.'));
 });
 
 await test('文案绝不回显白名单内容（不向陌生人泄露配置）', () => {
@@ -206,7 +215,7 @@ interface MsgOverrides {
   msgId?: string;
 }
 
-function makeCtx(policy: Record<string, unknown>, msg: MsgOverrides = {}, opts: { failSend?: boolean } = {}) {
+function makeCtx(policy: Record<string, unknown>, msg: MsgOverrides = {}, opts: { failSend?: boolean; hangSend?: boolean } = {}) {
   const sent: Array<{ target: unknown; text: string }> = [];
   let stopReason: string | undefined;
   let nextCalled = false;
@@ -221,6 +230,7 @@ function makeCtx(policy: Record<string, unknown>, msg: MsgOverrides = {}, opts: 
     bot: {
       appId: '998877',
       sendText: async (target: unknown, text: string) => {
+        if (opts.hangSend) await new Promise(() => {}); // 永不 settle：复现挂住的请求
         if (opts.failSend) throw new Error('boom: send failed');
         sent.push({ target, text });
       },
@@ -344,13 +354,102 @@ await test('发送失败 → 回滚预留，下一条仍能收到提示', async 
   assert.equal(ok.sent.length, 1, '上一次失败不得让该用户在冷却窗口内彻底静默');
 });
 
-await test('提示走被动锚点（不带显式 msgId，由网关挂接）', async () => {
+await test('发送挂住 → 超时后仍走到 ctx.stop（不悬住被拒消息）', async () => {
+  _resetAccessNotice();
+  const mwFast = dynamicAccessControl({
+    accountId: ACCT,
+    getRuntime: () => ({}),
+    noticeTimeoutMs: 50,
+  });
+  const h = makeCtx(
+    { c2cMode: 'allowlist', allowFrom: [ALLOWED] },
+    { senderId: 'STALL_USER' },
+    { hangSend: true },
+  );
+  await mwFast(h.ctx as never, (async () => h.setNext(true)) as never);
+  assert.equal(h.getStop(), 'access:not_allowlisted', '发送挂死也必须完成拦截');
+  assert.ok(
+    h.logs.some((l) => l.includes('timeout, cooldown kept')),
+    '超时应留痕并说明冷却未回滚',
+  );
+});
+
+await test('发送超时（结果不明）→ 保留冷却，下一条不再重复发', async () => {
+  _resetAccessNotice();
+  const mwFast = dynamicAccessControl({
+    accountId: ACCT,
+    getRuntime: () => ({}),
+    noticeTimeoutMs: 50,
+  });
+  const policy = { c2cMode: 'allowlist', allowFrom: [ALLOWED] };
+  const hang = makeCtx(policy, { senderId: 'DUP_USER' }, { hangSend: true });
+  await mwFast(hang.ctx as never, (async () => hang.setNext(true)) as never);
+
+  const next = makeCtx(policy, { senderId: 'DUP_USER' });
+  await mwFast(next.ctx as never, (async () => next.setNext(true)) as never);
+  assert.equal(next.sent.length, 0, '超时后平台可能已投递，不应立刻再发一条');
+  assert.equal(next.getStop(), 'access:not_allowlisted');
+});
+
+await test('发送确定性失败 → 回滚预留（与超时相反）', async () => {
+  _resetAccessNotice();
+  const policy = { c2cMode: 'allowlist', allowFrom: [ALLOWED] };
+  const fail = makeCtx(policy, { senderId: 'RETRY_USER' }, { failSend: true });
+  await mw(fail.ctx as never, (async () => fail.setNext(true)) as never);
+  const next = makeCtx(policy, { senderId: 'RETRY_USER' });
+  await mw(next.ctx as never, (async () => next.setNext(true)) as never);
+  assert.equal(next.sent.length, 1, '确定性失败必须让用户还能收到下一条提示');
+});
+
+await test('迟到失败不得抹掉更新的预留（release 校验 token）', () => {
+  _resetAccessNotice();
+  const t0 = 7_000_000;
+  // 第一次发送挂起，10 分钟后同一实体的第二封消息重新预留并成功发出
+  const hanging = reserveAccessNotice({ accountId: ACCT, scope: 'c2c', id: 'STALE', now: t0 });
+  assert.equal(hanging.allowed, true);
+  const newer = reserveAccessNotice({
+    accountId: ACCT,
+    scope: 'c2c',
+    id: 'STALE',
+    now: t0 + ACCESS_NOTICE_COOLDOWN_MS,
+  });
+  assert.equal(newer.allowed, true);
+
+  // 挂起的那条此刻才失败：无条件 delete key 会把新冷却一并抹掉
+  hanging.release();
+
+  const afterStaleFailure = reserveAccessNotice({
+    accountId: ACCT,
+    scope: 'c2c',
+    id: 'STALE',
+    now: t0 + ACCESS_NOTICE_COOLDOWN_MS + 1,
+  });
+  assert.equal(
+    afterStaleFailure.allowed,
+    false,
+    '新预留的冷却必须仍在——否则用户会紧接着再收一条重复诊断',
+  );
+});
+
+await test('容量压力下不淘汰未过期的冷却（条目宁可临时超出上限）', () => {
+  _resetAccessNotice();
+  const t0 = 8_000_000;
+  for (let i = 0; i < 2100; i++) {
+    reserveAccessNotice({ accountId: ACCT, scope: 'c2c', id: `cap-${i}`, now: t0 });
+  }
+  const first = reserveAccessNotice({ accountId: ACCT, scope: 'c2c', id: 'cap-0', now: t0 + 1000 });
+  assert.equal(first.allowed, false, '最早的条目冷却未过，不该被容量控制淘汰');
+  assert.equal(first.allowed ? '' : first.reason, 'cooldown');
+});
+
+await test('提示走被动锚点（SDK 从 ctx.replyTarget.msgId 取当前入站消息）', async () => {
   _resetAccessNotice();
   const h = makeCtx({ c2cMode: 'allowlist', allowFrom: [ALLOWED] }, { senderId: 'ANCHOR_USER', msgId: 'mm-1' });
   await mw(h.ctx as never, (async () => h.setNext(true)) as never);
   assert.equal(h.sent.length, 1);
-  const target = h.sent[0].target as { targetId?: string };
+  const target = h.sent[0].target as { targetId?: string; msgId?: string };
   assert.equal(target.targetId, 'ANCHOR_USER');
+  assert.equal(target.msgId, 'mm-1', 'msgId 必须透传给 SDK 走被动回复，不吃每日主动预算');
 });
 
 // ============ 收尾 ============

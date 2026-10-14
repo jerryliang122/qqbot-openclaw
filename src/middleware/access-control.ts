@@ -11,9 +11,12 @@
 import type { Middleware } from '@tencent-connect/qqbot-nodejs';
 import { getPairingApi } from '../adapter/pairing.js';
 import {
+  ACCESS_NOTICE_SEND_TIMEOUT_MS,
   buildAccessNoticeText,
   isMessageAddressedToBot,
+  NoticeSendTimeoutError,
   reserveAccessNotice,
+  withNoticeTimeout,
 } from '../features/access-notice.js';
 
 
@@ -29,8 +32,13 @@ import {
 export function dynamicAccessControl(params: {
   accountId: string;
   getRuntime: () => any;
+  /**
+   * 拒绝提示发送的本地超时上限。生产用默认值；测试注入极短值以复现
+   * 「发送请求挂住」而不必等满 8s。
+   */
+  noticeTimeoutMs?: number;
 }): Middleware {
-  const { accountId, getRuntime } = params;
+  const { accountId, getRuntime, noticeTimeoutMs = ACCESS_NOTICE_SEND_TIMEOUT_MS } = params;
 
   return async (ctx, next) => {
     const p = ctx.state.policy as Record<string, unknown> | undefined;
@@ -81,7 +89,7 @@ export function dynamicAccessControl(params: {
     ctx.log?.info?.(
       `[access] blocked ${isGroup ? 'group' : 'c2c'} from ${id}: not in ${listLabel}`,
     );
-    await notifyNotAllowlisted(ctx, { accountId, isGroup, id });
+    await notifyNotAllowlisted(ctx, { accountId, isGroup, id, timeoutMs: noticeTimeoutMs });
     ctx.stop('access:not_allowlisted');
   };
 }
@@ -96,7 +104,7 @@ export function dynamicAccessControl(params: {
  */
 async function notifyNotAllowlisted(
   ctx: any,
-  opts: { accountId: string; isGroup: boolean; id: string },
+  opts: { accountId: string; isGroup: boolean; id: string; timeoutMs: number },
 ): Promise<void> {
   const { accountId, isGroup, id } = opts;
   const scope = isGroup ? 'group' : 'c2c';
@@ -118,13 +126,22 @@ async function notifyNotAllowlisted(
 
   const text = buildAccessNoticeText({ scope, id, accountId });
   try {
-    // 不带显式 msgId：网关 attachMsgIdWithQuota 会选中本条入站消息的被动锚点
-    await ctx.bot.sendText(ctx.replyTarget, text);
+    // 被动回复靠 ctx.replyTarget.msgId —— SDK 的 deriveReplyTarget 已把当前
+    // 入站消息的 messageId 挂在上面，sendText 见 msgId 即带 body.msg_id 下发。
+    // 被拒消息没有 turn，不存在跟别的 turn 抢配额的问题，故不必绕网关锚点选取
+    // （绕过去反而会挑到更早的缓存 msg_id，或在死锚点时降级主动、把每日预算
+    // 暴露给刷屏者）。套本地超时：请求挂住就永远走不到 ctx.stop。
+    await withNoticeTimeout(ctx.bot.sendText(ctx.replyTarget, text), opts.timeoutMs);
     ctx.log?.info?.(`[access] sent not-allowlisted notice to ${scope} ${id}`);
   } catch (err) {
-    reservation.release();
+    // 超时 = 结果不明（平台可能已投递）→ **保留冷却不回滚**，否则紧接着的
+    // 下一条被拒消息会再发一遍，用户收到重复诊断；等冷却窗口过去自然恢复。
+    if (!(err instanceof NoticeSendTimeoutError)) {
+      reservation.release();
+    }
     ctx.log?.warn?.(
-      `[access] not-allowlisted notice send failed for ${scope} ${id}: ${err instanceof Error ? err.message : String(err)}`,
+      `[access] not-allowlisted notice send failed for ${scope} ${id}` +
+        `${err instanceof NoticeSendTimeoutError ? ' (timeout, cooldown kept)' : ''}: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 }
