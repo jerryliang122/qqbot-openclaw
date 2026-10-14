@@ -34,7 +34,16 @@ export const ACCESS_NOTICE_COOLDOWN_MS = 10 * 60 * 1000;
 /** 每账号每日提示条数上限（跨被拒实体累计，防大量陌生者把 bot 当回声板） */
 export const ACCESS_NOTICE_DAILY_CAP = 50;
 
-/** 冷却表容量上限：先扫过期条目，仍超限再按插入序淘汰 */
+/**
+ * 提示发送的本地超时。中间件 await 的是裸 SDK 发送——请求挂住就永远走不到
+ * `ctx.stop`，被拒消息的处理会一直悬着（占住防抖槽位）。
+ *
+ * 取值远小于网关出站 30s：提示是诊断消息，等 30s 没有收益，8s 足够覆盖
+ * 正常 API 往返。
+ */
+export const ACCESS_NOTICE_SEND_TIMEOUT_MS = 8_000;
+
+/** 冷却表容量上限：先扫过期条目；过期条目不足时宁可超出也不动未过期的 */
 const MAX_TRACKED_KEYS = 2000;
 
 export type AccessNoticeScope = 'c2c' | 'group';
@@ -44,10 +53,18 @@ export type AccessNoticeDenial = {
   reason: 'cooldown' | 'daily_cap';
 };
 
-/** 冷却槽：accountId + scope + 被拒实体 id 维度 */
-const lastSentAt = new Map<string, number>();
+/** 已发出的预留句柄：`release` 只在本次预留仍是持有者时才生效 */
+export type AccessNoticeReservation = {
+  allowed: true;
+  release: () => void;
+};
+
+/** 冷却槽：accountId + scope + 被拒实体 id 维度；token 用于校验预留归属 */
+const lastSentAt = new Map<string, { at: number; token: symbol }>();
 /** 每日计数：accountId 维度，跨天自动重置 */
 const dailyCounters = new Map<string, { date: string; count: number }>();
+
+let tokenSeq = 0;
 
 function today(now: number): string {
   return new Date(now).toISOString().slice(0, 10);
@@ -57,37 +74,41 @@ function cooldownKey(accountId: string, scope: AccessNoticeScope, id: string): s
   return `${accountId}:${scope}:${id}`;
 }
 
-/** 先扫过期（超冷却窗口）条目，再按插入序 FIFO 淘汰，避免长期运行无限累积 */
+/**
+ * 容量控制：先扫过期（超冷却窗口）条目；**过期条目不足时宁可临时超出上限，
+ * 也不淘汰未过期的条目**——淘汰会让被误伤的发送者在 10 分钟内再收一条，
+ * 节流形同虚设。条目寿命上限即冷却窗口，稳态规模由「10 分钟内的被拒实体数」
+ * 自然封顶，一个条目几十字节，不构成内存风险。
+ */
 function enforceCapacity(now: number): void {
   if (lastSentAt.size <= MAX_TRACKED_KEYS) return;
-  for (const [key, at] of lastSentAt) {
-    if (now - at >= ACCESS_NOTICE_COOLDOWN_MS) lastSentAt.delete(key);
-  }
-  while (lastSentAt.size > MAX_TRACKED_KEYS) {
-    const oldest = lastSentAt.keys().next().value;
-    if (oldest === undefined) break;
-    lastSentAt.delete(oldest);
+  for (const [key, slot] of lastSentAt) {
+    if (now - slot.at >= ACCESS_NOTICE_COOLDOWN_MS) lastSentAt.delete(key);
   }
 }
 
 /**
  * 预留一条提示额度（冷却 + 每日上限）。
  *
- * 预留即写表，调用方发送失败必须调 `release()` 回滚——否则一次发送失败
- * 会让该用户在冷却窗口内彻底静默，等于把本次要修的 bug 换个入口复现。
+ * 预留即写表，调用方在**确定发送失败**时必须调 `release()` 回滚——否则一次
+ * 发送失败会让该用户在冷却窗口内彻底静默，等于把本次要修的 bug 换个入口复现。
+ *
+ * `release()` 校验 token：一次发送挂起超过冷却窗口后，同一实体的**新**预留
+ * 可能已就位，此时旧请求的迟到失败若无条件删除 key，会把新冷却一并抹掉，
+ * 让该用户紧接着又收到一条。
  */
 export function reserveAccessNotice(params: {
   accountId: string;
   scope: AccessNoticeScope;
   id: string;
   now?: number;
-}): { allowed: true; release: () => void } | AccessNoticeDenial {
+}): AccessNoticeReservation | AccessNoticeDenial {
   const { accountId, scope, id } = params;
   const now = params.now ?? Date.now();
   const key = cooldownKey(accountId, scope, id);
 
   const last = lastSentAt.get(key);
-  if (last !== undefined && now - last < ACCESS_NOTICE_COOLDOWN_MS) {
+  if (last !== undefined && now - last.at < ACCESS_NOTICE_COOLDOWN_MS) {
     return { allowed: false, reason: 'cooldown' };
   }
 
@@ -102,17 +123,43 @@ export function reserveAccessNotice(params: {
   }
 
   counter.count += 1;
-  lastSentAt.set(key, now);
+  const token = Symbol(`notice-${tokenSeq++}`);
+  lastSentAt.set(key, { at: now, token });
   enforceCapacity(now);
 
   return {
     allowed: true,
     release: () => {
+      // 仅当 key 仍由本次预留持有时才回滚，避免抹掉更新的预留
+      if (lastSentAt.get(key)?.token !== token) return;
       lastSentAt.delete(key);
       const current = dailyCounters.get(accountId);
       if (current && current.date === date && current.count > 0) current.count -= 1;
     },
   };
+}
+
+/** 发送超时（**结果不明**：平台可能已投递）——与确定性失败区分对待 */
+export class NoticeSendTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`访问提示发送超时（${ms}ms，结果不明）`);
+    this.name = 'NoticeSendTimeoutError';
+  }
+}
+
+/**
+ * 给提示发送套本地超时。原始 promise 仍会跑完：挂 `.catch` 吞掉它的迟到
+ * 拒绝，否则超时后无人接管的 rejection 会变成 unhandledRejection 噪音。
+ */
+export function withNoticeTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  if (ms <= 0) return promise;
+  promise.catch(() => {
+    /* 迟到失败：调用方已按超时处理（结果不明），此处只防止 unhandledRejection */
+  });
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new NoticeSendTimeoutError(ms)), ms)),
+  ]);
 }
 
 /**
@@ -149,6 +196,12 @@ export function isMessageAddressedToBot(
 /**
  * 拒绝提示文案。刻意带出**被拒者自己的 ID**——用户拿到的第一手可粘贴线索，
  * 无需另跑 `/bot-me`；也不回显任何白名单内容（不泄露配置给陌生人）。
+ *
+ * 两处配置层级约束（改文案时务必保持）：
+ * - **命名账号的主路径必须是 `accounts.<id>`**：顶层 `channels.qqbot.allowFrom`
+ *   只属于 default 账号，让命名账号的用户去改顶层会改错地方、拒绝依旧。
+ * - **群提示不得出现真实 accountId**：群提示是公开广播，任何触发者都能看到。
+ *   命名账号在群里只给「同名键在 `accounts.<accountId>` 下」的泛化指引。
  */
 export function buildAccessNoticeText(params: {
   scope: AccessNoticeScope;
@@ -158,9 +211,17 @@ export function buildAccessNoticeText(params: {
   const { scope, id, accountId } = params;
   const listKey = scope === 'group' ? 'groupAllowFrom' : 'allowFrom';
   const idLabel = scope === 'group' ? '本群 groupOpenid' : '你的 OpenID';
-  // 非 default 账号的配置在 accounts.<id> 下——配错层级是常见误配，直接点破
+  const isNamedAccount = accountId !== 'default';
+
+  // 私聊只有当事人看得到 → 直接给准确路径；群是公开广播 → 只给泛化指引，不暴露账号名
+  const configPath =
+    isNamedAccount && scope === 'c2c'
+      ? `channels.qqbot.accounts.${accountId}.${listKey}`
+      : `channels.qqbot.${listKey}`;
   const accountHint =
-    accountId === 'default' ? [] : [`多账号机器人请改：channels.qqbot.accounts.${accountId}.${listKey}`];
+    isNamedAccount && scope === 'group'
+      ? ['（多账号机器人在 `channels.qqbot.accounts.<accountId>` 下有同名键）']
+      : [];
   const remedy =
     scope === 'group'
       ? '把上面的 ID 加进 `groupAllowFrom`，或设 `groupPolicy: "open"` 放行所有群；'
@@ -170,7 +231,7 @@ export function buildAccessNoticeText(params: {
     `🚫 未接入：${scope === 'group' ? '本群' : '你的 OpenID'}不在本机器人的 \`${listKey}\` 白名单里，消息已拦截。`,
     '',
     `${idLabel}：\`${id}\``,
-    `配置位置：openclaw.json → \`channels.qqbot.${listKey}\``,
+    `配置位置：openclaw.json → \`${configPath}\``,
     ...accountHint,
     '',
     remedy,
