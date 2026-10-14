@@ -6,6 +6,7 @@
 
 import type { PluginRuntime } from "openclaw/plugin-sdk";
 import { setOpenClawVersion } from "./bot-instance.js";
+import { flushAllC2CInboundDebouncers } from "./features/inbound-debounce.js";
 import { flushAllRefIndexStores } from "./features/ref-index-store.js";
 import { getOpenclawVersion } from "./utils/pkg-version.js";
 
@@ -25,6 +26,10 @@ function installExitHooksOnce(): void {
 
   const flush = () => {
     try { flushAllRefIndexStores(); } catch {}
+    // c2c 入站防抖缓冲 best-effort 冲刷：SIGINT/SIGTERM 下 process.exit
+    // 不等待（丢失 ≤ 一个窗口的消息，与在途处理同级别损失）；beforeExit
+    // 下 drain 的异步 dispatch 会重新拉起事件循环自然完成。
+    try { void flushAllC2CInboundDebouncers(); } catch {}
   };
 
   process.on('beforeExit', flush);

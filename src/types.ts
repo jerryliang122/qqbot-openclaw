@@ -185,6 +185,15 @@ export interface QQBotAccountConfig {
    */
   typing?: TypingIndicatorConfig;
   /**
+   * 私聊入站消息防抖合并（仅 C2C 生效；群聊合并由框架 followup 队列承担）
+   *
+   * QQ 私聊除图片外，文件与文字只能是两条独立消息（无"文件描述"附件窗口），
+   * 而 c2c turn 可插嘴——先发的文件 turn 会被随后到达的文字直接打断。
+   * 启用后，同一发送者在防抖窗口内的连续消息合并为一次 dispatch，
+   * 文件与伴随文字组成一个 turn。
+   */
+  inboundDebounce?: InboundDebounceConfig;
+  /**
    * 指令面板配置（openclaw 原生指令 → QQ Bot 指令面板自动注册）
    */
   commands?: CommandsConfig;
@@ -328,6 +337,28 @@ export interface TypingIndicatorConfig {
    * 受 QPS 限制，低于 20000 会被钳制到 20000
    */
   intervalMs?: number;
+}
+
+/**
+ * 私聊入站消息防抖合并配置（仅 C2C 生效）
+ */
+export interface InboundDebounceConfig {
+  /**
+   * 是否启用防抖合并（默认 true）
+   *
+   * 窗口自同发送者的最后一条消息起算（滑动窗口，框架硬上限为
+   * debounceMs × 5）。代价：每条私聊消息的 dispatch 固定延后一个窗口。
+   */
+  enabled?: boolean;
+  /**
+   * 防抖窗口毫秒数，解析优先级：
+   * 1. 本值（显式配置，0 = 关闭）
+   * 2. openclaw 框架 messages.inbound.byChannel.qqbot / messages.inbound.debounceMs
+   * 3. 默认 3000
+   *
+   * 钳制范围 [0, 60000]。
+   */
+  debounceMs?: number;
 }
 
 /**
