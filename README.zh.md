@@ -13,7 +13,7 @@
 > 运行要求：OpenClaw `>= 2026.9.1`；npm 包名 [`@jerryliang122/openclaw-qqbot`](https://www.npmjs.com/package/@jerryliang122/openclaw-qqbot)。
 > 与旧版本的差异及升级指南见 [CHANGELOG](CHANGELOG.md)。上游仓库：[tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot)。
 
-### 🚀 当前版本： `v1.0.0`
+### 🚀 当前版本： `v2.6.0`
 
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![QQ Bot](https://img.shields.io/badge/QQ_Bot-API_v2-red)](https://bot.q.qq.com/wiki/)
@@ -177,7 +177,7 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 > **你**：`/bot-version`
 >
-> **QQBot**：🦞框架版本：OpenClaw 2026.9.1 / 🤖QQBot 插件版本：v1.0.0 / 🌟GitHub 仓库
+> **QQBot**：🦞框架版本：OpenClaw 2026.9.1 / 🤖QQBot 插件版本：v2.6.0 / 🌟GitHub 仓库
 
 一目了然查看框架版本、插件版本，并可直接跳转官方仓库。
 
