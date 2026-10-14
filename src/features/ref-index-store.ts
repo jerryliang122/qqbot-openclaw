@@ -287,3 +287,30 @@ export function flushAllRefIndexStores(): void {
     store.flush();
   }
 }
+
+/**
+ * 判断一条消息是否**引用了本 bot 的出站消息**（= 隐式被点名）。
+ *
+ * 唯一实现点：`mentionGate` 的 `isImplicitMention` 回调（middleware-setup）
+ * 与访问控制拒绝提示的「群里是否在叫 bot」判定（access-notice）共用此
+ * 判定。两处各自查一遍 ref-index 必然漂移——一旦隐式引用语义调整，提示会
+ * 在「以为被点名」与「实际没点名」之间错位。
+ *
+ * 索引不可用（读盘异常）时按「未引用」处理：宁可少回一条提示，也不该在
+ * 陌生群里误判成被点名而公开广播白名单配置。
+ */
+export function isQuoteOfBotMessage(
+  msg: { refMsgIdx?: string } | undefined,
+  accountId: string,
+): boolean {
+  const refMsgIdx = msg?.refMsgIdx;
+  if (!refMsgIdx) return false;
+  try {
+    const entry = getPersistedRefIndexStore(accountId).get(refMsgIdx) as
+      | { isBot?: boolean }
+      | undefined;
+    return entry?.isBot === true;
+  } catch {
+    return false;
+  }
+}
