@@ -584,6 +584,34 @@ Besides `requireMention`, each group supports these settings:
 }
 ```
 
+#### Direct-Message Access Control (`dmPolicy` / `allowFrom`)
+
+Control who may DM the bot via `dmPolicy` (default `allowlist`):
+
+| Policy | Description |
+|--------|-------------|
+| `"allowlist"` (default) | Only users listed in `allowFrom` may DM the bot |
+| `"open"` | Anyone may DM the bot |
+| `"pairing"` | Allowlist + pairing codes: strangers get a code, the admin approves with `/bot-pairing approve <code>` |
+| `"disabled"` | Direct messages are disabled entirely |
+
+```json
+{
+  "channels": {
+    "qqbot": {
+      "dmPolicy": "allowlist",
+      "allowFrom": ["USER_OPENID_1", "USER_OPENID_2"]
+    }
+  }
+}
+```
+
+**An empty `allowFrom`, or one containing `"*"`, applies no restriction.**
+
+> ⚠️ **OpenIDs are per-account**: a user OpenID obtained by bot A is meaningless to bot B. In multi-bot setups each account needs its own `allowFrom`.
+
+**Rejected senders get a reply**: when a DM's OpenID is not in the allowlist, the bot no longer drops the message silently — it replies with a diagnostic message containing **your own OpenID** and the exact config path. Paste that ID into `allowFrom` and save; it takes effect without a restart. Notices are throttled to once per 10 minutes per sender and 50 per account per day.
+
 #### Group Access Control (`groupPolicy`)
 
 Control which groups are allowed via `groupPolicy`:
@@ -604,6 +632,10 @@ Control which groups are allowed via `groupPolicy`:
   }
 }
 ```
+
+> An empty `groupAllowFrom`, or one containing `"*"`, applies no restriction.
+>
+> **In groups the bot only speaks up when explicitly addressed**: if the group is not in `groupAllowFrom` *and* the message **@-mentions the bot or quotes the bot's message**, the bot replies with a diagnostic message containing the `groupOpenid`. Ordinary chatter (no mention) is still dropped silently, so a bot dragged into an unfamiliar group never broadcasts its allowlist configuration.
 
 > You can also use [**`/bot-group-always`**](#bot-group-always--group-response-mode-toggle) to toggle account-level defaults at runtime without restarting.
 

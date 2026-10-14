@@ -25,7 +25,7 @@ import type { ResolvedQQBotAccount } from '../types.js';
 import { buildCommandList } from '../commands/index.js';
 import { attachmentProcessor } from '../middleware/attachment.js';
 import { assembleBody } from '../dispatch/body-assembler.js';
-import { getPersistedRefIndexStore } from '../features/ref-index-store.js';
+import { getPersistedRefIndexStore, isQuoteOfBotMessage } from '../features/ref-index-store.js';
 import { createPolicyInjector } from '../middleware/policy-injector.js';
 import { getHistoryStore, historyGroupKey } from '../features/history-store.js';
 import { dynamicAccessControl } from '../middleware/access-control.js';
@@ -87,20 +87,13 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
   //    isImplicitMention：引用 bot 出站消息 = 隐式被点名（对齐 telegram
   //    reply-to-bot 语义）。ref-index get 为同步内存查询，可直接放同步回调；
   //    仅全量模式（GROUP_MESSAGE_CREATE）下未 @ 消息才可能带引用进到这里。
+  //    判定收敛在 ref-index-store 的 isQuoteOfBotMessage —— 访问控制的拒绝
+  //    提示（「群里是否在叫 bot」）复用同一函数，两处不得各查一遍。
   bot.use(mentionGate({
-      isImplicitMention: (ctx) => {
-        const msg = ctx.message as { refMsgIdx?: string };
-        if (!msg?.refMsgIdx) return false;
-        try {
-          const entry = getPersistedRefIndexStore(account.accountId).get(msg.refMsgIdx) as
-            | { isBot?: boolean }
-            | undefined;
-          return entry?.isBot === true;
-        } catch (err) {
-          ctx.log.debug?.(`[mention] implicit quote-bot check failed: ${err instanceof Error ? err.message : String(err)}`);
-          return false;
-        }
-      },
+      isImplicitMention: (ctx) => isQuoteOfBotMessage(
+        ctx.message as { refMsgIdx?: string },
+        account.accountId,
+      ),
     }));
   // 7. 内容清洗（去 @marker、表情标签、多余空白）
   // SDK 用 appId 匹配 @标记，但 QQ openid 不等于 appId，追加 stripMentionText 正确剥离

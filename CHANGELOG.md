@@ -8,6 +8,14 @@
 
 ---
 
+## [Unreleased]
+
+### 新增
+
+- **白名单未命中不再静默丢弃：被拒用户收到可操作的诊断提示**。`dmPolicy` / `groupPolicy` 为 `allowlist`（默认）时，发送者不在 `allowFrom` / `groupAllowFrom` 的消息此前被 `dynamicAccessControl` 直接 `ctx.stop('access:not_allowlisted')` 丢弃，用户侧**零反馈**——「bot 挂了」「bot 装睡」「allowFrom 配错了」三种情况完全无法区分，只能翻服务端日志。而 OpenID 是 per-account 的（bot A 拿到的 openid 在 bot B 上无意义），配错本身就是高频误配。现新增 `src/features/access-notice.ts`，在拦截前发一条诊断消息：**私聊恒回告**，文案带出**被拒者自己的 OpenID** 与准确配置层级（默认账号 vs `accounts.<id>.allowFrom`，配错层级一并点破），用户可直接复制粘贴后热更新生效，无需另跑 `/bot-me`；文案**绝不回显白名单内容**，不向陌生人泄露配置。**群场景仅在被 @ / 引用 bot 时回告**：群提示是公开广播，bot 被拉进陌生群时逐条回「本群不在白名单」等于对外广播该 bot 配了白名单，全量推送群里还会变刷屏；只有明确点名 bot（`GROUP_AT_MESSAGE_CREATE` / `mentions[].is_you` / 内容 `<@!appId>` 标记 / 引用 bot 出站消息）时对方才可能在等回复。@/引用判定与 `mentionGate` **同源**——隐式引用逻辑收敛为 `ref-index-store` 导出的 `isQuoteOfBotMessage`，由 `middleware-setup` 的 `isImplicitMention` 回调与本提示共用，杜绝两处各查一遍 ref-index 导致的语义漂移。**节流**：同一被拒实体（私聊 = 发送者 openid / 群 = groupOpenid）10 分钟冷却 + 每账号每日 50 条上限，防陌生人把 bot 当回声板；额度预留后若发送失败会**回滚**，避免一次发送失败就让该用户在冷却窗口内彻底静默。提示经 `ctx.bot.sendText` 不带显式 msgId 发出，由网关 `attachMsgIdWithQuota` 自动挂载被动锚点（入站 `cacheMsgId` 在进中间件链之前已登记），正常路径吃被动回复额度、**不占每日 1000 条主动预算**。**保持原样的边界**：`disabled` 是管理员显式拉下的总闸（此时回话等于架空该开关，仍静默）；`pairing` 模式本就有配对挑战文案。回归测试 `tests/access-notice.test.ts`（27 例：文案 / @ 判定四路 / 冷却与每日上限 / 中间件端到端）。
+
+---
+
 ## [2.5.0] - 2026-10-14
 
 ### 新增

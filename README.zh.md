@@ -604,6 +604,34 @@ openclaw message send --channel "qqbot" \
 }
 ```
 
+#### 私聊访问控制（dmPolicy / allowFrom）
+
+通过 `dmPolicy` 控制哪些用户可以私聊机器人（默认 `allowlist`）：
+
+| 策略 | 说明 |
+|------|------|
+| `"allowlist"`（默认） | 仅 `allowFrom` 白名单中的用户可私聊 |
+| `"open"` | 所有用户均可私聊 |
+| `"pairing"` | 白名单 + 配对码：陌生用户私聊时收到配对码，管理员 `/bot-pairing approve <code>` 放行 |
+| `"disabled"` | 禁止所有私聊 |
+
+```json
+{
+  "channels": {
+    "qqbot": {
+      "dmPolicy": "allowlist",
+      "allowFrom": ["USER_OPENID_1", "USER_OPENID_2"]
+    }
+  }
+}
+```
+
+**`allowFrom` 为空或含 `"*"` 时不做限制**（所有用户均可私聊）。
+
+> ⚠️ **OpenID 是 per-account 的**：机器人 A 拿到的用户 OpenID 在机器人 B 上无意义，多账号场景下每个账号都要单独配置自己的 `allowFrom`。
+
+**被拒绝时会收到提示**：私聊消息的 OpenID 不在白名单里时，机器人不会静默丢弃，而是回复一条诊断消息，其中包含**你自己的 OpenID** 与配置位置——直接把它加进 `allowFrom` 保存配置即生效（热更新，无需重启）。同一用户 10 分钟内只提示一次，每个账号每天最多提示 50 条（防刷屏）。
+
 #### 群访问控制（groupPolicy）
 
 通过 `groupPolicy` 控制哪些群允许机器人加入并接收消息：
@@ -624,6 +652,10 @@ openclaw message send --channel "qqbot" \
   }
 }
 ```
+
+> `groupAllowFrom` 为空或含 `"*"` 时不做限制。
+>
+> **群场景只在明确叫 bot 时才回告**：本群不在 `groupAllowFrom` 里且消息 **@ 了机器人或引用了机器人的消息**时，机器人会公开回复一条含 `groupOpenid` 的诊断消息；普通闲聊（未点名 bot）仍然静默丢弃，避免在陌生群里对外广播白名单配置。
 
 > 也可通过 [**`/bot-group-always`** 指令](#bot-group-always--群消息响应模式切换) 在运行时动态切换账户级默认值，无需重启。
 
