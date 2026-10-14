@@ -10,10 +10,17 @@
  *    - 窗口内两条消息 → 单次 dispatch，textForAgent 含分节头与两段内容，
  *      锚点 messageId = 最后一条；media facts 合并；
  *    - 单条消息 → 原样直发，无分节头；
- *    - 控制命令（stop）旁路防抖立即 dispatch；
- *    - 滑动窗口：窗口内新消息重置计时；
- *    - 超窗消息 → 各自独立 dispatch；
- *    - 群消息 / 防抖关闭 → enqueue 返回 false（调用方走直发路径）。
+ *    - 三类旁路（控制命令 stop / 斜杠命令 / 多问题 keyed 答案）：
+ *      不被合并且原样直发；有 pending buffer 时先冲刷再执行（保序）；
+ *    - 滑动窗口：窗口内新消息重置计时（宽裕量 400ms 防事件循环延迟抖动）；
+ *    - 超窗消息 → 各自独立 dispatch；不同发送者互不合并；
+ *    - 到达顺序排序：入队顺序与平台到达顺序相反时按 timestamp 排序，
+ *      载体 = 最新到达的消息；
+ *    - 入队 await 语义：enqueue 的 promise 在 flush dispatch 完成后才
+ *      resolve（typing 中间件链据此续命到 turn 结束）；
+ *    - 防抖中途禁用：pending buffer 先冲刷再返回 false（消息不乱序）；
+ *    - 群消息 / 防抖关闭 → enqueue 返回 false（调用方走直发路径）；
+ *    - 退出冲刷：flushAllC2CInboundDebouncers 强制发出窗口内 pending 消息。
  *
  * 运行方式: npx tsx tests/inbound-debounce.test.ts
  */
@@ -42,6 +49,21 @@ async function test(name: string, fn: () => Promise<void> | void) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * 框架 debouncer 的 flush timer 是 unref() 的：裸测试环境里若无其他
+ * ref'd 定时器，事件循环会在 flush 前空转退出（进程带着未决 await 静默
+ * 终止）。生产环境由 WS 心跳/typing 续期等长活定时器撑住，无此问题。
+ * 等待任何依赖 flush timer 的 promise 时用本 helper 挂一个 ref'd 心跳。
+ */
+async function keepAlive<T>(p: Promise<T>): Promise<T> {
+  const heartbeat = setInterval(() => {}, 50);
+  try {
+    return await p;
+  } finally {
+    clearInterval(heartbeat);
+  }
+}
+
 // ── 真实模块 ──
 
 const {
@@ -55,6 +77,7 @@ const {
 } = await import('../src/features/inbound-debounce.ts');
 const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
 const { registerGateway } = await import('../src/outbound/outbound-service.ts');
+const { registerPendingMultiQuestion } = await import('../src/features/question-helpers.ts');
 
 // ── 测试基础设施（对齐 room-event.test.ts）──
 
@@ -118,6 +141,7 @@ function makeC2CMsgAndCtx(overrides: {
   content?: string;
   senderId?: string;
   scope?: 'c2c' | 'group';
+  timestamp?: string;
   assembledBody?: any;
   processedAttachments?: any;
 } = {}) {
@@ -132,7 +156,7 @@ function makeC2CMsgAndCtx(overrides: {
     attachments: [],
     replyTarget: { scope, targetId: overrides.senderId ?? 'USER_C2C' },
     mentions: [],
-    timestamp: new Date().toISOString(),
+    timestamp: overrides.timestamp ?? new Date().toISOString(),
     raw: {},
   } as any;
   const ctx = {
@@ -166,6 +190,11 @@ function setupScenario(inboundDebounce?: any) {
   const captured: CapturedInbound[] = [];
   const runtime = makeFakeRuntime(captured);
   return { account: makeAccount(inboundDebounce), runtime, captured };
+}
+
+/** 便捷封装：fire-and-forget 入队（buffered 项的 promise 要到 flush 才 resolve） */
+function fire(scenario: { account: any; runtime: any }, mc: { msg: any; ctx: any }): Promise<boolean> {
+  return enqueueC2CInboundMessage(mc.ctx, mc.msg, scenario.account, scenario.runtime);
 }
 
 // ── 配置解析 ──
@@ -278,7 +307,7 @@ group('集成：窗口内合并 / 单条直发 / 旁路 / 滑动窗口');
 const W = 120;
 
 await test('窗口内「文件 + 文字」→ 单次 dispatch，合并 body，锚点为最后一条', async () => {
-  const { account, runtime, captured } = setupScenario({ debounceMs: W });
+  const scenario = setupScenario({ debounceMs: W });
   const file = makeC2CMsgAndCtx({
     content: '',
     assembledBody: {
@@ -302,13 +331,14 @@ await test('窗口内「文件 + 文字」→ 单次 dispatch，合并 body，�
     assembledBody: { webBody: '总结一下这个文件', agentBody: '总结一下这个文件', rawBody: '总结一下这个文件' },
   });
 
-  assert.equal(await enqueueC2CInboundMessage(file.ctx, file.msg, account, runtime), true);
+  // fire-and-forget：buffered 项的 promise 到 flush dispatch 完成才 resolve
+  const pf = fire(scenario, file);
   await sleep(40);
-  assert.equal(await enqueueC2CInboundMessage(text.ctx, text.msg, account, runtime), true);
-  await sleep(W + 80);
-  assert.equal(captured.length, 1, `expected 1 dispatch, got ${captured.length}`);
+  const pt = fire(scenario, text);
+  await keepAlive(Promise.all([pf, pt]));
+  assert.equal(scenario.captured.length, 1, `expected 1 dispatch, got ${scenario.captured.length}`);
 
-  const { ingest, params, ctxPayload } = captured[0]!;
+  const { ingest, params, ctxPayload } = scenario.captured[0]!;
   assert.ok(ingest.textForAgent.includes('[消息 1/2]'), 'missing section header 1');
   assert.ok(ingest.textForAgent.includes('[消息 2/2]'), 'missing section header 2');
   assert.ok(ingest.textForAgent.includes('report.pdf'), 'file info missing');
@@ -322,95 +352,199 @@ await test('窗口内「文件 + 文字」→ 单次 dispatch，合并 body，�
 });
 
 await test('单条消息 → 原样直发（无分节头，body 不变）', async () => {
-  const { account, runtime, captured } = setupScenario({ debounceMs: W });
+  const scenario = setupScenario({ debounceMs: W });
   const one = makeC2CMsgAndCtx({
     content: '你好',
     assembledBody: { webBody: '你好', agentBody: '你好', rawBody: '你好' },
   });
-  assert.equal(await enqueueC2CInboundMessage(one.ctx, one.msg, account, runtime), true);
-  await sleep(W + 80);
-  assert.equal(captured.length, 1);
-  assert.equal(captured[0]!.ingest.textForAgent, '你好');
-  assert.ok(!captured[0]!.ingest.textForAgent.includes('[消息'));
+  assert.equal(await keepAlive(fire(scenario, one)), true);
+  assert.equal(scenario.captured.length, 1);
+  assert.equal(scenario.captured[0]!.ingest.textForAgent, '你好');
+  assert.ok(!scenario.captured[0]!.ingest.textForAgent.includes('[消息'));
 });
 
 await test('控制命令（stop）旁路防抖，立即 dispatch', async () => {
-  const { account, runtime, captured } = setupScenario({ debounceMs: W });
+  const scenario = setupScenario({ debounceMs: W });
   const stop = makeC2CMsgAndCtx({
     content: 'stop',
     assembledBody: { webBody: 'stop', agentBody: 'stop', rawBody: 'stop' },
   });
-  assert.equal(await enqueueC2CInboundMessage(stop.ctx, stop.msg, account, runtime), true);
+  assert.equal(await keepAlive(fire(scenario, stop)), true);
   // 旁路路径在 enqueue 内同步完成 dispatch，无需等窗口
-  assert.equal(captured.length, 1, `expected immediate dispatch, got ${captured.length}`);
-  assert.equal(captured[0]!.ingest.textForCommands, 'stop');
+  assert.equal(scenario.captured.length, 1, `expected immediate dispatch, got ${scenario.captured.length}`);
+  assert.equal(scenario.captured[0]!.ingest.textForCommands, 'stop');
 });
 
-await test('滑动窗口：窗口期内的新消息重置计时', async () => {
-  const { account, runtime, captured } = setupScenario({ debounceMs: W });
+await test('斜杠命令旁路：不被合并，原样直发（pending buffer 先冲刷，保序）', async () => {
+  const scenario = setupScenario({ debounceMs: W });
+  const file = makeC2CMsgAndCtx({
+    content: '',
+    assembledBody: { webBody: '[文件] a.pdf', agentBody: '[文件] a.pdf', rawBody: '' },
+  });
+  const slash = makeC2CMsgAndCtx({
+    content: '/status',
+    assembledBody: { webBody: '/status', agentBody: '/status', rawBody: '/status' },
+  });
+
+  const pf = fire(scenario, file); // 进 buffer
+  await sleep(30); // 窗口内
+  assert.equal(await keepAlive(fire(scenario, slash)), true); // 旁路：先冲刷 buffer 再执行命令
+  await keepAlive(pf);
+  assert.equal(scenario.captured.length, 2, `expected buffer-flush + command dispatch, got ${scenario.captured.length}`);
+  assert.equal(scenario.captured[0]!.ingest.textForAgent, '[文件] a.pdf', 'buffer must flush before command');
+  assert.equal(scenario.captured[1]!.ingest.textForCommands, '/status', 'command text must stay unmerged');
+});
+
+await test('多问题 keyed 答案旁路：原样直发不被合并（认领文本不被改写）', async () => {
+  const scenario = setupScenario({ debounceMs: W });
+  // 独立 sender：pending 记录 TTL（200ms）内仍在注册表里，同 sender 会
+  // 让后续用例的消息误命中 keyed 旁路（跨测试污染）
+  const answer = makeC2CMsgAndCtx({
+    senderId: 'USER_QM',
+    content: '1: 3\n2: 1',
+    assembledBody: { webBody: '1: 3\n2: 1', agentBody: '1: 3\n2: 1', rawBody: '1: 3\n2: 1' },
+  });
+  registerPendingMultiQuestion(
+    'q-bypass-test',
+    'c2c',
+    answer.msg.replyTarget.targetId,
+    [{ header: '题1', question: '选一个', options: ['a', 'b', 'c'] }],
+    200, // 短 TTL：cleanup timer 不悬挂测试进程
+  );
+  assert.equal(await keepAlive(fire(scenario, answer)), true);
+  assert.equal(scenario.captured.length, 1, 'keyed answer must bypass debounce immediately');
+  assert.equal(scenario.captured[0]!.ingest.textForCommands, '1: 3\n2: 1');
+});
+
+await test('到达顺序排序：入队顺序颠倒时按平台 timestamp 排序，载体 = 最新到达', async () => {
+  const scenario = setupScenario({ debounceMs: W });
+  const base = Date.now();
+  // 快消息（文字）先完成中间件先入队，但平台时间戳更晚；
+  // 慢消息（附件下载耗时）后入队，平台时间戳更早（用户先发的文件）
+  const file = makeC2CMsgAndCtx({
+    content: '',
+    timestamp: new Date(base).toISOString(),
+    assembledBody: { webBody: '[文件] early.pdf', agentBody: '[文件] early.pdf', rawBody: '' },
+  });
+  const text = makeC2CMsgAndCtx({
+    content: '后到的说明',
+    timestamp: new Date(base + 1000).toISOString(),
+    assembledBody: { webBody: '后到的说明', agentBody: '后到的说明', rawBody: '后到的说明' },
+  });
+
+  const pt = fire(scenario, text); // 先入队（中间件完成顺序）
+  await sleep(20);
+  const pf = fire(scenario, file); // 后入队（真实到达更早）
+  await keepAlive(Promise.all([pt, pf]));
+
+  assert.equal(scenario.captured.length, 1);
+  const { ingest, params } = scenario.captured[0]!;
+  const body = ingest.textForAgent as string;
+  assert.ok(
+    body.indexOf('[消息 1/2]\n[文件] early.pdf') < body.indexOf('[消息 2/2]\n后到的说明'),
+    'arrival order must follow platform timestamp, not enqueue order',
+  );
+  // 载体 = 最新到达（text），锚点取其 messageId
+  assert.equal(params.raw.messageId, text.msg.messageId);
+});
+
+await test('入队 await 语义：promise 在 flush dispatch 完成后才 resolve（typing 续命）', async () => {
+  const scenario = setupScenario({ debounceMs: 150 });
+  const one = makeC2CMsgAndCtx({
+    content: 'hold',
+    assembledBody: { webBody: 'hold', agentBody: 'hold', rawBody: 'hold' },
+  });
+  const p = fire(scenario, one);
+  // 窗口未过：无 dispatch，promise 未 resolve
+  const early = await Promise.race([p.then(() => 'done' as const), sleep(20).then(() => 'pending' as const)]);
+  assert.equal(early, 'pending');
+  assert.equal(scenario.captured.length, 0);
+  await keepAlive(p); // resolve 时 dispatch 必已完成
+  assert.equal(scenario.captured.length, 1, 'enqueue promise must resolve after flush dispatch');
+});
+
+await test('滑动窗口：窗口期内的新消息重置计时（宽窗口防事件循环抖动）', async () => {
+  // 用 400ms 窗口：入队间隙需 >400ms 的事件循环停顿才会破坏前提（CI 低概率），
+  // 断言点的裕量同样放大；计时器按到期顺序执行，后断言稳健
+  const W2 = 400;
+  const scenario = setupScenario({ debounceMs: W2 });
   const a = makeC2CMsgAndCtx({ content: 'a', assembledBody: { webBody: 'a', agentBody: 'a', rawBody: 'a' } });
   const b = makeC2CMsgAndCtx({ content: 'b', assembledBody: { webBody: 'b', agentBody: 'b', rawBody: 'b' } });
 
-  await enqueueC2CInboundMessage(a.ctx, a.msg, account, runtime);
-  await sleep(W / 2); // 60ms：窗口 120ms 未过，b 进入同一 buffer 并重置计时
-  await enqueueC2CInboundMessage(b.ctx, b.msg, account, runtime);
-  await sleep(W / 2 + 20); // t≈140ms：距 b 到达仅 80ms < 120ms，不应 flush
-  assert.equal(captured.length, 0, `flushed too early at ${W / 2 + 20}ms after b`);
-  await sleep(W); // t≈260ms：b 的窗口已过
-  assert.equal(captured.length, 1);
-  assert.ok(captured[0]!.ingest.textForAgent.includes('a'));
-  assert.ok(captured[0]!.ingest.textForAgent.includes('b'));
+  const pa = fire(scenario, a);
+  await sleep(120); // 30% 窗口：未过
+  const pb = fire(scenario, b); // 重置计时，deadline = b + 400ms
+  const mid = await Promise.race([Promise.all([pa, pb]).then(() => 'flushed' as const), sleep(280).then(() => 'pending' as const)]);
+  assert.equal(mid, 'pending', `flushed too early (~400ms after a, only ~280ms after b)`);
+  await keepAlive(Promise.all([pa, pb]));
+  assert.equal(scenario.captured.length, 1);
+  assert.ok((scenario.captured[0]!.ingest.textForAgent as string).includes('a'));
+  assert.ok((scenario.captured[0]!.ingest.textForAgent as string).includes('b'));
 });
 
 await test('超窗消息 → 各自独立 dispatch', async () => {
-  const { account, runtime, captured } = setupScenario({ debounceMs: W });
+  const scenario = setupScenario({ debounceMs: W });
   const a = makeC2CMsgAndCtx({ content: '先到', assembledBody: { webBody: '先到', agentBody: '先到', rawBody: '先到' } });
   const b = makeC2CMsgAndCtx({ content: '后到', assembledBody: { webBody: '后到', agentBody: '后到', rawBody: '后到' } });
-  await enqueueC2CInboundMessage(a.ctx, a.msg, account, runtime);
-  await sleep(W + 80);
-  await enqueueC2CInboundMessage(b.ctx, b.msg, account, runtime);
-  await sleep(W + 80);
-  assert.equal(captured.length, 2);
-  assert.equal(captured[0]!.ingest.textForAgent, '先到');
-  assert.equal(captured[1]!.ingest.textForAgent, '后到');
+  await keepAlive(fire(scenario, a)); // await 到第一次 flush 完成
+  await keepAlive(fire(scenario, b));
+  assert.equal(scenario.captured.length, 2);
+  assert.equal(scenario.captured[0]!.ingest.textForAgent, '先到');
+  assert.equal(scenario.captured[1]!.ingest.textForAgent, '后到');
 });
 
 await test('不同发送者互不合并', async () => {
-  const { account, runtime, captured } = setupScenario({ debounceMs: W });
+  const scenario = setupScenario({ debounceMs: W });
   const u1 = makeC2CMsgAndCtx({ senderId: 'USER_1', content: '来自1', assembledBody: { webBody: '来自1', agentBody: '来自1', rawBody: '来自1' } });
   const u2 = makeC2CMsgAndCtx({ senderId: 'USER_2', content: '来自2', assembledBody: { webBody: '来自2', agentBody: '来自2', rawBody: '来自2' } });
-  await enqueueC2CInboundMessage(u1.ctx, u1.msg, account, runtime);
-  await enqueueC2CInboundMessage(u2.ctx, u2.msg, account, runtime);
-  await sleep(W + 80);
-  assert.equal(captured.length, 2);
-  assert.equal(captured[0]!.ingest.textForAgent, '来自1');
-  assert.equal(captured[1]!.ingest.textForAgent, '来自2');
+  const p1 = fire(scenario, u1);
+  const p2 = fire(scenario, u2);
+  await keepAlive(Promise.all([p1, p2]));
+  assert.equal(scenario.captured.length, 2);
+  assert.equal(scenario.captured[0]!.ingest.textForAgent, '来自1');
+  assert.equal(scenario.captured[1]!.ingest.textForAgent, '来自2');
+});
+
+await test('防抖中途禁用：pending buffer 先冲刷再返回 false（消息不乱序）', async () => {
+  const scenario = setupScenario({ debounceMs: 200 });
+  const old = makeC2CMsgAndCtx({ content: '旧消息', assembledBody: { webBody: '旧消息', agentBody: '旧消息', rawBody: '旧消息' } });
+  const fresh = makeC2CMsgAndCtx({ content: '新消息', assembledBody: { webBody: '新消息', agentBody: '新消息', rawBody: '新消息' } });
+
+  const pOld = fire(scenario, old); // 进 buffer
+  await sleep(30);
+  (scenario.account.config as any).inboundDebounce = { debounceMs: 0 }; // 配置热更新为关闭
+  // 返回 false 前必须先把该发送者的 pending buffer 冲刷掉（保序）
+  assert.equal(await keepAlive(fire(scenario, fresh)), false);
+  await keepAlive(pOld);
+  assert.equal(scenario.captured.length, 1, 'pending buffer must be flushed before returning false');
+  assert.equal(scenario.captured[0]!.ingest.textForAgent, '旧消息');
 });
 
 await test('群消息 → 返回 false（不接管，调用方走直发）', async () => {
-  const { account, runtime, captured } = setupScenario({ debounceMs: W });
+  const scenario = setupScenario({ debounceMs: W });
   const g = makeC2CMsgAndCtx({ scope: 'group', content: '群消息' });
-  assert.equal(await enqueueC2CInboundMessage(g.ctx, g.msg, account, runtime), false);
-  await sleep(W + 60);
-  assert.equal(captured.length, 0);
+  assert.equal(await fire(scenario, g), false);
+  await sleep(60);
+  assert.equal(scenario.captured.length, 0);
 });
 
 await test('防抖关闭（debounceMs: 0）→ 返回 false', async () => {
-  const { account, runtime, captured } = setupScenario({ debounceMs: 0 });
+  const scenario = setupScenario({ debounceMs: 0 });
   const one = makeC2CMsgAndCtx({ content: 'x' });
-  assert.equal(await enqueueC2CInboundMessage(one.ctx, one.msg, account, runtime), false);
+  assert.equal(await fire(scenario, one), false);
   await sleep(60);
-  assert.equal(captured.length, 0);
+  assert.equal(scenario.captured.length, 0);
 });
 
 await test('退出冲刷：flushAllC2CInboundDebouncers 强制发出窗口内 pending 消息', async () => {
-  const { account, runtime, captured } = setupScenario({ debounceMs: 10_000 });
+  const scenario = setupScenario({ debounceMs: 10_000 });
   const a = makeC2CMsgAndCtx({ content: 'pending', assembledBody: { webBody: 'pending', agentBody: 'pending', rawBody: 'pending' } });
-  await enqueueC2CInboundMessage(a.ctx, a.msg, account, runtime);
-  assert.equal(captured.length, 0);
-  await flushAllC2CInboundDebouncers();
-  assert.equal(captured.length, 1, 'flushKey should force-dispatch pending buffer');
-  assert.equal(captured[0]!.ingest.textForAgent, 'pending');
+  const pa = fire(scenario, a);
+  assert.equal(scenario.captured.length, 0);
+  await keepAlive(flushAllC2CInboundDebouncers());
+  assert.equal(scenario.captured.length, 1, 'flushKey should force-dispatch pending buffer');
+  assert.equal(scenario.captured[0]!.ingest.textForAgent, 'pending');
+  await keepAlive(pa); // 冲刷触发 onFlush，入队 promise 随之 resolve
 });
 
 // ── 结果 ──
