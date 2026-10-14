@@ -126,11 +126,16 @@ async function notifyNotAllowlisted(
 
   const text = buildAccessNoticeText({ scope, id, accountId });
   try {
-    // 被动回复靠 ctx.replyTarget.msgId —— SDK 的 deriveReplyTarget 已把当前
-    // 入站消息的 messageId 挂在上面，sendText 见 msgId 即带 body.msg_id 下发。
-    // 被拒消息没有 turn，不存在跟别的 turn 抢配额的问题，故不必绕网关锚点选取
-    // （绕过去反而会挑到更早的缓存 msg_id，或在死锚点时降级主动、把每日预算
-    // 暴露给刷屏者）。套本地超时：请求挂住就永远走不到 ctx.stop。
+    // 被动回复锚点取自 ctx.replyTarget.msgId —— SDK 的 deriveReplyTarget 在
+    // handleInboundMessage 组链之前就把入站 messageId 挂到 replyTarget 上，
+    // sendText 见 msgId 即下发 body.msg_id。
+    //
+    // 注意**不能**改走网关 attachMsgIdWithQuota：被拒消息的 msg_id 并不在
+    // msgid-cache 里（插件 cacheMsgId 挂在链尾 downstream 的 bot.on('message')
+    // 上，ctx.stop 不调 next() 时它根本不执行），网关会挑到更早的缓存 msg_id
+    // 或降级主动，把每日预算暴露给刷屏者。
+    //
+    // 套本地超时：请求挂住就永远走不到 ctx.stop。
     await withNoticeTimeout(ctx.bot.sendText(ctx.replyTarget, text), opts.timeoutMs);
     ctx.log?.info?.(`[access] sent not-allowlisted notice to ${scope} ${id}`);
   } catch (err) {

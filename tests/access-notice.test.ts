@@ -442,14 +442,19 @@ await test('容量压力下不淘汰未过期的冷却（条目宁可临时超�
   assert.equal(first.allowed ? '' : first.reason, 'cooldown');
 });
 
-await test('提示走被动锚点（SDK 从 ctx.replyTarget.msgId 取当前入站消息）', async () => {
+await test('提示走被动锚点：原样传 ctx.replyTarget（不改走网关锚点选取）', async () => {
   _resetAccessNotice();
   const h = makeCtx({ c2cMode: 'allowlist', allowFrom: [ALLOWED] }, { senderId: 'ANCHOR_USER', msgId: 'mm-1' });
   await mw(h.ctx as never, (async () => h.setNext(true)) as never);
   assert.equal(h.sent.length, 1);
+  // 被拒消息的 msg_id 不在 msgid-cache 里（cacheMsgId 挂在链尾 downstream，
+  // ctx.stop 不调 next() 时不执行），故只能靠 SDK 组链前挂好的
+  // ctx.replyTarget.msgId。断言「原对象透传 + msgId 未被替换」：一旦有人把
+  // 提示改走 attachMsgIdWithQuota（从 cache 选锚点），此用例即失效。
+  assert.equal(h.sent[0].target, h.ctx.replyTarget, '必须原样透传 ctx.replyTarget，不得另行选取锚点');
   const target = h.sent[0].target as { targetId?: string; msgId?: string };
   assert.equal(target.targetId, 'ANCHOR_USER');
-  assert.equal(target.msgId, 'mm-1', 'msgId 必须透传给 SDK 走被动回复，不吃每日主动预算');
+  assert.equal(target.msgId, 'mm-1', 'msgId 必须是本条入站消息，吃被动回复额度');
 });
 
 // ============ 收尾 ============
