@@ -382,9 +382,16 @@ export async function enqueueC2CInboundMessage(
  *
  * 框架 debouncer 的 drain() 只等待在途任务、不冲刷 pending buffer
  * （buffer 的 flush timer 是 unref 的，退出时永不触发）——必须对每个
- * 活跃 key 显式 flushKey 才能把窗口内的消息发出去。flushAll 只等待
- * admission（dispatch 被框架接受），不等 turn 完成（进程退出场景下
- * turn 本来也跑不完）。
+ * 活跃 key 显式 flushKey 才能把窗口内的消息发出去。
+ *
+ * 等待深度：本插件 onFlush 的 admission 与 completion 是**同一个
+ * promise**（含完整 dispatchToOpenClaw，生产路径即整个 turn run），
+ * 框架 runFlush 的 race([admission, completion]) 实际等它完整 settle
+ * ——即 flushAll 等到的是 dispatch 完成而非"仅获准"（Sourcery 意见
+ * 曾据旧注释误判为后者）。注意 dispatch 完成 ≠ agent turn 一定跑完
+ * （turn 被框架队列 defer 时 inboundRun 先 resolve、turn 后台继续），
+ * 无界等 turn 是刻意拒绝的设计（Ctrl+C 卡死）；调用方（runtime.ts
+ * shutdown）以有界上限（1.5s）封顶。
  */
 export async function flushAllC2CInboundDebouncers(): Promise<void> {
   await Promise.allSettled(

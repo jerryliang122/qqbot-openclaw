@@ -44,9 +44,11 @@ function installExitHooksOnce(): void {
     void flushDebounceBuffers();
   });
 
-  // SIGINT/SIGTERM：有界等待（≤1.5s）缓冲冲刷完成再退出——无界等待会让
-  // Ctrl+C 卡在跑不完的 turn 上，纯 exit 又会丢弃窗口内已收到的消息。
-  // 二次信号不受影响（handler 幂等，超时定时器兜底强退）。
+  // SIGINT/SIGTERM：有界等待（≤1.5s）缓冲冲刷完成再退出——flush 等的是
+  // dispatch 完成而非"仅获准"（onFlush 的 admission === completion）；
+  // 不为整个 agent turn 无界等待（turn 被框架队列 defer 时后台继续，
+  // 无界等待会让 Ctrl+C 卡死）。二次信号不受影响（handler 幂等，
+  // 超时定时器兜底强退）。
   const shutdown = () => {
     flushStores();
     const forceExit = () => process.exit(0);
