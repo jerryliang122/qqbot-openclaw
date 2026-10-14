@@ -8,6 +8,18 @@
 
 ---
 
+## [2.5.0] - 2026-10-14
+
+### 新增
+
+- **私聊入站消息防抖合并：文件 + 伴随文字组成单个 turn**（含三轮 Sourcery 评审闭环）。QQ 私聊除图片外，文件与文字只能是两条独立消息（QQ 无「文件描述」附件窗口），而 c2c turn 可插嘴——先发的文件 turn 会被随后到达的文字**直接打断**（exclusive + abortSignal，文件处理半途而废），这是结构性缺陷而非体验问题。新模块 `src/features/inbound-debounce.ts` 在 handleMessage 层把同一发送者在防抖窗口内的连续消息合并为一次 dispatch，复用框架官方防抖原语（`openclaw/plugin-sdk/channel-inbound` 的 `createInboundDebouncer` / `resolveInboundDebounceMs` / `shouldDebounceTextInbound`，telegram 通道同款；滑动窗口——每条新消息重置计时，框架硬上限 `debounceMs × 5` 防连珠炮无限延期）。合并语义：按**平台事件 timestamp 稳定排序**（中间件链并发执行，附件下载慢的早到消息可能晚于快消息完成 enqueue，入队顺序 ≠ 到达顺序），载体 = 最新到达消息的 ctx/msg（被动回复锚点 / 请求上下文取自它），`assembledBody` 加 `[消息 i/N]` 分节头拼接、`processedAttachments.media` 按序 concat（保住框架正规媒体通道的 media facts，文件 localPath 进 MediaPaths）。三类旁路在 `shouldDebounce` 内返回 false（经框架序列化：先冲刷同 key pending buffer 再执行，顺序保持）：控制命令（stop/esc/abort/exit）、斜杠命令（rawBody 以 `/` 开头，合并会破坏命令标记）、多问题 ask_user keyed 答案（合并会改写 `1: 3\n2: 1` 使框架认领失败、ask_user 挂起）。**入队 await 语义（typing 续命）**：enqueue 阻塞至 batch dispatch 完成才 resolve——SDK 并发处理消息、held-open 中间件链不阻塞其他消息，typing 续期 timer 据此活到 turn 结束（与防抖前行为一致）；非载体项在 flush 开始先 resolve，只留载体一个续期源。防抖中途被禁用（配置热更新）先 `flushKey` 该发送者 pending buffer 再直发（保序，防旧 buffer 晚于新消息 flush 造成乱序 + turn 打断）。退出冲刷：框架 `drain()` 不冲刷 pending buffer（flush timer 是 unref 的，退出时永不触发），对自跟踪 key 逐个 `flushKey`，SIGINT/SIGTERM 有界等待（≤1.5s）——无界等 turn 会让 Ctrl+C 卡死、纯 exit 丢窗口内消息，有界等待取中。与 telegram 刻意相反：**纯附件消息必须防抖**（telegram 默认 lane 媒体直发——`shouldDebounceTextInbound` 的 hasMedia 分支返回 false——本插件场景正是要 hold 住文件等伴随文字，故 hasMedia 刻意传 false、仅借它的控制命令判定）。**注意默认开启**：每条私聊消息的 dispatch 固定延后一个窗口（3000ms），这是合并的固有代价；配置优先级 `channels.qqbot.inboundDebounce.{enabled, debounceMs}`（`0`/`false` 关闭）→ 框架 `messages.inbound.byChannel.qqbot` / `messages.inbound.debounceMs` → 默认 3000（钳制 [0, 60000]）。群聊恒不防抖（框架 followup 队列已承担合并，且 mention 门控语义要求逐条判定）。实现过程中修复的 CI 事故：runtime.ts 静态导入 inbound-debounce 形成环 `plugin-logger → runtime → inbound-debounce → dispatch → plugin-logger`，dispatch 图内模块顶层求值撞上未初始化的 plugin-logger（tsx/esbuild 下 `__name is not a function`、三个测试文件加载期崩溃），exit hook 改动态 import 断环。回归测试 `tests/inbound-debounce.test.ts`（26 用例：配置矩阵 / 合并纯函数 / 窗口合并 / 三类旁路保序 / 到达排序 / typing-hold / 滑动窗口 / 中途禁用保序 / 跨账号隔离 / 退出冲刷）；`tests/sdk-surface.test.ts` 守卫自动纳管 `channel-inbound` 子路径（两版 SDK 均在，无需抬地板）。
+
+### 修复
+
+- **多问题 ask_user pending 会话键 account-blind**（Sourcery 评审第三轮发现）。`question-helpers` 的 `pendingByConversation` 会话键原为 `${scope}:${targetId}`——QQ openid 是 per-account 的（bot A 与 bot B 的同字符串 targetId 指向不同用户），不带账号维度会让 A 账号的 pending 多问题误命中 B 账号同 targetId 的会话：secret-capture 的「多问题红线放行」误触发、防抖 keyed 旁路误旁路（文件+文字被拆开直发，文字打断文件 turn）。修复：accountId 纳入会话键第一维（`${accountId}:${scope}:${targetId}`），`registerPendingMultiQuestion` / `findPendingMultiQuestionByConversation` 全链路补 accountId 必填首参，dispatch（投递登记）/ secret-capture（红线放行）/ inbound-debounce（keyed 旁路）三个生产调用点同步传插件账号 ID。
+
+---
+
 ## [2.4.1] - 2026-10-12
 
 ### 修复
