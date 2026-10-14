@@ -961,6 +961,29 @@ After receiving a private message, the bot shows "typing…" and renews it perio
 - **Quota note**: typing notifications share the passive-reply quota of the user message they reply to (QQ Open Platform allows ~5 passive replies per message). Once the passive quota is exhausted, typing — just like reply messages — automatically falls back to proactive sending (no msg_id); renewal is never interrupted
 - **Intermediate-message refresh**: when the bot sends a message (e.g. chain-of-thought intermediate output), the QQ client terminates the indicator; if the framework task is still running, the plugin renews the indicator 5 seconds after the message (still guarded by the 20s QPS spacing). After the final reply completes the task, no further refresh is sent
 
+#### Inbound Debounce — C2C private chat only (merge rapid consecutive messages)
+
+In a QQ private chat, a file and its accompanying text must be sent as two separate messages (apart from images, QQ offers no "file description" attachment window). A c2c turn is interruptible, so the text message arriving right after a file used to **abort** the in-flight file turn mid-processing. With inbound debounce enabled, consecutive messages from the same sender within the window are merged into a single agent turn (file + "summarize this" → one turn).
+
+```json
+{
+  "channels": {
+    "qqbot": {
+      "inboundDebounce": {
+        "enabled": true,
+        "debounceMs": 3000
+      }
+    }
+  }
+}
+```
+
+- `enabled` — enable/disable (default: `true`)
+- `debounceMs` — sliding window in milliseconds, restarted by each new message (default: `3000`). Resolution order: this value → openclaw `messages.inbound.byChannel.qqbot` / `messages.inbound.debounceMs` → default `3000`. Set `0` (or `enabled: false`) to disable. Clamped to `[0, 60000]`; the framework enforces a hard cap of `debounceMs × 5` counted from the first message, so rapid-fire sending cannot postpone the flush forever
+- **Latency note**: every c2c message's dispatch is delayed by one window — that is the inherent cost of merging. Per-message bookkeeping (passive reply anchors, known-user tracking, typing) still happens immediately on receipt
+- **Bypasses**: plugin slash commands (`/bot-*`) never enter the debounce (intercepted earlier in the middleware chain); framework control commands (`stop` / `abort` / …) bypass it and dispatch immediately
+- Groups are never debounced — group merging is owned by the framework followup queue, and group mention gating must see each message individually
+
 ---
 
 ## 📚 Documentation & Links
