@@ -23,24 +23,41 @@ function installExitHooksOnce(): void {
   if (exitHooksInstalled) return;
   exitHooksInstalled = true;
 
-  const flush = () => {
+  const flushStores = () => {
     try { flushAllRefIndexStores(); } catch {}
-    // c2c 入站防抖缓冲 best-effort 冲刷：动态 import 断开静态环
-    // plugin-logger → runtime → inbound-debounce → dispatch → plugin-logger
-    // （静态边会让 dispatch 图内的模块顶层求值撞上未初始化的 plugin-logger，
-    // tsx/esbuild 下表现为 `__name is not a function`，见 CI 事故）。
-    // SIGINT/SIGTERM 下 process.exit 不等待（丢失 ≤ 一个窗口的消息）；
-    // beforeExit 下 flush 的异步 dispatch 会重新拉起事件循环自然完成。
+  };
+
+  // c2c 入站防抖缓冲冲刷：动态 import 断开静态环
+  // plugin-logger → runtime → inbound-debounce → dispatch → plugin-logger
+  // （静态边会让 dispatch 图内的模块顶层求值撞上未初始化的 plugin-logger，
+  // tsx/esbuild 下表现为 `__name is not a function`，见 CI 事故）。
+  const flushDebounceBuffers = async (): Promise<void> => {
     try {
-      void import("./features/inbound-debounce.js")
-        .then((m) => m.flushAllC2CInboundDebouncers())
-        .catch(() => {});
+      const m = await import("./features/inbound-debounce.js");
+      await m.flushAllC2CInboundDebouncers();
     } catch {}
   };
 
-  process.on('beforeExit', flush);
-  process.on('SIGINT', () => { flush(); process.exit(0); });
-  process.on('SIGTERM', () => { flush(); process.exit(0); });
+  process.on('beforeExit', () => {
+    flushStores();
+    // flush 的异步 dispatch 会重新拉起事件循环，turn 自然跑完后再进 beforeExit
+    void flushDebounceBuffers();
+  });
+
+  // SIGINT/SIGTERM：有界等待（≤1.5s）缓冲冲刷完成再退出——无界等待会让
+  // Ctrl+C 卡在跑不完的 turn 上，纯 exit 又会丢弃窗口内已收到的消息。
+  // 二次信号不受影响（handler 幂等，超时定时器兜底强退）。
+  const shutdown = () => {
+    flushStores();
+    const forceExit = () => process.exit(0);
+    const timer = setTimeout(forceExit, 1500);
+    void flushDebounceBuffers().finally(() => {
+      clearTimeout(timer);
+      forceExit();
+    });
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 export function getQQBotRuntime(): PluginRuntime {

@@ -18,19 +18,37 @@
  *   语音）必须开窗等待伴随文本，这正是本功能的存在理由。因此
  *   shouldDebounceTextInbound 仅用于文本消息的控制命令旁路判定，
  *   hasMedia 刻意传 false，纯附件消息独立判定为 true。
- * - 控制命令（框架 abort 触发词 stop/esc/abort/exit 等）旁路防抖即时
- *   dispatch（对齐 telegram）；若旁路时同 key 已有 pending buffer，
- *   debouncer 会先冲刷 buffer 再执行命令，顺序保持。
+ *
+ * 三类旁路（shouldDebounce 返回 false，经框架 debouncer 序列化：
+ * 若同 key 有 pending buffer 会先冲刷再执行，顺序保持）：
+ * - 控制命令（框架 abort 触发词 stop/esc/abort/exit 等，判定来自
+ *   shouldDebounceTextInbound / isControlCommandMessage）；
+ * - 斜杠命令（rawBody 以 '/' 开头）：合并会破坏 buildCtxPayload 的
+ *   命令标记（rawBody 拼接后可能不以 '/' 开头），必须原样直发；
+ * - 多问题 ask_user 的 keyed 答案文本（"1: 3\n2: 1"）：合并会改写答案
+ *   文本，框架 keyed 文本认领失败 → 挂起的 ask_user 永远等不到答案；
+ *   按 findPendingMultiQuestionByConversation('c2c', peer) 识别。
  *
  * 合并语义（onFlush 多条时）：
- * - 载体 = 最后一条消息的 ctx/msg（messageId = 被动回复锚点，窗口最新、
- *   配额最全；request context 同样取自最后一条）；
+ * - 先按平台事件 timestamp 稳定排序（中间件链并发执行，附件下载慢的
+ *   早到消息可能晚于快消息完成 enqueue——入队顺序 ≠ 到达顺序）；
+ * - 载体 = 排序后最后一条（最新到达）消息的 ctx/msg（messageId = 被动
+ *   回复锚点，窗口最新、配额最全；request context 同样取自它）；
  * - ctx.state.assembledBody ← 各条 agentBody/webBody 按序拼接（[消息 i/N]
  *   分节头），rawBody 按行拼接；各条 assembledBody 由 envelopeFormatter
  *   中间件在入站时逐条产出（附件下载/STT 已完成），缺失时兜底现场组装；
  * - ctx.state.processedAttachments ← 各条字段合并（media 数组按序 concat，
  *   保住框架正规媒体通道的 media facts，文件 localPath 才能进 MediaPaths）；
  * - 单条 flush → 原路径直发，零行为变化。
+ *
+ * 入队 await 语义（typing 续命，Sourcery 意见 6）：enqueueC2CInboundMessage
+ * 不在入队时返回，而是等到该项所在 batch 的 dispatch 完成才 resolve——
+ * SDK 的 handleInboundMessage 并发执行（onMessage 不 await），held-open
+ * 的中间件链不会阻塞其他消息；typing 中间件的续期 timer 恰好活到 turn
+ * 结束（与防抖前行为一致）。非载体项在 flush 开始时先 resolve（它们的
+ * typing 实例立即退场，只留载体一个续期源，避免 N 条消息 N 个 typing
+ * 推送烧配额）。deferred 在 onError / onCancel 也必须 resolve，否则
+ * handleMessage 永久挂起。
  *
  * per-message 记账（msgid-cache 被动锚点登记、recordKnownUser、群模式
  * 推断）在 enqueue 之前由 handleMessage 照常逐条立即执行，不受防抖影响。
@@ -53,11 +71,18 @@ import { assembleBody } from '../dispatch/body-assembler.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { runWithRequestContext } from '../request-context.js';
 import { dispatchToOpenClaw } from '../dispatch/index.js';
+import { findPendingMultiQuestionByConversation } from './question-helpers.js';
 
 /** 默认防抖窗口：3 秒（QQ 客户端连发"文件 + 说明"的典型间隔内） */
 export const DEFAULT_C2C_INBOUND_DEBOUNCE_MS = 3000;
 /** 防抖窗口上限（钳制） */
 export const MAX_C2C_INBOUND_DEBOUNCE_MS = 60_000;
+
+/** 入队项的完成信号：flush dispatch 完成时 resolve（见模块头「typing 续命」段） */
+interface ItemDone {
+  promise: Promise<void>;
+  resolve: () => void;
+}
 
 /** 防抖队列条目：一条已完成中间件链处理的 c2c 入站消息 */
 export interface C2CInboundDebounceItem {
@@ -68,6 +93,8 @@ export interface C2CInboundDebounceItem {
   log?: PluginLogger;
   /** 入队时的框架配置快照（控制命令判定用，逐条取新） */
   cfg: Record<string, unknown>;
+  /** 完成信号（enqueueC2CInboundMessage 内部创建，onFlush/onError/onCancel resolve） */
+  done?: ItemDone;
 }
 
 type Debouncer = ReturnType<typeof createInboundDebouncer<C2CInboundDebounceItem>>;
@@ -112,17 +139,32 @@ export function resolveC2CInboundDebounceMs(
   return DEFAULT_C2C_INBOUND_DEBOUNCE_MS;
 }
 
-/** shouldDebounce 策略：c2c 全量防抖，唯控制命令旁路（见模块头注释） */
+/**
+ * shouldDebounce 策略：c2c 全量防抖，三类旁路（见模块头注释）。
+ * 旁路经框架 debouncer 序列化（先冲刷同 key pending buffer 再执行）。
+ */
 function shouldDebounceC2CItem(item: C2CInboundDebounceItem): boolean {
   const text = String(item.msg?.content ?? '').trim();
   if (!text) return true; // 纯附件消息（文件/图片/语音）必须开窗等待伴随文本
+
+  // 斜杠命令：合并会破坏命令标记（rawBody 拼接后可能不以 '/' 开头）
+  if (text.startsWith('/')) return false;
+
+  // 多问题 ask_user 的 keyed 答案文本：合并会改写答案、认领失败
+  if (findPendingMultiQuestionByConversation('c2c', item.msg.replyTarget.targetId)) {
+    return false;
+  }
+
+  // 控制命令（stop/esc/abort/exit 等）：hasMedia 刻意传 false——框架默认
+  // 策略不防抖媒体，本插件场景相反，仅借它的控制命令判定
   return shouldDebounceTextInbound({ text, cfg: item.cfg as never, hasMedia: false });
 }
 
 /**
  * 合并多条消息的 assembledBody。
  * agentBody/webBody 加 [消息 i/N] 分节头按序拼接；rawBody 按行拼接
- * （下游斜杠命令判定只看首字符，拼接后语义与首条一致）。
+ * （下游斜杠命令判定只看首字符，拼接后语义与首条一致——斜杠命令本身
+ * 已经旁路防抖，不会进入合并路径）。
  */
 export function mergeAssembledBodies(list: AssembledBody[]): AssembledBody {
   if (list.length === 1) return list[0]!;
@@ -174,6 +216,12 @@ async function dispatchItem(item: C2CInboundDebounceItem): Promise<void> {
   );
 }
 
+/** 平台事件 timestamp → epoch ms（不可解析回退 0，排序时沉到最前＝最旧） */
+function arrivalMs(item: C2CInboundDebounceItem): number {
+  const parsed = Date.parse(String((item.msg as { timestamp?: unknown }).timestamp ?? ''));
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
 /**
  * 构造合并载体：直接改写最后一条消息 ctx 的 state（dispatch 侧只从
  * ctx.state.assembledBody / ctx.state.processedAttachments 读取，不复制
@@ -200,11 +248,19 @@ function buildMergedCarrier(items: C2CInboundDebounceItem[]): MiddlewareContext 
   return last.ctx;
 }
 
+function settleItems(items: C2CInboundDebounceItem[]): void {
+  for (const i of items) i.done?.resolve();
+}
+
 function getOrCreateDebouncer(item: C2CInboundDebounceItem, initialDebounceMs: number): Debouncer {
   const existing = debouncers.get(item.account.accountId);
   if (existing) return existing.debouncer;
 
   const dlog = item.log?.child('inbound-debounce');
+  // onFlush 闭包晚于 debouncers.set 生效（flush 只能发生在首次 enqueue 之后），
+  // 用 holder 引用避免「创建时 entry 尚未入表」的先有鸡先有蛋
+  const entryHolder: { current?: { debouncer: Debouncer; keys: Set<string> } } = {};
+
   const debouncer = createInboundDebouncer<C2CInboundDebounceItem>({
     debounceMs: initialDebounceMs,
     serializeImmediate: true,
@@ -212,17 +268,37 @@ function getOrCreateDebouncer(item: C2CInboundDebounceItem, initialDebounceMs: n
     resolveDebounceMs: (i) => resolveC2CInboundDebounceMs(i.account, i.cfg),
     buildKey: buildC2CDebounceKey,
     shouldDebounce: shouldDebounceC2CItem,
-    onFlush: (items) => {
+    onFlush: (rawItems) => {
+      // 同步前缀（JS 单线程，不会与并发 enqueue 交错）：
+      // 1. key 清理——batch 即被冲刷的 buffer，对应 key 立即出表，
+      //    防止长期运行下 entry.keys 无限累积（Sourcery 意见 7）；
+      //    之后到达的同 key 消息会重新 add，语义正确。
+      // 2. 到达顺序排序——中间件链并发，入队顺序 ≠ 平台到达顺序
+      //    （Sourcery 意见 5），按平台 timestamp 稳定排序。
+      // 3. 非载体项的完成信号立即 resolve——它们的 typing 中间件实例
+      //    退场，只留载体一个续期源（Sourcery 意见 6）。
+      const entry = entryHolder.current;
+      for (const i of rawItems) entry?.keys.delete(buildC2CDebounceKey(i));
+      const items = rawItems.length > 1
+        ? [...rawItems].sort((a, b) => arrivalMs(a) - arrivalMs(b))
+        : rawItems;
+      if (items.length > 1) settleItems(items.slice(0, -1));
+
       const completion = (async () => {
-        if (items.length === 1) {
-          await dispatchItem(items[0]!);
-          return;
+        try {
+          if (items.length === 1) {
+            await dispatchItem(items[0]!);
+            return;
+          }
+          const last = items[items.length - 1]!;
+          dlog?.info(
+            `[inbound-debounce] merged ${items.length} c2c messages sender=${last.msg.senderId} anchorMsgId=${last.msg.messageId}`,
+          );
+          await dispatchItem({ ...last, ctx: buildMergedCarrier(items) });
+        } finally {
+          // 载体项在 dispatch 完成后 resolve：其 typing 链活到 turn 结束
+          settleItems(items);
         }
-        const last = items[items.length - 1]!;
-        dlog?.info(
-          `[inbound-debounce] merged ${items.length} c2c messages sender=${last.msg.senderId} anchorMsgId=${last.msg.messageId}`,
-        );
-        await dispatchItem({ ...last, ctx: buildMergedCarrier(items) });
       })();
       return { admission: completion, completion };
     },
@@ -232,18 +308,28 @@ function getOrCreateDebouncer(item: C2CInboundDebounceItem, initialDebounceMs: n
         `c2c debounce flush failed (${items.length} items, first msgId=${first?.msg.messageId ?? '?'}): ` +
           `${err instanceof Error ? err.message : String(err)}`,
       );
+      // flush 失败也必须放行完成信号，否则 handleMessage 永久挂起
+      settleItems(items);
+    },
+    onCancel: (items) => {
+      // 防御路径：cancelKey（当前无调用方）导致的丢弃，同样放行信号
+      settleItems(items);
     },
   });
-  debouncers.set(item.account.accountId, { debouncer, keys: new Set() });
+  const entry = { debouncer, keys: new Set<string>() };
+  entryHolder.current = entry;
+  debouncers.set(item.account.accountId, entry);
   return debouncer;
 }
 
 /**
  * c2c 入站消息入防抖队列。
  *
- * 返回 true = 已接管（进缓冲区，或控制命令旁路的立即 dispatch 已在
- * enqueue 内完成）；返回 false = 未接管（防抖关闭或非 c2c 消息），
- * 调用方走原直发路径。
+ * 返回 true = 已接管（进缓冲区，或旁路的立即 dispatch 已在内部完成）；
+ * 返回 false = 未接管（防抖关闭或非 c2c 消息），调用方走原直发路径。
+ * 注意：返回 true 时本函数阻塞至该项所在 batch 的 dispatch 完成
+ * （见模块头「入队 await 语义」），调用方的中间件链（含 typing 续期）
+ * 据此活到 turn 结束。
  */
 export async function enqueueC2CInboundMessage(
   ctx: MiddlewareContext,
@@ -256,12 +342,28 @@ export async function enqueueC2CInboundMessage(
 
   const cfg = (getAdapters(runtime).getConfig?.() ?? {}) as Record<string, unknown>;
   const debounceMs = resolveC2CInboundDebounceMs(account, cfg);
-  if (!(debounceMs > 0)) return false;
-
   const item: C2CInboundDebounceItem = { ctx, msg, account, runtime, log, cfg };
-  getOrCreateDebouncer(item, debounceMs);
-  const entry = debouncers.get(account.accountId)!;
-  entry.keys.add(buildC2CDebounceKey(item));
+  const key = buildC2CDebounceKey(item);
+
+  if (!(debounceMs > 0)) {
+    // 防抖中途被禁用：先冲刷该发送者的 pending buffer 再交还调用方直发，
+    // 否则旧 buffer 晚于新消息 flush，消息乱序且新 turn 可能被旧 turn 打断
+    const entry = debouncers.get(account.accountId);
+    if (entry) await entry.debouncer.flushKey(key);
+    return false;
+  }
+
+  let resolveDone!: () => void;
+  const done: ItemDone = {
+    promise: new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    }),
+    resolve: resolveDone,
+  };
+  item.done = done;
+
+  const debouncer = getOrCreateDebouncer(item, debounceMs);
+  debouncers.get(account.accountId)!.keys.add(key);
 
   if (!announced.has(account.accountId)) {
     announced.add(account.accountId);
@@ -270,7 +372,8 @@ export async function enqueueC2CInboundMessage(
       ?.info(`[inbound-debounce] c2c inbound debounce armed (debounceMs=${debounceMs}, sliding window, framework cap ×5)`);
   }
 
-  await entry.debouncer.enqueue(item);
+  await debouncer.enqueue(item);
+  await done.promise;
   return true;
 }
 
@@ -279,9 +382,9 @@ export async function enqueueC2CInboundMessage(
  *
  * 框架 debouncer 的 drain() 只等待在途任务、不冲刷 pending buffer
  * （buffer 的 flush timer 是 unref 的，退出时永不触发）——必须对每个
- * 活跃 key 显式 flushKey 才能把窗口内的消息发出去。SIGINT/SIGTERM 下
- * best-effort（process.exit 不等待）；beforeExit 下 flush 的异步 dispatch
- * 会重新拉起事件循环自然完成。
+ * 活跃 key 显式 flushKey 才能把窗口内的消息发出去。flushAll 只等待
+ * admission（dispatch 被框架接受），不等 turn 完成（进程退出场景下
+ * turn 本来也跑不完）。
  */
 export async function flushAllC2CInboundDebouncers(): Promise<void> {
   await Promise.allSettled(
