@@ -541,6 +541,7 @@ await test('红线：多问题 ask_user pending 中的会话 → 消息放行', 
   registerPendingSecretInput(makePending());
   // 同会话登记一个进行中的多问题 ask_user
   registerPendingMultiQuestion(
+    'default',
     'ask_0123456789abcdef0123456789abcdef',
     'c2c',
     USER,

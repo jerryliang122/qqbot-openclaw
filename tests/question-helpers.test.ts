@@ -563,7 +563,7 @@ const PARSED_ISOTHER_QUESTIONS = parseMultiQuestionPrompt([
 ].join('\n'))!;
 
 function resetPending(questions = PARSED_QUESTIONS): void {
-  registerPendingMultiQuestion(MULTI_ID, 'c2c', 'peer-1', questions);
+  registerPendingMultiQuestion('test-account', MULTI_ID, 'c2c', 'peer-1', questions);
 }
 
 test('未登记 -> unknown', () => {
@@ -573,10 +573,12 @@ test('未登记 -> unknown', () => {
 
 test('会话索引：登记后可按会话查到，终态后查不到', () => {
   resetPending();
-  assert.deepEqual(findPendingMultiQuestionByConversation('c2c', 'peer-1'), { questionId: MULTI_ID });
-  assert.equal(findPendingMultiQuestionByConversation('group', 'peer-1'), undefined);
+  assert.deepEqual(findPendingMultiQuestionByConversation('test-account', 'c2c', 'peer-1'), { questionId: MULTI_ID });
+  assert.equal(findPendingMultiQuestionByConversation('test-account', 'group', 'peer-1'), undefined);
+  // 账号维度隔离：openid 是 per-account 的，他账号同 targetId 查不到
+  assert.equal(findPendingMultiQuestionByConversation('other-account', 'c2c', 'peer-1'), undefined);
   markMultiQuestionResolved(MULTI_ID);
-  assert.equal(findPendingMultiQuestionByConversation('c2c', 'peer-1'), undefined);
+  assert.equal(findPendingMultiQuestionByConversation('test-account', 'c2c', 'peer-1'), undefined);
 });
 
 test('逐题缓冲 -> 集齐后 complete 并携带答案快照', () => {
@@ -655,11 +657,11 @@ test('索引越界 -> unknown', () => {
 test('TTL 过期 -> unknown', async () => {
   // 独立 recordId，避免与后续同步用例的重注册交错
   const TTL_ID = 'ask_ffffffffffffffffffffffffffffffff';
-  registerPendingMultiQuestion(TTL_ID, 'c2c', 'peer-ttl', PARSED_QUESTIONS, 5);
+  registerPendingMultiQuestion('test-account', TTL_ID, 'c2c', 'peer-ttl', PARSED_QUESTIONS, 5);
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(recordMultiQuestionTap(TTL_ID, 0, 0).status, 'unknown');
   assert.equal(getPendingMultiQuestions(TTL_ID), null);
-  assert.equal(findPendingMultiQuestionByConversation('c2c', 'peer-ttl'), undefined);
+  assert.equal(findPendingMultiQuestionByConversation('test-account', 'c2c', 'peer-ttl'), undefined);
 });
 
 console.log('\n=== 9. 确认卡答案文本 ===');

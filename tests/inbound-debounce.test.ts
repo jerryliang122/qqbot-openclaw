@@ -405,6 +405,7 @@ await test('多问题 keyed 答案旁路：原样直发不被合并（认领文�
     assembledBody: { webBody: '1: 3\n2: 1', agentBody: '1: 3\n2: 1', rawBody: '1: 3\n2: 1' },
   });
   registerPendingMultiQuestion(
+    'test-account',
     'q-bypass-test',
     'c2c',
     answer.msg.replyTarget.targetId,
@@ -414,6 +415,28 @@ await test('多问题 keyed 答案旁路：原样直发不被合并（认领文�
   assert.equal(await keepAlive(fire(scenario, answer)), true);
   assert.equal(scenario.captured.length, 1, 'keyed answer must bypass debounce immediately');
   assert.equal(scenario.captured[0]!.ingest.textForCommands, '1: 3\n2: 1');
+});
+
+await test('keyed 旁路按账号隔离：他账号的 pending 不影响本账号合并', async () => {
+  const scenario = setupScenario({ debounceMs: W });
+  const a = makeC2CMsgAndCtx({ content: '前半句', assembledBody: { webBody: '前半句', agentBody: '前半句', rawBody: '前半句' } });
+  const b = makeC2CMsgAndCtx({ content: '后半句', assembledBody: { webBody: '后半句', agentBody: '后半句', rawBody: '后半句' } });
+  // openid 是 per-account 的：另一账号（other-account）同 targetId 的 pending
+  // 多问题不应让本账号（test-account）的消息误走 keyed 旁路
+  registerPendingMultiQuestion(
+    'other-account',
+    'q-cross-account',
+    'c2c',
+    a.msg.replyTarget.targetId,
+    [{ header: '题', question: '选一个', options: ['a', 'b'] }],
+    200,
+  );
+  const pa = fire(scenario, a);
+  await sleep(30);
+  const pb = fire(scenario, b);
+  await keepAlive(Promise.all([pa, pb]));
+  assert.equal(scenario.captured.length, 1, 'other-account pending must not bypass this account');
+  assert.ok((scenario.captured[0]!.ingest.textForAgent as string).includes('[消息 1/2]'));
 });
 
 await test('到达顺序排序：入队顺序颠倒时按平台 timestamp 排序，载体 = 最新到达', async () => {

@@ -533,11 +533,16 @@ interface PendingMultiQuestion {
 }
 
 const pendingMultiQuestions = new Map<string, PendingMultiQuestion>();
-/** `${scope}:${targetId}` -> questionId，供入站文字答案按会话定位 */
+/**
+ * `${accountId}:${scope}:${targetId}` -> questionId，供入站文字答案按会话定位。
+ * accountId 必须入键：QQ openid 是 per-account 的（bot A 与 bot B 的同字符串
+ * targetId 指向不同用户），不带账号维度会让 A 账号的 pending 误命中 B 账号
+ * 同 targetId 的会话（2026-10-14 Sourcery 评审发现，防抖 keyed 旁路受此影响）。
+ */
 const pendingByConversation = new Map<string, string>();
 
-function conversationKey(scope: 'c2c' | 'group', targetId: string): string {
-  return `${scope}:${targetId}`;
+function conversationKey(accountId: string, scope: 'c2c' | 'group', targetId: string): string {
+  return `${accountId}:${scope}:${targetId}`;
 }
 
 /**
@@ -545,6 +550,7 @@ function conversationKey(scope: 'c2c' | 'group', targetId: string): string {
  * 必须在发送按钮消息之前调用，避免「先点后登记」竞态。
  */
 export function registerPendingMultiQuestion(
+  accountId: string,
   questionId: string,
   scope: 'c2c' | 'group',
   targetId: string,
@@ -566,22 +572,23 @@ export function registerPendingMultiQuestion(
       if (pendingMultiQuestions.get(questionId) === entry) {
         pendingMultiQuestions.delete(questionId);
       }
-      if (pendingByConversation.get(conversationKey(scope, targetId)) === questionId) {
-        pendingByConversation.delete(conversationKey(scope, targetId));
+      if (pendingByConversation.get(conversationKey(accountId, scope, targetId)) === questionId) {
+        pendingByConversation.delete(conversationKey(accountId, scope, targetId));
       }
     }, ttlMs),
   };
   entry.cleanupTimer.unref?.();
   pendingMultiQuestions.set(questionId, entry);
-  pendingByConversation.set(conversationKey(scope, targetId), questionId);
+  pendingByConversation.set(conversationKey(accountId, scope, targetId), questionId);
 }
 
-/** 按会话查找进行中的多问题单（终态/提交中/已过期不算） */
+/** 按会话查找进行中的多问题单（终态/提交中/已过期不算）；会话键含账号维度 */
 export function findPendingMultiQuestionByConversation(
+  accountId: string,
   scope: 'c2c' | 'group',
   targetId: string,
 ): { questionId: string } | undefined {
-  const questionId = pendingByConversation.get(conversationKey(scope, targetId));
+  const questionId = pendingByConversation.get(conversationKey(accountId, scope, targetId));
   if (!questionId) return undefined;
   const entry = pendingMultiQuestions.get(questionId);
   if (!entry || entry.terminal || entry.resolving || entry.expiresAtMs <= Date.now()) {

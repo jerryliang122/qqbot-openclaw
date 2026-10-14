@@ -339,7 +339,7 @@ export async function dispatchToOpenClaw(
             const scope = envelope.chatScope === 'group' ? 'group' as const : 'c2c' as const;
             const replyTarget = { scope, targetId: peerId };
             // 先登记再发送，避免用户先点按钮时查无此单
-            registerPendingMultiQuestion(questionId, scope, peerId, questions);
+            registerPendingMultiQuestion(account.accountId, questionId, scope, peerId, questions);
             try {
               for (const [index, question] of questions.entries()) {
                 const cardText = formatMultiQuestionCard(question, index, questions.length);
