@@ -14,6 +14,8 @@
  *      不被合并且原样直发；有 pending buffer 时先冲刷再执行（保序）；
  *      运行中的 turn 不阻塞旁路（admission 在 lane 决策时放行，
  *      /stop 挡在 keyChains 后排队是 2026-10-16 修复的回归缺陷）；
+ *      挂起 ask_user 的 keyed 答案同机制立即 dispatch（死锁类钉子）；
+ *      跨窗口消息在运行中的 turn 期间即 dispatch（插嘴语义显式拍板）；
  *      放行时点取 lane 决策而非 inboundRun 调用（入队前不抢先，
  *      Sourcery 意见 2）；dispatch 失败（run 抛错）不悬挂 enqueue、
  *      不卡死同 key 后续旁路；
@@ -671,6 +673,91 @@ await test('退出冲刷两段式：flushAll 等在途 turn 的 completion，宽
   releaseTurn();
   await keepAlive(Promise.all([pf, flushP]));
   assert.equal(flushDone, true);
+});
+
+await test('跨窗口第二文件在 turn A 运行中即 dispatch——插嘴语义（二轮评审显式拍板）', async () => {
+  // 拍板结论：放行在 lane 决策处 ⇒ 窗口外的同发送者消息不再串行在
+  // 运行中的 turn 之后（v2.5.0–v2.6.0 的意外串行被放弃，c2c 恢复
+  // pre-v2.5.0 插嘴语义，对齐框架 createInboundDebounceFlush 契约；
+  // 窗口内合并不受影响）。本用例钉住该决策：turn A 运行中，窗口外的
+  // 文件 2 必须能 dispatch（真实框架里它 exclusive 入场 abort turn A，
+  // 插件级测试钉 dispatch 时机即可）。修复前（admission === completion）
+  // 文件 2 会排在 turn A 之后——本用例红。
+  let releaseTurn!: () => void;
+  const turnHanging = new Promise<void>((r) => {
+    releaseTurn = r;
+  });
+  const scenario = setupScenario({ debounceMs: 120 }, turnHanging);
+
+  const file1 = makeC2CMsgAndCtx({
+    content: '',
+    assembledBody: { webBody: '[文件] 1.pdf', agentBody: '[文件] 1.pdf', rawBody: '' },
+  });
+  const p1 = fire(scenario, file1);
+  await keepAlive(sleep(250)); // 窗口过 → turn A 已入 lane 且运行中（hang）
+  assert.equal(scenario.captured.length, 1);
+
+  const file2 = makeC2CMsgAndCtx({
+    content: '',
+    assembledBody: { webBody: '[文件] 2.pdf', agentBody: '[文件] 2.pdf', rawBody: '' },
+  });
+  const p2 = fire(scenario, file2); // 窗口外、非旁路 → 新 buffer
+  await keepAlive(sleep(450)); // 文件 2 的窗口走完 → flush → dispatch
+  assert.equal(
+    scenario.captured.length,
+    2,
+    'out-of-window message must dispatch while previous turn still runs (interjection semantics)',
+  );
+  assert.ok((scenario.captured[1]!.ingest.textForAgent as string).includes('2.pdf'));
+
+  releaseTurn();
+  await keepAlive(Promise.all([p1, p2]));
+});
+
+await test('挂起 ask_user 的 keyed 答案在 turn 运行中立即 dispatch（死锁类钉子）', async () => {
+  // 与 /stop 同一旁路机制、但后果更重：ask_user turn 运行中（等待答案），
+  // keyed 答案若被同 key 链排队即死锁——答案等 turn 完成、turn 等答案。
+  // 修复前（admission === completion）正是如此；放行在 lane 决策处后
+  // 答案立即 dispatch、turn 得以续跑。
+  let releaseTurn!: () => void;
+  const turnHanging = new Promise<void>((r) => {
+    releaseTurn = r;
+  });
+  const scenario = setupScenario({ debounceMs: 120 }, turnHanging);
+  const senderId = 'USER_ASK'; // 独立 sender 防 keyed pending 跨测试污染
+  const ask = makeC2CMsgAndCtx({
+    senderId,
+    content: '帮我选一下',
+    assembledBody: { webBody: '帮我选一下', agentBody: '帮我选一下', rawBody: '帮我选一下' },
+  });
+  const p1 = fire(scenario, ask);
+  await keepAlive(sleep(250)); // ask turn 已入 lane 且运行中（模拟挂起 ask_user）
+  assert.equal(scenario.captured.length, 1);
+
+  registerPendingMultiQuestion(
+    'test-account',
+    'q-deadlock-pin',
+    'c2c',
+    senderId,
+    [{ header: '题1', question: '选一个', options: ['a', 'b'] }],
+    200, // 短 TTL：cleanup timer 不悬挂测试进程
+  );
+  const answer = makeC2CMsgAndCtx({
+    senderId,
+    content: '1: a',
+    assembledBody: { webBody: '1: a', agentBody: '1: a', rawBody: '1: a' },
+  });
+  const p2 = fire(scenario, answer); // keyed 旁路：不得被运行中的 turn 排队
+  await keepAlive(sleep(80));
+  assert.equal(
+    scenario.captured.length,
+    2,
+    'keyed answer must dispatch while the awaiting turn still runs (deadlock before fix)',
+  );
+  assert.equal(scenario.captured[1]!.ingest.textForCommands, '1: a');
+
+  releaseTurn();
+  await keepAlive(Promise.all([p1, p2]));
 });
 
 await test('到达顺序排序：入队顺序颠倒时按平台 timestamp 排序，载体 = 最新到达', async () => {
