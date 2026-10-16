@@ -42,7 +42,19 @@
  * 不是「inboundRun 已调用」，那到真正入队还有多个异步段，提前放行会让
  * /stop 抢先入队而无处可取消，Sourcery 评审意见 2）时 resolve，
  * completion settle 时兜底；此后同 key 旁路必然晚于本 turn 入队，
- * 顺序确定。退出冲刷两段式：flushKey 等 lane 决策，再等在途
+ * 顺序确定。
+ *
+ * 跨窗口语义（2026-10-16 二轮评审显式拍板，勿"修"回去）：放行在 lane
+ * 决策处意味着**窗口外**的同发送者消息（如 10s 后再发的第二个文件）
+ * 不再串行在运行中的 turn 之后——turn B 以 exclusive 入场会 abort 运行
+ * 中的 turn A，c2c 恢复 pre-v2.5.0 的插嘴语义（对齐框架
+ * createInboundDebounceFlush 在 adopted/deferred 即 markAdmitted 的契约）；
+ * 窗口内合并（本模块存在理由）不受影响。刻意不做「只放旁路项插队」的
+ * 收窄：那需要 enqueue 早退式旁路（设计红线已否决）或对抗框架
+ * debouncer 的链管理，且会让普通文字消息（改需求、追问）重现
+ * 「等长任务跑完才 dispatch」的同款缺陷——/stop 只是这类消息里最典型的。
+ *
+ * 退出冲刷两段式：flushKey 等 lane 决策，再等在途
  * completion（activeCompletions）——宽限内能完成的 turn 把回复发完。
  *
  * 合并语义（onFlush 多条时）：
@@ -328,7 +340,13 @@ function getOrCreateDebouncer(item: C2CInboundDebounceItem, initialDebounceMs: n
       // Sourcery 评审意见 2）。completion settle 时兜底 admit（覆盖
       // ingest 丢弃 / dispatch 抛错 / adapters 缺失——链永不悬挂）。
       // 语义对齐框架 createInboundDebounceFlush 的 admission 设计
-      // （adopted/deferred/failed 任一即放行）。
+      // （adopted/deferred/failed 任一即放行）。刻意**不用**它本身（onFlush
+      // 的第 2 个参数，当前被忽略）：采用它会用框架包装的 lifecycle 替换
+      // 我方传入的对象，而 dispatch.ts 刻意让同一个 lifecycle 对象同时
+      // 出现在 runDispatchLifecycle 与 replyOptions.turnAdoptionLifecycle
+      // 以满足框架的所有权校验（assertPreparedDispatchLifecycle）——换对象
+      // 会破坏该校验。此处手搓等价语义（钩子触发 + completion 兜底），
+      // 勿"简化"回去。
       let markAdmitted!: () => void;
       const admission = new Promise<void>((resolve) => {
         markAdmitted = resolve;
