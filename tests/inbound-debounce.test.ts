@@ -12,9 +12,13 @@
  *    - 单条消息 → 原样直发，无分节头；
  *    - 三类旁路（控制命令 stop / 斜杠命令 / 多问题 keyed 答案）：
  *      不被合并且原样直发；有 pending buffer 时先冲刷再执行（保序）；
- *      运行中的 turn 不阻塞旁路（admission 在 turn 提交时放行，
+ *      运行中的 turn 不阻塞旁路（admission 在 lane 决策时放行，
  *      /stop 挡在 keyChains 后排队是 2026-10-16 修复的回归缺陷）；
- *      dispatch 失败（run 抛错）不悬挂 enqueue、不卡死同 key 后续旁路；
+ *      放行时点取 lane 决策而非 inboundRun 调用（入队前不抢先，
+ *      Sourcery 意见 2）；dispatch 失败（run 抛错）不悬挂 enqueue、
+ *      不卡死同 key 后续旁路；
+ *    - 退出冲刷两段式：flushAll 先等 lane 决策、再等在途 completion，
+ *      宽限内能完成的 turn 不丢回复（Sourcery 意见 1）；
  *    - 滑动窗口：窗口内新消息重置计时（宽裕量 400ms 防事件循环延迟抖动）；
  *    - 超窗消息 → 各自独立 dispatch；不同发送者互不合并；
  *    - 到达顺序排序：入队顺序与平台到达顺序相反时按 timestamp 排序，
@@ -93,11 +97,15 @@ interface CapturedInbound {
   ctxPayload: any;
 }
 
-function makeFakeRuntime(captured: CapturedInbound[], hang?: Promise<void>) {
+function makeFakeRuntime(captured: CapturedInbound[], hang?: Promise<void>, admissionGate?: Promise<void>) {
   // dispatchToOpenClaw 的执行序：buildCtxPayload（调 buildContext）→
   // adapters.inboundRun——ctxPayload 先产出、后入栈，用暂存变量衔接。
-  // hang：传入时 run 在记录 captured（入口）后挂起直至该 promise resolve
-  // ——模拟"turn 已提交进网关但仍在运行"的长任务场景。
+  // hang：run 在 lane 采纳并调用 runDispatch 后挂起直至该 promise resolve
+  // ——模拟"turn 已入 lane 队列但仍在运行"的长任务场景。
+  // admissionGate：run 在 resolveTurn 前先等该 promise——模拟框架
+  // runChannelTurn 入队前的异步管线（ingest/classify/preflight/
+  // resolveTurn 多个 await 段，dist/run-channel-turn-*.js），用于验证
+  // 放行信号取 lane 决策而非「inboundRun 已调用」。
   let pendingCtxPayload: any;
   return {
     version: 'test',
@@ -106,6 +114,13 @@ function makeFakeRuntime(captured: CapturedInbound[], hang?: Promise<void>) {
         run: async (params: any) => {
           captured.push({ params, ingest: params.adapter.ingest({}), ctxPayload: pendingCtxPayload });
           pendingCtxPayload = undefined;
+          if (admissionGate) await admissionGate;
+          const resolved = params.adapter.resolveTurn?.(params.raw, {}, {});
+          try {
+            await resolved?.runDispatch?.();
+          } catch {
+            /* dispatchReply 抛错由 dispatchToOpenClaw 自行处理 */
+          }
           if (hang) await hang;
           return { dispatched: true };
         },
@@ -115,7 +130,12 @@ function makeFakeRuntime(captured: CapturedInbound[], hang?: Promise<void>) {
         },
       },
       reply: {
-        dispatchReplyWithBufferedBlockDispatcher: () => ({ queuedFinal: true, counts: { final: 1 } }),
+        dispatchReplyWithBufferedBlockDispatcher: (params: any) => {
+          // 模拟框架 lane 仲裁：真实框架在 session lane 接纳 turn 时调用
+          // replyOptions.turnAdoptionLifecycle 的 onAdopted/onDeferred
+          params?.replyOptions?.turnAdoptionLifecycle?.onAdopted?.();
+          return { queuedFinal: true, counts: { final: 1 } };
+        },
       },
       routing: {
         resolveAgentRoute: (params: any) => ({
@@ -189,12 +209,12 @@ function makeAccount(inboundDebounce?: any): any {
 }
 
 /** 场景重置 + 组装（每个集成用例独立 runtime / 防抖器） */
-function setupScenario(inboundDebounce?: any, hang?: Promise<void>) {
+function setupScenario(inboundDebounce?: any, hang?: Promise<void>, admissionGate?: Promise<void>) {
   resetC2CInboundDebouncersForTest();
   _resetAdaptersCache();
   installFakeGateway();
   const captured: CapturedInbound[] = [];
-  const runtime = makeFakeRuntime(captured, hang);
+  const runtime = makeFakeRuntime(captured, hang, admissionGate);
   return { account: makeAccount(inboundDebounce), runtime, captured };
 }
 
@@ -579,6 +599,78 @@ await test('dispatch 失败（run 抛错）不卡死同 key 后续旁路，enque
   await keepAlive(p2);
   assert.equal(captured.length, 2, 'bypass after failed batch must not be blocked');
   assert.equal(captured[1]!.ingest.textForCommands, '/stop');
+});
+
+await test('放行取 lane 决策而非 inboundRun 调用时点——入队前 /stop 不抢先 dispatch', async () => {
+  // Sourcery 意见 2：框架 runChannelTurn 在真正入队前还有 ingest →
+  // classify → preflight → resolveTurn 多个异步段。若放行信号取
+  // 「adapters.inboundRun 已调用」，任务批次尚未入 lane 时链已释放，
+  // /stop 会抢先到达 lane 而无处可取消，任务随后入队继续跑（stop 落空）。
+  // admissionGate 把 lane 决策闸住：闸门释放前（turn 已 dispatch、
+  // captured 已记录，但尚未入队），/stop 不得 dispatch。
+  let releaseAdoption!: () => void;
+  const adoptionGate = new Promise<void>((r) => {
+    releaseAdoption = r;
+  });
+  const scenario = setupScenario({ debounceMs: 120 }, undefined, adoptionGate);
+
+  const task = makeC2CMsgAndCtx({
+    content: '闸门中的任务',
+    assembledBody: { webBody: '闸门中的任务', agentBody: '闸门中的任务', rawBody: '闸门中的任务' },
+  });
+  const pf = fire(scenario, task);
+  await keepAlive(sleep(200)); // flush → dispatch → run 入口已记录，但 lane 决策被闸住
+  assert.equal(scenario.captured.length, 1, 'task dispatched but not yet admitted into lane');
+
+  const stop = makeC2CMsgAndCtx({
+    content: '/stop',
+    assembledBody: { webBody: '/stop', agentBody: '/stop', rawBody: '/stop' },
+  });
+  const ps = fire(scenario, stop);
+  await keepAlive(sleep(80));
+  assert.equal(
+    scenario.captured.length,
+    1,
+    '/stop must NOT dispatch before previous turn is admitted into the lane (pre-enqueue release race)',
+  );
+
+  releaseAdoption(); // lane 采纳任务批次 → 链放行
+  await keepAlive(sleep(80));
+  assert.equal(scenario.captured.length, 2, '/stop dispatches right after lane admission');
+  assert.equal(scenario.captured[1]!.ingest.textForCommands, '/stop');
+  await keepAlive(Promise.all([pf, ps]));
+});
+
+await test('退出冲刷两段式：flushAll 等在途 turn 的 completion，宽限内完成的回复不丢', async () => {
+  // Sourcery 意见 1：SIGINT/SIGTERM 时若 flushAll 只等 admission（lane
+  // 决策）就返回，shutdown handler 立即 forceExit，正在运行的 turn 即使
+  // 能在 1.5s 宽限内跑完也会被杀掉、回复丢失。flushAll 必须再等在途
+  // completion（调用方 runtime.ts 以 1.5s 有界封顶，不会无限等）。
+  let releaseTurn!: () => void;
+  const turnHanging = new Promise<void>((r) => {
+    releaseTurn = r;
+  });
+  const scenario = setupScenario({ debounceMs: 120 }, turnHanging);
+
+  const task = makeC2CMsgAndCtx({
+    content: '退出前的任务',
+    assembledBody: { webBody: '退出前的任务', agentBody: '退出前的任务', rawBody: '退出前的任务' },
+  });
+  const pf = fire(scenario, task);
+  await keepAlive(sleep(200)); // turn 已入 lane（onAdopted 已触发）且运行中
+  assert.equal(scenario.captured.length, 1);
+
+  let flushDone = false;
+  const flushP = keepAlive(
+    flushAllC2CInboundDebouncers().then(() => {
+      flushDone = true;
+    }),
+  );
+  await keepAlive(sleep(80));
+  assert.equal(flushDone, false, 'flushAll must keep waiting for the in-flight turn completion');
+  releaseTurn();
+  await keepAlive(Promise.all([pf, flushP]));
+  assert.equal(flushDone, true);
 });
 
 await test('到达顺序排序：入队顺序颠倒时按平台 timestamp 排序，载体 = 最新到达', async () => {
