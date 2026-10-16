@@ -8,6 +8,18 @@
 
 ---
 
+## [2.6.1] - 2026-10-16
+
+### 修复
+
+- **任务 turn 运行期间，`/stop` 等旁路消息被排队阻塞，c2c 插嘴语义失效**（v2.5.0 引入防抖合并后的回归，含两轮 Sourcery 评审闭环）。用户报告：任务执行中发送 `/stop` 无法及时送达 openclaw，总要等任务跑完命令才被 dispatch 进框架。根因在插件与框架 debouncer 的配合方式：防抖 `onFlush` 返回 `admission === completion`（同一个 promise，覆盖整个 turn run），而框架 debouncer（`dist/inbound-debounce-*.js`）的 `enqueue` 对旁路项（控制命令 / 斜杠命令 / keyed 答案）在**同 key 存在 in-flight 任务链时会排队等其 settle**——于是任务 turn 不结束，同发送者的 `/stop` 就进不了 dispatch，`exclusive + abortSignal` 的插嘴取消完全失效；更隐蔽的是挂起 ask_user 的 keyed 答案走同一旁路，会被**自己正在等待的 turn** 死锁（答案永远送不进去）。修复：**admission（放行）与 completion（typing 续命）解耦**——`dispatchToOpenClaw` 新增 `onTurnSubmitted` 选项，从框架 `turnAdoptionLifecycle` 的 `onAdopted` / `onDeferred` / `onAbandoned`（= turn 已入 lane 队列）触发，防抖据此提前放行同 key 任务链，completion settle 时兜底（ingest 丢弃 / dispatch 抛错 / adapters 缺失等路径链不悬挂）；typing 续命语义不变（`enqueueC2CInboundMessage` 仍等到 batch dispatch 完成才 resolve）。信号刻意取 lane 决策而非「inboundRun 已调用」：框架 `runChannelTurn` 到真正入队还有 ingest → classify → preflight → resolveTurn 多个异步段，调用时放行会让 `/stop` 抢在前一批次入队前到达 lane、无处可取消（Sourcery 二轮意见）；此后同 key 旁路必然晚于本 turn 入队，顺序确定。
+- **退出冲刷丢已提交 turn 的回复**（Sourcery 首轮意见 1）。admission 提前放行后，SIGINT/SIGTERM 的 `flushAllC2CInboundDebouncers` 会在 lane 决策处即返回，shutdown handler 随即 `forceExit`——退出宽限（≤1.5s）内本可跑完、把回复发完的 turn 被杀。修复：退出冲刷改**两段式**——第一段逐 key `flushKey` 等 lane 决策，第二段等全部在途 completion（`activeCompletions` 登记簿，settle 自移除）；仍在 runtime.ts ≤1.5s 有界封顶内，不会无界等 turn（Ctrl+C 卡死是刻意拒绝的）。
+- **跨窗口串行语义显式拍板**（二轮评审发现）。放行在 lane 决策处的直接后果：**窗口外**的同发送者消息（如 10 秒后再发的第二个文件）不再排队等运行中的 turn 跑完——turn B 以 exclusive 入场会 abort 运行中的 turn A。v2.5.0–v2.6.0 因 `admission === completion` 意外获得的「全部同发送者消息串行」就此放弃，c2c 恢复 pre-v2.5.0 插嘴语义（对齐框架 `createInboundDebounceFlush` 在 adopted/deferred 即 markAdmitted 的契约）；**窗口内合并（防抖特性的存在理由）不受影响**。刻意不做「只放旁路项插队」的收窄：那需要设计红线已否决的 enqueue 早退式旁路或对抗框架 debouncer，且会让普通文字消息（改需求、追问）重现「等长任务跑完才 dispatch」的同款缺陷。该决策连同理由已写入 AGENTS.md 红线与模块头。
+- **包根类型导出缺失**（Sourcery 意见 4）：`DispatchToOpenClawOptions` 随 `dispatchToOpenClaw` 在包根 `index.ts` 导出，TypeScript 消费方可按名导入。
+- 回归测试 `tests/inbound-debounce.test.ts` 26 → **33 用例**：新增「运行中 turn 不阻塞 `/stop` / 控制词」「放行取 lane 决策时点（入队前不抢先）」「dispatch 失败不悬挂、不卡同 key 后续旁路」「退出冲刷两段式」「挂起 ask_user 的 keyed 答案立即 dispatch（死锁类钉子）」「跨窗口消息插嘴语义」六组钉子，全部经反向验证（对 v2.6.0 代码转红）；AGENTS.md 防抖红线同步更新（含此前用例计数 25 的欠账修正）。
+
+---
+
 ## [2.6.0] - 2026-10-14
 
 ### 新增
