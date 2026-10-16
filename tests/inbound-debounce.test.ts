@@ -12,6 +12,9 @@
  *    - 单条消息 → 原样直发，无分节头；
  *    - 三类旁路（控制命令 stop / 斜杠命令 / 多问题 keyed 答案）：
  *      不被合并且原样直发；有 pending buffer 时先冲刷再执行（保序）；
+ *      运行中的 turn 不阻塞旁路（admission 在 turn 提交时放行，
+ *      /stop 挡在 keyChains 后排队是 2026-10-16 修复的回归缺陷）；
+ *      dispatch 失败（run 抛错）不悬挂 enqueue、不卡死同 key 后续旁路；
  *    - 滑动窗口：窗口内新消息重置计时（宽裕量 400ms 防事件循环延迟抖动）；
  *    - 超窗消息 → 各自独立 dispatch；不同发送者互不合并；
  *    - 到达顺序排序：入队顺序与平台到达顺序相反时按 timestamp 排序，
@@ -90,9 +93,11 @@ interface CapturedInbound {
   ctxPayload: any;
 }
 
-function makeFakeRuntime(captured: CapturedInbound[]) {
+function makeFakeRuntime(captured: CapturedInbound[], hang?: Promise<void>) {
   // dispatchToOpenClaw 的执行序：buildCtxPayload（调 buildContext）→
-  // adapters.inboundRun——ctxPayload 先产出、后入栈，用暂存变量衔接
+  // adapters.inboundRun——ctxPayload 先产出、后入栈，用暂存变量衔接。
+  // hang：传入时 run 在记录 captured（入口）后挂起直至该 promise resolve
+  // ——模拟"turn 已提交进网关但仍在运行"的长任务场景。
   let pendingCtxPayload: any;
   return {
     version: 'test',
@@ -101,6 +106,7 @@ function makeFakeRuntime(captured: CapturedInbound[]) {
         run: async (params: any) => {
           captured.push({ params, ingest: params.adapter.ingest({}), ctxPayload: pendingCtxPayload });
           pendingCtxPayload = undefined;
+          if (hang) await hang;
           return { dispatched: true };
         },
         buildContext: (params: any) => {
@@ -183,12 +189,12 @@ function makeAccount(inboundDebounce?: any): any {
 }
 
 /** 场景重置 + 组装（每个集成用例独立 runtime / 防抖器） */
-function setupScenario(inboundDebounce?: any) {
+function setupScenario(inboundDebounce?: any, hang?: Promise<void>) {
   resetC2CInboundDebouncersForTest();
   _resetAdaptersCache();
   installFakeGateway();
   const captured: CapturedInbound[] = [];
-  const runtime = makeFakeRuntime(captured);
+  const runtime = makeFakeRuntime(captured, hang);
   return { account: makeAccount(inboundDebounce), runtime, captured };
 }
 
@@ -437,6 +443,142 @@ await test('keyed 旁路按账号隔离：他账号的 pending 不影响本账�
   await keepAlive(Promise.all([pa, pb]));
   assert.equal(scenario.captured.length, 1, 'other-account pending must not bypass this account');
   assert.ok((scenario.captured[0]!.ingest.textForAgent as string).includes('[消息 1/2]'));
+});
+
+group('回归：旁路不被运行中的 turn 阻塞（2026-10-16 /stop 卡死修复）');
+
+await test('turn 运行中到达的 /stop 立即 dispatch，不等 turn 跑完', async () => {
+  // 场景：任务 turn 已提交进网关且仍在运行（run 挂起）。此时同发送者
+  // 发来 /stop——框架 debouncer 的 enqueue 对旁路项在同 key 有 in-flight
+  // 任务链时会排队等其 settle；修复前 admission === completion（覆盖整个
+  // turn run），/stop 要等任务 turn 跑完才 dispatch，插嘴语义失效。
+  // 修复后 admission 在 turn 提交（onTurnSubmitted）时即放行，/stop
+  // 在 turn 仍在运行时就完成 dispatch（fake run 在入口记录 captured）。
+  let releaseTurn!: () => void;
+  const turnHanging = new Promise<void>((r) => {
+    releaseTurn = r;
+  });
+  const scenario = setupScenario({ debounceMs: 120 }, turnHanging);
+
+  const task = makeC2CMsgAndCtx({
+    content: '长任务',
+    assembledBody: { webBody: '长任务', agentBody: '长任务', rawBody: '长任务' },
+  });
+  const pf = fire(scenario, task); // 进 buffer
+  await keepAlive(sleep(200)); // 窗口过 → flush → dispatchToOpenClaw → run 入口挂起（turn 运行中）
+  assert.equal(scenario.captured.length, 1, 'task turn must be submitted and still running');
+  assert.equal(scenario.captured[0]!.ingest.textForAgent, '长任务');
+
+  const stop = makeC2CMsgAndCtx({
+    content: '/stop',
+    assembledBody: { webBody: '/stop', agentBody: '/stop', rawBody: '/stop' },
+  });
+  const ps = fire(scenario, stop); // 旁路：无 pending buffer；key 链须已随 turn 提交释放
+  await keepAlive(sleep(80)); // 同步前缀 → inboundRun 入口，远小于窗口/turn 时长
+  assert.equal(
+    scenario.captured.length,
+    2,
+    '/stop must dispatch while previous turn is still running (was queued behind it before fix)',
+  );
+  assert.equal(scenario.captured[1]!.ingest.textForCommands, '/stop', 'command text must stay unmerged');
+
+  releaseTurn(); // 放行挂起的 turn（两条 run 共用同一 hang）
+  await keepAlive(Promise.all([pf, ps]));
+  assert.equal(scenario.captured.length, 2);
+});
+
+await test('turn 运行中到达的控制命令（stop）同样立即 dispatch', async () => {
+  // 同机制的控制命令词形态（非斜杠）：shouldDebounceTextInbound 判定旁路
+  let releaseTurn!: () => void;
+  const turnHanging = new Promise<void>((r) => {
+    releaseTurn = r;
+  });
+  const scenario = setupScenario({ debounceMs: 120 }, turnHanging);
+
+  const task = makeC2CMsgAndCtx({
+    content: '另一个长任务',
+    assembledBody: { webBody: '另一个长任务', agentBody: '另一个长任务', rawBody: '另一个长任务' },
+  });
+  const pf = fire(scenario, task);
+  await keepAlive(sleep(200));
+  assert.equal(scenario.captured.length, 1);
+
+  const stopWord = makeC2CMsgAndCtx({
+    content: 'stop',
+    assembledBody: { webBody: 'stop', agentBody: 'stop', rawBody: 'stop' },
+  });
+  const ps = fire(scenario, stopWord);
+  await keepAlive(sleep(80));
+  assert.equal(
+    scenario.captured.length,
+    2,
+    'control word must dispatch while previous turn is still running',
+  );
+  assert.equal(scenario.captured[1]!.ingest.textForCommands, 'stop');
+
+  releaseTurn();
+  await keepAlive(Promise.all([pf, ps]));
+});
+
+await test('dispatch 失败（run 抛错）不卡死同 key 后续旁路，enqueue promise 不悬挂', async () => {
+  // completion reject 路径：dispatchToOpenClaw 尾部 rethrow → onFlush 的
+  // completion 拒绝 → finally 兜底 admit + settleItems（onError 再 settle 幂等）。
+  // 若无兜底，失败批次的 key 链悬挂，同 key 后续旁路消息被永久卡死。
+  let failFirst = true;
+  const captured: CapturedInbound[] = [];
+  const runtime = {
+    version: 'test',
+    channel: {
+      inbound: {
+        run: async (params: any) => {
+          captured.push({ params, ingest: params.adapter.ingest({}), ctxPayload: undefined });
+          if (failFirst) {
+            failFirst = false;
+            throw new Error('gateway exploded');
+          }
+          return { dispatched: true };
+        },
+        buildContext: (params: any) => ({ ...params, __built: true }),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: () => ({ queuedFinal: true, counts: { final: 1 } }),
+      },
+      routing: {
+        resolveAgentRoute: (params: any) => ({
+          sessionKey: `qqbot:test:${params.peer.id}`,
+          accountId: params.accountId,
+          agentId: 'default',
+        }),
+      },
+      session: {
+        resolveStorePath: () => '',
+        recordInboundSession: async () => {},
+      },
+    },
+    config: { current: {} },
+  } as any;
+  resetC2CInboundDebouncersForTest();
+  _resetAdaptersCache();
+  installFakeGateway();
+  const scenario = { account: makeAccount({ debounceMs: 120 }), runtime, captured };
+
+  const first = makeC2CMsgAndCtx({
+    content: '会失败的消息',
+    assembledBody: { webBody: '会失败的消息', agentBody: '会失败的消息', rawBody: '会失败的消息' },
+  });
+  const p1 = fire(scenario, first);
+  await keepAlive(sleep(200)); // flush → dispatch → run 抛错 → completion reject → 兜底 admit + onError settle
+  await keepAlive(p1); // onError/onCancel 路径必须放行 done 信号（不悬挂）
+  assert.equal(captured.length, 1);
+
+  const stop = makeC2CMsgAndCtx({
+    content: '/stop',
+    assembledBody: { webBody: '/stop', agentBody: '/stop', rawBody: '/stop' },
+  });
+  const p2 = fire(scenario, stop); // key 链必须已释放（不能被失败批次卡住）
+  await keepAlive(p2);
+  assert.equal(captured.length, 2, 'bypass after failed batch must not be blocked');
+  assert.equal(captured[1]!.ingest.textForCommands, '/stop');
 });
 
 await test('到达顺序排序：入队顺序颠倒时按平台 timestamp 排序，载体 = 最新到达', async () => {

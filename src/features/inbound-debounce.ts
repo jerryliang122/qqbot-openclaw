@@ -20,7 +20,8 @@
  *   hasMedia 刻意传 false，纯附件消息独立判定为 true。
  *
  * 三类旁路（shouldDebounce 返回 false，经框架 debouncer 序列化：
- * 若同 key 有 pending buffer 会先冲刷再执行，顺序保持）：
+ * 若同 key 有 pending buffer 会先冲刷再执行，顺序保持；同 key 有
+ * in-flight 任务链时等其放行——见下「admission 放行」段）：
  * - 控制命令（框架 abort 触发词 stop/esc/abort/exit 等，判定来自
  *   shouldDebounceTextInbound / isControlCommandMessage）；
  * - 斜杠命令（rawBody 以 '/' 开头）：合并会破坏 buildCtxPayload 的
@@ -29,6 +30,16 @@
  *   文本，框架 keyed 文本认领失败 → 挂起的 ask_user 永远等不到答案；
  *   按 findPendingMultiQuestionByConversation(accountId, 'c2c', peer) 识别
  *   （会话键含账号维度——openid 是 per-account 的，跨账号不共享 pending）。
+ *
+ * admission 放行（2026-10-16 修复，红线）：onFlush 返回的 admission 与
+ * completion 必须解耦——框架 debouncer 的同 key 任务链持有到 admission
+ * settle，enqueue 对旁路项在同 key 有 in-flight 任务时会排队等它。若
+ * admission === completion（覆盖整个 turn run），任务 turn 运行期间到达的
+ * /stop 要等 turn 跑完才 dispatch（插嘴失效），挂起 ask_user 的 keyed
+ * 答案更会被自己等待的 turn 死锁。admission 必须在「turn 已提交进框架
+ * 网关」（dispatchToOpenClaw 的 onTurnSubmitted = adapters.inboundRun
+ * 已调用）时 resolve，completion settle 时兜底；网关按提交序 FIFO，
+ * 旁路仍晚于同 key 前一批次的提交，顺序保持。
  *
  * 合并语义（onFlush 多条时）：
  * - 先按平台事件 timestamp 稳定排序（中间件链并发执行，附件下载慢的
@@ -71,7 +82,7 @@ import type { ProcessedAttachments } from '../middleware/attachment.js';
 import { assembleBody } from '../dispatch/body-assembler.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { runWithRequestContext } from '../request-context.js';
-import { dispatchToOpenClaw } from '../dispatch/index.js';
+import { dispatchToOpenClaw, type DispatchToOpenClawOptions } from '../dispatch/index.js';
 import { findPendingMultiQuestionByConversation } from './question-helpers.js';
 
 /** 默认防抖窗口：3 秒（QQ 客户端连发"文件 + 说明"的典型间隔内） */
@@ -206,7 +217,10 @@ export function mergeProcessedAttachments(list: ProcessedAttachments[]): Process
 }
 
 /** 单条/合并后的统一 dispatch 入口（请求级上下文取自载体消息） */
-async function dispatchItem(item: C2CInboundDebounceItem): Promise<void> {
+async function dispatchItem(
+  item: C2CInboundDebounceItem,
+  opts?: DispatchToOpenClawOptions,
+): Promise<void> {
   const targetId = `qqbot:c2c:${item.msg.replyTarget.targetId}`;
   await runWithRequestContext(
     {
@@ -215,7 +229,7 @@ async function dispatchItem(item: C2CInboundDebounceItem): Promise<void> {
       openId: item.msg.senderId,
       target: targetId,
     },
-    () => dispatchToOpenClaw(item.ctx, item.msg, item.account, item.runtime, item.log),
+    () => dispatchToOpenClaw(item.ctx, item.msg, item.account, item.runtime, item.log, opts),
   );
 }
 
@@ -287,23 +301,49 @@ function getOrCreateDebouncer(item: C2CInboundDebounceItem, initialDebounceMs: n
         : rawItems;
       if (items.length > 1) settleItems(items.slice(0, -1));
 
+      // admission（放行）与 completion（typing 续命）解耦（2026-10-16 修复）：
+      // 框架 debouncer 的同 key 任务链持有到 onFlush 返回的 admission settle
+      // 为止；而旁路消息（/stop 等控制命令、斜杠命令、keyed 答案）在 enqueue
+      // 时若同 key 有 in-flight 任务会被排队等其 settle（inbound-debounce
+      // 框架实现 enqueue 的 keyChains 分支）。此前 admission === completion
+      // （覆盖整个 turn run），任务运行期间到达的 /stop 要等 turn 跑完才
+      // dispatch——插嘴语义（c2c exclusive + abortSignal 取消旧 turn）完全
+      // 失效，且挂起 ask_user 的 keyed 答案会被自己等待的 turn 死锁。
+      // 现 admission 在 turn 提交进框架网关（onTurnSubmitted，即
+      // adapters.inboundRun 已调用）时 resolve：链及时释放，旁路立即
+      // dispatch；网关按提交序 FIFO，顺序仍保持。completion settle 时兜底
+      // admit（覆盖 adapters 缺失提前返回 / 提交前抛错——链永不悬挂）。
+      // 语义对齐框架 createInboundDebounceFlush 的 admission 设计
+      // （adopted/deferred/failed 任一即放行），但不依赖框架回调时机。
+      let markAdmitted!: () => void;
+      const admission = new Promise<void>((resolve) => {
+        markAdmitted = resolve;
+      });
+      let admitted = false;
+      const admit = () => {
+        if (admitted) return;
+        admitted = true;
+        markAdmitted();
+      };
+
       const completion = (async () => {
         try {
           if (items.length === 1) {
-            await dispatchItem(items[0]!);
+            await dispatchItem(items[0]!, { onTurnSubmitted: admit });
             return;
           }
           const last = items[items.length - 1]!;
           dlog?.info(
             `[inbound-debounce] merged ${items.length} c2c messages sender=${last.msg.senderId} anchorMsgId=${last.msg.messageId}`,
           );
-          await dispatchItem({ ...last, ctx: buildMergedCarrier(items) });
+          await dispatchItem({ ...last, ctx: buildMergedCarrier(items) }, { onTurnSubmitted: admit });
         } finally {
           // 载体项在 dispatch 完成后 resolve：其 typing 链活到 turn 结束
           settleItems(items);
+          admit();
         }
       })();
-      return { admission: completion, completion };
+      return { admission, completion };
     },
     onError: (err, items) => {
       const first = items[0];
@@ -387,14 +427,14 @@ export async function enqueueC2CInboundMessage(
  * （buffer 的 flush timer 是 unref 的，退出时永不触发）——必须对每个
  * 活跃 key 显式 flushKey 才能把窗口内的消息发出去。
  *
- * 等待深度：本插件 onFlush 的 admission 与 completion 是**同一个
- * promise**（含完整 dispatchToOpenClaw，生产路径即整个 turn run），
- * 框架 runFlush 的 race([admission, completion]) 实际等它完整 settle
- * ——即 flushAll 等到的是 dispatch 完成而非"仅获准"（Sourcery 意见
- * 曾据旧注释误判为后者）。注意 dispatch 完成 ≠ agent turn 一定跑完
- * （turn 被框架队列 defer 时 inboundRun 先 resolve、turn 后台继续），
- * 无界等 turn 是刻意拒绝的设计（Ctrl+C 卡死）；调用方（runtime.ts
- * shutdown）以有界上限（1.5s）封顶。
+ * 等待深度（2026-10-16 admission/completion 解耦后）：onFlush 的
+ * admission 在 turn 提交进网关（onTurnSubmitted）时 resolve，框架
+ * runFlush 的 race([admission, completion]) 随之 settle——flushAll 对
+ * 每个 key 等到的是「dispatch 已提交（或已完成/失败）」而非整个
+ * turn run。批次的载体完成信号（done.promise）仍覆盖完整
+ * dispatchToOpenClaw，但 flushKey 不等它。turn 被框架队列 defer 时
+ * inboundRun 先 resolve、turn 后台继续；无界等 turn 是刻意拒绝的设计
+ * （Ctrl+C 卡死）；调用方（runtime.ts shutdown）以有界上限（1.5s）封顶。
  */
 export async function flushAllC2CInboundDebouncers(): Promise<void> {
   await Promise.allSettled(

@@ -82,6 +82,25 @@ function combineAbortSignals(
 }
 
 
+/** dispatchToOpenClaw 可选行为开关（c2c 防抖 admission 信号等） */
+export interface DispatchToOpenClawOptions {
+  /**
+   * turn 已提交进框架网关（adapters.inboundRun 已调用）时触发，恰好一次。
+   *
+   * 用途：c2c 入站防抖（inbound-debounce.ts）据此释放框架 debouncer 的
+   * 同 key 任务链——框架 enqueue 对旁路项（/stop 等控制命令）在同 key
+   * 存在 in-flight 任务时会排队等待其 settle，而防抖 onFlush 的 completion
+   * 覆盖整个 turn run；若不提前放行，任务运行期间到达的 /stop 要等
+   * turn 跑完才 dispatch，插嘴语义（exclusive + abortSignal 取消旧 turn）
+   * 完全失效。信号取「inboundRun 已调用」这一确定性时点：网关按调用序
+   * FIFO 仲裁，此后同 key 的旁路 dispatch 仍晚于本 turn 提交，顺序保持。
+   *
+   * 未触发的路径（adapters 缺失提前返回、提交前抛错）由调用方以
+   * completion settle 兜底放行，链不会悬挂。
+   */
+  onTurnSubmitted?: () => void;
+}
+
 /**
  * 将经过中间件处理的入站消息转发给 OpenClaw AI
  */
@@ -91,6 +110,7 @@ export async function dispatchToOpenClaw(
   account: ResolvedQQBotAccount,
   runtime: PluginRuntime,
   log?: PluginLogger,
+  opts?: DispatchToOpenClawOptions,
 ): Promise<void> {
   const dlog = log?.child('dispatch');
   const adapters = getAdapters(runtime, dlog);
@@ -513,7 +533,18 @@ export async function dispatchToOpenClaw(
   let dispatchError: unknown;
   const hadDispatchError = () => dispatchError !== undefined;
 
+  // turn 提交信号：恰好一次（多 runDispatch 重试路径也不会重复触发）。
+  // 必须在 await inboundRun 之前同步触发——放行越早，后续旁路消息
+  // （/stop）越能及时 dispatch 插嘴；网关 FIFO 保证提交顺序。
+  let turnSubmittedNotified = false;
+  const notifyTurnSubmitted = () => {
+    if (turnSubmittedNotified) return;
+    turnSubmittedNotified = true;
+    opts?.onTurnSubmitted?.();
+  };
+
   try {
+    notifyTurnSubmitted();
     await adapters.inboundRun!({
       channel: 'qqbot',
       accountId: route.accountId,
