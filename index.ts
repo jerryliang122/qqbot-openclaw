@@ -56,7 +56,7 @@ export { getBotForAccount, tryGetBotForAccount, buildUserAgent } from './src/bot
 export { QQBotGateway } from './src/gateway/index.js';
 export { sendText, sendMedia } from './src/outbound/outbound-service.js';
 export { parseTarget } from './src/outbound/target.js';
-export { dispatchToOpenClaw } from './src/dispatch/index.js';
+export { dispatchToOpenClaw, type DispatchToOpenClawOptions } from './src/dispatch/index.js';
 export {
   PersistedRefIndexStore,
   getPersistedRefIndexStore,

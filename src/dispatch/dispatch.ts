@@ -85,18 +85,25 @@ function combineAbortSignals(
 /** dispatchToOpenClaw 可选行为开关（c2c 防抖 admission 信号等） */
 export interface DispatchToOpenClawOptions {
   /**
-   * turn 已提交进框架网关（adapters.inboundRun 已调用）时触发，恰好一次。
+   * turn 已入队框架网关（session lane 已决策：onAdopted / onDeferred /
+   * onAbandoned 任一触发）时通知，恰好一次。
    *
    * 用途：c2c 入站防抖（inbound-debounce.ts）据此释放框架 debouncer 的
    * 同 key 任务链——框架 enqueue 对旁路项（/stop 等控制命令）在同 key
    * 存在 in-flight 任务时会排队等待其 settle，而防抖 onFlush 的 completion
    * 覆盖整个 turn run；若不提前放行，任务运行期间到达的 /stop 要等
    * turn 跑完才 dispatch，插嘴语义（exclusive + abortSignal 取消旧 turn）
-   * 完全失效。信号取「inboundRun 已调用」这一确定性时点：网关按调用序
-   * FIFO 仲裁，此后同 key 的旁路 dispatch 仍晚于本 turn 提交，顺序保持。
+   * 完全失效。
    *
-   * 未触发的路径（adapters 缺失提前返回、提交前抛错）由调用方以
-   * completion settle 兜底放行，链不会悬挂。
+   * 信号必须取 lane 决策钩子而非「adapters.inboundRun 已调用」：框架
+   * runChannelTurn 在真正入队前还有 ingest → classify → preflight →
+   * resolveTurn 多个异步段（dist/run-channel-turn-*.js），调用时放行会让
+   * 后续 /stop 抢在本 turn 入队前到达 lane、无处可取消（Sourcery 意见 2）；
+   * onAdopted/onDeferred 即「已进 lane 队列」，此时放行后续 dispatch 必然
+   * 晚于本 turn，顺序确定。onAbandoned 为防御路径（未经采纳即被弃）。
+   * 钩子未触发的路径（ingest 丢弃 / classify handled / dispatch 抛错 /
+   * adapters 缺失提前返回）由调用方以 completion settle 兜底放行，
+   * 链不会悬挂。
    */
   onTurnSubmitted?: () => void;
 }
@@ -475,14 +482,26 @@ export async function dispatchToOpenClaw(
   // 仅私聊允许插嘴取消；群聊不打断（排队由框架 followup 队列处理）
   const interruptible = !isGroup;
 
+  // turn 入队信号：恰好一次（deferred → adopted 等多次 lane 决策不重复触发）。
+  // 从 lane 决策钩子触发（见 DispatchToOpenClawOptions.onTurnSubmitted 注释），
+  // 不在 inboundRun 调用时触发——那会在 turn 真正入队前放行同 key 链。
+  let turnSubmittedNotified = false;
+  const notifyTurnSubmitted = () => {
+    if (turnSubmittedNotified) return;
+    turnSubmittedNotified = true;
+    opts?.onTurnSubmitted?.();
+  };
+
   const turnAdoptionLifecycle = {
     admission,
     abortSignal: interruptible ? turnAbort.signal : undefined,
     onAdopted: () => {
       dlog?.debug(`turn adopted (exclusive, ${isGroup ? 'group' : 'c2c'}) sessionKey=${route.sessionKey}`);
+      notifyTurnSubmitted();
     },
     onDeferred: () => {
       dlog?.debug(`turn deferred behind active turn sessionKey=${route.sessionKey}`);
+      notifyTurnSubmitted();
     },
     onAbandoned: () => {
       if (interruptible) {
@@ -491,6 +510,8 @@ export async function dispatchToOpenClaw(
       } else {
         dlog?.info(`group turn abandoned without owning reply lane sessionKey=${route.sessionKey}`);
       }
+      // 防御路径：未经采纳/排队即被弃的 turn，链同样该放行
+      notifyTurnSubmitted();
     },
   };
   const combinedAbortSignal = interruptible
@@ -533,18 +554,7 @@ export async function dispatchToOpenClaw(
   let dispatchError: unknown;
   const hadDispatchError = () => dispatchError !== undefined;
 
-  // turn 提交信号：恰好一次（多 runDispatch 重试路径也不会重复触发）。
-  // 必须在 await inboundRun 之前同步触发——放行越早，后续旁路消息
-  // （/stop）越能及时 dispatch 插嘴；网关 FIFO 保证提交顺序。
-  let turnSubmittedNotified = false;
-  const notifyTurnSubmitted = () => {
-    if (turnSubmittedNotified) return;
-    turnSubmittedNotified = true;
-    opts?.onTurnSubmitted?.();
-  };
-
   try {
-    notifyTurnSubmitted();
     await adapters.inboundRun!({
       channel: 'qqbot',
       accountId: route.accountId,

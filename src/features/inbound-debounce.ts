@@ -36,10 +36,14 @@
  * settle，enqueue 对旁路项在同 key 有 in-flight 任务时会排队等它。若
  * admission === completion（覆盖整个 turn run），任务 turn 运行期间到达的
  * /stop 要等 turn 跑完才 dispatch（插嘴失效），挂起 ask_user 的 keyed
- * 答案更会被自己等待的 turn 死锁。admission 必须在「turn 已提交进框架
- * 网关」（dispatchToOpenClaw 的 onTurnSubmitted = adapters.inboundRun
- * 已调用）时 resolve，completion settle 时兜底；网关按提交序 FIFO，
- * 旁路仍晚于同 key 前一批次的提交，顺序保持。
+ * 答案更会被自己等待的 turn 死锁。admission 必须在「turn 已入队框架
+ * lane」（dispatchToOpenClaw 的 onTurnSubmitted = 框架
+ * turnAdoptionLifecycle 的 onAdopted/onDeferred/onAbandoned 任一——注意
+ * 不是「inboundRun 已调用」，那到真正入队还有多个异步段，提前放行会让
+ * /stop 抢先入队而无处可取消，Sourcery 评审意见 2）时 resolve，
+ * completion settle 时兜底；此后同 key 旁路必然晚于本 turn 入队，
+ * 顺序确定。退出冲刷两段式：flushKey 等 lane 决策，再等在途
+ * completion（activeCompletions）——宽限内能完成的 turn 把回复发完。
  *
  * 合并语义（onFlush 多条时）：
  * - 先按平台事件 timestamp 稳定排序（中间件链并发执行，附件下载慢的
@@ -115,6 +119,12 @@ type Debouncer = ReturnType<typeof createInboundDebouncer<C2CInboundDebounceItem
 const debouncers = new Map<string, { debouncer: Debouncer; keys: Set<string> }>();
 /** 每账号只打一次「防抖已接管」INFO（对齐 [queue] 接管留痕惯例） */
 const announced = new Set<string>();
+/**
+ * 在途 flush 的 completion（已 catch，永不 reject）。退出冲刷第二段等待
+ * 用（见 flushAllC2CInboundDebouncers）：pending buffer 冲到「lane 已决策」
+ * 只是第一段，turn 本身还要跑完——宽限期内能完成的 turn 应把回复发完。
+ */
+const activeCompletions = new Set<Promise<void>>();
 
 /** 防抖 key：账号 + 发送者（与 buildKey 回调同一实现，退出冲刷时复用） */
 function buildC2CDebounceKey(item: C2CInboundDebounceItem): string {
@@ -309,12 +319,16 @@ function getOrCreateDebouncer(item: C2CInboundDebounceItem, initialDebounceMs: n
       // （覆盖整个 turn run），任务运行期间到达的 /stop 要等 turn 跑完才
       // dispatch——插嘴语义（c2c exclusive + abortSignal 取消旧 turn）完全
       // 失效，且挂起 ask_user 的 keyed 答案会被自己等待的 turn 死锁。
-      // 现 admission 在 turn 提交进框架网关（onTurnSubmitted，即
-      // adapters.inboundRun 已调用）时 resolve：链及时释放，旁路立即
-      // dispatch；网关按提交序 FIFO，顺序仍保持。completion settle 时兜底
-      // admit（覆盖 adapters 缺失提前返回 / 提交前抛错——链永不悬挂）。
+      // 现 admission 在 turn 入队框架 lane（onTurnSubmitted = 框架
+      // turnAdoptionLifecycle 的 onAdopted/onDeferred/onAbandoned 任一）时
+      // resolve：此时 turn 已在 lane 队列里，链及时释放，旁路立即 dispatch
+      // 且必然晚于本 turn 入队，顺序确定（信号取 lane 决策而非
+      // 「inboundRun 已调用」——后者到入队还有 ingest/classify/preflight/
+      // resolveTurn 多个异步段，提前放行会让 /stop 抢先入队而无处可取消，
+      // Sourcery 评审意见 2）。completion settle 时兜底 admit（覆盖
+      // ingest 丢弃 / dispatch 抛错 / adapters 缺失——链永不悬挂）。
       // 语义对齐框架 createInboundDebounceFlush 的 admission 设计
-      // （adopted/deferred/failed 任一即放行），但不依赖框架回调时机。
+      // （adopted/deferred/failed 任一即放行）。
       let markAdmitted!: () => void;
       const admission = new Promise<void>((resolve) => {
         markAdmitted = resolve;
@@ -343,6 +357,13 @@ function getOrCreateDebouncer(item: C2CInboundDebounceItem, initialDebounceMs: n
           admit();
         }
       })();
+      // 登记在途 completion（已 catch，永不 reject）供退出冲刷第二段等待
+      // （flushAllC2CInboundDebouncers）；settle 后自移除，防长期运行累积。
+      // 派生 promise 不影响 completion 本身的 rejection 传播（runFlush 自会
+      // catch → onError），也不产生 unhandled rejection。
+      const tracked = completion.catch(() => {});
+      activeCompletions.add(tracked);
+      void tracked.finally(() => activeCompletions.delete(tracked));
       return { admission, completion };
     },
     onError: (err, items) => {
@@ -427,25 +448,31 @@ export async function enqueueC2CInboundMessage(
  * （buffer 的 flush timer 是 unref 的，退出时永不触发）——必须对每个
  * 活跃 key 显式 flushKey 才能把窗口内的消息发出去。
  *
- * 等待深度（2026-10-16 admission/completion 解耦后）：onFlush 的
- * admission 在 turn 提交进网关（onTurnSubmitted）时 resolve，框架
- * runFlush 的 race([admission, completion]) 随之 settle——flushAll 对
- * 每个 key 等到的是「dispatch 已提交（或已完成/失败）」而非整个
- * turn run。批次的载体完成信号（done.promise）仍覆盖完整
- * dispatchToOpenClaw，但 flushKey 不等它。turn 被框架队列 defer 时
- * inboundRun 先 resolve、turn 后台继续；无界等 turn 是刻意拒绝的设计
- * （Ctrl+C 卡死）；调用方（runtime.ts shutdown）以有界上限（1.5s）封顶。
+ * 两段式等待（Sourcery 评审意见 1，2026-10-16 二轮）：
+ * 1. 逐 key flushKey——onFlush 的 admission 在 lane 决策时 resolve，
+ *    故这一段等到「全部 pending 消息已 dispatch 且 turn 已入 lane 队列」；
+ * 2. 等待全部在途 completion（activeCompletions，含完整 dispatchToOpenClaw
+ *    = 整个 turn run）——退出宽限内能跑完的 turn 把回复发完再退，不因
+ *    admission 提前放行而丢已提交 turn 的回复。
+ * 两段都在调用方的有界封顶之内（runtime.ts shutdown ≤1.5s，二次信号
+ * 幂等、超时定时器兜底强退）——不会无界等 turn（Ctrl+C 卡死是刻意
+ * 拒绝的），defer 的 turn 后台继续属于既有语义。
  */
 export async function flushAllC2CInboundDebouncers(): Promise<void> {
+  // 先冲刷 pending buffer（第一段：等到 lane 决策）。冲刷触发的 onFlush
+  // 在 admission resolve 前已同步登记 completion，故第二段的快照必然包含
   await Promise.allSettled(
     [...debouncers.values()].flatMap(({ debouncer, keys }) =>
       [...keys].map((key) => debouncer.flushKey(key)),
     ),
   );
+  // 第二段：等在途 dispatch 的 completion（turn 跑完或失败）
+  await Promise.allSettled([...activeCompletions]);
 }
 
 /** 测试用：清空 debouncer 注册表与一次性公告标记 */
 export function resetC2CInboundDebouncersForTest(): void {
   debouncers.clear();
   announced.clear();
+  activeCompletions.clear();
 }
