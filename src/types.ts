@@ -22,9 +22,11 @@ export interface ResolvedQQBotAccount {
   enabled: boolean;
   appId: string;
   /** appId 的来源：config=配置文件、env=环境变量、none=未配置 */
-  appIdSource: "config" | "env" | "none";
+  appIdSource?: "config" | "env" | "none";
   clientSecret: string;
   secretSource: "config" | "file" | "env" | "none";
+  /** 凭据文件路径（secretSource === "file" 时有效）；运行期由网关启动时读一次 */
+  clientSecretFile?: string;
   /** 系统提示词 */
   systemPrompt?: string;
   /** 是否支持 markdown 消息（默认 true） */

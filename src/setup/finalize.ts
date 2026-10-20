@@ -20,7 +20,12 @@ type Runtime = {
 
 function isConfigured(cfg: OpenClawConfig, accountId: string): boolean {
   const account = resolveQQBotAccount(cfg, accountId);
-  return Boolean(account.appId && account.clientSecret);
+  // 凭据文件账号：密钥在运行期才读，这里只看「来源已配置」——
+  // 否则已用 clientSecretFile 配置好的账号会被误判为未配置、又被拉去扫码登录
+  if (account.appId && (account.clientSecret || (account.secretSource === 'file' && account.clientSecretFile))) {
+    return true;
+  }
+  return false;
 }
 
 async function linkViaQrCode(cfg: OpenClawConfig, _accountId: string, prompter: Prompter, rt: Runtime): Promise<OpenClawConfig> {

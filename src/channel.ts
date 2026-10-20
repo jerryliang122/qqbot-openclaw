@@ -238,13 +238,18 @@ const qqbotConfigAdapter = {
     inspectQQBotAccount(cfg, accountId),
   isConfigured: (account: ResolvedQQBotAccount, _cfg: OpenClawConfig) => {
     if (account?.appId && account?.clientSecret) return true;
+    // 凭据文件：文件在账号启动时读一次，此处不读盘但配置来源已就位 → 视为已配置
+    if (account?.appId && account?.secretSource === 'file' && account?.clientSecretFile) return true;
     return loadCredentialBackup(account?.accountId) !== null;
   },
   describeAccount: (account: ResolvedQQBotAccount, _cfg: OpenClawConfig) => ({
     accountId: account?.accountId ?? DEFAULT_ACCOUNT_ID,
     name: account?.name,
     enabled: account?.enabled ?? false,
-    configured: Boolean(account?.appId && account?.clientSecret),
+    configured: Boolean(
+      account?.appId
+      && (account?.clientSecret || (account?.secretSource === 'file' && account?.clientSecretFile)),
+    ),
     tokenSource: account?.secretSource,
     appIdSource: account?.appIdSource,
   }),

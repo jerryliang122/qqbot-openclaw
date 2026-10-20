@@ -13,7 +13,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { inferQQBotChatType } from '../src/outbound/target.js';
 import { qqbotMessagingAdapter } from '../src/messaging-adapter.js';
-import { inspectQQBotAccount, resolveQQBotAccount } from '../src/config.js';
+import {
+  applyQQBotAccountConfig,
+  inspectQQBotAccount,
+  materializeQQBotAccountSecret,
+  resolveQQBotAccount,
+} from '../src/config.js';
 import { qqbotPlugin } from '../src/channel.js';
 
 function test(name: string, fn: () => void) {
@@ -110,7 +115,7 @@ test('inspectAccount：插件已挂载该只读面', () => {
 
 // ── 3. clientSecretFile ──
 
-test('clientSecretFile：真的被读取（此前只标记来源、从不读盘）', () => {
+test('clientSecretFile：resolveQQBotAccount 不读盘（热路径无阻塞 I/O）', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qqbot-secret-'));
   const file = path.join(dir, 'secret.txt');
   fs.writeFileSync(file, 'FILE_SECRET\n');
@@ -120,17 +125,38 @@ test('clientSecretFile：真的被读取（此前只标记来源、从不读盘�
   } as never;
 
   const account = resolveQQBotAccount(cfg, undefined);
-  assert.strictEqual(account.clientSecret, 'FILE_SECRET', '必须真正读出文件内容');
+  // 解析阶段只标记来源，不读盘
+  assert.strictEqual(account.clientSecret, '');
   assert.strictEqual(account.secretSource, 'file');
+  assert.strictEqual(account.clientSecretFile, file);
 
-  const inspection = inspectQQBotAccount(cfg, undefined);
-  assert.strictEqual(inspection.secretStatus, 'available');
-  assert.strictEqual(inspection.configured, true);
+  // 读盘只发生在账号启动时（materializeQQBotAccountSecret）
+  const materialized = materializeQQBotAccountSecret(account);
+  assert.strictEqual(materialized.clientSecret, 'FILE_SECRET');
+  assert.strictEqual(materialized.secretSource, 'file');
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('clientSecretFile：文件不存在时按不可用处理（不抛错）', () => {
+test('clientSecretFile：巡检不读盘、不materialize凭据', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qqbot-secret-'));
+  const file = path.join(dir, 'secret.txt');
+  fs.writeFileSync(file, 'FILE_SECRET\n');
+
+  const cfg = {
+    channels: { qqbot: { appId: 'APP1', clientSecretFile: file } },
+  } as never;
+
+  const inspection = inspectQQBotAccount(cfg, undefined);
+  // 来源已配置 → 已配置；但只读路径不materialize → configured_unavailable
+  assert.strictEqual(inspection.configured, true);
+  assert.strictEqual(inspection.secretSource, 'file');
+  assert.strictEqual(inspection.secretStatus, 'configured_unavailable');
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('clientSecretFile：文件缺失时按不可用处理（不抛错）', () => {
   const cfg = {
     channels: { qqbot: { appId: 'APP1', clientSecretFile: '/nonexistent/qqbot-secret' } },
   } as never;
@@ -138,10 +164,37 @@ test('clientSecretFile：文件不存在时按不可用处理（不抛错）', (
   assert.strictEqual(account.clientSecret, '');
   assert.strictEqual(account.secretSource, 'file');
 
+  // 启动时materialize读不到 → 账号保持无凭据，走备份恢复/报错路径
+  assert.strictEqual(materializeQQBotAccountSecret(account).clientSecret, '');
+
   const inspection = inspectQQBotAccount(cfg, undefined);
-  // 文件路径已配置但当前路径拿不到 → configured_unavailable
   assert.strictEqual(inspection.secretStatus, 'configured_unavailable');
   assert.strictEqual(inspection.configured, true);
+});
+
+test('凭据互斥：写入文件凭据会清掉内联密钥（反之亦然）', () => {
+  const base = {
+    channels: { qqbot: { appId: 'APP1', clientSecret: 'OLD_INLINE' } },
+  } as never;
+
+  // 写文件 → 内联被清
+  const withFile = applyQQBotAccountConfig(base, 'default', {
+    appId: 'APP1',
+    clientSecretFile: '/etc/qqbot.secret',
+  });
+  const qqbot = withFile.channels?.qqbot as Record<string, unknown>;
+  assert.strictEqual(qqbot.clientSecret, undefined);
+  assert.strictEqual(qqbot.clientSecretFile, '/etc/qqbot.secret');
+
+  // 写内联 → 文件被清
+  const withInline = applyQQBotAccountConfig(
+    { channels: { qqbot: { appId: 'APP1', clientSecretFile: '/etc/qqbot.secret' } } } as never,
+    'default',
+    { appId: 'APP1', clientSecret: 'NEW_INLINE' },
+  );
+  const qqbot2 = withInline.channels?.qqbot as Record<string, unknown>;
+  assert.strictEqual(qqbot2.clientSecret, 'NEW_INLINE');
+  assert.strictEqual(qqbot2.clientSecretFile, undefined);
 });
 
 // ── 4. capabilities 完整性 ──

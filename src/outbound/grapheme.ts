@@ -85,10 +85,15 @@ function getSegmenter(): Intl.Segmenter | null {
 /**
  * 本地 `findGraphemeChunkEnd` 等价实现
  *
- * 规则（对齐 openclaw 2026.10.5 的 dist/grapheme-*.mjs）：
+ * 逐行对齐 openclaw 2026.10.5 的 `dist/grapheme-*.mjs`（含 `avoidTrailingHighSurrogateBreak`
+ * 的「end+1 兜底」——缺了它，文本以 emoji 开头且预算很小时会**零进展**，
+ * 分块循环卡死、消息原样超限被平台拒收）。
+ *
+ * 官方契约：
  * 1. 期望切点落在两个 ASCII 字符之间且不是 CRLF 中间 → 直接用（不必分段）
  * 2. 否则吸附到所在字形簇的起点
- * 3. 吸附后无进展 → 退回硬上限；再不行 → 代理对安全的部分切
+ * 3. 预算内放不下完整字形簇时，允许**代理对安全**的部分切
+ *    （前导代理对可以比 maxEnd 多一个码元）
  */
 export function localFindGraphemeChunkEnd(
   text: string,
@@ -110,7 +115,7 @@ export function localFindGraphemeChunkEnd(
   const before = text.charCodeAt(preferred - 1);
   const after = text.charCodeAt(preferred);
   // 切点两侧都是 ASCII 且不是 CRLF → 无需字形吸附
-  if (before <= 127 && after <= 127 && !(before === 13 && after === 10)) {
+  if (Number.isInteger(preferred) && before <= 127 && after <= 127 && !(before === 13 && after === 10)) {
     return preferred;
   }
 
@@ -121,16 +126,12 @@ export function localFindGraphemeChunkEnd(
   }
 
   const segments = seg.segment(text);
-  const codePoint = text.codePointAt(preferred);
-  const segIndex = codePoint !== undefined && codePoint > 0xffff ? preferred + 1 : preferred;
-  const containing = segments.containing(segIndex);
-  let end = containing?.index ?? preferred;
+  let end = containingSegmentIndex(segments, text, preferred) ?? preferred;
 
   if (end <= start && preferred < hardEnd) {
-    const fallbackCodePoint = text.codePointAt(hardEnd);
-    const fallbackIndex =
-      fallbackCodePoint !== undefined && fallbackCodePoint > 0xffff ? hardEnd + 1 : hardEnd;
-    end = segments.containing(fallbackIndex)?.index ?? hardEnd;
+    end = hardEnd === text.length
+      ? hardEnd
+      : containingSegmentIndex(segments, text, hardEnd) ?? hardEnd;
   }
 
   if (end > start) return end;
@@ -138,14 +139,51 @@ export function localFindGraphemeChunkEnd(
 }
 
 /**
- * 代理对安全的部分切：不在高代理项（emoji 的后半个 UTF-16 码元）之后断开
+ * 找到包含指定位置的字形簇起点
+ *
+ * 与官方 `containingSegment` 同语义：位置若落在代理对的后半个码元上，
+ * 需前移一个码元才能取到正确的簇。
  */
-function avoidTrailingHighSurrogateBreak(text: string, start: number, hardEnd: number): number {
-  if (hardEnd <= start) return start;
-  const last = text.charCodeAt(hardEnd - 1);
-  // 0xD800–0xDBFF 是高代理项（emoji 前半）
-  if (last >= 0xd800 && last <= 0xdbff && hardEnd < text.length) {
-    return hardEnd - 1;
+function containingSegmentIndex(
+  segments: Intl.Segments,
+  text: string,
+  index: number,
+): number | undefined {
+  const position = Number.isNaN(index) ? 0 : Math.trunc(index);
+  const codePoint = text.codePointAt(position);
+  const segment = segments.containing(
+    codePoint !== undefined && codePoint > 0xffff ? position + 1 : position,
+  );
+  return segment?.index;
+}
+
+/** 是否是高代理项（UTF-16 0xD800–0xDBFF） */
+function isHighSurrogate(codeUnit: number): boolean {
+  return codeUnit >= 0xd800 && codeUnit <= 0xdbff;
+}
+
+/** 是否是低代理项（UTF-16 0xDC00–0xDFFF） */
+function isLowSurrogate(codeUnit: number): boolean {
+  return codeUnit >= 0xdc00 && codeUnit <= 0xdfff;
+}
+
+/**
+ * 代理对安全的部分切：不在高代理项（emoji 前半）与低代理项（后半）之间断开
+ *
+ * 逐行对齐官方 `avoidTrailingHighSurrogateBreak`。注意 `end + 1` 兜底分支：
+ * 预算只剩 1 个码元且它正好是代理对前半时，退到 start 会**零进展**，
+ * 此时前移一个码元（略超预算）才能推进——官方注释即「a leading surrogate
+ * pair can exceed maxEnd by one code unit」。
+ */
+function avoidTrailingHighSurrogateBreak(text: string, start: number, end: number): number {
+  if (
+    end <= start
+    || end >= text.length
+    || !isHighSurrogate(text.charCodeAt(end - 1))
+    || !isLowSurrogate(text.charCodeAt(end))
+  ) {
+    return end;
   }
-  return hardEnd;
+  const adjusted = end - 1;
+  return adjusted > start ? adjusted : end + 1;
 }
