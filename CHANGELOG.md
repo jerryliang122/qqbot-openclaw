@@ -8,7 +8,7 @@
 
 ---
 
-## [Unreleased]
+## [2.7.0] - 2026-10-20
 
 ### 新增
 
@@ -43,6 +43,15 @@
   - `inferMediaKind` 把 `.amr` / `.flac` / `.aac` / `.m4a` 也判成 `voice`——平台不认这些格式，会隐式降级成文件卡片，还丢掉我们设的文件名。现只认平台明确的 4 种格式，其余按文件投递（结果一致、行为可预期）。
   - 语音**不做体积检查**，纯靠平台隐式降级。现抽出 `resolveOutboundMediaKind`，语音超 20MB 软限制时**显式**降级为文件投递并打 WARN 日志。
   另核实：官方《消息类型》页明确**表情表态仅频道支持**（单聊/群聊 ❌），故 `capabilities.reactions: false` 与平台一致。
+
+### 变更
+
+- **openclaw 2026.10.5 起，框架会在后台复盘改动 skill 后，向触发它的那次会话主动发一条「💾 Learned: updated `xxx` (…). Say "undo" to revert this skill change.」通知**（**行为变更说明，非缺陷，本插件未做任何改动**）。
+  这是 openclaw 10.5 新增的 Skill Workshop（自学习）功能。逐版本核对 dist 确认：**9.1 与 10.1–10.4 都有后台复盘，但都没有「外发通知」这一步**（10.5 才加的 `postWorkshopChangeNotice`），所以升级到 10.5 后才会看到这条消息。
+  - **默认就是开的**：`skills.workshop.autonomous.mode` 的默认值就是 `"auto"`（不配即开）。
+  - **群聊同样会收到**：投递判定只有「渠道可投递 + 有 target.to」两条，**没有「是不是群」的条件**；而且这是框架**主动外发**的出站消息，不经过入站中间件链 → 群里的「仅被 @ 才响应」（`requireMention`）对它**无效**。
+  - **在 QQ 侧按主动消息发送**：该通知的 payload 只有 `{text}`、不带 `replyToId` → 不消耗被动回复配额，走 QQ 主动消息通道（受其频率/风控限制）。
+  - **不需要时**配 `skills.workshop.autonomous.mode: "off"` 关掉自动复盘（`skill_workshop` 工具本身仍在，agent 主动 `/learn` 与手改 skill 不受影响）；也可用 tool policy 按**群 / 发送者维度**单独禁 `skill_workshop`（准入检查在 `prepareSkillExperienceReviewCandidate`，policy 链含 `groupPolicy` / `senderPolicy`）。
 
 ### 文档
 
