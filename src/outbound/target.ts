@@ -46,6 +46,37 @@ export function normalizeTarget(target: string): string | undefined {
 }
 
 /**
+ * 推断目标地址对应的会话类型（OpenClaw `ChatType` 语义）
+ *
+ * 10.5 官方通道插件指南：宿主做「隐式 owner 心跳投递」时依赖通道直接给出
+ * 会话类型分类；通道不提供 `inferTargetChatType` 时，Gateway 状态会一直
+ * 报 `waiting for route`（路由等不到可判定的会话类型）。
+ *
+ * 映射：
+ *   - `qqbot:c2c:<openid>` / 裸 openid（32 位 hex / UUID）→ `direct`
+ *   - `qqbot:group:<groupid>`                              → `group`
+ *   - 其余（空、无法判定、QQ 频道等本插件不支持的 scope）   → `undefined`
+ *     （交回宿主走常规路由，不猜）
+ */
+export function inferQQBotChatType(to: string): 'direct' | 'group' | undefined {
+  if (!to || typeof to !== 'string') return undefined;
+
+  const id = to.replace(/^qqbot:/i, '');
+
+  if (id.startsWith('c2c:')) {
+    return id.length > 'c2c:'.length ? 'direct' : undefined;
+  }
+  if (id.startsWith('group:')) {
+    return id.length > 'group:'.length ? 'group' : undefined;
+  }
+  // 裸 openid 形态按私聊处理（与 parseTarget 的默认分支一致）
+  if (OPENID_HEX_RE.test(id) || OPENID_UUID_RE.test(id)) {
+    return 'direct';
+  }
+  return undefined;
+}
+
+/**
  * 解析目标地址字符串为 SDK ReplyTarget
  * 
  * 注意：此函数总是返回 ReplyTarget，即使输入无效（targetId 可能为空字符串）

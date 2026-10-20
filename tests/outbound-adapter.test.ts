@@ -22,6 +22,7 @@ function test(name: string, fn: () => Promise<void> | void) {
 const mockAccount: ResolvedQQBotAccount = {
   accountId: 'test-account',
   appId: 'test-app-id',
+  appIdSource: 'config',
   clientSecret: 'test-secret',
   secretSource: 'config',
   enabled: true,

@@ -21,6 +21,8 @@ export interface ResolvedQQBotAccount {
   name?: string;
   enabled: boolean;
   appId: string;
+  /** appId 的来源：config=配置文件、env=环境变量、none=未配置 */
+  appIdSource: "config" | "env" | "none";
   clientSecret: string;
   secretSource: "config" | "file" | "env" | "none";
   /** 系统提示词 */

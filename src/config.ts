@@ -1,5 +1,6 @@
 import type { ResolvedQQBotAccount, QQBotAccountConfig, ToolPolicy, GroupConfig, GroupCoalesceConfig, ProgressCardConfig } from "./types.js";
 import type { OpenClawConfig, GroupPolicy } from "openclaw/plugin-sdk";
+import fs from "node:fs";
 import { loadCredentialBackup } from "./features/credential-backup.js";
 
 // ============ Agent-aware mentionPatterns 解析 ============
@@ -298,6 +299,38 @@ export function resolveQQBotEnvClientSecret(): string {
 }
 
 /**
+ * 从 `clientSecretFile` 读取凭据
+ *
+ * 2026-10-20 修复：`clientSecretFile` 此前只是「声明了但从不读取」——
+ * `resolveQQBotAccount` 会把 `secretSource` 标成 "file" 却把 `clientSecret` 留空，
+ * 于是 `resolveDefaultQQBotAccountId` 认为该账号「可运行」并选中它，
+ * 但网关启动时又因 `clientSecret` 为空直接放弃（`gateway/lifecycle.ts`），
+ * 用户表现为「配了文件凭据却静默起不来」。
+ *
+ * 这里真正读文件（同步、小文件），并用进程内缓存避免热路径反复读盘。
+ * 读取失败返回空串，由调用方按「凭据不可用」处理，不抛错。
+ */
+const clientSecretFileCache = new Map<string, { value: string; mtimeMs: number }>();
+
+export function readQQBotClientSecretFile(filePath: string): string {
+  const trimmedPath = filePath.trim();
+  if (!trimmedPath) return "";
+  try {
+    const stat = fs.statSync(trimmedPath);
+    const cached = clientSecretFileCache.get(trimmedPath);
+    if (cached && cached.mtimeMs === stat.mtimeMs) {
+      return cached.value;
+    }
+    const value = fs.readFileSync(trimmedPath, "utf8").trim();
+    clientSecretFileCache.set(trimmedPath, { value, mtimeMs: stat.mtimeMs });
+    return value;
+  } catch {
+    clientSecretFileCache.delete(trimmedPath);
+    return "";
+  }
+}
+
+/**
  * 列出所有 QQBot 账户 ID
  */
 export function listQQBotAccountIds(cfg: OpenClawConfig): string[] {
@@ -410,6 +443,7 @@ export function resolveQQBotAccount(
   // 基础配置
   let accountConfig: QQBotAccountConfig = {};
   let appId = "";
+  let appIdSource: "config" | "env" | "none" = "none";
   let clientSecret = "";
   let secretSource: "config" | "file" | "env" | "none" = "none";
 
@@ -421,11 +455,13 @@ export function resolveQQBotAccount(
       markdownSupport: qqbot?.markdownSupport ?? true,
     };
     appId = normalizeAppId(qqbot?.appId);
+    if (appId) appIdSource = "config";
   } else {
     // 命名账户从 accounts 读取
     const account = qqbot?.accounts?.[resolvedAccountId];
     accountConfig = account ?? {};
     appId = normalizeAppId(account?.appId);
+    if (appId) appIdSource = "config";
   }
 
   // 解析 clientSecret
@@ -433,7 +469,9 @@ export function resolveQQBotAccount(
     clientSecret = accountConfig.clientSecret;
     secretSource = "config";
   } else if (accountConfig.clientSecretFile) {
-    // 从文件读取（运行时处理）
+    // 从文件读取（2026-10-20 修复：此前只标记来源、从不真正读盘，
+    // 导致「配了 clientSecretFile 的账号被选为默认账号却起不来」）
+    clientSecret = readQQBotClientSecretFile(accountConfig.clientSecretFile);
     secretSource = "file";
   } else if (resolvedAccountId === DEFAULT_ACCOUNT_ID && resolveQQBotEnvClientSecret()) {
     clientSecret = resolveQQBotEnvClientSecret();
@@ -443,6 +481,7 @@ export function resolveQQBotAccount(
   // AppId 也可以从环境变量读取
   if (!appId && resolvedAccountId === DEFAULT_ACCOUNT_ID) {
     appId = normalizeAppId(resolveQQBotEnvAppId());
+    if (appId) appIdSource = "env";
   }
 
   return {
@@ -450,6 +489,7 @@ export function resolveQQBotAccount(
     name: accountConfig.name,
     enabled: accountConfig.enabled !== false,
     appId,
+    appIdSource,
     clientSecret,
     secretSource,
     systemPrompt: accountConfig.systemPrompt,
@@ -458,6 +498,81 @@ export function resolveQQBotAccount(
     userAgentSuffix: resolveUserAgentSuffix(cfg),
     config: accountConfig,
   };
+}
+
+/**
+ * 只读账户巡检结果
+ *
+ * 供 `config.inspectAccount` 使用：只描述配置状态，不做 token 交换 / 不触发扫码登录，
+ * 供 `openclaw status`、`openclaw channels status`、doctor 等只读命令路径使用。
+ */
+export interface QQBotAccountInspection {
+  accountId: string;
+  name?: string;
+  enabled: boolean;
+  /** appId 就位且凭据非「未配置」即视为已配置 */
+  configured: boolean;
+  appIdSource: "config" | "env" | "none";
+  appIdStatus: "available" | "missing";
+  /** 凭据在配置里的来源（与「当前路径能否取到」是两件事） */
+  secretSource: "config" | "file" | "env" | "none";
+  /**
+   * - `available`：凭据已就位（配置内联 / 环境变量 / 可读的凭据文件 / 备份可恢复）
+   * - `configured_unavailable`：凭据来源已配置，但当前路径取不到具体值
+   * - `missing`：未配置任何凭据来源
+   */
+  secretStatus: "available" | "configured_unavailable" | "missing";
+}
+
+/**
+ * 只读巡检某个 QQ Bot 账户
+ *
+ * 与 `resolveQQBotAccount` 的区别：只描述状态、不 materialize 运行期凭据
+ * （不做 token 交换 / 不触发扫码登录），缺失时如实上报而非抛错。
+ */
+export function inspectQQBotAccount(
+  cfg: OpenClawConfig,
+  accountId?: string | null
+): QQBotAccountInspection {
+  const account = resolveQQBotAccount(cfg, accountId ?? undefined);
+
+  const appIdStatus: "available" | "missing" = account.appId ? "available" : "missing";
+
+  let secretStatus: "available" | "configured_unavailable" | "missing";
+  if (account.clientSecret) {
+    // 配置内联 / 环境变量 / 可读的凭据文件
+    secretStatus = "available";
+  } else if (account.secretSource === "file") {
+    // 凭据文件已配置但读不到（路径错 / 权限不足 / 文件不存在）
+    secretStatus = "configured_unavailable";
+  } else if (hasCredentialBackup(account.accountId)) {
+    // 配置里没有凭据，但暂存备份可在运行期恢复 → 已配置、当前路径取不到
+    secretStatus = "configured_unavailable";
+  } else {
+    secretStatus = "missing";
+  }
+
+  return {
+    accountId: account.accountId,
+    name: account.name,
+    enabled: account.enabled,
+    configured: appIdStatus === "available" && secretStatus !== "missing",
+    appIdSource: account.appIdSource,
+    appIdStatus,
+    secretSource: account.secretSource,
+    secretStatus,
+  };
+}
+
+/**
+ * 凭据备份是否存在（只读探测，不抛错）
+ */
+function hasCredentialBackup(accountId: string): boolean {
+  try {
+    return loadCredentialBackup(accountId) !== null;
+  } catch {
+    return false;
+  }
 }
 
 /**

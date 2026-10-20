@@ -388,6 +388,7 @@ openclaw gateway restart
 - `accounts` 下的每个 key（如 `bot2`、`bot3`）就是该账户的 `accountId`
 - 每个账户都可以独立配置 `enabled`、`name`、`allowFrom`、`systemPrompt` 等字段
 - 也可以不配顶层默认账户，只在 `accounts` 里配置所有机器人
+- 不想把密钥写在配置里时，可以改用文件：`"clientSecretFile": "/etc/openclaw/qqbot.secret"`（文件内容会去掉首尾空白后作为密钥使用；运行期才读盘，所以轮换文件后重启该账户即生效）。默认账户与命名账户都支持。
 
 通过 CLI 添加第二个机器人（如果框架支持 `--account` 参数）：
 

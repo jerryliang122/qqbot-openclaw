@@ -8,6 +8,27 @@
 
 ---
 
+## [Unreleased]
+
+### 新增
+
+- **接入 openclaw 10.5 的通道插件契约（地板不动，peer 与钉版仍为 2026.9.1）**。逐子路径 diff 实测：9.1 → 10.5 的 `plugin-sdk` **净增 29 个子路径 / 净删 9 个**（删的 9 个在 10.2 已删，10.2–10.5 无新增删除），而**本插件用到的 26 个子路径中，19 个的导出面逐字未变**——即 10.5 官方文档里的绝大部分「通道插件最佳实践」在 9.1 就已存在，**不抬地板也能吃到 10.5 的能力**。本次落地四项：
+  - **`messaging.inferTargetChatType`**（`src/messaging-adapter.ts` + `src/outbound/target.ts` 的 `inferQQBotChatType`）：宿主做「隐式 owner 心跳投递」时依赖通道**直接给出目标对应的会话类型分类**，通道不提供时宿主只能走通用路由搜索，Gateway 状态会一直报 `waiting for route`。语义：`qqbot:c2c:*` / 裸 openid → `direct`，`qqbot:group:*` → `group`，**其余一律 `undefined`（不猜）**——QQ 频道（`qqbot:channel:*`）本插件不支持，猜成 `direct` 会把路由带偏。
+  - **`config.inspectAccount`**（`src/config.ts` 的 `inspectQQBotAccount`）：补上 10.5 官方推荐的**只读账户巡检面**。`resolveAccount` 是运行期路径、允许快速失败；而 `openclaw status` / `openclaw channels status` / doctor / config 修复等只读命令路径不该为了「描述配置」而触发 token 交换或扫码登录。巡检只描述状态（`appIdSource` / `appIdStatus` / `secretSource` / `secretStatus`），凭据已配置但当前路径取不到时上报 `configured_unavailable`，而非谎报「未配置」或直接抛错。
+  - **`capabilities.tts.voice` 声明**：`{ synthesisTarget: "voice-note", transcodesAudio: true, captionedFinalText: false }`。此前**未声明** → 框架把 QQ 的 TTS 当普通音频文件（`audio-file`）投递，而不是语音气泡；且 `captionedFinalText: false` 是必需的——QQ 语音消息不带文字说明，声明为 true 会让框架把终稿正文 defer 成语音附注文本（`shouldDeferFinalTtsText`）而正文永不到达。**刻意仍不声明 `capabilities.nativeCommands`**——QQ「指令面板」是「点面板把指令文本填进输入框」的引导型 UI，不是框架意义上的 provider-native slash command，声明它会与 `commands.text=false` 的文本斜杠指令路由语义冲突。
+  - **字形簇安全分块**（`src/outbound/grapheme.ts` + `src/outbound/chunker.ts`）：接 openclaw 10.5 新增的 `openclaw/plugin-sdk/text-grapheme`（`findGraphemeChunkEnd`）。此前框架 `chunkMarkdownText` 按「换行/空白」断点切块，**中文长句没有空白时会在硬上限处直接截断**，切点落在 emoji（代理对 / ZWJ 序列 / 组合符号）中间就把字形切碎、QQ 侧渲染成豆腐块；而本地 GFM 表格 fallback 则是**整块不切**，超限消息被平台直接拒收（消息丢失）。现对**仍超限**的块做二次切分（优先换行断点 → 空格断点 → 字形簇边界），保证每块 ≤ 上限且不切碎 emoji。该子路径**9.1 基线不存在、且发布包不带 `.d.ts`**，故按「能力探测 + 本地 `Intl.Segmenter` 等价回退」实现（懒调用 + try/catch，子路径缺失不影响插件加载与分块行为），并在 `tests/sdk-surface.test.ts` 的 `EXEMPT_SUBPATHS` **显式登记豁免**（理由与 `webhook-ingress` 的「静默失效」本质不同：回退路径功能等价，且有行为测试兜底）。
+- **回归测试**：`tests/channel-contract-10-5.test.ts`（12 例：会话类型推断四类目标 / 只读巡检三态 / `clientSecretFile` 真读盘 / capabilities 声明）与 `tests/chunker-grapheme.test.ts`（12 例：代理对 / ZWJ 序列不被切开 / 超限块必被切开且内容不丢 / 能力探测回退路径行为正确）。
+
+### 修复
+
+- **`clientSecretFile` 是「声明了但从不读取」的死配置**。`resolveQQBotAccount` 此前只把 `secretSource` 标成 `"file"` 却把 `clientSecret` 留空——于是 `resolveDefaultQQBotAccountId` 认为该账号「可运行」（`accountShapeRunnable` 的 `hasSecretSource` 含 `clientSecretFile`）并把它选为默认账号，但网关启动时又因 `clientSecret` 为空直接放弃（`gateway/lifecycle.ts`），用户表现为「配了文件凭据却静默起不来」，且 `openclaw status` 会把它误报成未配置。现 `readQQBotClientSecretFile` 真正读盘（进程内按 mtime 缓存，避免热路径反复读盘）；文件不可读时 `clientSecret` 为空、`secretSource` 仍为 `file`，只读巡检面据此上报 `configured_unavailable`。
+
+### 文档
+
+- **AGENTS.md 补 2026.10.5 盯版结论**：子路径增删全量、审批面「10.5 重构了 native 审批 runtime」说法的实测纠正（`createChannelApprovalNativeRuntimeAdapter` 工厂签名两版一致；`presentation.buildPendingPayload` 与 `transport.*` 的参数属性集逐项相同，10.5 只是把内联对象类型重组成具名 context，**通道侧回调签名一字不改**，故审批功能无需返工）、TTS 配置 schema 两版逐字相同（`config-contracts` 新增的 `TtsMode` / `TtsPersonaConfig` / `TtsPersonaFallbackPolicy` 只是 9.1 就存在类型的重新导出，`SessionResetMode` 是会话重置策略、与 TTS 无关）、群话题（group thread）是 10.5 全新能力且配置在顶层 `cfg.broadcast["<channel>:<peerId>"]`、29 个新子路径里 20 个对 TS 消费方等于「无类型」需补 ambient stub、`feature-contract` / `feature-plugin` 是 typebox 的插件功能 RPC 契约而非「通道能力声明」。
+
+---
+
 ## [2.6.1] - 2026-10-16
 
 ### 修复

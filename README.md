@@ -393,6 +393,7 @@ Edit `~/.openclaw/openclaw.json` and add an `accounts` field under `channels.qqb
 - Each key under `accounts` (e.g. `bot2`, `bot3`) is the `accountId` for that bot
 - Each account can independently configure `enabled`, `name`, `allowFrom`, `systemPrompt`, etc.
 - You may also skip the top-level default account and only configure bots inside `accounts`
+- Instead of an inline `clientSecret`, an account may point at a file: `"clientSecretFile": "/etc/openclaw/qqbot.secret"` (the file's contents are trimmed and used as the secret; it is read at runtime, so rotating the file takes effect on the next account start). This works for the default account and for named accounts alike.
 
 Add a second bot via CLI (if the framework supports the `--account` parameter):
 

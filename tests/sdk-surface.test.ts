@@ -235,7 +235,35 @@ function probeRuntime(sub: string, names: string[]): { error?: string; missing: 
  * 已实测 9.1 上可正常 require（34 个导出），无豁免必要。
  * 将来确有必要豁免时，在此登记并写明理由，让遗漏变成显式决定。
  */
-const EXEMPT_SUBPATHS: Record<string, string> = {};
+const EXEMPT_SUBPATHS: Record<string, string> = {
+  /**
+   * text-grapheme（openclaw 2026.10.5 新增，9.1 基线不存在）
+   *
+   * 豁免理由（与 webhook-ingress 的情况**本质不同**，故可豁免）：
+   *
+   * 1. **不构成加载期炸裂**。守卫要防的是「子路径被删 → dist/index.cjs 在加载期
+   *    抛 ERR_PACKAGE_PATH_NOT_EXPORTED → 插件整体加载失败、功能全灭」。
+   *    text-grapheme 的引用在 src/outbound/grapheme.ts 里，且 req() 调用**被包在
+   *    try/catch 内、且是懒调用**（首次分块时才触发，不在模块顶层）——
+   *    子路径不存在时只是回退本地实现，插件照常加载、照常工作。
+   *
+   * 2. **回退是功能等价的，不是静默失效**。本地实现用 `Intl.Segmenter` 按字形簇
+   *    切块，与官方 `findGraphemeChunkEnd` 语义一致（优先期望断点 → 吸附字形簇
+   *    边界 → 代理对安全兜底）。子路径被删后唯一变化是「不再用官方原语」，
+   *    **分块行为不变**——这与 webhook-ingress 的「功能静默失效」有本质区别。
+   *
+   * 3. **地板不抬**。按 AGENTS.md 的地板判据，本适配在新旧两版都成立，
+   *    抬地板会打断存量用户却换零能力收益。开放平台 ≥ 2026.10.5 的用户
+   *    自动走官方原语，9.1 用户走本地等价实现。
+   *
+   * 4. **豁免有行为测试兜底**：tests/chunker-grapheme.test.ts 断言
+   *    「能力探测失败时回退函数仍可用」+「切分不切碎 emoji/ZWJ/代理对」
+   *    +「超限块必被切开且内容不丢」——即回退路径是被验证过的，不是想当然。
+   */
+  'openclaw/plugin-sdk/text-grapheme':
+    '2026.10.5 新增的可选能力，懒调用 + try/catch + 本地 Intl.Segmenter 等价回退；' +
+    '子路径缺失不影响插件加载与分块行为（回退见 tests/chunker-grapheme.test.ts）',
+};
 
 // ── 1 & 2. 子路径存在性 + 运行时可 require + 值导出存在性 ──
 

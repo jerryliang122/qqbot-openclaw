@@ -4,7 +4,7 @@
  * 处理目标解析、会话路由
  */
 
-import { normalizeTarget, isQQBotTarget, tryParseTarget } from './outbound/target.js';
+import { normalizeTarget, isQQBotTarget, tryParseTarget, inferQQBotChatType } from './outbound/target.js';
 
 /**
  * 解析会话目标
@@ -75,4 +75,11 @@ export const qqbotMessagingAdapter = {
     looksLikeId: isQQBotTarget,
     hint: 'QQ Bot 目标格式: qqbot:c2c:openid (私聊) 或 qqbot:group:groupid (群聊)',
   },
+  /**
+   * 直接给出目标对应的会话类型分类。
+   *
+   * 宿主做「隐式 owner 心跳投递」时依赖这个直接分类；通道不提供时，
+   * Gateway 状态会一直报 `waiting for route`（10.5 官方通道插件指南）。
+   */
+  inferTargetChatType: ({ to }: { to: string }) => inferQQBotChatType(to),
 };
