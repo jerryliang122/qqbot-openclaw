@@ -29,6 +29,15 @@
   - **`isConfigured` 语义三处对齐**（config 适配器 / setup finalize / 只读巡检）：`secretSource === "file"` 且配了 `appId` 即视为已配置，否则已配好文件凭据的账号会被误判为未配置、被拉去重新扫码
   - 读盘缓存按 `mtimeMs + size + ino` 判定——只看 mtime 会在「轮转密钥但沿用旧 mtime」（备份还原 / `cp -p` / 某些挂载的时间精度）时读到旧值
 
+### 修复
+
+- **语音（语音条）投递口径与 QQ 平台对齐（2026-10-20 核实官方文档）**
+  官方《富媒体消息概述》的富媒体限制是**体积制、不是时长制**：`file_type` 3 语音（silk）**软限制 20MB / 硬限制 200MB**，「超过软限制会降级为文件类型上传，超过硬限制会报错」；平台只把 **silk/mp3/wav/ogg** 渲染成语音条。**平台文档里没有任何语音时长（秒）限制**——「60 秒以内是语音条」是体积与时长的相关性错觉（TTS 语音通常只有几百 KB～1 MB）。
+  我们代码侧此前有两处与平台不一致：
+  - `inferMediaKind` 把 `.amr` / `.flac` / `.aac` / `.m4a` 也判成 `voice`——平台不认这些格式，会隐式降级成文件卡片，还丢掉我们设的文件名。现只认平台明确的 4 种格式，其余按文件投递（结果一致、行为可预期）。
+  - 语音**不做体积检查**，纯靠平台隐式降级。现抽出 `resolveOutboundMediaKind`，语音超 20MB 软限制时**显式**降级为文件投递并打 WARN 日志。
+  另核实：官方《消息类型》页明确**表情表态仅频道支持**（单聊/群聊 ❌），故 `capabilities.reactions: false` 与平台一致。
+
 ### 文档
 
 - **AGENTS.md 补 2026.10.5 盯版结论**：子路径增删全量、审批面「10.5 重构了 native 审批 runtime」说法的实测纠正（`createChannelApprovalNativeRuntimeAdapter` 工厂签名两版一致；`presentation.buildPendingPayload` 与 `transport.*` 的参数属性集逐项相同，10.5 只是把内联对象类型重组成具名 context，**通道侧回调签名一字不改**，故审批功能无需返工）、TTS 配置 schema 两版逐字相同（`config-contracts` 新增的 `TtsMode` / `TtsPersonaConfig` / `TtsPersonaFallbackPolicy` 只是 9.1 就存在类型的重新导出，`SessionResetMode` 是会话重置策略、与 TTS 无关）、群话题（group thread）是 10.5 全新能力且配置在顶层 `cfg.broadcast["<channel>:<peerId>"]`、29 个新子路径里 20 个对 TS 消费方等于「无类型」需补 ambient stub、`feature-contract` / `feature-plugin` 是 typebox 的插件功能 RPC 契约而非「通道能力声明」。

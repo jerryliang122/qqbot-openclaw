@@ -86,7 +86,17 @@ export function getFileSize(filePath: string): number {
 // ── 扩展名 → MediaKind 映射 ──
 
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.ico']);
-const VOICE_EXTS = new Set(['.wav', '.mp3', '.silk', '.amr', '.ogg', '.flac', '.aac', '.m4a']);
+/**
+ * 语音扩展名——**只保留 QQ 平台明确支持的格式**
+ *
+ * 官方文档《富媒体消息概述》：「语音：支持 **silk/mp3/wav/ogg** 格式，发送后展示语音条」，
+ * 且 file_type 表里语音的格式列写的是 `silk`。
+ *
+ * 此前这里还含 `.amr` / `.flac` / `.aac` / `.m4a`——这些格式平台**不认**，
+ * 我们却按语音（file_type=3）上传，平台会把它降级成文件卡片（且拿不到我们设的文件名）。
+ * 与其依赖平台的隐式降级，不如直接按文件投递：结果一致、行为可预期。
+ */
+const VOICE_EXTS = new Set(['.silk', '.mp3', '.wav', '.ogg']);
 const VIDEO_EXTS = new Set(['.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv']);
 
 /**
