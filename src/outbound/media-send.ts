@@ -27,10 +27,12 @@ import {
   isLocalFilePath,
   isDataUrl,
   normalizePath,
+  getFileSize,
   inferMediaKind,
   inferMediaKindFromMime,
   isPathInAllowedRoots,
 } from './local-file-router.js';
+import { QQBOT_VOICE_SOFT_LIMIT_BYTES } from '../constants.js';
 import type { MediaKind } from './outbound-service.js';
 
 // ── 类型 ──
@@ -133,6 +135,40 @@ const MAX_DATA_URL_BYTES = 10 * 1024 * 1024;
 // ── 统一入口 ──
 
 /**
+ * 决定出站媒体投递类型
+ *
+ * 优先级：显式 `mediaKind` > `mimeType` > 文件扩展名。
+ * 随后按平台软限制做**显式降级**：语音（file_type=3）超过 20MB 软限制时
+ * 改按文件（file_type=4）投递——官方文档《富媒体消息概述》写的是
+ * 「超过软限制会降级为文件类型上传，超过硬限制会报错」。
+ * 平台侧降级是隐式的（我们拿不到文件卡片的名字），这里显式做，结果一致但可预期。
+ *
+ * 注意：语音**没有时长限制**，只有体积限制——「60 秒以内是语音条」是体积与时长的
+ * 相关性错觉（TTS 语音通常只有几百 KB～1 MB，远低于 20 MB）。
+ */
+export function resolveOutboundMediaKind(params: {
+  mediaKind?: MediaKind;
+  mimeType?: string;
+  path: string;
+  isLocal: boolean;
+  sizeBytes?: number;
+}): MediaKind {
+  let kind = params.mediaKind
+    ?? (params.mimeType ? inferMediaKindFromMime(params.mimeType) : undefined)
+    ?? inferMediaKind(params.path);
+
+  if (
+    kind === 'voice'
+    && params.isLocal
+    && params.sizeBytes !== undefined
+    && params.sizeBytes > QQBOT_VOICE_SOFT_LIMIT_BYTES
+  ) {
+    kind = 'file';
+  }
+  return kind;
+}
+
+/**
  * 统一富媒体发送入口
  */
 export async function sendMedia(params: SendMediaParams): Promise<SendMediaResult> {
@@ -153,10 +189,26 @@ export async function sendMedia(params: SendMediaParams): Promise<SendMediaResul
     return { error: resolved.error };
   }
 
-  // 2. 推断类型
-  const kind = params.mediaKind
-    ?? (params.mimeType ? inferMediaKindFromMime(params.mimeType) : undefined)
-    ?? inferMediaKind(resolved.path);
+  // 2. 推断类型（语音超 20MB 软限制 → 显式降级为文件，见 resolveOutboundMediaKind）
+  const sizeBytes = resolved.isLocal ? getFileSize(resolved.path) : undefined;
+  const kind = resolveOutboundMediaKind({
+    mediaKind: params.mediaKind,
+    mimeType: params.mimeType,
+    path: resolved.path,
+    isLocal: resolved.isLocal,
+    sizeBytes: sizeBytes !== undefined && sizeBytes >= 0 ? sizeBytes : undefined,
+  });
+  if (
+    kind === 'file'
+    && sizeBytes !== undefined
+    && sizeBytes > QQBOT_VOICE_SOFT_LIMIT_BYTES
+    && (params.mediaKind ?? inferMediaKind(resolved.path)) === 'voice'
+  ) {
+    const sizeMB = (sizeBytes / (1024 * 1024)).toFixed(1);
+    mlog?.warn(
+      `voice exceeds platform soft limit (${sizeMB}MB > 20MB) → sending as file instead`,
+    );
+  }
 
   // 3. 获取 gateway（带单账号回退：issue #15——message 工具主动发媒体时
   //    请求键可能解析到未运行的 "default"，单账号部署回退到唯一运行中的网关）。
