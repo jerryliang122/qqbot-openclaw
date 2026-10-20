@@ -577,3 +577,27 @@ declare module "openclaw/plugin-sdk" {
 declare module "openclaw/plugin-sdk/text-utility-runtime" {
   export function truncateUtf16Safe(input: string, maxLen: number): string;
 }
+
+// 2026.10.5 新增子路径。openclaw 发布包同样显式排除其 .d.ts（exports 里也没有
+// "types" 条件），故 TS 消费方必须自带 ambient 声明，否则 typecheck 报 TS7016。
+// 运行时导出：findGraphemeChunkEnd（按字形簇切块，emoji/ZWJ/组合符号不被切开）。
+// 仅 2026.10.5+ 存在；2026.9.1 基线无此子路径 → 运行时须能力探测 + 回退
+// （见 src/outbound/grapheme.ts）。
+declare module "openclaw/plugin-sdk/text-grapheme" {
+  /**
+   * 在 [start, maxEnd] 内选一个整字形簇的切点。
+   *
+   * @param text 源文本
+   * @param start 起点（含）
+   * @param maxEnd 硬上限（含）
+   * @param preferredEnd 期望切点（会被吸附到字形簇边界）
+   * @param allowPartial 无完整字形簇可切时是否允许代理对安全的部分切
+   */
+  export function findGraphemeChunkEnd(
+    text: string,
+    start: number,
+    maxEnd: number,
+    preferredEnd?: number,
+    allowPartial?: boolean,
+  ): number;
+}

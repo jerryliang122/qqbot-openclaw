@@ -22,6 +22,7 @@ import {
   resolveGroupConfig,
   resolveGroupConfigKey,
   applyQQBotAccountConfig,
+  inspectQQBotAccount,
 } from './config.js';
 import { loadCredentialBackup } from './features/credential-backup.js';
 import { qqbotSetupWizard } from './setup/surface.js';
@@ -230,6 +231,11 @@ const qqbotConfigAdapter = {
   resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) =>
     resolveQQBotAccount(cfg, accountId),
   defaultAccountId: (cfg: OpenClawConfig) => resolveDefaultQQBotAccountId(cfg),
+  // 只读巡检：供 `openclaw status` / `openclaw channels status` / doctor 等
+  // 只读命令路径使用——不 materialize 运行期凭据（不做 token 交换、不触发扫码），
+  // 缺凭据时如实上报状态而不是抛错。10.5 官方推荐的只读巡检面。
+  inspectAccount: (cfg: OpenClawConfig, accountId?: string | null) =>
+    inspectQQBotAccount(cfg, accountId),
   isConfigured: (account: ResolvedQQBotAccount, _cfg: OpenClawConfig) => {
     if (account?.appId && account?.clientSecret) return true;
     return loadCredentialBackup(account?.accountId) !== null;
@@ -240,6 +246,7 @@ const qqbotConfigAdapter = {
     enabled: account?.enabled ?? false,
     configured: Boolean(account?.appId && account?.clientSecret),
     tokenSource: account?.secretSource,
+    appIdSource: account?.appIdSource,
   }),
   setAccountEnabled: ({ cfg, accountId, enabled }: {
     cfg: OpenClawConfig;

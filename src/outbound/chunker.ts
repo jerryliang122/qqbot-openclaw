@@ -7,6 +7,7 @@
 
 import { getAdapters } from '../adapter/resolve.js';
 import { tryGetQQBotRuntime } from '../runtime.js';
+import { resolveFindGraphemeChunkEnd } from './grapheme.js';
 
 // ── GFM 表格检测 ──
 
@@ -69,12 +70,69 @@ export function chunkMarkdownPreservingTables(text: string, limit: number): stri
 }
 
 /**
+ * 切分超限块（字形簇安全）
+ *
+ * 框架 chunker 按「换行 / 空白」断点切块：中文长句没有空白时会**在硬上限处
+ * 直接截断**，切点正好落在 emoji 中间就把字形切碎；本地 GFM fallback 则是
+ * 整块不切，超限消息被平台直接拒收（消息丢失）。
+ *
+ * 这里对「仍然超限」的块做二次切分：优先换行断点 → 空格断点 → 字形簇边界，
+ * 保证每块 ≤ limit 且不切碎 emoji / ZWJ 序列 / 组合符号。
+ */
+export function splitOversizedChunk(chunk: string, limit: number): string[] {
+  if (limit <= 0 || chunk.length <= limit) return [chunk];
+
+  const findEnd = resolveFindGraphemeChunkEnd();
+  const out: string[] = [];
+  let rest = chunk;
+
+  while (rest.length > limit) {
+    const window = rest.slice(0, limit + 1);
+    // 优先换行断点，其次空格断点，都没有则用硬上限
+    let preferred = window.lastIndexOf('\n');
+    if (preferred <= 0) preferred = window.lastIndexOf(' ');
+    if (preferred <= 0) preferred = limit;
+
+    const end = findEnd(rest, 0, limit, preferred);
+    // 无法切分（极端输入）→ 原样保留，不制造空块 / 死循环
+    if (end <= 0) break;
+
+    out.push(rest.slice(0, end));
+    rest = rest.slice(end);
+  }
+
+  if (rest) out.push(rest);
+  return out.length > 0 ? out : [chunk];
+}
+
+/**
+ * 保证每个块都不超限
+ */
+export function enforceChunkLimit(chunks: string[], limit: number): string[] {
+  if (limit <= 0) return chunks;
+  const out: string[] = [];
+  for (const chunk of chunks) {
+    if (chunk.length <= limit) {
+      out.push(chunk);
+      continue;
+    }
+    out.push(...splitOversizedChunk(chunk, limit));
+  }
+  return out;
+}
+
+/**
  * chunker 入口（框架 ChannelOutboundAdapter.chunker 契约）：
  * runtime adapter 的 chunkMarkdownText 优先，低版本降级到本地实现。
+ *
+ * 两条路径都过一遍 `enforceChunkLimit`——超限块（长中文句 / 超长表格行 /
+ * 落在 emoji 边界的硬截断）在这里按字形簇安全切开。
  */
 export function chunkQQBotMarkdown(text: string, limit: number): string[] {
   const rt = tryGetQQBotRuntime();
   const adapterChunker = rt ? getAdapters(rt).chunkMarkdownText : null;
-  if (adapterChunker) return adapterChunker(text, limit);
-  return chunkMarkdownPreservingTables(text, limit);
+  const chunks = adapterChunker
+    ? adapterChunker(text, limit)
+    : chunkMarkdownPreservingTables(text, limit);
+  return enforceChunkLimit(chunks, limit);
 }
