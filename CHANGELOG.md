@@ -27,7 +27,7 @@
   - **负预算被钳成 1**——`Math.max(1, limit - overhead)` 把「前缀本身已超限」的事实掩盖成「每段只剩 1 字符」。
 
   实测复现：5114 字的超长单行围栏被切成 **5110 块、其中 5109 块各 5120 字（全部超限 → 平台拒收）**。修复照抄框架 `resolveFenceReopenLine` 的**逐级降级**：完整开栏行放得下就用 → 否则降级为裸 marker → 再放不下放弃围栏上下文；info string **只取首个 token**（语言标识，超过 32 字符视为没有语言标识）；表头上下文另加**预算规则**——上下文开销 > 正文预算（overhead > limit/2）时整段放弃上下文按纯文本切。另补**首刀不得落在围栏开栏行内部**（框架同义约束 `minProgressIdx`），否则首块只剩一个孤零零的 ```js。
-  修复后同一输入切成 **2 块（5000 + 124）、零超限**，与框架路径同形。**框架路径本身无此问题**（`rt.channel.text.chunkMarkdownText` 自带封顶），受影响的是本地 GFM fallback 这条安全网。新增 `tests/chunker-context-overhead.test.ts`（10 例）锁定。
+  修复后同一输入切成 **2 块（5000 + 124）、零超限**，与框架路径同形。**框架路径本身无此问题**（`rt.channel.text.chunkMarkdownText` 自带封顶），受影响的是本地 GFM fallback 这条安全网。新增 `tests/chunker-context-overhead.test.ts`（11 例）锁定——末例是**伪随机不变量测试**（固定种子、300 轮）：每块 ≤ 上限、内容不丢、块数不爆炸（命中围栏前缀 106 次 / 表头前缀 105 次，非空转）。
 - **`enforceChunkLimit` 注释覆盖面收敛**：该函数只处理**严格超限**（`length > limit`）的块；框架 chunker 对无空白中文长串会切出**恰好等于 limit** 的块，其切点只受代理对级保护，切点落在 ZWJ 序列或组合符号中间时仍会切碎字形——该残留**在框架路径上依然存在**，注释改为准确表述并在 AGENTS.md 记录边界（真修需在切点处重锚定，成本另议，暂不处理）。
 
 - **`clientSecretFile` 是「声明了但从不读取」的死配置**。`resolveQQBotAccount` 此前只把 `secretSource` 标成 `"file"` 却把 `clientSecret` 留空——于是 `resolveDefaultQQBotAccountId` 认为该账号「可运行」（`accountShapeRunnable` 的 `hasSecretSource` 含 `clientSecretFile`）并把它选为默认账号，但网关启动时又因 `clientSecret` 为空直接放弃（`gateway/lifecycle.ts`），用户表现为「配了文件凭据却静默起不来」，且 `openclaw status` 会把它误报成未配置。
