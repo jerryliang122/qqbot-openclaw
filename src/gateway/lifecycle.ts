@@ -14,6 +14,7 @@ import {
   resolveQQBotAccount,
   applyQQBotAccountConfig,
   resolveQQBotEnvClientSecret,
+  materializeQQBotAccountSecret,
 } from '../config.js';
 import { getQQBotRuntime } from '../runtime.js';
 import { getAdapters } from '../adapter/resolve.js';
@@ -51,6 +52,15 @@ export async function startAccountWithCredentialRecovery(ctx: StartAccountContex
     ...(ctx.log?.info ? { output: ctx.log as PluginLogger } : {}),
   });
   const runtime = getQQBotRuntime();
+
+  // 凭据文件：账号启动时读一次（resolveQQBotAccount 是热路径，不读盘）
+  if (!account.clientSecret && account.secretSource === 'file') {
+    const materialized = materializeQQBotAccountSecret(account);
+    if (materialized.clientSecret) {
+      log?.info(`[qqbot:${account.accountId}] 从凭据文件加载密钥 (secretSource=file)`);
+      account = materialized;
+    }
+  }
 
   // 凭证恢复：配置中 appId/secret 为空时尝试从暂存文件恢复
   if (!account.appId || !account.clientSecret) {
@@ -206,16 +216,30 @@ export async function logoutAndClearCredentials(params: {
 
   if (nextQQBot) {
     const qqbot = nextQQBot as Record<string, unknown>;
-    if (accountId === DEFAULT_ACCOUNT_ID && qqbot.clientSecret) {
-      delete qqbot.clientSecret;
-      cleared = true;
-      changed = true;
+    if (accountId === DEFAULT_ACCOUNT_ID) {
+      // 内联密钥与凭据文件都要清——只清内联的话，clientSecretFile 仍指向一个
+      // 有效密钥文件，注销后账号仍可用同一份凭据重新起来（等于没注销）
+      if (qqbot.clientSecret) {
+        delete qqbot.clientSecret;
+        cleared = true;
+        changed = true;
+      }
+      if (qqbot.clientSecretFile) {
+        delete qqbot.clientSecretFile;
+        cleared = true;
+        changed = true;
+      }
     }
     const accounts = qqbot.accounts as Record<string, Record<string, unknown>> | undefined;
     if (accounts && accountId in accounts) {
       const entry = accounts[accountId];
       if (entry && 'clientSecret' in entry) {
         delete entry.clientSecret;
+        cleared = true;
+        changed = true;
+      }
+      if (entry && 'clientSecretFile' in entry) {
+        delete entry.clientSecretFile;
         cleared = true;
         changed = true;
       }

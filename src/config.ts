@@ -307,27 +307,58 @@ export function resolveQQBotEnvClientSecret(): string {
  * 但网关启动时又因 `clientSecret` 为空直接放弃（`gateway/lifecycle.ts`），
  * 用户表现为「配了文件凭据却静默起不来」。
  *
- * 这里真正读文件（同步、小文件），并用进程内缓存避免热路径反复读盘。
- * 读取失败返回空串，由调用方按「凭据不可用」处理，不抛错。
+ * ## 调用位置（重要）
+ *
+ * 只在**账号启动时**读一次（`gateway/lifecycle.ts`），**不在** `resolveQQBotAccount`
+ * 里读——后者是热路径，同步读盘会阻塞事件循环（网络挂载上的 stat/read 可能卡住
+ * 整个进程），而且只读巡检路径（`config.inspectAccount`）也不该materialize凭据。
+ *
+ * ## 缓存
+ *
+ * 进程内按 `mtimeMs + size + ino` 缓存。**只看 mtime 不够**：轮转密钥时若新文件
+ * 沿用旧 mtime（备份还原、`cp -p`、某些挂载的时间精度），会读到旧值。
+ * 加上 size + ino 后，换文件必然换 inode；同 inode 原地改写则由 mtime/size 捕获。
  */
-const clientSecretFileCache = new Map<string, { value: string; mtimeMs: number }>();
+const clientSecretFileCache = new Map<string, { value: string; stamp: string }>();
+
+function clientSecretFileStamp(stat: fs.Stats): string {
+  return `${stat.mtimeMs}:${stat.size}:${stat.ino}`;
+}
 
 export function readQQBotClientSecretFile(filePath: string): string {
   const trimmedPath = filePath.trim();
   if (!trimmedPath) return "";
   try {
     const stat = fs.statSync(trimmedPath);
+    const stamp = clientSecretFileStamp(stat);
     const cached = clientSecretFileCache.get(trimmedPath);
-    if (cached && cached.mtimeMs === stat.mtimeMs) {
+    if (cached && cached.stamp === stamp) {
       return cached.value;
     }
     const value = fs.readFileSync(trimmedPath, "utf8").trim();
-    clientSecretFileCache.set(trimmedPath, { value, mtimeMs: stat.mtimeMs });
+    clientSecretFileCache.set(trimmedPath, { value, stamp });
     return value;
   } catch {
     clientSecretFileCache.delete(trimmedPath);
     return "";
   }
+}
+
+/**
+ * 把凭据文件的值materialize进运行期账号
+ *
+ * 仅在**账号启动时**调用一次（`gateway/lifecycle.ts`）。返回带凭据的新账号对象；
+ * 读不到（文件缺失 / 权限不足 / 未配置文件路径）时原样返回，调用方据此走
+ * 「暂存备份恢复」或报错路径。
+ */
+export function materializeQQBotAccountSecret(
+  account: ResolvedQQBotAccount,
+): ResolvedQQBotAccount {
+  if (account.clientSecret) return account;
+  if (account.secretSource !== "file" || !account.clientSecretFile) return account;
+  const secret = readQQBotClientSecretFile(account.clientSecretFile);
+  if (!secret) return account;
+  return { ...account, clientSecret: secret };
 }
 
 /**
@@ -469,9 +500,11 @@ export function resolveQQBotAccount(
     clientSecret = accountConfig.clientSecret;
     secretSource = "config";
   } else if (accountConfig.clientSecretFile) {
-    // 从文件读取（2026-10-20 修复：此前只标记来源、从不真正读盘，
-    // 导致「配了 clientSecretFile 的账号被选为默认账号却起不来」）
-    clientSecret = readQQBotClientSecretFile(accountConfig.clientSecretFile);
+    // 凭据文件：**这里不读盘**。
+    // resolveQQBotAccount 是热路径（每次出站发送都会解析一次账号），同步读盘会
+    // 阻塞事件循环（网络挂载上的 stat/read 可能卡住整个进程）。
+    // 文件在**账号启动时读一次**（gateway/lifecycle.ts），读到的值经
+    // materializeQQBotAccountSecret 注入运行期账号。
     secretSource = "file";
   } else if (resolvedAccountId === DEFAULT_ACCOUNT_ID && resolveQQBotEnvClientSecret()) {
     clientSecret = resolveQQBotEnvClientSecret();
@@ -492,6 +525,7 @@ export function resolveQQBotAccount(
     appIdSource,
     clientSecret,
     secretSource,
+    clientSecretFile: secretSource === "file" ? accountConfig.clientSecretFile : undefined,
     systemPrompt: accountConfig.systemPrompt,
     markdownSupport: accountConfig.markdownSupport !== false,
     commandPanelNative: accountConfig.commands?.native !== false,
@@ -517,8 +551,9 @@ export interface QQBotAccountInspection {
   /** 凭据在配置里的来源（与「当前路径能否取到」是两件事） */
   secretSource: "config" | "file" | "env" | "none";
   /**
-   * - `available`：凭据已就位（配置内联 / 环境变量 / 可读的凭据文件 / 备份可恢复）
-   * - `configured_unavailable`：凭据来源已配置，但当前路径取不到具体值
+   * - `available`：凭据已在配置/环境变量中就位
+   * - `configured_unavailable`：凭据来源已配置，但**当前只读路径不materialize**
+   *   （凭据文件在运行期才读、暂存备份在运行期才恢复）
    * - `missing`：未配置任何凭据来源
    */
   secretStatus: "available" | "configured_unavailable" | "missing";
@@ -527,8 +562,9 @@ export interface QQBotAccountInspection {
 /**
  * 只读巡检某个 QQ Bot 账户
  *
- * 与 `resolveQQBotAccount` 的区别：只描述状态、不 materialize 运行期凭据
- * （不做 token 交换 / 不触发扫码登录），缺失时如实上报而非抛错。
+ * 与 `resolveQQBotAccount` 的区别：**全程不读盘、不 materialize 运行期凭据**
+ * （不读凭据文件、不做 token 交换、不触发扫码登录）——只读命令路径不该为了
+ * 「描述配置」而产生副作用或阻塞 I/O。缺失时如实上报而非抛错。
  */
 export function inspectQQBotAccount(
   cfg: OpenClawConfig,
@@ -540,10 +576,10 @@ export function inspectQQBotAccount(
 
   let secretStatus: "available" | "configured_unavailable" | "missing";
   if (account.clientSecret) {
-    // 配置内联 / 环境变量 / 可读的凭据文件
+    // 配置内联 / 环境变量
     secretStatus = "available";
   } else if (account.secretSource === "file") {
-    // 凭据文件已配置但读不到（路径错 / 权限不足 / 文件不存在）
+    // 凭据文件已配置，但文件在账号启动时才读 → 当前只读路径不materialize
     secretStatus = "configured_unavailable";
   } else if (hasCredentialBackup(account.accountId)) {
     // 配置里没有凭据，但暂存备份可在运行期恢复 → 已配置、当前路径取不到
@@ -557,7 +593,7 @@ export function inspectQQBotAccount(
     name: account.name,
     enabled: account.enabled,
     configured: appIdStatus === "available" && secretStatus !== "missing",
-    appIdSource: account.appIdSource,
+    appIdSource: account.appIdSource ?? "none",
     appIdStatus,
     secretSource: account.secretSource,
     secretStatus,
@@ -578,18 +614,39 @@ function hasCredentialBackup(accountId: string): boolean {
 /**
  * 应用账户配置
  */
+/**
+ * 计算凭据字段（内联密钥 与 凭据文件 互斥）
+ *
+ * 两者同时存在时 `resolveQQBotAccount` 优先取内联密钥 → 凭据文件被**静默忽略**，
+ * 用户表现为「配了 clientSecretFile 却还在用旧密钥」。故写入时强制互斥：
+ * 写内联就清文件，写文件就清内联。
+ */
+function resolveCredentialFields(input: {
+  clientSecret?: string;
+  clientSecretFile?: string;
+}): { clientSecret?: string; clientSecretFile?: string } {
+  if (input.clientSecret) {
+    return { clientSecret: input.clientSecret, clientSecretFile: undefined };
+  }
+  if (input.clientSecretFile) {
+    return { clientSecret: undefined, clientSecretFile: input.clientSecretFile };
+  }
+  return {};
+}
+
 export function applyQQBotAccountConfig(
   cfg: OpenClawConfig,
   accountId: string,
   input: { appId?: string; clientSecret?: string; clientSecretFile?: string; name?: string }
 ): OpenClawConfig {
   const next = { ...cfg };
+  const credentialFields = resolveCredentialFields(input);
 
   if (accountId === DEFAULT_ACCOUNT_ID) {
     // 如果没有设置过 allowFrom，默认设置为 ["*"]
     const existingConfig = (next.channels?.qqbot as QQBotChannelConfig) || {};
     const allowFrom = existingConfig.allowFrom ?? ["*"];
-    
+
     next.channels = {
       ...next.channels,
       qqbot: {
@@ -597,11 +654,7 @@ export function applyQQBotAccountConfig(
         enabled: true,
         allowFrom,
         ...(input.appId ? { appId: input.appId } : {}),
-        ...(input.clientSecret
-          ? { clientSecret: input.clientSecret }
-          : input.clientSecretFile
-            ? { clientSecretFile: input.clientSecretFile }
-            : {}),
+        ...credentialFields,
         ...(input.name ? { name: input.name } : {}),
       },
     };
@@ -609,7 +662,7 @@ export function applyQQBotAccountConfig(
     // 如果没有设置过 allowFrom，默认设置为 ["*"]
     const existingAccountConfig = (next.channels?.qqbot as QQBotChannelConfig)?.accounts?.[accountId] || {};
     const allowFrom = existingAccountConfig.allowFrom ?? ["*"];
-    
+
     next.channels = {
       ...next.channels,
       qqbot: {
@@ -622,11 +675,7 @@ export function applyQQBotAccountConfig(
             enabled: true,
             allowFrom,
             ...(input.appId ? { appId: input.appId } : {}),
-            ...(input.clientSecret
-              ? { clientSecret: input.clientSecret }
-              : input.clientSecretFile
-                ? { clientSecretFile: input.clientSecretFile }
-                : {}),
+            ...credentialFields,
             ...(input.name ? { name: input.name } : {}),
           },
         },
