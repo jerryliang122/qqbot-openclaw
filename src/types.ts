@@ -44,6 +44,17 @@ export type GroupPolicy = "open" | "allowlist" | "disabled";
 /** 工具策略：full=全部 | restricted=限制敏感工具 | none=禁止 */
 export type ToolPolicy = "full" | "restricted" | "none";
 
+/**
+ * 群级工具策略（交给框架的 allow/alsoAllow/deny 三段式）。
+ *
+ * 与 openclaw 的 GroupToolPolicyConfig 同形；`groups.<id>.tools` 原样透传。
+ */
+export interface GroupToolPolicy {
+  allow?: string[];
+  alsoAllow?: string[];
+  deny?: string[];
+}
+
 /** 群消息合并配置 */
 export interface GroupCoalesceConfig {
   /**
@@ -94,8 +105,29 @@ export interface GroupConfig {
    * - room_event：门控放行全部消息，未被 @/称呼/引用的作为 room_event 被动
    *   房间事件进框架（AI 只读上下文，不自动回复，想发言走主动 message 工具；
    *   框架自动压制 typing/流式/steer）。成本提示：每条消息一次推理 pass。
+   *
+   * 回落链（2026-10-20 补齐，对齐 openclaw 2026.10.5 的框架裁决）：
+   *   本键（群级显式，最高） > agents.entries.<id>.groupChat.unmentionedInbound
+   *     > messages.groupChat.unmentionedInbound > "user_request"
    */
   unmentionedInbound?: 'user_request' | 'room_event';
+  /**
+   * room_event 是否强制要求 message 工具可用（默认 true）。
+   *
+   * true：message 工具确定不可用时，该群**自动降级回 user_request**
+   *   （bot 恢复正常回复权）并打 WARN——避免"配了 room_event 却是永久沉默"
+   *   （2026-10-06 线上事故的同类故障）。
+   * false：严格模式——不降级，message 工具不可用时保持 room_event 静默语义
+   *   （由用户自行保证工具面）。
+   */
+  roomEventRequireMessageTool?: boolean;
+  /**
+   * 群级工具白名单（显式声明时原样透传给框架；不声明则按 toolPolicy 兜底）。
+   *
+   * 与 `toolPolicy` 的关系：`tools` 是更细粒度的声明，优先级更高。
+   * ⚠️ room_event 群若在此处排除 `message`，该群将失去唯一发声通道。
+   */
+  tools?: GroupToolPolicy;
   /** 群消息合并配置（覆盖账号级配置） */
   coalesce?: GroupCoalesceConfig;
 }

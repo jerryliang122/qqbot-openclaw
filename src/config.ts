@@ -1,11 +1,11 @@
-import type { ResolvedQQBotAccount, QQBotAccountConfig, ToolPolicy, GroupConfig, GroupCoalesceConfig, ProgressCardConfig } from "./types.js";
+import type { ResolvedQQBotAccount, QQBotAccountConfig, ToolPolicy, GroupConfig, GroupCoalesceConfig, GroupToolPolicy, ProgressCardConfig } from "./types.js";
 import type { OpenClawConfig, GroupPolicy } from "openclaw/plugin-sdk";
 import fs from "node:fs";
 import { loadCredentialBackup } from "./features/credential-backup.js";
 
 // ============ Agent-aware mentionPatterns 解析 ============
 
-type AgentEntry = { id?: string; groupChat?: { mentionPatterns?: string[]; historyLimit?: number } };
+export type AgentEntry = { id?: string; groupChat?: { mentionPatterns?: string[]; historyLimit?: number; unmentionedInbound?: 'user_request' | 'room_event' } };
 
 /**
  * 在配置中定位 agent 条目，兼容两种形态：
@@ -16,7 +16,7 @@ type AgentEntry = { id?: string; groupChat?: { mentionPatterns?: string[]; histo
  * 永远解析为空数组，room_event 群的称呼唤醒（如「沈处」）全部失效——
  * 本应唤醒为 user_request 的消息被归为 room_event，回复权被压制成结构性沉默。
  */
-function findAgentEntry(cfg: OpenClawConfig, agentId: string): AgentEntry | undefined {
+export function findAgentEntry(cfg: OpenClawConfig, agentId: string): AgentEntry | undefined {
   const agents = (cfg as Record<string, unknown>).agents as
     | { list?: AgentEntry[]; entries?: Record<string, AgentEntry> }
     | undefined;
@@ -113,7 +113,7 @@ const DEFAULT_GROUP_COALESCE_CONFIG: Required<GroupCoalesceConfig> = {
   enabled: true,
 };
 
-const DEFAULT_GROUP_CONFIG: Omit<Required<GroupConfig>, "prompt" | "coalesce" | "historyMode" | "unmentionedInbound"> & { coalesce: Required<GroupCoalesceConfig>; historyMode: 'clear' | 'rolling'; unmentionedInbound: 'user_request' | 'room_event' } = {
+const DEFAULT_GROUP_CONFIG: Omit<Required<GroupConfig>, "prompt" | "coalesce" | "historyMode" | "unmentionedInbound" | "roomEventRequireMessageTool" | "tools"> & { coalesce: Required<GroupCoalesceConfig>; historyMode: 'clear' | 'rolling'; unmentionedInbound: 'user_request' | 'room_event' } = {
   requireMention: true,
   ignoreOtherMentions: false,
   toolPolicy: "restricted",
@@ -158,11 +158,23 @@ export function isGroupAllowed(cfg: OpenClawConfig, groupOpenid: string, account
   }).allowed;
 }
 
-export type ResolvedGroupConfig = Omit<Required<GroupConfig>, "prompt" | "coalesce" | "historyMode" | "unmentionedInbound"> & {
+export type ResolvedGroupConfig = Omit<Required<GroupConfig>, "prompt" | "coalesce" | "historyMode" | "unmentionedInbound" | "roomEventRequireMessageTool" | "tools"> & {
   prompt: string;
   coalesce: Required<GroupCoalesceConfig>;
   historyMode: 'clear' | 'rolling';
   unmentionedInbound: 'user_request' | 'room_event';
+  /**
+   * 群级**显式**配置的 unmentionedInbound（未显式配置时为 undefined）。
+   *
+   * 与 `unmentionedInbound` 的区别：后者是"带上默认值"的解析结果，不能用来判断
+   * 用户是否显式配过——而入站策略回落链（群级 > per-agent > 全局）必须区分
+   * "显式配了 user_request" 与 "没配"。见 features/room-event.ts。
+   */
+  unmentionedInboundExplicit?: 'user_request' | 'room_event';
+  /** room_event 是否强制要求 message 工具可用（默认 true，见 GroupConfig 注释） */
+  roomEventRequireMessageTool?: boolean;
+  /** 群级工具白名单（显式声明时原样透传给框架） */
+  tools?: GroupToolPolicy;
 };
 
 /**
@@ -221,6 +233,9 @@ export function resolveGroupConfigFromAccount(account: ResolvedQQBotAccount, gro
     enabled: specificCfg.coalesce?.enabled ?? wildcardCfg.coalesce?.enabled ?? accountDefaultCoalesce.enabled ?? DEFAULT_GROUP_COALESCE_CONFIG.enabled,
   };
 
+  // 群级显式值（不含默认值）：入站策略回落链据此判断"用户是否显式配过"
+  const unmentionedInboundExplicit = specificCfg.unmentionedInbound ?? wildcardCfg.unmentionedInbound;
+
   return {
     requireMention: specificCfg.requireMention ?? wildcardCfg.requireMention ?? accountDefaultRequireMention,
     ignoreOtherMentions: specificCfg.ignoreOtherMentions ?? wildcardCfg.ignoreOtherMentions ?? DEFAULT_GROUP_CONFIG.ignoreOtherMentions,
@@ -229,7 +244,9 @@ export function resolveGroupConfigFromAccount(account: ResolvedQQBotAccount, gro
     prompt: specificCfg.prompt ?? wildcardCfg.prompt ?? DEFAULT_GROUP_PROMPT,
     historyLimit: specificCfg.historyLimit ?? wildcardCfg.historyLimit ?? DEFAULT_GROUP_CONFIG.historyLimit,
     historyMode: specificCfg.historyMode ?? wildcardCfg.historyMode ?? DEFAULT_GROUP_CONFIG.historyMode,
-    unmentionedInbound: specificCfg.unmentionedInbound ?? wildcardCfg.unmentionedInbound ?? DEFAULT_GROUP_CONFIG.unmentionedInbound,
+    unmentionedInbound: unmentionedInboundExplicit ?? DEFAULT_GROUP_CONFIG.unmentionedInbound,
+    unmentionedInboundExplicit,
+    roomEventRequireMessageTool: specificCfg.roomEventRequireMessageTool ?? wildcardCfg.roomEventRequireMessageTool,
     coalesce,
   };
 }
@@ -261,6 +278,70 @@ export function resolveIgnoreOtherMentions(cfg: OpenClawConfig, groupOpenid: str
 /** 解析群工具策略 */
 export function resolveToolPolicy(cfg: OpenClawConfig, groupOpenid: string, accountId?: string): ToolPolicy {
   return resolveGroupConfig(cfg, groupOpenid, accountId).toolPolicy;
+}
+
+/**
+ * restricted 群的结构性工具集（兜底层）。
+ *
+ * **必须含 message**：room_event 群的发声唯一通道就是 message 工具
+ * （最终文本不投递），缺了它群就永久沉默——2026-10-06 线上事故即此。
+ *
+ * 不含 exec/process/文件写入/控制面/平台写操作：qqbot_platform_api 支持任意
+ * method+path 的平台写请求，提示词诱导即可变更/删除平台资源。
+ */
+export const RESTRICTED_DEFAULT_TOOLS = [
+  'message',
+  'web_search',
+  'web_fetch',
+  'x_search',
+  'session_status',
+  'heartbeat_respond',
+  'view_image',
+  'tts',
+  'cron',
+  'qqbot_remind',
+  // progress_card：纯会话级状态工具（无副作用），restricted 群显式开
+  // progressCard.scope 后 agent 才能维护卡片（2026-10-08 进度卡片功能）
+  'progress_card',
+] as const;
+
+/**
+ * 解析某个群的**最终工具策略**（插件交给框架的那份）。
+ *
+ * 优先级：
+ *   1. 用户显式配置的 `channels.qqbot.groups.<id>.tools`（原样透传）
+ *   2. `toolPolicy` 兜底：full → undefined（交给 agent 的 tools.profile）
+ *      / none → 全禁 / restricted → RESTRICTED_DEFAULT_TOOLS
+ *
+ * **唯一事实来源**：channel.ts 的 groups adapter 与 room_event 的
+ * message 工具守卫都调用本函数——两边算出不同结果就会导致"框架允许发消息
+ * 但插件判定不能发"（或反之），故必须共用。
+ */
+export function resolveGroupToolPolicyConfig(
+  cfg: OpenClawConfig,
+  accountId: string | undefined | null,
+  groupOpenid: string,
+): GroupToolPolicy | undefined {
+  const qqbotCfg = (cfg.channels?.qqbot ?? {}) as Record<string, unknown>;
+  const accounts = qqbotCfg.accounts as Record<string, Record<string, unknown>> | undefined;
+  const groups = (
+    accountId && accountId !== 'default' && accounts?.[accountId]
+      ? accounts[accountId]?.groups
+      : qqbotCfg.groups
+  ) as Record<string, { tools?: unknown }> | undefined;
+
+  if (groups) {
+    const matchedKey = resolveGroupConfigKey(groups as Record<string, GroupConfig>, groupOpenid);
+    const matchedEntry = matchedKey ? groups[matchedKey] : undefined;
+    if (matchedEntry?.tools !== undefined) {
+      return matchedEntry.tools as GroupToolPolicy;
+    }
+  }
+
+  const toolPolicy = resolveToolPolicy(cfg, groupOpenid, accountId ?? undefined);
+  if (toolPolicy === 'full') return undefined;              // 交给 agent tools.profile
+  if (toolPolicy === 'none') return { allow: [], deny: ['*'] }; // 管理员全禁
+  return { allow: [...RESTRICTED_DEFAULT_TOOLS] };
 }
 
 /** 解析群名称（优先配置，fallback 为 openid 前 8 位） */

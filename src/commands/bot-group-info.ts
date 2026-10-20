@@ -4,14 +4,23 @@ import { resolveGroupConfigFromAccount } from '../config.js';
 import { getGroupModeFacts } from '../features/group-mode-store.js';
 import { getPushAuthorizeFacts } from '../features/push-authorization-store.js';
 import { getProactiveUsage } from '../features/proactive-budget.js';
+import { resolveGroupRoomEventPolicy } from '../features/room-event.js';
+
+/** 入站策略来源的可读名 */
+const SOURCE_LABEL: Record<string, string> = {
+  group: '群级配置',
+  agent: '按 agent 配置',
+  global: '全局配置',
+  default: '默认',
+};
 
 /** /bot-group-info — 展示当前群的推送模式推断与生效配置（排障用） */
-export function botGroupInfo(account: ResolvedQQBotAccount): SlashCommand {
+export function botGroupInfo(account: ResolvedQQBotAccount, getRuntime?: () => any): SlashCommand {
   return {
     name: 'bot-group-info',
     description: '查看当前群的推送模式与生效配置',
     scope: 'group',
-    usage: '/bot-group-info  在群内发送，查看该群的推送模式推断与生效配置',
+    usage: '/bot-group-info  在群内发送，查看该群的推送模式与生效配置',
     handler: async (ctx: SlashCommandHandlerContext) => {
       const groupOpenid = (ctx.message as { groupOpenid?: string }).groupOpenid;
       if (!groupOpenid) return '❌ 仅可在群聊中使用';
@@ -20,6 +29,11 @@ export function botGroupInfo(account: ResolvedQQBotAccount): SlashCommand {
       const pushAuth = getPushAuthorizeFacts(account.accountId, groupOpenid);
       const cfg = resolveGroupConfigFromAccount(account, groupOpenid);
       const usage = getProactiveUsage(account.accountId);
+
+      // 裁决后的入站策略（群级 > per-agent > 全局 > 默认）+ message 工具守卫。
+      // 展示**裁决结果**而非群级配置原值——群级没配但全局/按 agent 配了
+      // room_event 时，只有裁决结果才反映真实生效的行为。
+      const { policy } = resolveGroupRoomEventPolicy(account, groupOpenid, getRuntime);
 
       const modeLine = !facts
         ? '推送模式：尚未观测到事件（发一条群消息后可推断）'
@@ -37,6 +51,16 @@ export function botGroupInfo(account: ResolvedQQBotAccount): SlashCommand {
         ? '推送授权事件：未见（群主未动过推送开关，或平台未推送）'
         : `推送授权事件：最近 ${new Date(pushAuth.lastEventAt ?? pushAuth.updatedAt).toISOString()}（type=${pushAuth.lastEventType}，scope=${pushAuth.scope || '?'}，累计 ${pushAuth.eventCount} 次）`;
 
+      const inboundLine = policy.effectiveMode === 'room_event'
+        ? '**room_event**（被动房间事件进框架，AI 只读、想发言走主动 message 工具）'
+        : policy.degraded
+          ? `拦截（只进历史，不上报）——原配置为 room_event，但已降级：${policy.degradedReason ?? 'message 工具不可用'}`
+          : '拦截（只进历史，不上报）';
+
+      const toolLine = policy.effectiveMode === 'room_event'
+        ? `message 工具：${policy.messageToolAvailable ? '可用（房间可发言）' : '不可用（房间无法发言）'}`
+        : '';
+
       return [
         `🤖 群信息（${groupOpenid.slice(0, 8)}…）`,
         '',
@@ -45,13 +69,15 @@ export function botGroupInfo(account: ResolvedQQBotAccount): SlashCommand {
         pushAuthLine,
         '',
         `requireMention：${cfg.requireMention ? '是（需 @ 才响应）' : '否（所有消息都响应）'}`,
-        `未 @ 消息入站：${cfg.unmentionedInbound === 'room_event' ? '**room_event**（被动房间事件进框架，AI 只读、想发言走主动 message 工具）' : '拦截（只进历史，不上报）'}`,
+        `未 @ 消息入站：${inboundLine}`,
+        `入站策略来源：${SOURCE_LABEL[policy.source] ?? policy.source}`,
+        toolLine,
         `排队策略：框架队列（${cfg.coalesce.enabled ? 'collect 合并批处理' : 'followup 排队不合并'}）`,
         `历史缓存：${cfg.historyLimit} 条（0=禁用，模式 ${cfg.historyMode === 'rolling' ? 'rolling（bot 发言计入）' : 'clear（回复后清空）'}）`,
         `工具策略：${cfg.toolPolicy}`,
         '',
         `今日主动消息用量：${usage.count}/${usage.limit}（被动回复不计数；异常增长说明 msgid-cache 常过期或被动配额常耗尽）`,
-      ].join('\n');
+      ].filter((line) => line !== '').join('\n');
     },
   };
 }

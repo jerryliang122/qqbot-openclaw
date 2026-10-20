@@ -7,7 +7,7 @@
 import { createChatChannelPlugin } from 'openclaw/plugin-sdk/channel-core';
 import { DEFAULT_ACCOUNT_ID } from 'openclaw/plugin-sdk/account-id';
 import type { OpenClawConfig } from 'openclaw/plugin-sdk/config-contracts';
-import type { ResolvedQQBotAccount, GroupConfig } from './types.js';
+import type { ResolvedQQBotAccount } from './types.js';
 import {
   setAccountEnabledInConfigSection,
   deleteAccountFromConfigSection,
@@ -18,9 +18,8 @@ import {
   resolveQQBotAccount,
   resolveDefaultQQBotAccountId,
   resolveRequireMention,
-  resolveToolPolicy,
   resolveGroupConfig,
-  resolveGroupConfigKey,
+  resolveGroupToolPolicyConfig,
   applyQQBotAccountConfig,
   inspectQQBotAccount,
 } from './config.js';
@@ -68,7 +67,12 @@ export const qqbotThreadingAdapter = {
 };
 
 /**
- * restricted 群的工具白名单。
+ * restricted 群的工具白名单与工具策略解析已移到 `config.ts`
+ * （`RESTRICTED_DEFAULT_TOOLS` / `resolveGroupToolPolicyConfig`）。
+ *
+ * 移走的原因：room_event 的 message 工具守卫必须与本 adapter 算出**同一份**
+ * 工具策略——两边结果不一致就会出现"框架允许发消息、插件却判定不能发"
+ * （或反之）的错配。
  *
  * ⚠️ 红线（2026-10-06 线上事故，openclaw 9.5→9.7 升级后复发）：
  * 2026.9.6+ 框架会把 groups.resolveToolPolicy 的返回值作为会话工具策略真正
@@ -86,37 +90,7 @@ export const qqbotThreadingAdapter = {
  *   支持任意 method+path 的平台写请求，提示词诱导即可变更/删除平台资源，
  *   不得进 restricted 白名单）
  * - none → { allow: [], deny: ['*'] }（管理员显式全禁，保持原义）
- *
- * ⚠️ 版本行为差异：openclaw ≤2026.9.5 不把本返回值应用到 run 工具集
- * （旧 `restricted→{allow:[]}` 映射因此长期无害）。在那些版本上 restricted
- * 群的工具集由 agent 自身 tools.profile 决定——这与升级前行为一致，不是
- * 本映射引入的回归；真正的强制力从 2026.9.6 起生效。
  */
-/**
- * restricted 群的结构性工具集（fallback 兜底，由 resolveToolPolicy 委托给
- * 框架 resolveChannelGroupToolsPolicy 后，当用户未在配置中声明
- * channels.qqbot.groups.<id>.tools 时的兜底层）。
- *
- * 与 Telegram 行为对齐：工具策略由用户通过配置声明，插件代码不再硬编码。
- * 用户可在 channels.qqbot.groups.*.tools 中覆盖任意群的允许工具集。
- *
- * 保留 message / cron + qqbot_remind（提醒工具链）的原因同前，不再赘述。
- */
-const RESTRICTED_DEFAULT_TOOLS = [
-  'message',
-  'web_search',
-  'web_fetch',
-  'x_search',
-  'session_status',
-  'heartbeat_respond',
-  'view_image',
-  'tts',
-  'cron',
-  'qqbot_remind',
-  // progress_card：纯会话级状态工具（无副作用），restricted 群显式开
-  // progressCard.scope 后 agent 才能维护卡片（2026-10-08 进度卡片功能）
-  'progress_card',
-] as const;
 
 /**
  * QQBot Groups Adapter
@@ -137,28 +111,9 @@ export const qqbotGroupsAdapter = {
     groupId?: string | null;
   }) => {
     if (!groupId) return undefined;
-
-    const qqbotCfg = (cfg.channels?.qqbot ?? {}) as Record<string, unknown>;
-    const groups = accountId && accountId !== 'default' && (qqbotCfg.accounts as Record<string, unknown> | undefined)?.[accountId]
-      ? ((qqbotCfg.accounts as Record<string, unknown>)[accountId] as Record<string, unknown>)?.groups as Record<string, { tools?: unknown }> | undefined
-      : (qqbotCfg.groups as Record<string, { tools?: unknown }> | undefined);
-
-    // 用户显式配置了 channels.qqbot.groups.<id>.tools → 直接返回（用户可控的工具策略；
-    // 这与 Telegram 的配置驱动模式对齐：工具白名单由用户在配置中声明，插件代码不再硬编码）
-    if (groups) {
-      const matchedKey = resolveGroupConfigKey(groups as Record<string, GroupConfig>, groupId);
-      const matchedEntry = matchedKey ? groups[matchedKey] : undefined;
-      if (matchedEntry?.tools !== undefined) {
-        return matchedEntry.tools as { allow?: string[]; alsoAllow?: string[]; deny?: string[] };
-      }
-    }
-
-    // 无显式 tools 配置：按 toolPolicy 字符串决定 fallback
-    const toolPolicy = resolveToolPolicy(cfg, groupId, accountId ?? undefined);
-    if (toolPolicy === 'full') return undefined;            // 交给 agent tools.profile
-    if (toolPolicy === 'none') return { allow: [], deny: ['*'] }; // 管理员全禁
-    // restricted（默认）：backward compat——旧配置升级后不丧失工具访问能力
-    return { allow: [...RESTRICTED_DEFAULT_TOOLS] };
+    // 统一走 config.ts 的共享解析（与 room_event 的 message 工具守卫同源）：
+    // 用户显式配置的 groups.<id>.tools 原样透传；未声明时按 toolPolicy 兜底。
+    return resolveGroupToolPolicyConfig(cfg, accountId ?? undefined, groupId);
   },
 
   resolveGroupIntroHint: ({ cfg, accountId, groupId }: {

@@ -406,6 +406,121 @@ await test('出站适配器接受限定目标（message 工具 to=qqbot:group:X 
   assert.equal(parsed.targetId, 'GROUP_ROOM');
 });
 
+group('入站策略回落链（端到端）');
+
+await test('全局 messages.groupChat.unmentionedInbound=room_event → 群未显式配置也走 room_event', async () => {
+  const { msg, ctx } = makeGroupMsgAndCtx({ content: '闲聊' });
+  const account = makeAccount(); // 群级没有任何配置
+  _resetAdaptersCache();
+  let captured: CapturedDispatch = {};
+  const runtime = makeFakeRuntime();
+  const patchedRuntime = {
+    ...runtime,
+    config: {
+      current: () => ({ messages: { groupChat: { unmentionedInbound: 'room_event' } } }),
+    },
+  } as any;
+  patchedRuntime.channel.inbound.run = async (params: any) => {
+    const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+    captured.ctxPayload = plan;
+    await plan.runDispatch();
+    return { dispatched: true };
+  };
+  patchedRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = (params2: any) => {
+    captured = { ...captured, replyOptions: params2.replyOptions, ctxPayload: params2.ctx };
+    return { queuedFinal: true, counts: { final: 1 } };
+  };
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, patchedRuntime);
+  assert.equal(captured.ctxPayload?.InboundEventKind, 'room_event', '全局配置应生效');
+  assert.equal(captured.replyOptions?.sourceReplyDeliveryMode, 'message_tool_only');
+});
+
+await test('群工具白名单不含 message → 自动降级为 user_request（不静默）', async () => {
+  const { msg, ctx } = makeGroupMsgAndCtx({ content: '闲聊' });
+  const account = makeAccount({ GROUP_ROOM: { unmentionedInbound: 'room_event' } });
+  _resetAdaptersCache();
+  let captured: CapturedDispatch = {};
+  const runtime = makeFakeRuntime();
+  const patchedRuntime = {
+    ...runtime,
+    config: {
+      current: () => ({
+        channels: { qqbot: { groups: { GROUP_ROOM: { tools: { allow: ['web_search'] } } } } },
+      }),
+    },
+  } as any;
+  patchedRuntime.channel.inbound.run = async (params: any) => {
+    const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+    captured.ctxPayload = plan;
+    await plan.runDispatch();
+    return { dispatched: true };
+  };
+  patchedRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = (params2: any) => {
+    captured = { ...captured, replyOptions: params2.replyOptions, ctxPayload: params2.ctx };
+    return { queuedFinal: true, counts: { final: 1 } };
+  };
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, patchedRuntime);
+  assert.equal(captured.ctxPayload?.InboundEventKind, 'user_request', '工具不可用时必须降级（防永久沉默）');
+  assert.equal(captured.replyOptions?.sourceReplyDeliveryMode, undefined, '降级后恢复自动投递');
+});
+
+await test('room_event 群里被 @ 的 turn 仍是 user_request（不压成静默）', async () => {
+  const { msg, ctx } = makeGroupMsgAndCtx({
+    rawEventType: 'GROUP_AT_MESSAGE_CREATE',
+    mentionState: { wasMentioned: true },
+  });
+  const account = makeAccount({ GROUP_ROOM: { unmentionedInbound: 'room_event' } });
+  const captured = await runDispatch({ account, msg, ctx });
+  assert.equal(captured.ctxPayload?.InboundEventKind, 'user_request');
+  assert.equal(captured.replyOptions?.sourceReplyDeliveryMode, undefined, '被 @ 的 turn 必须能正常回话');
+});
+
+group('称呼唤醒穿门控');
+
+await test('mentionPatterns 命中时门控放行（普通群也能被称呼唤醒）', async () => {
+  const { mentionGate } = await import('@tencent-connect/qqbot-nodejs');
+  const { buildMentionGateResolveConfig } = await import('../src/gateway/middleware-setup.ts');
+  const middleware = mentionGate({ resolveConfig: buildMentionGateResolveConfig() });
+  const ctx: any = {
+    message: {
+      kind: 'group',
+      content: '沈处帮我看下这个',
+      rawEventType: 'GROUP_MESSAGE_CREATE',
+    },
+    state: {
+      policy: { group: { requireMention: true } },
+      mentionPatterns: ['沈处'],
+    },
+    bot: { appId: 'TEST_APP_ID' },
+    log: { debug: () => {} },
+    stop: () => { (ctx as any).stopped = 'mention-gate'; },
+  };
+  let nextCalled = false;
+  await middleware(ctx, async () => { nextCalled = true; });
+  assert.ok(nextCalled, '称呼唤醒的消息必须穿过门控');
+  assert.equal(ctx.state.nameMentioned, true, '门控判定结果落 state 供 dispatch 复用');
+  assert.equal(ctx.state.mention.wasMentioned, false, 'SDK 层面仍算未被 @（不是 SDK 的信号）');
+});
+
+await test('未命中 mentionPatterns 时门控照常拦截', async () => {
+  const { mentionGate } = await import('@tencent-connect/qqbot-nodejs');
+  const { buildMentionGateResolveConfig } = await import('../src/gateway/middleware-setup.ts');
+  const middleware = mentionGate({ resolveConfig: buildMentionGateResolveConfig() });
+  const ctx: any = {
+    message: { kind: 'group', content: '闲聊', rawEventType: 'GROUP_MESSAGE_CREATE' },
+    state: { policy: { group: { requireMention: true } }, mentionPatterns: ['沈处'] },
+    bot: { appId: 'TEST_APP_ID' },
+    log: { debug: () => {} },
+    stop: () => { (ctx as any).stopped = 'mention-gate'; },
+  };
+  let nextCalled = false;
+  await middleware(ctx, async () => { nextCalled = true; });
+  assert.ok(!nextCalled, '没命中称呼的普通消息仍应被拦下');
+  assert.ok((ctx as any).stopped?.includes('mention-gate'));
+});
+
 // ── 结果 ──
 
 console.log('\n' + '='.repeat(60));

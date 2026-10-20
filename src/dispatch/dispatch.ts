@@ -38,13 +38,82 @@ import {
 } from '../features/question-helpers.js';
 import { tryGetBotForAccount } from '../bot-instance.js';
 import { resolveGroupConfigFromAccount, resolveMentionPatterns, resolveProgressCardConfig } from '../config.js';
-import { detectWasMentioned } from '../utils/mention.js';
+import { detectEventMention, matchesNamePattern } from '../utils/mention.js';
+import {
+  classifyInboundEventKind,
+  resolveRoomEventPolicy,
+  resolveVisibleRepliesMode,
+  resolveWakeDecision,
+  type RoomEventPolicy,
+  type VisibleRepliesMode,
+} from '../features/room-event.js';
 
 /** 失败兜底文案（对齐 telegram：Something went wrong while processing your request.） */
 const FAILURE_FALLBACK_TEXT = 'Something went wrong while processing your request. Please try again.';
 
 /** 每进程只打一次「框架排队已接管线」INFO（排障锚点，确认 collect 真实生效） */
 let frameworkQueueAnnounced = false;
+
+/**
+ * room_event 降级告警去重集合（account+group 维度）。
+ *
+ * 降级是配置级问题（工具面缺 message），每条消息都 WARN 会刷屏——
+ * 每个群只报一次，修复配置后重启即恢复。
+ */
+const roomEventDegradedGroups = new Set<string>();
+
+function warnRoomEventDegraded(
+  dlog: PluginLogger | undefined,
+  accountId: string,
+  groupId: string | undefined,
+  reason: string | undefined,
+): void {
+  const key = `${accountId}:${groupId ?? '-'}`;
+  if (roomEventDegradedGroups.has(key)) return;
+  roomEventDegradedGroups.add(key);
+  dlog?.warn(
+    `[room-event] group=${groupId} 降级为 user_request：${reason ?? 'message 工具不可用'}。`
+    + 'room_event 的唯一发声通道是 message 工具，缺它会导致群里永久沉默。'
+    + '修法：把 message 加进该群工具白名单（channels.qqbot.groups.<id>.tools.allow），'
+    + '或设 groups.<id>.roomEventRequireMessageTool=false 保持严格静默。',
+  );
+}
+
+/** 测试用：清空降级告警去重集合 */
+export function _resetRoomEventDegradedWarnings(): void {
+  roomEventDegradedGroups.clear();
+}
+
+/**
+ * 取本条消息生效的 room_event 策略。
+ *
+ * 优先复用中间件链里 policyInjector 已裁决好的结果（挂在 ctx.state），
+ * 保证「门控放行与否」与「入站分类」同源；中间件链不存在时（如单测直接调
+ * dispatch）就地复算。
+ */
+function resolveDispatchRoomEventPolicy(params: {
+  ctx: MiddlewareContext;
+  cfg: unknown;
+  account: ResolvedQQBotAccount;
+  groupOpenid: string;
+  agentId: string;
+}): RoomEventPolicy {
+  const stored = (params.ctx.state as { roomEventPolicy?: (RoomEventPolicy & { agentId?: string; groupOpenid?: string }) } | undefined)
+    ?.roomEventPolicy;
+  if (
+    stored &&
+    stored.agentId === params.agentId &&
+    stored.groupOpenid === params.groupOpenid
+  ) {
+    return stored;
+  }
+  return resolveRoomEventPolicy({
+    cfg: params.cfg as any,
+    account: params.account,
+    groupOpenid: params.groupOpenid,
+    agentId: params.agentId,
+  });
+}
 
 /**
  * 合并 AbortSignal（Node >= 20.3 使用 AbortSignal.any，低版本手工 fan-in）。
@@ -176,27 +245,64 @@ export async function dispatchToOpenClaw(
     : undefined;
 
   // ── room_event 分类（全量模式群的被动房间事件）──
-  // wasMentioned 三种唤醒方式：@（AT 事件 / mentions.is_you / 内容标记，由
-  // mentionGate 判定）、称呼（mentionPatterns，如「沈处」）、引用 bot 出站
-  // （mentionGate isImplicitMention）。均未命中且群开启 room_event 时，
-  // 该消息作为被动房间事件进框架：AI 只读上下文，最终文本不投递
-  // （message_tool_only），想发言走主动 message 工具；框架自动压 typing/
-  // 流式、排队不 steer。斜杠命令始终是显式用户意图 → user_request。
+  // 唤醒判定（唯一口径，见 features/room-event.ts 的 resolveWakeDecision）：
+  //   @（AT 事件 / mentions.is_you / 内容标记）→ 引用 bot 出站（implicit）
+  //   → 称呼（mentionPatterns，如「沈处」）
+  // 三者均未命中且群处于 room_event 时，该消息作为被动房间事件进框架：
+  // AI 只读上下文，最终文本不投递（message_tool_only），想发言走主动 message
+  // 工具；框架自动压 typing/流式、排队不 steer。斜杠命令始终是显式用户意图
+  // → user_request。
   const mentionState = (ctx.state as { mention?: { wasMentioned?: boolean; implicit?: boolean } }).mention;
-  const nameMentioned = isGroup
-    ? detectWasMentioned({
+  const mentionPatterns = (ctx.state as { mentionPatterns?: string[] }).mentionPatterns
+    ?? resolveMentionPatterns(cfg, agentId);
+  // 事件级 @ 信号兜底：单测里消息可能不经中间件链直达 dispatch，
+  // 此时 ctx.state.mention 不存在
+  const eventMentioned = isGroup
+    ? detectEventMention({
         eventType: (msg as { rawEventType?: string }).rawEventType,
         mentions: (msg as { mentions?: Array<{ is_you?: boolean }> }).mentions,
-        content: msg.content,
-        mentionPatterns: resolveMentionPatterns(cfg, agentId),
       })
     : false;
-  const wasMentioned = !!(mentionState?.wasMentioned || mentionState?.implicit || nameMentioned);
-  const isSlash = /^\//.test(assembled.rawBody ?? '');
-  const inboundEventKind =
-    isGroup && groupCfg?.unmentionedInbound === 'room_event' && !wasMentioned && !isSlash
-      ? 'room_event' as const
-      : 'user_request' as const;
+  const nameMentioned = isGroup
+    ? ((ctx.state as { nameMentioned?: boolean }).nameMentioned
+      ?? matchesNamePattern({ content: msg.content, mentionPatterns }))
+    : false;
+  const wake = resolveWakeDecision({
+    mentionState: {
+      wasMentioned: mentionState?.wasMentioned === true || eventMentioned,
+      implicit: mentionState?.implicit === true,
+    },
+    nameMentioned,
+  });
+
+  // 入站策略（群级 > per-agent > 全局 > 默认）+ message 工具守卫
+  const roomEventPolicy = resolveDispatchRoomEventPolicy({
+    ctx,
+    cfg,
+    account,
+    groupOpenid: isGroup ? (envelope.groupId ?? '') : '',
+    agentId,
+  });
+  if (roomEventPolicy.degraded) {
+    warnRoomEventDegraded(dlog, account.accountId, envelope.groupId, roomEventPolicy.degradedReason);
+  }
+
+  const inboundEventKind = classifyInboundEventKind({
+    isGroup,
+    rawBody: assembled.rawBody ?? '',
+    wake,
+    unmentionedInbound: roomEventPolicy.effectiveMode,
+  });
+
+  // 可见回复模式按 **turn** 判定，不是按群：
+  // - room_event turn → 严格投递（最终文本不投递，只能走 message 工具）
+  // - user_request turn → 配置驱动（messages.groupChat.visibleReplies，
+  //   默认 automatic = 现状：最终文本自动投递）
+  // 同一群里两种 turn 交替出现时，可见性必须逐 turn 判定——
+  // 否则 room_event 群里被 @ 的那条消息也会被压成静默（= 用户 @ 了 bot 却没回音）。
+  const turnVisibleReplies: VisibleRepliesMode = inboundEventKind === 'room_event'
+    ? 'message_tool'
+    : resolveVisibleRepliesMode({ cfg, mode: 'user_request' });
 
   // 分类可观测性：room_event 事件触发一次推理 pass（成本排障命门），必须留痕；
   // room_event 群里被唤醒为 user_request 时标注唤醒来源（@/称呼/引用），
@@ -205,15 +311,8 @@ export async function dispatchToOpenClaw(
     dlog?.info(
       `[room-event] passive room event group=${envelope.groupId} sender=${envelope.senderId} contentLen=${(msg.content ?? '').length}`,
     );
-  } else if (isGroup && groupCfg?.unmentionedInbound === 'room_event' && !isSlash) {
-    const wakeSource = mentionState?.wasMentioned
-      ? 'mention'
-      : mentionState?.implicit
-        ? 'quote-bot'
-        : nameMentioned
-          ? 'name-pattern'
-          : 'unknown';
-    dlog?.info(`[wake] ${wakeSource} → user_request group=${envelope.groupId} sender=${envelope.senderId}`);
+  } else if (isGroup && roomEventPolicy.effectiveMode === 'room_event' && !/^\//.test(assembled.rawBody ?? '')) {
+    dlog?.info(`[wake] ${wake.source} → user_request group=${envelope.groupId} sender=${envelope.senderId}`);
   }
 
   if (queueModeOverride && !frameworkQueueAnnounced) {
@@ -599,7 +698,16 @@ export async function dispatchToOpenClaw(
                 runId: envelope.messageId,
                 turnAdoptionLifecycle,
                 ...(queueModeOverride ? { queueModeOverride } : {}),
-                ...(inboundEventKind === 'room_event' ? { sourceReplyDeliveryMode: 'message_tool_only' as const } : {}),
+                // 可见回复模式（对齐框架 source-reply-delivery-mode 的裁决）：
+                // - room_event turn → 严格投递（message_tool_only）：最终文本不投递，
+                //   发言必须走 message 工具
+                // - user_request turn → 按 messages.groupChat.visibleReplies 走
+                //   （默认 automatic = 现状：最终文本自动投递）
+                // 传 undefined 时框架会按自己的配置裁决，这里显式传是为了让
+                // "房间静默"这件事在插件侧可断言、可观测。
+                ...(turnVisibleReplies === 'message_tool'
+                  ? { sourceReplyDeliveryMode: 'message_tool_only' as const }
+                  : {}),
                 ...(streamingController?.isStaticSendMode
                   ? {
                       // 对齐 telegram 模式一：显式关掉 SDK block streaming，绕开 coalescer
@@ -714,7 +822,16 @@ export async function dispatchToOpenClaw(
 
   // 失败兜底（对齐 telegram）：dispatch 抛错、deliver 抛错或底层发送失败，
   // 且用户未收到任何可见回复时，发送兜底消息而非静默失败。
-  if ((hadDispatchError() || deliverErrorCount > 0 || outboundSendFail > 0) && !turnAbort.signal.aborted) {
+  //
+  // room_event turn 例外：被动房间事件的语义是"AI 只在被叫醒时说话"，
+  // 错误兜底属于系统噪声——群里每条消息都跑一次 turn，provider 抖动会刷屏。
+  // 该场景只记日志（下方 warn/error 已覆盖），房间保持安静。
+  // 注意：room_event 群里**被 @ 的那条**是 user_request turn，仍会发兜底。
+  if (
+    (hadDispatchError() || deliverErrorCount > 0 || outboundSendFail > 0)
+    && !turnAbort.signal.aborted
+    && inboundEventKind !== 'room_event'
+  ) {
     const streamedVisible = !!streamingController
       && streamingController.currentPhase !== 'failed'
       && (streamingController.currentPhase === 'done' || streamingController.hasSentChunks);
