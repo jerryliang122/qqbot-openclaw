@@ -51,13 +51,34 @@ test('本地切点：切点落在代理对中间时回退到簇边界', () => {
 });
 
 test('本地切点：ZWJ 家庭 emoji 不被拆开', () => {
-  // 👨‍👩‍👧 = 5 个码位（含 2 个 ZWJ）
+  // 👨‍👩‍👧 = 8 个 UTF-16 码元（👨2 + ZWJ1 + 👩2 + ZWJ1 + 👧2）
   const family = '👨‍👩‍👧';
   const text = `前缀${family}后缀`;
+  const familyStart = text.indexOf(family);
+  const familyEnd = familyStart + family.length;
+
   const end = localFindGraphemeChunkEnd(text, 0, text.length - 2, text.length - 2);
-  // 切点若落在 family 内部会被吸附到 family 起点
-  assert.ok(end <= text.indexOf(family) + family.length);
-  assert.ok(end >= 0);
+  // 切点必须落在 family 的**边界**上（起点或终点），不能落在 family 内部
+  assert.ok(
+    end === familyStart || end === familyEnd,
+    `切点 ${end} 必须等于 family 起点 ${familyStart} 或终点 ${familyEnd}，不能落在 family 内部`,
+  );
+  // 无论落在哪一端，都不能切出半个字形簇
+  assert.ok(end >= 0 && end <= text.length);
+});
+
+test('本地切点：ZWJ 家庭 emoji 不会被切成两半（任意预算）', () => {
+  const family = '👨‍👩‍👧';
+  const text = `前缀${family}后缀`;
+  const familyStart = text.indexOf(family);
+  const familyEnd = familyStart + family.length;
+
+  for (let maxEnd = 1; maxEnd <= text.length; maxEnd++) {
+    const end = localFindGraphemeChunkEnd(text, 0, maxEnd);
+    // 切点要么在 family 之前，要么在 family 之后（末尾），不能插进 family 内部
+    const inside = end > familyStart && end < familyEnd;
+    assert.ok(!inside, `maxEnd=${maxEnd} 切点 ${end} 落在 family 内部 [${familyStart},${familyEnd})`);
+  }
 });
 
 test('本地切点：切点必须落在完整字形簇边界（不产生半个 emoji）', () => {

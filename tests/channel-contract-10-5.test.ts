@@ -106,11 +106,35 @@ test('inspectAccount：命名账号单独巡检', () => {
   assert.strictEqual(inspection.configured, true);
 });
 
-test('inspectAccount：插件已挂载该只读面', () => {
+test('inspectAccount：插件已挂载该只读面（且真的返回巡检结果）', () => {
   const cfgAdapter = (qqbotPlugin as unknown as {
     config?: { inspectAccount?: (cfg: unknown, accountId?: string | null) => unknown };
   }).config;
   assert.strictEqual(typeof cfgAdapter?.inspectAccount, 'function');
+
+  // 不能只断言「是个函数」——空壳函数也会通过，宿主却拿不到巡检结果。
+  // 这里真的调一次，断言拿回来的就是巡检结果。
+  const cfg = {
+    channels: { qqbot: { appId: 'APP1', clientSecret: 'SECRET' } },
+  } as never;
+  const result = cfgAdapter!.inspectAccount!(cfg, undefined) as {
+    accountId?: string;
+    configured?: boolean;
+    appIdStatus?: string;
+    secretStatus?: string;
+  };
+  assert.strictEqual(result?.accountId, 'default');
+  assert.strictEqual(result?.configured, true);
+  assert.strictEqual(result?.appIdStatus, 'available');
+  assert.strictEqual(result?.secretStatus, 'available');
+
+  // 缺凭据时也不能抛错，且要如实上报
+  const missing = cfgAdapter!.inspectAccount!({ channels: { qqbot: {} } } as never, undefined) as {
+    configured?: boolean;
+    secretStatus?: string;
+  };
+  assert.strictEqual(missing?.configured, false);
+  assert.strictEqual(missing?.secretStatus, 'missing');
 });
 
 // ── 3. clientSecretFile ──
