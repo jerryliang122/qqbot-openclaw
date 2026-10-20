@@ -195,3 +195,70 @@ test('上下文预算规则：开销过半时放弃上下文', () => {
     assert.ok(c.length <= 100, `块长度 ${c.length} 超过上限 100`);
   }
 });
+
+// ── 6. 随机输入的不变量（伪随机 · 固定种子 · 可复现） ──
+
+/** 线性同余伪随机（固定种子 → 结果可复现） */
+function lcg(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 0x100000000;
+  };
+}
+
+/** needle 是否为 haystack 的子序列 */
+function isSubsequence(needle: string, haystack: string): boolean {
+  let i = 0;
+  for (let j = 0; j < haystack.length && i < needle.length; j++) {
+    if (haystack[j] === needle[i]) i++;
+  }
+  return i === needle.length;
+}
+
+test('随机输入不变量：每块不超限、内容不丢、块数不爆炸', () => {
+  const rand = lcg(20261020);
+  const pieces = [
+    'x',
+    '中文',
+    '😀',
+    '👨‍👩‍👧',
+    '```ts\n',
+    '```js {"k":"',
+    '```',
+    '| a | b |\n',
+    '|---|---|\n',
+    '\n',
+    ' ',
+  ];
+
+  for (let iter = 0; iter < 300; iter++) {
+    const n = 1 + Math.floor(rand() * 12);
+    let text = '';
+    for (let i = 0; i < n; i++) {
+      const p = pieces[Math.floor(rand() * pieces.length)];
+      text += p.repeat(1 + Math.floor(rand() * 400));
+    }
+
+    const chunks = chunkQQBotMarkdown(text, LIMIT);
+
+    // ① 每块都不超限（平台硬上限，超限即拒收）
+    for (const c of chunks) {
+      assert.ok(c.length <= LIMIT, `块长度 ${c.length} 超过上限 ${LIMIT}（iter=${iter}）`);
+    }
+
+    // ② 块数不爆炸：续段最多携带 limit/2 的上下文 → 块数不超过纯文本硬切的 3 倍
+    const pureTextChunks = Math.ceil(text.length / LIMIT) + 1;
+    assert.ok(
+      chunks.length <= pureTextChunks * 3 + 4,
+      `块数 ${chunks.length} 异常膨胀（纯文本硬切约 ${pureTextChunks} 块，iter=${iter}）`,
+    );
+
+    // ③ 内容不丢：原文（去掉换行）应是拼接结果的子序列
+    const joined = chunks.join('').replace(/\n/g, '');
+    assert.ok(
+      isSubsequence(text.replace(/\n/g, ''), joined),
+      `内容丢失（iter=${iter}，原文 ${text.length} 字，拼接 ${joined.length} 字）`,
+    );
+  }
+});
