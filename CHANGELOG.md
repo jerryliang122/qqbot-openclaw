@@ -21,6 +21,15 @@
 
 ### 修复
 
+- **结构上下文开销未封顶：一条超限消息会炸成上千条垃圾消息（分支评审发现）**
+  `src/outbound/chunker.ts` 的续段要补回围栏包裹 / 表格表头，这部分开销要从切分预算里扣。此前两个漏洞叠在一起：
+  - **围栏 info string 取整行**——`line.slice(m[1].length).trim()` 把 marker 之后的**整行**当成语言标识。LLM 常输出的超长单行（行内 JSON / 行内代码）整行都是 payload，重开前缀直接膨胀到超限；顺带该切法在**有前导空白**时还会把 marker 的头几个字符误当成 info string 的一部分。
+  - **负预算被钳成 1**——`Math.max(1, limit - overhead)` 把「前缀本身已超限」的事实掩盖成「每段只剩 1 字符」。
+
+  实测复现：5114 字的超长单行围栏被切成 **5110 块、其中 5109 块各 5120 字（全部超限 → 平台拒收）**。修复照抄框架 `resolveFenceReopenLine` 的**逐级降级**：完整开栏行放得下就用 → 否则降级为裸 marker → 再放不下放弃围栏上下文；info string **只取首个 token**（语言标识，超过 32 字符视为没有语言标识）；表头上下文另加**预算规则**——上下文开销 > 正文预算（overhead > limit/2）时整段放弃上下文按纯文本切。另补**首刀不得落在围栏开栏行内部**（框架同义约束 `minProgressIdx`），否则首块只剩一个孤零零的 ```js。
+  修复后同一输入切成 **2 块（5000 + 124）、零超限**，与框架路径同形。**框架路径本身无此问题**（`rt.channel.text.chunkMarkdownText` 自带封顶），受影响的是本地 GFM fallback 这条安全网。新增 `tests/chunker-context-overhead.test.ts`（10 例）锁定。
+- **`enforceChunkLimit` 注释覆盖面收敛**：该函数只处理**严格超限**（`length > limit`）的块；框架 chunker 对无空白中文长串会切出**恰好等于 limit** 的块，其切点只受代理对级保护，切点落在 ZWJ 序列或组合符号中间时仍会切碎字形——该残留**在框架路径上依然存在**，注释改为准确表述并在 AGENTS.md 记录边界（真修需在切点处重锚定，成本另议，暂不处理）。
+
 - **`clientSecretFile` 是「声明了但从不读取」的死配置**。`resolveQQBotAccount` 此前只把 `secretSource` 标成 `"file"` 却把 `clientSecret` 留空——于是 `resolveDefaultQQBotAccountId` 认为该账号「可运行」（`accountShapeRunnable` 的 `hasSecretSource` 含 `clientSecretFile`）并把它选为默认账号，但网关启动时又因 `clientSecret` 为空直接放弃（`gateway/lifecycle.ts`），用户表现为「配了文件凭据却静默起不来」，且 `openclaw status` 会把它误报成未配置。
   修复按「读盘只发生在该发生的地方」重新组织：
   - `resolveQQBotAccount` **全程不读盘**——它是热路径（每次出站发送都解析一次账号），同步 `stat`/`readFileSync` 会阻塞事件循环（网络挂载上可能卡死整机）；凭据文件改为在**账号启动时读一次**（`materializeQQBotAccountSecret`）
@@ -28,9 +37,6 @@
   - **注销同时清 `clientSecretFile`**——只清内联的话账号仍能用同一份文件凭据起来，等于没注销
   - **`isConfigured` 语义三处对齐**（config 适配器 / setup finalize / 只读巡检）：`secretSource === "file"` 且配了 `appId` 即视为已配置，否则已配好文件凭据的账号会被误判为未配置、被拉去重新扫码
   - 读盘缓存按 `mtimeMs + size + ino` 判定——只看 mtime 会在「轮转密钥但沿用旧 mtime」（备份还原 / `cp -p` / 某些挂载的时间精度）时读到旧值
-
-### 修复
-
 - **语音（语音条）投递口径与 QQ 平台对齐（2026-10-20 核实官方文档）**
   官方《富媒体消息概述》的富媒体限制是**体积制、不是时长制**：`file_type` 3 语音（silk）**软限制 20MB / 硬限制 200MB**，「超过软限制会降级为文件类型上传，超过硬限制会报错」；平台只把 **silk/mp3/wav/ogg** 渲染成语音条。**平台文档里没有任何语音时长（秒）限制**——「60 秒以内是语音条」是体积与时长的相关性错觉（TTS 语音通常只有几百 KB～1 MB）。
   我们代码侧此前有两处与平台不一致：
