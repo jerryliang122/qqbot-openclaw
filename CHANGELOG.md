@@ -27,6 +27,20 @@
 - **声明 `live.capabilities.nativeStreaming`（QQ 私聊原生流式）**：`src/message-adapter.ts` 此前**未声明**该能力，框架不会把 QQ 的原生流式当作通道能力。`draftPreview` **保持 false**（**不是漏声明**）：该能力在框架语义下是「先发一条可编辑的草稿消息占位」（Telegram 的 edit-preview 模型），而 QQ 私聊原生流式是 `openStream → update(前缀增长) → complete` 的**单消息流式**，平台约束「已下发文本的前缀不可变更」，没有「草稿占位 + 原地改写为终稿」的两阶段结构。`nativeStreaming` 是通道级声明而 QQ 流式**仅 C2C 开放**（SDK `openStream` 对非 c2c 直接 throw），群聊实际走进度卡片——真正的 scope 判断仍由插件内 `StreamingController` 把关。
 - **回归测试**：`tests/presentation-buttons.test.ts`（22 例：框架 action → QQ `action.type` 映射 / 不可落地控件丢弃保留文本 / `presentationCapabilities` 取值 / id 唯一 / 拆行 / label 截断 / ask_user 上下文解析）、`tests/message-adapter-capabilities.test.ts`（9 例：能力声明取值 + **「声明 inlineButtons 则必须存在落地实现」的一致性守卫**）、`tests/keyboard-permission-semantics.test.ts`（5 例：权限常量取值与官方一致 / 全仓不再有裸数字权限值 / `specify_user_ids` 当前未使用）。`tests/sdk-surface.test.ts` 另加**能力声明与实现一致性**分组（2 例）。
 
+- **补齐 manifest 的 `channels.qqbot` 配置 schema（Control UI 配置表单）**。`channels.qqbot` 段的配置 schema **只能**来自 `openclaw.plugin.json` 的 `channelConfigs.qqbot.schema`——框架的 registry 只从 manifest 采集通道 schema（`manifest-registry` 的 `buildRecord` → `collectChannelSchemaMetadataWithOwnership` → `prepareChannelConfigSchema`）；插件运行时的 `plugin.configSchema` 走的是**插件级** `plugins.<id>` 段，管不到 `channels.qqbot`。
+  此前 manifest 只声明了 `appId` / `clientSecret`，而插件实际读取的配置项有 **27 个**（`QQBotAccountConfig`）：`dmPolicy` / `allowFrom` / `groupPolicy` / `groupAllowFrom` / `groups`（含 `requireMention` / `toolPolicy` / `historyMode` / `unmentionedInbound` 等子项）/ `rateLimit`（三层限流）/ `transport` / `webhook` / `markdownSupport` / `audioFormatPolicy` / `urlDirectUpload` / `defaultRequireMention` / `groupCoalesce` / `deliverDebounce` / `typing` / `inboundDebounce` / `commands` / `streaming` / `progressCard` / `userAgentSuffix` / `clientSecretFile` 等。结果是 **Control UI 的 QQ 配置表单只有两个字段**——用户想配群策略、白名单、限流、流式、进度卡片等，只能手写 JSON。
+  现补齐：
+  - **schema 顶层 30 个字段** + **`accounts` 段 27 个字段**（逐字段列举而非 catchall，好让 UI 渲染出对应控件），`additionalProperties: false`（与 Telegram 一致，作用是**挡住拼错的字段**而非放行）
+  - **24 条 `uiHints`**（label + help），覆盖私聊准入、群策略、群配置、限流、传输方式、流式、进度卡片、防抖、指令面板、多账号等，help 文本写明默认值与 QQ 平台的特殊约束（如「群主在客户端选的推送模式插件不可控」「openid 按账号隔离」「防抖窗口钳制范围 [0, 60000]」「卡片只走被动回复不烧主动预算」）
+  - `capabilities.inlineButtons` 声明为与 Telegram 同款语义（`off` / `dm` / `group` / `all` / `allowlist`）——**注意**：配置侧 `capabilities` 在框架语义下是「只增不减」的并集项，插件侧的 `messageToolCapabilities` 才是提示词侧的实际开关，故该字段目前是**声明位**而非生效开关（生效开关见上方「私聊（C2C）能力声明与平台真实语义对齐」的插件侧实现）
+  - 新增 `tests/manifest-config-schema.test.ts`（15 例）——锁定「manifest 能被框架 `loadPluginManifest` 解析」「schema 覆盖 `QQBotAccountConfig` 的**全部**键（顶层 + accounts 段）」「**嵌套配置块的子字段**与对应 TS 接口逐项一致」「顶层与 accounts 段的嵌套 schema 逐字一致」「**框架真实的通道配置校验路径**能接受 setup 产出的配置」「uiHints 每条都有 label + help」。
+- **修正 manifest schema 的四处不匹配（Sourcery 评审发现）**。`additionalProperties: false` 下 schema 与真实配置结构的偏差会**直接拒掉用户的配置**（框架的通道配置校验走 `validatePluginSchemaValue`，与 Control UI 打开/保存配置同一条路径），故以下四处不是「描述不准」而是**功能缺陷**：
+  - **`deliverDebounce` 的子字段名写错**：schema 写的是 `debounceMs`，运行时实际读 `windowMs` / `maxWaitMs` / `separator`（`DeliverDebounceConfig`）。用户按 schema 配 `windowMs` 会被拒，按 schema 配 `debounceMs` 会被静默忽略。
+  - **`progressCard` 漏 `maxLines` / `reserveQuota`**：这两个字段是实打实在用的（`maxLines` 控制 checklist 渲染行数，`reserveQuota` 为最终回复保留被动配额槽），漏了就没法配。
+  - **漏 `mediaMaxMb`**：`src/setup/finalize.ts` 的 `applyAccountDefaults` **自己**就会往配置里写 `mediaMaxMb: 200`（扫码/手动登录流程都会调用），schema 不认它 → **用户跑完 setup 就得到一份 schema 拒绝的配置**。
+  - **`accounts` 段的嵌套字段全是裸壳**（`{"type": "object"}`）：UI 渲染不出子控件，且拼错的键被接受。现改为与顶层**逐字一致**的完整定义。
+  相应的测试也加严了：字段覆盖检查从「顶层键在不在」扩展到「**嵌套子字段**逐项对照 TS 接口」+「顶层与 accounts 段逐字一致」+「用框架**真实**的 `validatePluginSchemaValue` 验证 setup 产出的配置可被接受」+ 一条**反向断言**（确认该校验路径对 `additionalProperties: false` 确实敏感，否则上面的「通过」是假的）。**注**：不能用 `validateJsonSchemaValue` 做这件事——它只校验 schema 本身的形状，不做实例值校验，对 `additionalProperties: false` 完全不敏感，测出来的「通过」是假的。
+
 ### 变更
 
 - **插件键盘类型与 QQ SDK 结构对齐**：`src/types.ts` 的 `KeyboardButton.render_data` / `.action` 与 `KeyboardAction.data` / `.permission` 改为**必填**（此前可选，导致本插件的键盘类型无法直接交给 SDK 的 `bot.send({ keyboard })`，只能在边界处做强制转换）。
