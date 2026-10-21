@@ -16,7 +16,7 @@ import {
 } from '@tencent-connect/qqbot-nodejs';
 import os from 'node:os';
 import type { PluginRuntime } from 'openclaw/plugin-sdk';
-import type { ResolvedQQBotAccount } from '../types.js';
+import type { InlineKeyboard, ResolvedQQBotAccount } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
 import { createPluginLogger } from '../utils/plugin-logger.js';
 import { setupMiddlewares } from './middleware-setup.js';
@@ -49,6 +49,11 @@ export interface SendOptions {
    */
   passiveOnly?: boolean;
   text?: string;
+  /**
+   * QQ 原生按钮（keyboard）。与 `markdown` / `content` 平级下发
+   * （`body.keyboard`），平台拒收时由 `sendText` 降级为不带键盘重发。
+   */
+  keyboard?: InlineKeyboard;
 }
 
 /**
@@ -190,6 +195,7 @@ export class QQBotGateway {
   async sendText(target: ReplyTarget, text: string, opts?: SendOptions): Promise<MessageResponse> {
     const { target: resolved, msgSeq, rollback } = this.attachMsgIdWithQuota(target, opts);
     if (!resolved.msgId) recordProactiveSend(this.account.accountId);
+    const keyboard = opts?.keyboard;
     try {
       const result = await withTimeout(
         resolved.msgId
@@ -202,14 +208,35 @@ export class QQBotGateway {
               ...(this.account.markdownSupport
                 ? { markdown: { content: text } }
                 : { content: text }),
+              ...(keyboard ? { keyboard } : {}),
               extra: { msg_seq: msgSeq },
             })
-          : this.bot.sendText(resolved, text),
+          : keyboard
+            // 主动消息（无 msgId 锚点）带键盘：bot.sendText 不支持 keyboard，
+            // 改走 bot.send 并显式带上 msg_type=2（markdown）或 msg_type=0
+            ? this.bot.send({
+                target: resolved,
+                ...(this.account.markdownSupport
+                  ? { msgType: 2, markdown: { content: text } }
+                  : { msgType: 0, content: text }),
+                keyboard,
+              })
+            : this.bot.sendText(resolved, text),
         this.textTimeout, 'sendText',
       );
       this.notifyTypingRefresh(target);
       return result;
     } catch (err) {
+      // 平台拒收 keyboard（例如格式不被接受、按钮数量超限）时，**降级为
+      // 不带键盘重发一次**——正文绝不能因为按钮失败而丢失。降级重发仍走
+      // 同一锚点与配额，不额外消耗被动配额（不重复 reservePassiveReply）。
+      if (keyboard && resolved.msgId) {
+        const degraded = await this.sendTextWithoutKeyboard(resolved, text, msgSeq);
+        if (degraded) {
+          this.notifyTypingRefresh(target);
+          return degraded;
+        }
+      }
       const retried = await this.retryOnDeadAnchor(err, {
         target,
         resolved,
@@ -227,6 +254,37 @@ export class QQBotGateway {
       }
       rollback();
       throw err;
+    }
+  }
+
+  /**
+   * 键盘被平台拒收时的降级重发：去掉 keyboard 再发一次。
+   *
+   * 返回 null 表示降级重发也失败（调用方继续走原错误路径）。
+   */
+  private async sendTextWithoutKeyboard(
+    resolved: ReplyTarget,
+    text: string,
+    msgSeq?: number,
+  ): Promise<MessageResponse | null> {
+    try {
+      return await withTimeout(
+        this.bot.send({
+          target: resolved,
+          ...(this.account.markdownSupport
+            ? { markdown: { content: text } }
+            : { content: text }),
+          extra: { msg_seq: msgSeq },
+        }),
+        this.textTimeout, 'sendText(no-keyboard)',
+      );
+    } catch (err) {
+      this.log.warn?.(
+        `[qqbot] keyboard rejected, degraded resend also failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return null;
     }
   }
 

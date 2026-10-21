@@ -31,6 +31,7 @@ import { parseTarget, QQBOT_PREFIX_RE } from '../outbound/target.js';
 import { createPluginLogger } from '../utils/plugin-logger.js';
 import { resolveToolSessionRoute, type ToolDeliveryContext } from './tool-session.js';
 import type { InlineKeyboard, KeyboardButton } from '../types.js';
+import { KEYBOARD_PERMISSION_EVERYONE } from '../types.js';
 
 // 工具 execute 无 logger 参数可传；入站消息处理链路内 request-context
 // 处于活跃，模块级 logger 的 enrichMeta 自动带上 accountId/openId/messageId
@@ -93,7 +94,7 @@ function buildSecretInputKeyboard(): InlineKeyboard {
         type: 2 as const,
         data: '取消',
         enter: true,
-        permission: { type: 2 as const },
+        permission: { type: KEYBOARD_PERMISSION_EVERYONE },
         unsupport_tips: '当前客户端不支持，请手动发送 取消',
       },
     },

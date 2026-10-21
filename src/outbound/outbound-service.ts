@@ -7,7 +7,7 @@
 import * as path from 'node:path';
 import { MediaFileType } from '@tencent-connect/qqbot-nodejs';
 import type { QQBotGateway } from '../gateway/index.js';
-import type { ResolvedQQBotAccount } from '../types.js';
+import type { InlineKeyboard, ResolvedQQBotAccount } from '../types.js';
 import { createPluginLogger } from '../utils/plugin-logger.js';
 import { parseTarget } from './target.js';
 import {
@@ -222,6 +222,11 @@ export async function sendText(params: {
   account: ResolvedQQBotAccount;
   quotaReserved?: boolean;
   /**
+   * QQ 原生按钮（keyboard）。与 markdown/content 平级下发；平台拒收时
+   * 由网关降级为不带键盘重发（正文不丢）。
+   */
+  keyboard?: InlineKeyboard;
+  /**
    * 只走被动回复（progress card 等非正文消息用）：配额不可用时直接返回
    * error（不调网关、不降级主动、不烧每日主动预算）；锚点被平台确定性
    * 拒绝（40034005/40034128）时网关剔除死锚点后原错误上抛、同样不转
@@ -253,6 +258,7 @@ export async function sendText(params: {
       // 死锚点被平台确定性拒绝时网关同样不得转主动重发（剔除锚点后
       // 原错误上抛，本层 catch 返回 error、调用方丢弃）
       passiveOnly: params.passiveOnly,
+      ...(params.keyboard ? { keyboard: params.keyboard } : {}),
     });
     return { messageId: result.id };
   } catch (err: unknown) {

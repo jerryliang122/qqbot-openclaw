@@ -14,6 +14,7 @@
  */
 
 import type { InlineKeyboard, KeyboardButton } from '../types.js';
+import { KEYBOARD_PERMISSION_EVERYONE } from '../types.js';
 
 // ============ Constants ============
 
@@ -275,7 +276,7 @@ export function buildQuestionKeyboard(
     action: {
       type: 1 as const,
       data: `${QUESTION_CALLBACK_PREFIX}${questionId}:${index}`,
-      permission: { type: 2 as const },
+      permission: { type: KEYBOARD_PERMISSION_EVERYONE },
       click_limit: 1,
     },
     group_id: 'question',
@@ -320,7 +321,7 @@ export function buildMultiQuestionKeyboard(
       action: {
         type: 1 as const,
         data: `${MULTI_QUESTION_CALLBACK_PREFIX}${questionId}:${questionIndex}:${optionIndex}`,
-        permission: { type: 2 as const },
+        permission: { type: KEYBOARD_PERMISSION_EVERYONE },
         click_limit: 1,
       },
       group_id: `question-${questionIndex}`,
@@ -340,7 +341,7 @@ export function buildMultiQuestionKeyboard(
         // 点击后输入框预填 "题号: "，用户续写后手动发送
         data: `${questionIndex + 1}: `,
         enter: false,
-        permission: { type: 2 as const },
+        permission: { type: KEYBOARD_PERMISSION_EVERYONE },
         unsupport_tips: '当前客户端版本不支持，请直接回复「题号: 答案」',
       },
       // 指令按钮不属于互斥选项组
@@ -750,7 +751,7 @@ export function buildMultiQuestionConfirmKeyboard(answerText: string): InlineKey
         type: 2 as const,
         data: answerText,
         enter: true,
-        permission: { type: 2 as const },
+        permission: { type: KEYBOARD_PERMISSION_EVERYONE },
         unsupport_tips: '当前客户端不支持，请手动回复上方答案文本',
       },
     },
@@ -765,7 +766,7 @@ export function buildMultiQuestionConfirmKeyboard(answerText: string): InlineKey
         type: 2 as const,
         data: answerText,
         enter: false,
-        permission: { type: 2 as const },
+        permission: { type: KEYBOARD_PERMISSION_EVERYONE },
         unsupport_tips: '当前客户端不支持，请手动回复上方答案文本',
       },
     },
