@@ -205,6 +205,67 @@ async function main() {
     }
   });
 
+  // ── groups.<id> 子字段对照（GroupConfig）─────────────────────────
+  //
+  // 嵌套对照清单（上方 checks）救不了 groups：它的字段不在
+  // schema.groups.properties 下，而在 schema.groups.additionalProperties.properties
+  // （按群 openid 索引的映射值）。2026-10-21 审查发现该处漏了 #57 新增的
+  // tools / roomEventRequireMessageTool，导致用户照插件 WARN 指引配置
+  // groups.<id>.tools.allow 被校验器直接拒掉——本组用例把这条防线补上。
+
+  /** 取 groups.<id> 的子字段 schema（顶层或 accounts 段） */
+  const groupEntryProps = (source: Record<string, unknown>): Record<string, unknown> =>
+    ((source.groups as { additionalProperties?: { properties?: Record<string, unknown> } } | undefined)
+      ?.additionalProperties?.properties ?? {});
+
+  await test('groups.<id> 子字段与 GroupConfig 接口一致（顶层）', () => {
+    const truth = readInterfaceKeys('GroupConfig');
+    const schema = groupEntryProps(topProps);
+    const missing = truth.filter((k) => !(k in schema));
+    assert.strictEqual(
+      missing.length,
+      0,
+      `schema.groups.<id> 缺少子字段：${missing.join(', ')}。` +
+        `additionalProperties=false 下用户配了会被拒（如 room_event 降级 WARN 指引的 tools.allow）。`,
+    );
+    const extra = Object.keys(schema).filter((k) => !truth.includes(k));
+    assert.strictEqual(
+      extra.length,
+      0,
+      `schema.groups.<id> 有 GroupConfig 里不存在的子字段：${extra.join(', ')}（配了会被静默忽略）。`,
+    );
+  });
+
+  await test('groups.<id> 子字段与 GroupConfig 接口一致（accounts 段）', () => {
+    const truth = readInterfaceKeys('GroupConfig');
+    const schema = groupEntryProps(accountProps);
+    const missing = truth.filter((k) => !(k in schema));
+    assert.strictEqual(
+      missing.length,
+      0,
+      `accounts.<id>.groups.<id> 缺少子字段：${missing.join(', ')}。`,
+    );
+  });
+
+  await test('groups.<id>.tools 子字段与 GroupToolPolicy 接口一致', () => {
+    const truth = readInterfaceKeys('GroupToolPolicy');
+    const toolsSchema = (groupEntryProps(topProps).tools as
+      | { properties?: Record<string, unknown> }
+      | undefined)?.properties ?? {};
+    const missing = truth.filter((k) => !(k in toolsSchema));
+    assert.strictEqual(
+      missing.length,
+      0,
+      `groups.<id>.tools 缺少子字段：${missing.join(', ')}（GroupToolPolicy）。`,
+    );
+    const extra = Object.keys(toolsSchema).filter((k) => !truth.includes(k));
+    assert.strictEqual(
+      extra.length,
+      0,
+      `groups.<id>.tools 有 GroupToolPolicy 里不存在的子字段：${extra.join(', ')}。`,
+    );
+  });
+
   await test('schema 的 accounts 段不是 catchall（应逐字段列举以获得 UI 表单）', () => {
     const truth = readAccountConfigKeys();
     // accounts 段应覆盖大部分字段；若只列少数几个说明漏补
@@ -317,6 +378,58 @@ async function main() {
         streaming: { mode: 'partial', sendMode: 'stream' },
       },
     });
+  });
+
+  await test('room_event 群的 tools / roomEventRequireMessageTool 配置能通过真实校验器', () => {
+    // 2026-10-21 审查缺陷的回归锚点：这两个键是 room_event 的核心配置面
+    // （降级 WARN 的第一条修法就是 groups.<id>.tools.allow），曾因 schema
+    // 漏声明被 validatePluginSchemaValue 直接拒掉。必须用真实校验器
+    // （r 实例校验）而非 validateJsonSchemaValue（n 只查 schema 形状）。
+    const validator = require('./node_modules/openclaw/dist/schema-validator-CLfGeb79.js') as {
+      r: (params: {
+        origin: string;
+        schema: unknown;
+        cacheKey: string;
+        value: unknown;
+        applyDefaults: boolean;
+      }) => { ok: boolean; errors?: unknown[] };
+    };
+    const r = validator.r({
+      origin: 'external',
+      schema: qqbotSchema,
+      cacheKey: 'channel:qqbot',
+      value: {
+        appId: '102030405',
+        clientSecret: 'x'.repeat(32),
+        groups: {
+          ABC123: {
+            unmentionedInbound: 'room_event',
+            roomEventRequireMessageTool: false,
+            tools: { allow: ['message', 'web_search'], alsoAllow: ['tts'], deny: ['exec'] },
+          },
+          '*': { unmentionedInbound: 'user_request' },
+        },
+      },
+      applyDefaults: true,
+    });
+    assert.ok(
+      r.ok,
+      `room_event 群的工具白名单配置被通道 schema 拒绝：${JSON.stringify(r.errors ?? [], null, 2)}`,
+    );
+
+    // 反向：groups 条目内的未知键仍应被拒（确认本组断言对 additionalProperties 敏感）
+    const r2 = validator.r({
+      origin: 'external',
+      schema: qqbotSchema,
+      cacheKey: 'channel:qqbot',
+      value: {
+        appId: '102030405',
+        clientSecret: 'x'.repeat(32),
+        groups: { ABC123: { bogusGroupField: 1 } },
+      },
+      applyDefaults: true,
+    });
+    assert.strictEqual(r2.ok, false, 'groups.<id> 的未知字段应被 additionalProperties:false 拒绝');
   });
 
   await test('多账号配置能通过框架校验器', () => {

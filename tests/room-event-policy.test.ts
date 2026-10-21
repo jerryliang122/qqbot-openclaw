@@ -213,6 +213,35 @@ await test('agent / 全局层只有 alsoAllow → 同样视为不限制', () => 
   assert.equal(globalOnly.available, true);
 });
 
+await test('agents.entries 为空对象 → roster 属性已存在，不应用 agents.defaults', () => {
+  // 2026-10-21 审查缺陷的回归锚点：框架 hasAgentRosterProperty 按
+  // 「属性存在且值非 undefined」判定（空对象 {} 也算 roster），该形态下
+  // agents.defaults.tools 不生效。插件此前要求 entries 非空，会在该形态
+  // 误读 defaults 的白名单 → 把可用群误判成不可用并降级（方向与框架相反）。
+  const r = resolveMessageToolAvailability({
+    cfg: {
+      agents: {
+        entries: {}, // 空对象：roster 属性存在
+        defaults: { tools: { allow: ['web_search'] } }, // 不含 message
+      },
+    } as any,
+    agentId: 'main',
+  });
+  assert.equal(r.available, true, '空 entries 对象应视同有 roster，defaults 不应用');
+});
+
+await test('无 roster 属性（仅 defaults）→ 应用 agents.defaults 判定', () => {
+  // 对照：完全没写 entries/list 时，框架确实应用 agents.defaults —— 该层
+  // 显式排除 message 时插件应判不可用（与框架一致）。
+  const r = resolveMessageToolAvailability({
+    cfg: {
+      agents: { defaults: { tools: { allow: ['web_search'] } } },
+    } as any,
+    agentId: 'main',
+  });
+  assert.equal(r.available, false, '无 roster 时 defaults 生效，白名单不含 message 应判不可用');
+});
+
 await test('allow 含通配 "*" → 不限制', () => {
   const r = resolveMessageToolAvailability({
     cfg: {} as any,

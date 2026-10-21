@@ -29,6 +29,7 @@ import { sanitizeQQBotText } from './outbound/sanitize.js';
 import { chunkQQBotMarkdown } from './outbound/chunker.js';
 import {
   QQBOT_PRESENTATION_CAPABILITIES,
+  backfillQQBotPresentationFallbackText,
   countDroppedPresentationControls,
   readQQQuestionContext,
   renderQQBotKeyboard,
@@ -451,14 +452,18 @@ export function createQQBotChannelOutbound(params: QQBotOutboundAdapterParams = 
       presentation: MessagePresentation;
     }) => {
       try {
-        const channelData = payload.channelData as Record<string, unknown> | undefined;
+        // 防御层：fallback 模式下框架会把 payload.text 置空后再调本钩子
+        //（期待通道自行合成文本，Telegram 即如此），先回填避免空正文。
+        // 详见 presentation-buttons.ts 的 backfillQQBotPresentationFallbackText。
+        const effectivePayload = backfillQQBotPresentationFallbackText(payload, presentation);
+        const channelData = effectivePayload.channelData as Record<string, unknown> | undefined;
         // ask_user 上下文：把框架 question action 的 optionValue 映射回
         // QQ 回调所需的选项索引（无此上下文时 question 按钮被丢弃）。
         const questionContext = readQQQuestionContext(channelData);
         const keyboard = renderQQBotKeyboard(presentation, questionContext);
         if (!keyboard) {
           // 没有可落地的按钮 → 丢弃 presentation，保留正文。
-          const { presentation: _p, ...rest } = payload;
+          const { presentation: _p, ...rest } = effectivePayload;
           return rest as typeof payload;
         }
         const dropped = countDroppedPresentationControls(presentation, questionContext);
@@ -468,7 +473,7 @@ export function createQQBotChannelOutbound(params: QQBotOutboundAdapterParams = 
             `(${JSON.stringify(dropped.reasons)})`,
           );
         }
-        const { presentation: _p, ...rest } = payload;
+        const { presentation: _p, ...rest } = effectivePayload;
         return {
           ...rest,
           channelData: {

@@ -177,7 +177,14 @@ interface AgentToolsConfig {
 function resolveAgentToolsConfig(cfg: OpenClawConfig, agentId?: string): AgentToolsConfig | undefined {
   const raw = cfg as any;
   const agents = raw?.agents;
-  const hasRoster = Boolean(agents && (Array.isArray(agents.list) || (agents.entries && Object.keys(agents.entries).length > 0)));
+  // roster 判定对齐框架 hasAgentRosterProperty（agent-scope-config）：
+  // `agents.entries` / `agents.list` 属性存在且值非 undefined 即算——
+  // **空对象 `{}` 也算**。此前要求 entries 非空，会在 `agents: { entries: {} }`
+  // 形态下误读 agents.defaults.tools（框架在该形态不应用 defaults），导致
+  // room_event 的 message 工具守卫得出与框架相反的结论。
+  const hasRoster = Boolean(
+    agents && (agents.entries !== undefined || agents.list !== undefined),
+  );
   const agentEntry = agentId ? findAgentEntry(cfg, agentId) as (AgentToolsConfig & { id?: string }) | undefined : undefined;
   const agentTools = (agentEntry as any)?.tools as AgentToolsConfig | undefined;
   const implicitDefaults = hasRoster ? undefined : (agents?.defaults?.tools as AgentToolsConfig | undefined);
