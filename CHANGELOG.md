@@ -10,15 +10,36 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **私聊（C2C）能力声明与平台真实语义对齐**：模型在 QQ 上生成的按钮此前**落地不了**。
+  `src/agent-prompt-adapter.ts` 无条件向模型声明 `inlineButtons`，框架据此在 system prompt 里告知「可以用按钮」；但插件侧**没有**提供框架的 `presentationCapabilities` / `renderPresentation` 钩子（该契约由框架在 `deliver-prepare` 装配，Telegram 是全框架唯一提供方），模型的按钮块在出站时被通用降级路径（`materializeMessagePresentationFallback`）压成**纯文本列表**——用户看到的是「- 选项A」而不是可点的按钮。这正是「声明了但落地不了」的错配。
+  修复按**官方文档**落地（此前「QQ 内联按钮需平台审核、只能配模板消息」的判断有误）：`keyboard` 是发送接口的**一等字段**，与 `markdown` / `content` 平级，`keyboard.content.rows[].buttons[]` 可直接自定义。新增 `src/outbound/presentation-buttons.ts` 把框架的可移植 presentation 映射为 QQ 原生 keyboard，映射范围**刻意收窄**：
+  - `url` → `action.type=0`（跳转链接）｜`command` → `action.type=2`（指令型，客户端自动填入 `@bot` + 指令）｜`approval` → `action.type=1`（复用既有 `approve:v2:` 解析）｜`question` → `action.type=1`（复用既有 `qqbot:q:` 解析，经 payload 的 `channelData.askUser` 把选项文本换回索引）
+  - `callback` / `web-app` / `model-picker` → **丢弃控件、保留文本**（QQ 无按钮点击回流通道、无 web app、无模型选择器；发一个点了没人处理的事件比不发更糟）
+  出站侧新增 `sendPayload`（框架对含 `channelData` 的 payload 走该路径）与网关的 keyboard 下发 + **平台拒收时降级为不带键盘重发**（正文绝不能因按钮失败而丢失）。**声明保留 `inlineButtons`**，但注释与测试明确登记了上述能力边界。
+- **按钮权限语义写反（真 bug）**：`src/types.ts` 的 `action.permission.type` 注释此前是「0=全体 1=管理员 2=按钮指定 3=身份组」，**与官方定义完全相反**（官方为 **0=指定用户 1=管理员 2=所有人**）。按错误注释理解的下游代码把 `type: 2` 误当成「仅指定用户可见」，实际下发的是**「所有人可见可点」**——群聊里的审批卡片因此对全群可见。修正注释并把 8 处裸数字改为具名常量（`KEYBOARD_PERMISSION_EVERYONE` 等），语义显式化。
+  **行为未改**：框架的 approval request 只带 `turnSourceTo`（会话目标）、**不含发起者 openid**，按钮渲染阶段拿不到「谁触发了这次审批」；若下发 `specify_user_ids` 就必须猜一个 openid，猜错会导致**目标用户也看不到按钮**（比越权更严重：审批卡片直接失效）。故维持「所有人可见」，实际越权面由**点击时的操作者鉴权**兜底（`authorizeActorAction` 按 `allowFrom` 校验点击者）。待框架在 approval request 中提供发起者标识后再收窄。
+- **`tests/sdk-surface.test.ts` 的具名导入扫描正则跨语句误匹配**：`{...}` 的匹配体原为 `[\s\S]*?`，惰性匹配且允许跨越 `}`，会从一个 `import {` 一直吃到后面某个 `} from 'openclaw/plugin-sdk/…'`，把**中间其它 import 语句的具名子句误记到本子路径名下**。实测触发过：`src/outbound-adapter.ts` 里 `import { checkAndConsumePassiveReplyQuota, … } from './features/quota-manager.js'` 的三个名字被算到 `openclaw/plugin-sdk/interactive-runtime` 头上，守卫误报「子路径缺少运行时值」，把人引去查一个并不存在的 SDK 缺陷。改为 `[^}]*` 后匹配体不再越过本条 import 语句自己的闭合花括号。
+
 ### 新增
+
+- **声明 `live.capabilities.nativeStreaming`（QQ 私聊原生流式）**：`src/message-adapter.ts` 此前**未声明**该能力，框架不会把 QQ 的原生流式当作通道能力。`draftPreview` **保持 false**（**不是漏声明**）：该能力在框架语义下是「先发一条可编辑的草稿消息占位」（Telegram 的 edit-preview 模型），而 QQ 私聊原生流式是 `openStream → update(前缀增长) → complete` 的**单消息流式**，平台约束「已下发文本的前缀不可变更」，没有「草稿占位 + 原地改写为终稿」的两阶段结构。`nativeStreaming` 是通道级声明而 QQ 流式**仅 C2C 开放**（SDK `openStream` 对非 c2c 直接 throw），群聊实际走进度卡片——真正的 scope 判断仍由插件内 `StreamingController` 把关。
+- **回归测试**：`tests/presentation-buttons.test.ts`（22 例：框架 action → QQ `action.type` 映射 / 不可落地控件丢弃保留文本 / `presentationCapabilities` 取值 / id 唯一 / 拆行 / label 截断 / ask_user 上下文解析）、`tests/message-adapter-capabilities.test.ts`（9 例：能力声明取值 + **「声明 inlineButtons 则必须存在落地实现」的一致性守卫**）、`tests/keyboard-permission-semantics.test.ts`（5 例：权限常量取值与官方一致 / 全仓不再有裸数字权限值 / `specify_user_ids` 当前未使用）。`tests/sdk-surface.test.ts` 另加**能力声明与实现一致性**分组（2 例）。
 
 - **补齐 manifest 的 `channels.qqbot` 配置 schema（Control UI 配置表单）**。`channels.qqbot` 段的配置 schema **只能**来自 `openclaw.plugin.json` 的 `channelConfigs.qqbot.schema`——框架的 registry 只从 manifest 采集通道 schema（`manifest-registry` 的 `buildRecord` → `collectChannelSchemaMetadataWithOwnership` → `prepareChannelConfigSchema`）；插件运行时的 `plugin.configSchema` 走的是**插件级** `plugins.<id>` 段，管不到 `channels.qqbot`。
   此前 manifest 只声明了 `appId` / `clientSecret`，而插件实际读取的配置项有 **27 个**（`QQBotAccountConfig`）：`dmPolicy` / `allowFrom` / `groupPolicy` / `groupAllowFrom` / `groups`（含 `requireMention` / `toolPolicy` / `historyMode` / `unmentionedInbound` 等子项）/ `rateLimit`（三层限流）/ `transport` / `webhook` / `markdownSupport` / `audioFormatPolicy` / `urlDirectUpload` / `defaultRequireMention` / `groupCoalesce` / `deliverDebounce` / `typing` / `inboundDebounce` / `commands` / `streaming` / `progressCard` / `userAgentSuffix` / `clientSecretFile` 等。结果是 **Control UI 的 QQ 配置表单只有两个字段**——用户想配群策略、白名单、限流、流式、进度卡片等，只能手写 JSON。
   现补齐：
   - **schema 顶层 30 个字段** + **`accounts` 段 27 个字段**（逐字段列举而非 catchall，好让 UI 渲染出对应控件），`additionalProperties: false`（与 Telegram 一致，作用是**挡住拼错的字段**而非放行）
   - **24 条 `uiHints`**（label + help），覆盖私聊准入、群策略、群配置、限流、传输方式、流式、进度卡片、防抖、指令面板、多账号等，help 文本写明默认值与 QQ 平台的特殊约束（如「群主在客户端选的推送模式插件不可控」「openid 按账号隔离」「防抖窗口钳制范围 [0, 60000]」「卡片只走被动回复不烧主动预算」）
-  - `capabilities.inlineButtons` 声明为与 Telegram 同款语义（`off` / `dm` / `group` / `all` / `allowlist`）——**注意**：配置侧 `capabilities` 在框架语义下是「只增不减」的并集项，插件侧的 `messageToolCapabilities` 才是提示词侧的实际开关，故该字段目前是**声明位**而非生效开关（生效开关见 PR #58 的插件侧实现）
+  - `capabilities.inlineButtons` 声明为与 Telegram 同款语义（`off` / `dm` / `group` / `all` / `allowlist`）——**注意**：配置侧 `capabilities` 在框架语义下是「只增不减」的并集项，插件侧的 `messageToolCapabilities` 才是提示词侧的实际开关，故该字段目前是**声明位**而非生效开关（生效开关见上方「私聊（C2C）能力声明与平台真实语义对齐」的插件侧实现）
   - 新增 `tests/manifest-config-schema.test.ts`（11 例）——锁定「manifest 能被框架 `loadPluginManifest` 解析」「schema 覆盖 `QQBotAccountConfig` 的**全部**键（顶层 + accounts 段）」「schema 通过框架的 JSON Schema 合法性校验」「典型/多账号配置能通过校验」「uiHints 每条都有 label + help」。**字段覆盖完整性是硬断言**：`additionalProperties: false` 下漏一个键，用户写了就会被拒——测试直接以 `src/types.ts` 的 `QQBotAccountConfig` 为权威源做差集核对，新增配置项忘了补 schema 会立刻红。
+
+### 变更
+
+- **插件键盘类型与 QQ SDK 结构对齐**：`src/types.ts` 的 `KeyboardButton.render_data` / `.action` 与 `KeyboardAction.data` / `.permission` 改为**必填**（此前可选，导致本插件的键盘类型无法直接交给 SDK 的 `bot.send({ keyboard })`，只能在边界处做强制转换）。
+- **`capabilities.unsend: false` 的原因订正**：该字段表达的是「**本插件已实现该动作**」而非「平台是否支持」。QQ 平台**确实支持**撤回（`DELETE /v2/users/{openid}/messages/{msg_id}`，限 2 分钟内、仅限机器人自己发的消息，SDK 也已封装 `bot.recallMessage()`），但本插件**未实现** message 工具的 `unsend` 动作处理器，故如实声明为 false。`edit: false` 则是**平台真的不支持**（QQ 无编辑消息接口）——两者原因不同，注释已分开表述。
+- **`capabilities.reply: true` 补充实际表现说明**：QQ 支持引用回复，但分两条路径——被动回复用 `msg_id` 锚定；SDK 在**非 markdown 模式**（`msg_type=0` 纯文本）下额外下发 `message_reference` 字段渲染引用块，markdown 模式（`msg_type=2`，插件默认）下只有锚定回复。
 
 ---
 

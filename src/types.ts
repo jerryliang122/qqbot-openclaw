@@ -44,6 +44,17 @@ export type GroupPolicy = "open" | "allowlist" | "disabled";
 /** 工具策略：full=全部 | restricted=限制敏感工具 | none=禁止 */
 export type ToolPolicy = "full" | "restricted" | "none";
 
+/**
+ * 群级工具策略（交给框架的 allow/alsoAllow/deny 三段式）。
+ *
+ * 与 openclaw 的 GroupToolPolicyConfig 同形；`groups.<id>.tools` 原样透传。
+ */
+export interface GroupToolPolicy {
+  allow?: string[];
+  alsoAllow?: string[];
+  deny?: string[];
+}
+
 /** 群消息合并配置 */
 export interface GroupCoalesceConfig {
   /**
@@ -94,8 +105,29 @@ export interface GroupConfig {
    * - room_event：门控放行全部消息，未被 @/称呼/引用的作为 room_event 被动
    *   房间事件进框架（AI 只读上下文，不自动回复，想发言走主动 message 工具；
    *   框架自动压制 typing/流式/steer）。成本提示：每条消息一次推理 pass。
+   *
+   * 回落链（2026-10-20 补齐，对齐 openclaw 2026.10.5 的框架裁决）：
+   *   本键（群级显式，最高） > agents.entries.<id>.groupChat.unmentionedInbound
+   *     > messages.groupChat.unmentionedInbound > "user_request"
    */
   unmentionedInbound?: 'user_request' | 'room_event';
+  /**
+   * room_event 是否强制要求 message 工具可用（默认 true）。
+   *
+   * true：message 工具确定不可用时，该群**自动降级回 user_request**
+   *   （bot 恢复正常回复权）并打 WARN——避免"配了 room_event 却是永久沉默"
+   *   （2026-10-06 线上事故的同类故障）。
+   * false：严格模式——不降级，message 工具不可用时保持 room_event 静默语义
+   *   （由用户自行保证工具面）。
+   */
+  roomEventRequireMessageTool?: boolean;
+  /**
+   * 群级工具白名单（显式声明时原样透传给框架；不声明则按 toolPolicy 兜底）。
+   *
+   * 与 `toolPolicy` 的关系：`tools` 是更细粒度的声明，优先级更高。
+   * ⚠️ room_event 群若在此处排除 `message`，该群将失去唯一发声通道。
+   */
+  tools?: GroupToolPolicy;
   /** 群消息合并配置（覆盖账号级配置） */
   coalesce?: GroupCoalesceConfig;
 }
@@ -603,13 +635,61 @@ export interface InteractionAuthorizeData {
  */
 export type KeyboardActionType = 0 | 1 | 2 | 3;
 
-/** 按钮权限 */
+/**
+ * 按钮权限
+ *
+ * 语义以 QQ 开放平台官方文档为准（`action.permission.type`）：
+ *   0 = 指定用户（须同时下发 `specify_user_ids`）
+ *   1 = 管理员
+ *   2 = 所有人
+ *
+ * ⚠️ 历史坑：本文件此前把这个字段的注释写反了（把「指定用户」标成
+ * 「全体」、把「所有人」标成「按钮指定」），与官方定义完全相反。
+ * 按错误注释理解的下游代码把 `type: 2` 误当成「仅指定用户可见」，
+ * 实际下发的是「所有人可见可点」。修正注释不等于修正行为——见
+ * `KEYBOARD_PERMISSION_*` 常量与下方说明。
+ */
 export interface KeyboardPermission {
-  /** 0=全体  1=管理员  2=按钮指定  3=身份组 */
+  /** 0=指定用户  1=管理员  2=所有人 */
   type: 0 | 1 | 2 | 3;
   specify_role_ids?: string[];
   specify_user_ids?: string[];
 }
+
+/**
+ * `action.permission.type` = 所有人（官方定义）。
+ *
+ * 本插件所有内置按钮（审批 / ask_user / secret-input）当前统一使用该值。
+ * 语义上是「群内所有成员可见可点」——**不是**「仅发起者可见」。
+ *
+ * 为什么不改成 `type: 0`（指定用户）：框架的 approval request 只带
+ * `turnSourceTo`（会话目标），**不含发起者 openid**；按钮渲染阶段拿不到
+ * 「谁触发了这次审批」，若下发 `specify_user_ids` 就必须猜一个 openid，
+ * 猜错会导致**目标用户也看不到按钮**（比越权更严重：审批卡片直接失效）。
+ *
+ * 实际越权面由**点击时的操作者鉴权**兜底，而非按钮可见性：
+ * - 审批：`approval-capability.ts` 的 `authorizeActorAction` 按 `allowFrom` 校验
+ *   点击者身份，非授权者的点击被框架侧拒绝。
+ * - ask_user：走 `qqbot:qm:` 回调前缀，问题选项绑定具体 questionId。
+ *
+ * 待办：若未来框架在 approval request 中提供发起者标识（当前 2026.9.1
+ * 与 10.5 均无），应改为 `type: 0` + `specify_user_ids`，把可见性收窄到
+ * 发起者。届时需同步改 `tests/keyboard-permission-semantics.test.ts`。
+ */
+export const KEYBOARD_PERMISSION_EVERYONE = 2 as const;
+
+/**
+ * `action.permission.type` = 管理员（官方定义）。
+ * 保留给未来「仅管理员可操作」的场景（如群管理类审批）。
+ */
+export const KEYBOARD_PERMISSION_ADMIN = 1 as const;
+
+/**
+ * `action.permission.type` = 指定用户（官方定义），须配 `specify_user_ids`。
+ * 当前插件**未使用**——发起者 openid 在按钮渲染阶段不可得（见
+ * `KEYBOARD_PERMISSION_EVERYONE` 说明）。
+ */
+export const KEYBOARD_PERMISSION_SPECIFIED_USERS = 0 as const;
 
 /** 二次确认弹窗 */
 export interface KeyboardModal {
@@ -621,12 +701,14 @@ export interface KeyboardModal {
 /** 按钮 Action */
 export interface KeyboardAction {
   type: KeyboardActionType;
-  data?: string;
+  /** 回调数据 / URL / 指令文本（按 type 语义不同） */
+  data: string;
   /** true = 点击后直接发出（Enter）*/
   enter?: boolean;
   /** 仅指令型（type=2）：是否把指令发到输入框（reply=true）还是静默发出 */
   reply?: boolean;
-  permission?: KeyboardPermission;
+  /** 可见性控制（官方语义：0=指定用户 1=管理员 2=所有人） */
+  permission: KeyboardPermission;
   click_limit?: number;
   unsupport_tips?: string;
   modal?: KeyboardModal;
@@ -635,16 +717,23 @@ export interface KeyboardAction {
 /** 按钮渲染数据 */
 export interface KeyboardRenderData {
   label: string;
-  visited_label?: string;
+  visited_label: string;
   /** 0=灰色线框  1=蓝色线框  2=推荐回复专用  3=红色字体  4=蓝色背景 */
-  style?: 0 | 1 | 2 | 3 | 4;
+  style: 0 | 1 | 2 | 3 | 4;
 }
 
-/** 单个按钮 */
+/**
+ * 单个按钮
+ *
+ * `render_data` 与 `action` 为**必填**——与 QQ SDK 的 `InlineKeyboard`
+ * 结构严格一致（`@tencent-connect/qqbot-nodejs` 的
+ * `protocol/types.d.ts`）。此前两者可选，导致本插件的键盘类型无法直接
+ * 交给 SDK 的 `bot.send({ keyboard })`，只能在边界处做强制转换。
+ */
 export interface KeyboardButton {
   id: string;
-  render_data?: KeyboardRenderData;
-  action?: KeyboardAction;
+  render_data: KeyboardRenderData;
+  action: KeyboardAction;
   group_id?: string;
 }
 
@@ -667,11 +756,17 @@ export interface MessageKeyboard {
 }
 
 /**
- * Inline Keyboard（消息内嵌按钮，需平台审核）
+ * Inline Keyboard（消息内嵌按钮）
+ *
  * 发送字段：keyboard
  * JSON: { "keyboard": { "id": "...", "content": { "rows": [...] } } }
+ *
+ * 注：`content` 在 SDK 侧是可选的（可只给 `id` 引用平台模板），本插件
+ * 始终走「自定义 content」路线，故这里的 `content` 必填。
  */
-export type InlineKeyboard = MessageKeyboard;
+export type InlineKeyboard = {
+  content: CustomKeyboard;
+};
 
 /**
  * WebSocket 事件负载

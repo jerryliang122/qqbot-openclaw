@@ -32,12 +32,40 @@ import { dynamicAccessControl } from '../middleware/access-control.js';
 import { inboundGuard } from '../middleware/inbound-guard.js';
 import { secretCapture } from '../middleware/secret-capture.js';
 import { c2cTypingIndicator } from '../middleware/typing.js';
-import { stripMentionText } from '../utils/mention.js';
-import { resolveGroupConfigFromAccount } from '../config.js';
+import { stripMentionText, matchesNamePattern } from '../utils/mention.js';
 
 export interface MiddlewareSetupOptions {
   /** 获取 runtime */
   getRuntime: () => any;
+}
+
+/**
+ * 构造 mentionGate 的动态配置解析器。
+ *
+ * 两件事：
+ * 1. 把 `ctx.state.policy.group` 的动态值（requireMention / ignoreOtherMentions）
+ *    喂给门控（SDK 的 resolveConfig 优先级高于 ctx.state.policy，故必须显式透传）。
+ * 2. 把「称呼唤醒」（mentionPatterns 命中）也算作"在叫 bot" → 放行到 dispatch。
+ *    否则普通群（requireMention=true）里称呼唤醒会被门控拦掉、永远到不了
+ *    dispatch 的分类逻辑，README 承诺的「三种唤醒方式」名不副实。
+ *
+ * 判定结果落 `ctx.state.nameMentioned`：dispatch / body 组装直接复用，
+ * 保证「门控认为在叫 bot」与「分类认为在叫 bot」永远是同一结论
+ * （门控跑在内容清洗之前，清洗会剥离 @标记与表情标签，两处各算各的会漂移）。
+ */
+export function buildMentionGateResolveConfig() {
+  return (ctx: any) => {
+    const groupPolicy = (ctx.state?.policy as { group?: { requireMention?: boolean; ignoreOtherMentions?: boolean } } | undefined)?.group;
+    const nameWake = matchesNamePattern({
+      content: ctx.message?.content,
+      mentionPatterns: ctx.state?.mentionPatterns as string[] | undefined,
+    });
+    (ctx.state as Record<string, unknown>).nameMentioned = nameWake;
+    return {
+      requireMentionInGroup: nameWake ? false : (groupPolicy?.requireMention ?? true),
+      ignoreOtherMentions: groupPolicy?.ignoreOtherMentions ?? false,
+    };
+  };
 }
 
 /**
@@ -59,20 +87,23 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
 
   // 3. 动态策略注入 — 每条消息注入 ctx.state.policy
   //    后续 dynamicAccessControl / mentionGate / historyBuffer 自动读取
-  bot.use(createPolicyInjector(account));
+  //    同时裁决 room_event 入站策略（门控放行与否必须与 dispatch 分类同源）
+  bot.use(createPolicyInjector(account, { getRuntime: opts.getRuntime }));
 
   // 4. 群历史缓冲 — 放在门控之前，确保所有消息（含未 @bot）都计入上下文
   //    limit 从 ctx.state.policy.group.historyLimit 读取，key 带 accountId 前缀隔离多账号；
   //    room_event 群返回 undefined 跳过记录——该模式下每条消息已作为入站事件
-  //    进框架持久化 transcript，插件历史快照会造成双份上下文
+  //    进框架持久化 transcript，插件历史快照会造成双份上下文。
+  //    room_event 的判定读 policyInjector 已裁决好的策略（ctx.state.roomEventPolicy），
+  //    与 dispatch 的入站分类同源：只看群级配置会漏掉「per-agent / 全局配置
+  //    开启 room_event」的群，导致该群同时有 transcript 与历史快照两份上下文。
   bot.use(historyBuffer({
     store: getHistoryStore(),
     groupKey: (ctx) => {
       const gid = ctx.message.groupOpenid;
       if (ctx.message.kind !== 'group' || !gid) return undefined;
-      if (resolveGroupConfigFromAccount(account, gid).unmentionedInbound === 'room_event') {
-        return undefined;
-      }
+      const roomEventPolicy = ctx.state.roomEventPolicy as { effectiveMode?: string } | undefined;
+      if (roomEventPolicy?.effectiveMode === 'room_event') return undefined;
       return historyGroupKey(account.accountId, gid);
     },
   }));
@@ -89,11 +120,19 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
   //    仅全量模式（GROUP_MESSAGE_CREATE）下未 @ 消息才可能带引用进到这里。
   //    判定收敛在 ref-index-store 的 isQuoteOfBotMessage —— 访问控制的拒绝
   //    提示（「群里是否在叫 bot」）复用同一函数，两处不得各查一遍。
+  //
+  //    resolveConfig：把「称呼唤醒」也纳入门控 —— mentionPatterns 命中的消息
+  //    视为在叫 bot，放行到 dispatch。否则普通群（requireMention=true）里
+  //    称呼唤醒会被门控拦掉、永远到不了 dispatch 的分类逻辑，README 承诺的
+  //    「三种唤醒方式」名不副实（此前只有 room_event 群因门控全开才生效）。
+  //    patterns 由 policyInjector 解析好放在 ctx.state.mentionPatterns，
+  //    与 dispatch 的分类口径同源。
   bot.use(mentionGate({
       isImplicitMention: (ctx) => isQuoteOfBotMessage(
         ctx.message as { refMsgIdx?: string },
         account.accountId,
       ),
+      resolveConfig: buildMentionGateResolveConfig(),
     }));
   // 7. 内容清洗（去 @marker、表情标签、多余空白）
   // SDK 用 appId 匹配 @标记，但 QQ openid 不等于 appId，追加 stripMentionText 正确剥离

@@ -78,7 +78,7 @@ export function buildCommandList(account: ResolvedQQBotAccount, opts: CommandBui
     withAudit(botClearStorage(account)),
     withAudit(botApprove(opts.getRuntime)),
     withAudit(botGroupAlways(account, opts.getRuntime)),
-    withAudit(botGroupInfo(account)),
+    withAudit(botGroupInfo(account, opts.getRuntime)),
     withAudit(botPairing(opts.getRuntime)),
   );
 

@@ -25,6 +25,8 @@ import type {
 import type { ResolvedQQBotAccount } from '../types.js';
 import type { ProcessedAttachments } from '../middleware/attachment.js';
 import { getAdapters } from '../adapter/resolve.js';
+import { matchesNamePattern } from '../utils/mention.js';
+import { resolveWakeDecision } from '../features/room-event.js';
 
 // ── 协议常量 ─────────────────────────────
 const QUOTE_BEGIN = '[Quoted message begins]';
@@ -58,8 +60,26 @@ export function assembleBody(
   const rawBody = msg.content ?? '';
   const isGroup = msg.kind === 'group';
 
-  const mentionState = ctx.state.mention as { wasMentioned?: boolean } | undefined;
-  const wasMentioned = mentionState?.wasMentioned ?? false;
+  // 唤醒判定唯一口径（features/room-event.ts 的 resolveWakeDecision）：
+  // @提及 / 引用 bot 出站 / 称呼唤醒，三者任一命中即"在叫 bot"。
+  // 此前本模块只认 SDK 的 wasMentioned 标志，导致「称呼唤醒」既拿不到
+  // `(@you)` 标记、也拿不到群历史（与 dispatch 的分类口径不一致）。
+  const mentionState = ctx.state.mention as { wasMentioned?: boolean; implicit?: boolean } | undefined;
+  const nameMentioned = isGroup
+    ? ((ctx.state as { nameMentioned?: boolean }).nameMentioned
+      ?? matchesNamePattern({
+        content: msg.content,
+        mentionPatterns: ctx.state.mentionPatterns as string[] | undefined,
+      }))
+    : false;
+  const wake = resolveWakeDecision({
+    mentionState: {
+      wasMentioned: mentionState?.wasMentioned === true,
+      implicit: mentionState?.implicit === true,
+    },
+    nameMentioned,
+  });
+  const wasMentioned = wake.wasMentioned;
   const processed = ctx.state.processedAttachments as ProcessedAttachments | undefined;
   const quote = ctx.state.quote as ResolvedQuote | undefined;
   const history = ctx.state.history as HistoryEntry[] | undefined;

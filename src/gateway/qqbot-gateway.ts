@@ -16,7 +16,7 @@ import {
 } from '@tencent-connect/qqbot-nodejs';
 import os from 'node:os';
 import type { PluginRuntime } from 'openclaw/plugin-sdk';
-import type { ResolvedQQBotAccount } from '../types.js';
+import type { InlineKeyboard, ResolvedQQBotAccount } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
 import { createPluginLogger } from '../utils/plugin-logger.js';
 import { setupMiddlewares } from './middleware-setup.js';
@@ -28,6 +28,7 @@ import { getPersistedRefIndexStore } from '../features/ref-index-store.js';
 import { recordOutboundMessageId } from '../features/outbound-echo-store.js';
 import { recordOutboundToGroupHistory } from '../features/history-store.js';
 import { resolveGroupConfigFromAccount } from '../config.js';
+import { resolveGroupRoomEventPolicy } from '../features/room-event.js';
 import { checkAndConsumePassiveReplyQuota, invalidateMsgIdQuota } from '../features/quota-manager.js';
 import { recordProactiveSend } from '../features/proactive-budget.js';
 import { selectMsgIdForPassiveReply, evictMsgId, peekMsgIdReceivedAt } from '../features/msgid-cache.js';
@@ -49,6 +50,11 @@ export interface SendOptions {
    */
   passiveOnly?: boolean;
   text?: string;
+  /**
+   * QQ 原生按钮（keyboard）。与 `markdown` / `content` 平级下发
+   * （`body.keyboard`），平台拒收时由 `sendText` 降级为不带键盘重发。
+   */
+  keyboard?: InlineKeyboard;
 }
 
 /**
@@ -190,6 +196,7 @@ export class QQBotGateway {
   async sendText(target: ReplyTarget, text: string, opts?: SendOptions): Promise<MessageResponse> {
     const { target: resolved, msgSeq, rollback } = this.attachMsgIdWithQuota(target, opts);
     if (!resolved.msgId) recordProactiveSend(this.account.accountId);
+    const keyboard = opts?.keyboard;
     try {
       const result = await withTimeout(
         resolved.msgId
@@ -202,14 +209,35 @@ export class QQBotGateway {
               ...(this.account.markdownSupport
                 ? { markdown: { content: text } }
                 : { content: text }),
+              ...(keyboard ? { keyboard } : {}),
               extra: { msg_seq: msgSeq },
             })
-          : this.bot.sendText(resolved, text),
+          : keyboard
+            // 主动消息（无 msgId 锚点）带键盘：bot.sendText 不支持 keyboard，
+            // 改走 bot.send 并显式带上 msg_type=2（markdown）或 msg_type=0
+            ? this.bot.send({
+                target: resolved,
+                ...(this.account.markdownSupport
+                  ? { msgType: 2, markdown: { content: text } }
+                  : { msgType: 0, content: text }),
+                keyboard,
+              })
+            : this.bot.sendText(resolved, text),
         this.textTimeout, 'sendText',
       );
       this.notifyTypingRefresh(target);
       return result;
     } catch (err) {
+      // 平台拒收 keyboard（例如格式不被接受、按钮数量超限）时，**降级为
+      // 不带键盘重发一次**——正文绝不能因为按钮失败而丢失。降级重发仍走
+      // 同一锚点与配额，不额外消耗被动配额（不重复 reservePassiveReply）。
+      if (keyboard && resolved.msgId) {
+        const degraded = await this.sendTextWithoutKeyboard(resolved, text, msgSeq);
+        if (degraded) {
+          this.notifyTypingRefresh(target);
+          return degraded;
+        }
+      }
       const retried = await this.retryOnDeadAnchor(err, {
         target,
         resolved,
@@ -227,6 +255,37 @@ export class QQBotGateway {
       }
       rollback();
       throw err;
+    }
+  }
+
+  /**
+   * 键盘被平台拒收时的降级重发：去掉 keyboard 再发一次。
+   *
+   * 返回 null 表示降级重发也失败（调用方继续走原错误路径）。
+   */
+  private async sendTextWithoutKeyboard(
+    resolved: ReplyTarget,
+    text: string,
+    msgSeq?: number,
+  ): Promise<MessageResponse | null> {
+    try {
+      return await withTimeout(
+        this.bot.send({
+          target: resolved,
+          ...(this.account.markdownSupport
+            ? { markdown: { content: text } }
+            : { content: text }),
+          extra: { msg_seq: msgSeq },
+        }),
+        this.textTimeout, 'sendText(no-keyboard)',
+      );
+    } catch (err) {
+      this.log.warn?.(
+        `[qqbot] keyboard rejected, degraded resend also failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return null;
     }
   }
 
@@ -395,6 +454,24 @@ export class QQBotGateway {
     notifyOutboundMessageSent(this.account.accountId, target.scope, target.targetId);
   }
 
+  /**
+   * 该群是否处于 room_event（被动房间事件）模式。
+   *
+   * 走裁决后的策略（群级 > per-agent > 全局），与 dispatch 的入站分类、
+   * middleware 的历史缓冲跳过同源——三处若各算各的，会出现"群里既是
+   * room_event 又记历史快照"的双份上下文。
+   */
+  private isRoomEventGroup(groupOpenid: string): boolean {
+    try {
+      const { policy } = resolveGroupRoomEventPolicy(this.account, groupOpenid, () => this.runtime);
+      return policy.effectiveMode === 'room_event';
+    } catch {
+      // 裁决失败时按"非 room_event"处理：多记一份历史快照不会破坏功能，
+      // 漏记才会（room_event 群多记历史 = 双份上下文）
+      return false;
+    }
+  }
+
   private wrapBotSendForRefIndex(): void {
     const { accountId, appId } = this.account;
     const senderName = this.account.config.name ?? appId;
@@ -436,10 +513,15 @@ export class QQBotGateway {
       // rolling 历史模式：群出站记入 historyBuffer（isBot 标记，
       // 供"裁剪到最后一条 bot 发言"定位；historyLimit=0 或 room_event 群
       // ——上下文以框架 transcript 为准——时 no-op）
+      //
+      // room_event 判定走**裁决后的策略**（群级 > per-agent > 全局），
+      // 与 dispatch / historyBuffer 同源：只看群级配置会漏掉「per-agent /
+      // 全局配置开启 room_event」的群，导致该群同时存在 transcript 与
+      // 历史快照两份上下文。
       if (
         target.scope === 'group' &&
         target.targetId &&
-        resolveGroupConfigFromAccount(this.account, target.targetId).unmentionedInbound !== 'room_event'
+        !this.isRoomEventGroup(target.targetId)
       ) {
         recordOutboundToGroupHistory(accountId, target.targetId, {
           messageId: msg.id,
