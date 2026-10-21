@@ -8,6 +8,20 @@
 
 ---
 
+## [Unreleased]
+
+### 新增
+
+- **补齐 manifest 的 `channels.qqbot` 配置 schema（Control UI 配置表单）**。`channels.qqbot` 段的配置 schema **只能**来自 `openclaw.plugin.json` 的 `channelConfigs.qqbot.schema`——框架的 registry 只从 manifest 采集通道 schema（`manifest-registry` 的 `buildRecord` → `collectChannelSchemaMetadataWithOwnership` → `prepareChannelConfigSchema`）；插件运行时的 `plugin.configSchema` 走的是**插件级** `plugins.<id>` 段，管不到 `channels.qqbot`。
+  此前 manifest 只声明了 `appId` / `clientSecret`，而插件实际读取的配置项有 **27 个**（`QQBotAccountConfig`）：`dmPolicy` / `allowFrom` / `groupPolicy` / `groupAllowFrom` / `groups`（含 `requireMention` / `toolPolicy` / `historyMode` / `unmentionedInbound` 等子项）/ `rateLimit`（三层限流）/ `transport` / `webhook` / `markdownSupport` / `audioFormatPolicy` / `urlDirectUpload` / `defaultRequireMention` / `groupCoalesce` / `deliverDebounce` / `typing` / `inboundDebounce` / `commands` / `streaming` / `progressCard` / `userAgentSuffix` / `clientSecretFile` 等。结果是 **Control UI 的 QQ 配置表单只有两个字段**——用户想配群策略、白名单、限流、流式、进度卡片等，只能手写 JSON。
+  现补齐：
+  - **schema 顶层 30 个字段** + **`accounts` 段 27 个字段**（逐字段列举而非 catchall，好让 UI 渲染出对应控件），`additionalProperties: false`（与 Telegram 一致，作用是**挡住拼错的字段**而非放行）
+  - **24 条 `uiHints`**（label + help），覆盖私聊准入、群策略、群配置、限流、传输方式、流式、进度卡片、防抖、指令面板、多账号等，help 文本写明默认值与 QQ 平台的特殊约束（如「群主在客户端选的推送模式插件不可控」「openid 按账号隔离」「防抖窗口钳制范围 [0, 60000]」「卡片只走被动回复不烧主动预算」）
+  - `capabilities.inlineButtons` 声明为与 Telegram 同款语义（`off` / `dm` / `group` / `all` / `allowlist`）——**注意**：配置侧 `capabilities` 在框架语义下是「只增不减」的并集项，插件侧的 `messageToolCapabilities` 才是提示词侧的实际开关，故该字段目前是**声明位**而非生效开关（生效开关见 PR #58 的插件侧实现）
+  - 新增 `tests/manifest-config-schema.test.ts`（11 例）——锁定「manifest 能被框架 `loadPluginManifest` 解析」「schema 覆盖 `QQBotAccountConfig` 的**全部**键（顶层 + accounts 段）」「schema 通过框架的 JSON Schema 合法性校验」「典型/多账号配置能通过校验」「uiHints 每条都有 label + help」。**字段覆盖完整性是硬断言**：`additionalProperties: false` 下漏一个键，用户写了就会被拒——测试直接以 `src/types.ts` 的 `QQBotAccountConfig` 为权威源做差集核对，新增配置项忘了补 schema 会立刻红。
+
+---
+
 ## [2.7.0] - 2026-10-20
 
 ### 新增

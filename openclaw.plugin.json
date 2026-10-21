@@ -23,11 +23,446 @@
   "channelConfigs": {
     "qqbot": {
       "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "properties": {
+          "name": { "type": "string", "description": "账号显示名" },
+          "enabled": { "type": "boolean", "description": "是否启用该账号" },
           "appId": { "type": "string", "description": "QQ Bot AppID" },
-          "clientSecret": { "type": "string", "description": "QQ Bot AppSecret" }
+          "clientSecret": { "type": "string", "description": "QQ Bot AppSecret（与 clientSecretFile 互斥）" },
+          "clientSecretFile": { "type": "string", "description": "QQ Bot AppSecret 文件路径（与 clientSecret 互斥）" },
+          "capabilities": {
+            "description": "额外声明的通道能力（与插件内建能力取并集）",
+            "anyOf": [
+              { "type": "array", "items": { "type": "string" } },
+              {
+                "type": "object",
+                "properties": {
+                  "inlineButtons": {
+                    "type": "string",
+                    "enum": ["off", "dm", "group", "all", "allowlist"],
+                    "description": "内联按钮作用域（与 Telegram 同款语义）"
+                  }
+                },
+                "additionalProperties": false
+              }
+            ]
+          },
+          "dmPolicy": {
+            "type": "string",
+            "enum": ["pairing", "allowlist", "open", "disabled"],
+            "default": "allowlist",
+            "description": "私聊准入策略：pairing=配对码 | allowlist=白名单 | open=开放 | disabled=关闭"
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": { "anyOf": [{ "type": "string" }, { "type": "number" }] },
+            "description": "私聊白名单（openid；dmPolicy=allowlist 时生效）"
+          },
+          "groupPolicy": {
+            "type": "string",
+            "enum": ["open", "allowlist", "disabled"],
+            "default": "allowlist",
+            "description": "群消息策略：open=全响应 | allowlist=白名单 | disabled=不响应"
+          },
+          "groupAllowFrom": {
+            "type": "array",
+            "items": { "anyOf": [{ "type": "string" }, { "type": "number" }] },
+            "description": "群白名单（groupOpenid；groupPolicy=allowlist 时生效）"
+          },
+          "groups": {
+            "type": "object",
+            "description": "按群 openid 索引的群配置（\"*\" 为默认）",
+            "propertyNames": { "type": "string" },
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "requireMention": { "type": "boolean", "description": "是否需要 @机器人才响应（默认 true）" },
+                "ignoreOtherMentions": {
+                  "type": "boolean",
+                  "description": "忽略 @了其他用户但没 @bot 的消息（默认 false）"
+                },
+                "toolPolicy": {
+                  "type": "string",
+                  "enum": ["full", "restricted", "none"],
+                  "description": "群内 AI 可用工具范围（默认 restricted）"
+                },
+                "name": { "type": "string", "description": "群名称（用于 /bot-group-info 展示）" },
+                "prompt": { "type": "string", "description": "群消息行为提示（PE）" },
+                "historyLimit": { "type": "integer", "minimum": 0, "description": "群历史缓存条数（0 禁用，默认 20）" },
+                "historyMode": {
+                  "type": "string",
+                  "enum": ["clear", "rolling"],
+                  "description": "群历史清理时机：clear=每次回复后整清 | rolling=裁剪到最后一次 bot 发言后"
+                },
+                "unmentionedInbound": {
+                  "type": "string",
+                  "enum": ["user_request", "room_event"],
+                  "description": "未被 @ 的群消息入站策略：user_request=仅进历史 | room_event=作为房间事件进框架"
+                },
+                "coalesce": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean", "description": "是否启用群消息合并（默认 true）" }
+                  },
+                  "description": "群消息合并配置（覆盖账号级）"
+                }
+              }
+            }
+          },
+          "defaultRequireMention": {
+            "type": "boolean",
+            "description": "群消息是否默认需要 @机器人才响应（默认 true，优先级低于 groups.*.requireMention）"
+          },
+          "rateLimit": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "三层限流（sender / group / global，默认启用保守阈值）",
+            "properties": {
+              "enabled": { "type": "boolean", "description": "是否启用限流（默认 true）" },
+              "perSender": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "单发送者限流（默认 20 条/分钟）",
+                "properties": {
+                  "max": { "type": "number", "minimum": 0 },
+                  "windowMs": { "type": "number", "minimum": 1 }
+                }
+              },
+              "perGroup": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "单群限流（默认 60 条/分钟，c2c 按 sender 归组）",
+                "properties": {
+                  "max": { "type": "number", "minimum": 0 },
+                  "windowMs": { "type": "number", "minimum": 1 }
+                }
+              },
+              "global": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "全局限流（默认 300 条/分钟）",
+                "properties": {
+                  "max": { "type": "number", "minimum": 0 },
+                  "windowMs": { "type": "number", "minimum": 1 }
+                }
+              }
+            }
+          },
+          "transport": {
+            "type": "string",
+            "enum": ["websocket", "webhook"],
+            "default": "websocket",
+            "description": "消息接收传输方式"
+          },
+          "webhook": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "webhook 传输配置（transport=webhook 时生效）",
+            "properties": {
+              "path": { "type": "string", "description": "监听路径（默认 /qqbot/webhook）" }
+            }
+          },
+          "systemPrompt": { "type": "string", "description": "系统提示词（会添加在用户消息前面）" },
+          "markdownSupport": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否支持 markdown 消息（默认 true，设为 false 走纯文本）"
+          },
+          "audioFormatPolicy": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "音频格式策略：控制哪些格式可跳过转换",
+            "properties": {
+              "sttDirectFormats": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "STT 模型直接支持的音频格式（入站跳过 SILK→WAV 转换）"
+              },
+              "uploadDirectFormats": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "QQ 平台可直传的音频格式（出站跳过→SILK 转换，默认 .wav/.mp3/.silk）"
+              },
+              "transcodeEnabled": {
+                "type": "boolean",
+                "description": "是否启用语音转码（默认 true；环境无 ffmpeg 时可关掉直接发文件）"
+              }
+            }
+          },
+          "urlDirectUpload": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否启用公网 URL 直传 QQ 平台（失败自动回退为下载后 Base64 上传）"
+          },
+          "groupCoalesce": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "群消息合并配置（账号级）",
+            "properties": {
+              "enabled": { "type": "boolean", "description": "是否启用群消息合并（默认 true）" }
+            }
+          },
+          "deliverDebounce": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "出站消息合并回复（debounce）配置",
+            "properties": {
+              "enabled": { "type": "boolean", "description": "是否启用合并回复（默认 true）" },
+              "debounceMs": { "type": "number", "minimum": 0, "description": "合并窗口毫秒数（默认 1500）" }
+            }
+          },
+          "typing": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "\"正在输入\"指示器配置（仅 C2C 私聊生效）",
+            "properties": {
+              "enabled": { "type": "boolean", "description": "是否启用指示器（默认 true）" },
+              "intervalMs": {
+                "type": "number",
+                "minimum": 20000,
+                "description": "续期间隔毫秒数（默认 20000，受 QPS 限制不低于 20000）"
+              }
+            }
+          },
+          "inboundDebounce": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "私聊入站消息防抖合并（仅 C2C 生效）",
+            "properties": {
+              "enabled": { "type": "boolean", "description": "是否启用防抖合并（默认 true）" },
+              "debounceMs": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 60000,
+                "description": "防抖窗口毫秒数（0=关闭；默认 3000，钳制范围 [0, 60000]）"
+              }
+            }
+          },
+          "commands": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "指令面板配置（openclaw 原生指令 → QQ Bot 指令面板自动注册）",
+            "properties": {
+              "native": { "type": "boolean", "description": "是否自动注册原生指令到指令面板（默认 true）" }
+            }
+          },
+          "streaming": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "流式消息配置（仅 C2C 私聊支持流式 API）",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": ["partial", "off"],
+                "description": "流式模式：partial=打字机效果 | off=关闭（默认 off）"
+              },
+              "sendMode": {
+                "type": "string",
+                "enum": ["stream", "static"],
+                "description": "文本下发通道（仅 mode=partial 生效）：stream=流式打印机 | static=结束时整条发送"
+              }
+            }
+          },
+          "progressCard": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Progress Card（进度卡片）配置",
+            "properties": {
+              "enabled": { "type": "boolean", "description": "总开关（默认 true）" },
+              "scope": {
+                "type": "string",
+                "enum": ["c2c", "group", "both"],
+                "description": "生效范围（默认 c2c）"
+              },
+              "minIntervalMs": { "type": "number", "minimum": 0, "description": "两次卡片消息的最小间隔毫秒数（默认 1500）" },
+              "maxPerTurn": { "type": "number", "minimum": 0, "description": "每个 turn 最多发送的卡片条数（默认 3）" }
+            }
+          },
+          "userAgentSuffix": { "type": "string", "description": "User-Agent 尾部追加内容（私有化部署标识等）" },
+          "stt": {
+            "type": "object",
+            "description": "STT（语音转文字）历史遗留配置块——整块被忽略，保留仅为兼容旧配置",
+            "additionalProperties": true
+          },
+          "accounts": {
+            "type": "object",
+            "description": "多账号配置（每个账号一套凭据、网关与 token 缓存）",
+            "propertyNames": { "type": "string" },
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string", "description": "账号显示名" },
+                "enabled": { "type": "boolean", "description": "是否启用该账号" },
+                "appId": { "type": "string", "description": "QQ Bot AppID" },
+                "clientSecret": { "type": "string", "description": "QQ Bot AppSecret（与 clientSecretFile 互斥）" },
+                "clientSecretFile": { "type": "string", "description": "QQ Bot AppSecret 文件路径（与 clientSecret 互斥）" },
+                "dmPolicy": {
+                  "type": "string",
+                  "enum": ["pairing", "allowlist", "open", "disabled"],
+                  "default": "allowlist",
+                  "description": "私聊准入策略"
+                },
+                "allowFrom": {
+                  "type": "array",
+                  "items": { "anyOf": [{ "type": "string" }, { "type": "number" }] },
+                  "description": "私聊白名单（openid）"
+                },
+                "groupPolicy": {
+                  "type": "string",
+                  "enum": ["open", "allowlist", "disabled"],
+                  "default": "allowlist",
+                  "description": "群消息策略"
+                },
+                "groupAllowFrom": {
+                  "type": "array",
+                  "items": { "anyOf": [{ "type": "string" }, { "type": "number" }] },
+                  "description": "群白名单（groupOpenid）"
+                },
+                "transport": {
+                  "type": "string",
+                  "enum": ["websocket", "webhook"],
+                  "default": "websocket",
+                  "description": "消息接收传输方式"
+                },
+                "webhook": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "description": "webhook 传输配置（transport=webhook 时生效）",
+                  "properties": {
+                    "path": { "type": "string", "description": "监听路径（默认 /qqbot/webhook）" }
+                  }
+                },
+                "groups": {
+                  "type": "object",
+                  "propertyNames": { "type": "string" },
+                  "additionalProperties": { "type": "object" }
+                },
+                "rateLimit": { "type": "object" },
+                "systemPrompt": { "type": "string", "description": "系统提示词" },
+                "markdownSupport": { "type": "boolean", "description": "是否支持 markdown 消息" },
+                "audioFormatPolicy": { "type": "object" },
+                "urlDirectUpload": { "type": "boolean", "description": "是否启用公网 URL 直传" },
+                "defaultRequireMention": { "type": "boolean", "description": "群消息是否默认需要 @机器人才响应" },
+                "groupCoalesce": { "type": "object" },
+                "deliverDebounce": { "type": "object" },
+                "typing": { "type": "object" },
+                "inboundDebounce": { "type": "object" },
+                "commands": { "type": "object" },
+                "streaming": { "type": "object" },
+                "progressCard": { "type": "object" },
+                "userAgentSuffix": { "type": "string", "description": "User-Agent 尾部追加内容" },
+                "stt": {
+                  "type": "object",
+                  "description": "STT（语音转文字）历史遗留配置块——整块被忽略，保留仅为兼容旧配置",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "defaultAccount": { "type": "string", "description": "默认账号 id（未指定时取第一个可用账号）" }
+        }
+      },
+      "uiHints": {
+        "": {
+          "label": "QQ Bot",
+          "help": "QQ Bot 官方 API 通道配置。凭据（appId / clientSecret）与凭据文件（clientSecretFile）互斥；私聊准入由 dmPolicy + allowFrom 控制，群聊由 groupPolicy + groupAllowFrom + groups 控制。"
+        },
+        "dmPolicy": {
+          "label": "QQ Bot 私聊准入策略",
+          "help": "pairing=配对码（推荐）| allowlist=白名单 | open=开放（需 allowFrom=[\"*\"]）| disabled=关闭私聊。"
+        },
+        "allowFrom": {
+          "label": "QQ Bot 私聊白名单",
+          "help": "允许私聊的用户 openid 列表。openid 按账号隔离——A 账号的 openid 在 B 账号无效。"
+        },
+        "groupPolicy": {
+          "label": "QQ Bot 群消息策略",
+          "help": "open=全响应 | allowlist=白名单 | disabled=不响应。注意：群主在 QQ 客户端选的推送模式（AT 纯模式 / AT+最近N / 全量模式）插件不可控。"
+        },
+        "groupAllowFrom": {
+          "label": "QQ Bot 群白名单",
+          "help": "允许响应的群 openid 列表。群 openid 同样按账号隔离。"
+        },
+        "groups": {
+          "label": "QQ Bot 群配置",
+          "help": "按群 openid 索引的群级配置；\"*\" 为默认组。优先级：groups.{groupOpenid} > groups.* > 账号级 defaultRequireMention > true。"
+        },
+        "groups.*.requireMention": {
+          "label": "需要 @ 才响应",
+          "help": "该群是否需要 @机器人才响应（默认 true）。"
+        },
+        "groups.*.toolPolicy": {
+          "label": "群内工具策略",
+          "help": "full=全部工具 | restricted=限制敏感工具（默认）| none=禁止所有工具。"
+        },
+        "groups.*.historyMode": {
+          "label": "群历史窗口模式",
+          "help": "clear=每次回复后整清历史 | rolling=裁剪到最后一次 bot 发言之后的滚动窗口。"
+        },
+        "groups.*.unmentionedInbound": {
+          "label": "未被 @ 消息的入站策略",
+          "help": "user_request=维持现状（未 @ 消息只进历史）| room_event=作为房间事件进框架（AI 只读上下文，不自动回复）。"
+        },
+        "defaultRequireMention": {
+          "label": "群默认需要 @",
+          "help": "所有群是否默认需要 @机器人才响应（默认 true），仍可被群级配置覆盖。"
+        },
+        "rateLimit": {
+          "label": "QQ Bot 限流",
+          "help": "三层滑动窗口限流：perSender（默认 20 条/分钟）、perGroup（60 条/分钟）、global（300 条/分钟）。"
+        },
+        "transport": {
+          "label": "消息接收传输方式",
+          "help": "websocket=长连接（默认）| webhook=HTTP 回调（需公网可达地址）。"
+        },
+        "clientSecretFile": {
+          "label": "QQ Bot AppSecret 文件",
+          "help": "AppSecret 存文件时的路径。文件在账号启动时读一次；与内联 clientSecret 互斥（内联优先，文件被忽略）。"
+        },
+        "markdownSupport": {
+          "label": "支持 Markdown",
+          "help": "默认 true。关闭后按纯文本（msg_type=0）发送，同时消息引用改为带引用原文的引用块。"
+        },
+        "streaming": {
+          "label": "流式消息",
+          "help": "仅 C2C 私聊支持 QQ 流式 API。mode=partial 开启打字机效果；sendMode=static 则结束时整条发送。"
+        },
+        "progressCard": {
+          "label": "进度卡片",
+          "help": "把多步计划以 checklist 快照发到聊天。卡片只走被动回复（配额不足即丢弃，不烧主动消息预算）。"
+        },
+        "typing": {
+          "label": "正在输入指示器",
+          "help": "仅 C2C 私聊生效。intervalMs 受 QPS 限制，低于 20000 会被钳制。"
+        },
+        "inboundDebounce": {
+          "label": "私聊入站防抖",
+          "help": "仅 C2C 生效。QQ 私聊的文件与文字是两条独立消息，防抖把连续消息合并成一次 dispatch。debounceMs 钳制范围 [0, 60000]。"
+        },
+        "commands.native": {
+          "label": "自动同步原生指令到指令面板",
+          "help": "默认 true。把 openclaw 原生指令注册到 QQ Bot 指令面板；点击后指令文本填入输入框，以普通文本走斜杠指令路由。"
+        },
+        "urlDirectUpload": {
+          "label": "公网 URL 直传",
+          "help": "默认 true。平台自行拉取公网 URL；失败自动回退为插件下载后 Base64 上传。"
+        },
+        "accounts": {
+          "label": "QQ Bot 多账号",
+          "help": "每个账号一套凭据、网关与 token 缓存。openid 按账号隔离——A 账号的 openid 在 B 账号不可用。"
+        },
+        "defaultAccount": {
+          "label": "默认账号",
+          "help": "未显式指定账号时使用的账号 id。"
+        },
+        "capabilities.inlineButtons": {
+          "label": "QQ Bot 内联按钮作用域",
+          "help": "控制模型可用的按钮能力：off=关闭 | dm=仅私聊 | group=仅群 | all=全部 | allowlist=仅白名单会话（默认 allowlist）。"
         }
       },
       "label": "QQ Bot",
