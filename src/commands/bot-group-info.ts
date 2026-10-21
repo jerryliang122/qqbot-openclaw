@@ -71,13 +71,15 @@ export function botGroupInfo(account: ResolvedQQBotAccount, getRuntime?: () => a
         `requireMention：${cfg.requireMention ? '是（需 @ 才响应）' : '否（所有消息都响应）'}`,
         `未 @ 消息入站：${inboundLine}`,
         `入站策略来源：${SOURCE_LABEL[policy.source] ?? policy.source}`,
-        toolLine,
+        // 只有 room_event 群才有 message 工具这一行——用展开而非全局 filter，
+        // 否则会把上面刻意留的分隔空行也一并删掉（输出失去分组结构）
+        ...(toolLine ? [toolLine] : []),
         `排队策略：框架队列（${cfg.coalesce.enabled ? 'collect 合并批处理' : 'followup 排队不合并'}）`,
         `历史缓存：${cfg.historyLimit} 条（0=禁用，模式 ${cfg.historyMode === 'rolling' ? 'rolling（bot 发言计入）' : 'clear（回复后清空）'}）`,
         `工具策略：${cfg.toolPolicy}`,
         '',
         `今日主动消息用量：${usage.count}/${usage.limit}（被动回复不计数；异常增长说明 msgid-cache 常过期或被动配额常耗尽）`,
-      ].filter((line) => line !== '').join('\n');
+      ].join('\n');
     },
   };
 }

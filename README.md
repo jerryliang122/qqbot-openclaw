@@ -788,10 +788,11 @@ The check is deliberately conservative — it only downgrades when the tool is *
 
 | Tool surface | Verdict |
 |---|---|
-| `groups.<id>.tools.allow` without `message` (and no `alsoAllow`) | unavailable → downgrade |
-| `groups.<id>.tools.deny` containing `message` or `*` | unavailable → downgrade |
+| `groups.<id>.tools.allow` (non-empty) without `message` (and no `alsoAllow`) | unavailable → downgrade |
+| `groups.<id>.tools.deny` matching `message` (exact or glob, e.g. `mess*`) | unavailable → downgrade |
 | agent / global explicit `allow` list without `message` | unavailable → downgrade |
 | agent / global explicit `deny` containing `message` or `*` | unavailable → downgrade |
+| `allow` missing/empty with a non-empty `alsoAllow` | **not limiting** (the framework turns it into an implicit allow-all) |
 | agent `tools.profile` (including `minimal` / `coding`) | **not** a blocker — the framework force-grants `message` for room-event turns |
 | anything else (including unknown profiles) | assumed available |
 
@@ -804,6 +805,8 @@ To keep the strict silence semantics on purpose, opt out of the downgrade:
 #### Visible replies
 
 `messages.groupChat.visibleReplies` controls whether a group turn's final text is posted automatically (`"automatic"`, the default) or only through the `message` tool (`"message_tool"`). Room events always use `"message_tool"` — that is the structural silence described above. A normal (mentioned) turn in a room-event group is still delivered automatically.
+
+`messages.groupChat.*` applies to **group and channel conversations only** — direct messages read `messages.visibleReplies` instead, so a group-only setting never silences your DMs.
 
 #### Wake Modes (what counts as "being addressed")
 

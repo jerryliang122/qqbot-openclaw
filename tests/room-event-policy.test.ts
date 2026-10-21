@@ -126,6 +126,27 @@ await test('user_request + 全局 messages.visibleReplies 兜底', () => {
   assert.equal(resolveVisibleRepliesMode({ cfg, mode: 'user_request' }), 'message_tool');
 });
 
+await test('groupChat.visibleReplies 不影响非群（c2c/dm）turn', () => {
+  // 框架 c2c 分支只读 messages.visibleReplies；混读 groupChat 会把
+  // 「群里配 visibleReplies=message_tool」扩散到私聊，把 DM 终稿压成静默。
+  const cfg: any = { messages: { groupChat: { visibleReplies: 'message_tool' } } };
+  assert.equal(
+    resolveVisibleRepliesMode({ cfg, mode: 'user_request', chatType: 'direct' }),
+    'automatic',
+    'c2c 不得读 groupChat.visibleReplies',
+  );
+  assert.equal(
+    resolveVisibleRepliesMode({ cfg, mode: 'user_request', chatType: 'group' }),
+    'message_tool',
+    '群仍读 groupChat.visibleReplies',
+  );
+});
+
+await test('非群 turn 在 messages.visibleReplies=message_tool 时也生效', () => {
+  const cfg: any = { messages: { visibleReplies: 'message_tool' } };
+  assert.equal(resolveVisibleRepliesMode({ cfg, mode: 'user_request', chatType: 'direct' }), 'message_tool');
+});
+
 // ── 3. message 工具守卫 ────────────────────────────────────────
 
 group('message 工具守卫（防结构性沉默）');
@@ -161,6 +182,68 @@ await test('群白名单不含 message 但 alsoAllow 含 → 可用', () => {
     groupToolPolicy: { allow: ['web_search'], alsoAllow: ['message'] },
   });
   assert.equal(r.available, true);
+});
+
+await test('只有 alsoAllow（无 allow）→ 视为不限制（core unionAllow 产出 ["*", ...alsoAllow]）', () => {
+  // 框架 unionAllow：allow 缺失或为空数组时，alsoAllow 会带上 "*" → 隐式全放行。
+  // 按排他白名单判会把 tools:{alsoAllow:[...]} 的群误降级，与框架结论相反。
+  const onlyAlso = resolveMessageToolAvailability({
+    cfg: {} as any,
+    groupToolPolicy: { alsoAllow: ['web_search'] },
+  });
+  assert.equal(onlyAlso.available, true, '只有 alsoAllow 不是排他白名单');
+
+  const emptyAllow = resolveMessageToolAvailability({
+    cfg: {} as any,
+    groupToolPolicy: { allow: [], alsoAllow: ['web_search'] },
+  });
+  assert.equal(emptyAllow.available, true, 'allow: [] + alsoAllow 同样是隐式全放行');
+});
+
+await test('agent / 全局层只有 alsoAllow → 同样视为不限制', () => {
+  const agentOnly = resolveMessageToolAvailability({
+    cfg: { agents: { entries: { main: { tools: { alsoAllow: ['web_search'] } } } } } as any,
+    agentId: 'main',
+  });
+  assert.equal(agentOnly.available, true);
+
+  const globalOnly = resolveMessageToolAvailability({
+    cfg: { tools: { alsoAllow: ['web_search'] } } as any,
+  });
+  assert.equal(globalOnly.available, true);
+});
+
+await test('allow 含通配 "*" → 不限制', () => {
+  const r = resolveMessageToolAvailability({
+    cfg: {} as any,
+    groupToolPolicy: { allow: ['*'] },
+  });
+  assert.equal(r.available, true);
+});
+
+await test('deny 支持通配（框架同款 glob）：deny:["mess*"] 拦下 message', () => {
+  // core compileGlobPattern：含 "*" → 正则 ^...$；字面量比较会漏判这条
+  const r = resolveMessageToolAvailability({
+    cfg: {} as any,
+    groupToolPolicy: { deny: ['mess*'] },
+  });
+  assert.equal(r.available, false, '通配 deny 同样要判为不可用');
+});
+
+await test('allow 通配 "mess*" → 视为包含 message（不判为不可用）', () => {
+  const r = resolveMessageToolAvailability({
+    cfg: {} as any,
+    groupToolPolicy: { allow: ['mess*'] },
+  });
+  assert.equal(r.available, true);
+});
+
+await test('deny 大小写归一（MESSAGE 同样拦下）', () => {
+  const r = resolveMessageToolAvailability({
+    cfg: {} as any,
+    groupToolPolicy: { deny: ['MESSAGE'] },
+  });
+  assert.equal(r.available, false);
 });
 
 await test('agent profile=messaging → 可用', () => {
@@ -331,6 +414,17 @@ await test('工具不可用导致降级 → 展示降级原因', async () => {
   const out = String(await (cmd.handler as any)({ message: { groupOpenid: 'G1' } }));
   assert.ok(out.includes('已降级'), '应展示降级');
   assert.ok(out.includes('message 工具'), '应指出 message 工具问题');
+});
+
+await test('输出保留分组空行（filter 不得吃掉刻意留的分隔行）', async () => {
+  const { botGroupInfo } = await import('../src/commands/bot-group-info.ts');
+  const account = makeAccount({ G1: { unmentionedInbound: 'room_event' } });
+  const cmd = botGroupInfo(account);
+  const out = String(await (cmd.handler as any)({ message: { groupOpenid: 'G1' } }));
+  assert.ok(out.includes('\n\n'), '应保留空行分隔');
+  assert.ok(out.startsWith('🤖 群信息'), '首行应是标题');
+  const lines = out.split('\n');
+  assert.ok(lines.some((l) => l === ''), '不得出现被过滤掉的空行结构');
 });
 
 // ── 结果 ───────────────────────────────────────────────────────

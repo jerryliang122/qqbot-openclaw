@@ -112,6 +112,29 @@ function makeGroupMsgAndCtx(overrides: {
   return { msg, ctx };
 }
 
+function makeC2cMsgAndCtx(overrides: { content?: string } = {}) {
+  const msg = {
+    kind: 'c2c' as const,
+    messageId: `msg-${Math.random().toString(36).slice(2, 10)}`,
+    content: overrides.content ?? '在吗',
+    senderId: 'USER_A',
+    senderName: 'UserA',
+    attachments: [],
+    replyTarget: { scope: 'c2c' as const, targetId: 'USER_A' },
+    groupOpenid: undefined,
+    rawEventType: 'C2C_MESSAGE_CREATE',
+    mentions: [],
+    timestamp: Date.now(),
+    raw: {},
+  } as any;
+  const ctx = {
+    state: {},
+    message: { content: msg.content },
+    signal: undefined,
+  } as any;
+  return { msg, ctx };
+}
+
 function makeAccount(groups?: Record<string, any>): any {
   return {
     accountId: 'test-account',
@@ -519,6 +542,73 @@ await test('未命中 mentionPatterns 时门控照常拦截', async () => {
   await middleware(ctx, async () => { nextCalled = true; });
   assert.ok(!nextCalled, '没命中称呼的普通消息仍应被拦下');
   assert.ok((ctx as any).stopped?.includes('mention-gate'));
+});
+
+group('可见回复模式按会话类型隔离');
+
+await test('私聊 turn 不受 messages.groupChat.visibleReplies 影响（DM 终稿照常投递）', async () => {
+  const { msg, ctx } = makeC2cMsgAndCtx();
+  const account = makeAccount();
+  _resetAdaptersCache();
+  let captured: CapturedDispatch = {};
+  const runtime = makeFakeRuntime();
+  const patchedRuntime = {
+    ...runtime,
+    config: {
+      current: () => ({ messages: { groupChat: { visibleReplies: 'message_tool' } } }),
+    },
+  } as any;
+  patchedRuntime.channel.inbound.run = async (params: any) => {
+    const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+    captured.ctxPayload = plan;
+    await plan.runDispatch();
+    return { dispatched: true };
+  };
+  patchedRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = (params2: any) => {
+    captured = { ...captured, replyOptions: params2.replyOptions, ctxPayload: params2.ctx };
+    return { queuedFinal: true, counts: { final: 1 } };
+  };
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, patchedRuntime);
+  assert.equal(
+    captured.replyOptions?.sourceReplyDeliveryMode,
+    undefined,
+    '私聊不得被群级 visibleReplies 压成 message_tool_only（否则 DM 里 bot 看起来死了）',
+  );
+});
+
+await test('群 turn 在 messages.groupChat.visibleReplies=message_tool 时走严格投递', async () => {
+  const { msg, ctx } = makeGroupMsgAndCtx({
+    rawEventType: 'GROUP_AT_MESSAGE_CREATE',
+    mentionState: { wasMentioned: true },
+  });
+  const account = makeAccount({ GROUP_ROOM: { unmentionedInbound: 'room_event' } });
+  _resetAdaptersCache();
+  let captured: CapturedDispatch = {};
+  const runtime = makeFakeRuntime();
+  const patchedRuntime = {
+    ...runtime,
+    config: {
+      current: () => ({ messages: { groupChat: { visibleReplies: 'message_tool' } } }),
+    },
+  } as any;
+  patchedRuntime.channel.inbound.run = async (params: any) => {
+    const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+    captured.ctxPayload = plan;
+    await plan.runDispatch();
+    return { dispatched: true };
+  };
+  patchedRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = (params2: any) => {
+    captured = { ...captured, replyOptions: params2.replyOptions, ctxPayload: params2.ctx };
+    return { queuedFinal: true, counts: { final: 1 } };
+  };
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, patchedRuntime);
+  assert.equal(
+    captured.replyOptions?.sourceReplyDeliveryMode,
+    'message_tool_only',
+    '群内 user_request turn 按 groupChat.visibleReplies 走严格投递',
+  );
 });
 
 // ── 结果 ──

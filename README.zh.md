@@ -588,10 +588,11 @@ channels.qqbot.groups.<id>.unmentionedInbound          （群级，最高）
 
 | 工具面 | 判定 |
 |---|---|
-| `groups.<id>.tools.allow` 不含 `message`（且 `alsoAllow` 也不含） | 不可用 → 降级 |
-| `groups.<id>.tools.deny` 含 `message` 或 `*` | 不可用 → 降级 |
+| `groups.<id>.tools.allow`（非空）不含 `message`（且 `alsoAllow` 也不含） | 不可用 → 降级 |
+| `groups.<id>.tools.deny` 命中 `message`（精确或通配，如 `mess*`） | 不可用 → 降级 |
 | agent / 全局显式 `allow` 白名单不含 `message` | 不可用 → 降级 |
 | agent / 全局显式 `deny` 含 `message` 或 `*` | 不可用 → 降级 |
+| `allow` 缺失/为空 + `alsoAllow` 非空 | **不限制**（框架会把它合成隐式全放行） |
 | agent `tools.profile`（含 `minimal` / `coding`） | **不算阻塞**——框架在房间事件 turn 会强制授予 `message` |
 | 其余情况（含未知 profile） | 视为可用 |
 
@@ -602,6 +603,8 @@ channels.qqbot.groups.<id>.unmentionedInbound          （群级，最高）
 ```
 
 **可见回复模式**：`messages.groupChat.visibleReplies` 决定群 turn 的最终文本是否自动投递（`"automatic"`，默认）或只走 `message` 工具（`"message_tool"`）。房间事件恒为 `"message_tool"`——即上面的结构性沉默；同一群里被 @ 的那条仍自动投递。
+
+`messages.groupChat.*` **只作用于群/频道会话**；私聊读的是 `messages.visibleReplies`——群里配的可见回复模式不会把私聊也压成静默。
 
 **称呼唤醒**（群友不打 @、直接叫名字）：在 `agents` 段（不在 `channels.qqbot` 下）配置：
 

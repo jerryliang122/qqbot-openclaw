@@ -296,13 +296,18 @@ export async function dispatchToOpenClaw(
 
   // 可见回复模式按 **turn** 判定，不是按群：
   // - room_event turn → 严格投递（最终文本不投递，只能走 message 工具）
-  // - user_request turn → 配置驱动（messages.groupChat.visibleReplies，
-  //   默认 automatic = 现状：最终文本自动投递）
+  // - user_request turn → 配置驱动（群读 messages.groupChat.visibleReplies，
+  //   非群只读 messages.visibleReplies——框架的 c2c 分支同样不读 groupChat，
+  //   混读会把「群里配 visibleReplies=message_tool」扩散到私聊，把 DM 终稿压成静默）
   // 同一群里两种 turn 交替出现时，可见性必须逐 turn 判定——
   // 否则 room_event 群里被 @ 的那条消息也会被压成静默（= 用户 @ 了 bot 却没回音）。
   const turnVisibleReplies: VisibleRepliesMode = inboundEventKind === 'room_event'
     ? 'message_tool'
-    : resolveVisibleRepliesMode({ cfg, mode: 'user_request' });
+    : resolveVisibleRepliesMode({
+        cfg,
+        mode: 'user_request',
+        chatType: envelope.chatScope === 'group' ? 'group' : 'direct',
+      });
 
   // 分类可观测性：room_event 事件触发一次推理 pass（成本排障命门），必须留痕；
   // room_event 群里被唤醒为 user_request 时标注唤醒来源（@/称呼/引用），

@@ -139,15 +139,25 @@ export function resolveUnmentionedInboundMode(params: {
  * 解析群消息的可见回复模式。
  *
  * - room_event：强制 `message_tool`（严格投递：最终文本不投递，只能走 message 工具）
- * - 其余：`messages.groupChat.visibleReplies` → `messages.visibleReplies` → `automatic`
+ * - 群/频道的普通 turn：`messages.groupChat.visibleReplies` → `messages.visibleReplies`
+ * - 非群（c2c/dm）：**只读** `messages.visibleReplies`
+ *
+ * ⚠️ `groupChat.*` 只作用于群/频道：早先不分会话类型统一读 groupChat，
+ * 会让"群里配 visibleReplies=message_tool"把**私聊**的终稿也压成静默
+ * （框架的 c2c 分支只读 messages.visibleReplies）。
  */
 export function resolveVisibleRepliesMode(params: {
   cfg: OpenClawConfig;
   mode: UnmentionedInbound;
+  /** 会话类型；缺省按群处理（调用方未区分时保持旧行为） */
+  chatType?: 'group' | 'channel' | 'direct' | 'other';
 }): VisibleRepliesMode {
   if (params.mode === 'room_event') return 'message_tool';
   const messages = (params.cfg as any)?.messages;
-  const configured = messages?.groupChat?.visibleReplies ?? messages?.visibleReplies;
+  const groupLike = params.chatType === undefined || params.chatType === 'group' || params.chatType === 'channel';
+  const configured = groupLike
+    ? (messages?.groupChat?.visibleReplies ?? messages?.visibleReplies)
+    : messages?.visibleReplies;
   return configured === 'message_tool' ? 'message_tool' : 'automatic';
 }
 
@@ -185,31 +195,71 @@ interface ToolPolicyLayer {
 /**
  * 按框架语义合成一层的有效允许集。
  *
- * 对齐 core `pickSandboxToolPolicy`：`allow` 与 `alsoAllow` 取并集；
- * 两者都缺（或都空）表示"不限制"（空允许清单 = 允许一切未被 deny 的）。
+ * 对齐 core `unionAllow`（9.1 dist `sandbox-tool-policy-bkx-xmDc.js`）：
+ * - `allow` 非空 → 与 `alsoAllow` 取并集（白名单语义）
+ * - `allow` **缺失或为空数组** → `unionAllow` 产出 `["*", ...alsoAllow]`
+ *   ——**隐式全放行**（core 另打 `IMPLICIT_ALLOW_ALL_FROM_ALSO_ALLOW` 标记）
+ * - 两者都缺 → 不限制（空允许清单 = 允许一切未被 deny 的）
+ *
+ * ⚠️ 「只有 alsoAllow」不是排他白名单——早先按排他白名单判会把
+ * `tools: { alsoAllow: [...] }` 的群误判成"message 不可用"而降级，
+ * 与框架结论正好相反。
  */
 function effectiveAllowList(policy?: ToolPolicyLayer): string[] | undefined {
   if (!policy) return undefined;
   const allow = Array.isArray(policy.allow) ? policy.allow : undefined;
   const alsoAllow = Array.isArray(policy.alsoAllow) ? policy.alsoAllow : undefined;
-  if (!allow && (!alsoAllow || alsoAllow.length === 0)) return undefined;
-  const merged = [...(allow ?? []), ...(alsoAllow ?? [])];
-  return merged.length > 0 ? merged : undefined;
+  if (!allow || allow.length === 0) {
+    // allow 缺失/为空 → core 合成 ["*", ...alsoAllow]（含通配 = 实际不限制）
+    return alsoAllow && alsoAllow.length > 0 ? ['*', ...alsoAllow] : undefined;
+  }
+  return alsoAllow && alsoAllow.length > 0 ? [...allow, ...alsoAllow] : allow;
+}
+
+/**
+ * 判断一个 allow/deny 条目是否命中工具名（对齐 core 的 glob 匹配）。
+ *
+ * 对齐 core `compileGlobPattern` / `matchesAnyGlobPattern`
+ * （9.1 dist `glob-pattern-DFVWJ-hh.js`）：
+ * - `*` → 命中一切
+ * - 不含 `*` → 精确匹配（双方都经 `normalizeLowercaseStringOrEmpty` 小写化）
+ * - 含 `*` → 正则 `^...$`（`*` → `.*`；`?` 不是通配符，按字面量处理）
+ *
+ * ⚠️ 字面量比较会漏判 `deny: ["mess*"]` 这类通配写法——框架会拦下 message，
+ * 守卫却看不见，于是该群真的被静默。
+ */
+function toolPatternMatches(pattern: string, tool: string): boolean {
+  const normalizedPattern = (pattern ?? '').trim().toLowerCase();
+  const normalizedTool = tool.toLowerCase();
+  if (!normalizedPattern) return false;
+  if (normalizedPattern === '*') return true;
+  if (!normalizedPattern.includes('*')) return normalizedPattern === normalizedTool;
+  const escaped = normalizedPattern
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\\\*/g, '.*');
+  try {
+    return new RegExp(`^${escaped}$`).test(normalizedTool);
+  } catch {
+    return false;
+  }
 }
 
 /**
  * 判定某一层策略是否**确定屏蔽**了 message 工具，返回屏蔽原因。
  *
  * 对齐 core `createToolPolicyMatcher`：deny 优先；非空 allow 清单是白名单，
- * 清单外的工具一律不可用（空清单 = 不限制）。
+ * 清单外的工具一律不可用（空清单 = 不限制；含 `*` 通配 = 实际不限制）。
  */
 function layerBlocksMessage(policy?: ToolPolicyLayer): string | undefined {
   if (!policy) return undefined;
   const deny = policy.deny ?? [];
-  if (deny.includes('message') || deny.includes('*')) return '显式禁用 message 工具';
+  if (deny.some((pattern) => toolPatternMatches(pattern, 'message'))) {
+    return '显式禁用 message 工具';
+  }
   const allow = effectiveAllowList(policy);
-  if (allow && !allow.includes('message')) return '工具白名单不含 message 工具';
-  return undefined;
+  if (!allow || allow.length === 0) return undefined;
+  if (allow.some((pattern) => toolPatternMatches(pattern, 'message'))) return undefined;
+  return '工具白名单不含 message 工具';
 }
 
 /**
