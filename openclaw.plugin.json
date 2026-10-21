@@ -63,34 +63,6 @@
             "type": "string",
             "description": "QQ Bot AppSecret 文件路径（与 clientSecret 互斥）"
           },
-          "capabilities": {
-            "description": "额外声明的通道能力（与插件内建能力取并集）",
-            "anyOf": [
-              {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "inlineButtons": {
-                    "type": "string",
-                    "enum": [
-                      "off",
-                      "dm",
-                      "group",
-                      "all",
-                      "allowlist"
-                    ],
-                    "description": "内联按钮作用域（与 Telegram 同款语义）"
-                  }
-                },
-                "additionalProperties": false
-              }
-            ]
-          },
           "dmPolicy": {
             "type": "string",
             "enum": [
@@ -195,6 +167,32 @@
                     "room_event"
                   ],
                   "description": "未被 @ 的群消息入站策略：user_request=仅进历史 | room_event=作为房间事件进框架"
+                },
+                "roomEventRequireMessageTool": {
+                  "type": "boolean",
+                  "description": "room_event 是否强制要求 message 工具可用（默认 true：不可用时降级回 user_request 并打 WARN；false=严格静默模式，由用户自行保证工具面）"
+                },
+                "tools": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "allow": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "工具白名单（非空时清单外工具一律不可用；room_event 群必须包含 message，否则该群失去唯一发声通道）"
+                    },
+                    "alsoAllow": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "在 allow 基础上追加允许的工具（allow 缺失时框架合成隐式全放行）"
+                    },
+                    "deny": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "显式禁用的工具（优先级最高；支持 * 通配）"
+                    }
+                  },
+                  "description": "群级工具白名单（优先级高于 toolPolicy；未声明则按 toolPolicy 兜底）"
                 },
                 "coalesce": {
                   "type": "object",
@@ -640,6 +638,32 @@
                           "room_event"
                         ],
                         "description": "未被 @ 的群消息入站策略：user_request=仅进历史 | room_event=作为房间事件进框架"
+                      },
+                      "roomEventRequireMessageTool": {
+                        "type": "boolean",
+                        "description": "room_event 是否强制要求 message 工具可用（默认 true：不可用时降级回 user_request 并打 WARN；false=严格静默模式，由用户自行保证工具面）"
+                      },
+                      "tools": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                          "allow": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "工具白名单（非空时清单外工具一律不可用；room_event 群必须包含 message，否则该群失去唯一发声通道）"
+                          },
+                          "alsoAllow": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "在 allow 基础上追加允许的工具（allow 缺失时框架合成隐式全放行）"
+                          },
+                          "deny": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "显式禁用的工具（优先级最高；支持 * 通配）"
+                          }
+                        },
+                        "description": "群级工具白名单（优先级高于 toolPolicy；未声明则按 toolPolicy 兜底）"
                       },
                       "coalesce": {
                         "type": "object",

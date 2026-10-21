@@ -223,8 +223,13 @@ function truncateUtf8(value: string, maxBytes: number): string {
     const candidate = value.slice(0, end);
     if (utf8Bytes(candidate) <= maxBytes) return candidate;
     const code = value.charCodeAt(end - 1);
-    // 落在代理对后半 → 再退一格，避免切碎代理对
-    if (code >= 0xdc00 && code <= 0xdfff) end -= 1;
+    // 候选串超预算时，被移除的首个字符是 value[end-1]：
+    // 若它是**低代理**（代理对后半），必须连同其高代理一起移除（end -= 2），
+    // 否则下一个候选串会以孤儿高代理结尾（编码成 U+FFFD，尾部损坏）。
+    // ⚠️ 实测踩过的坑：两个分支都写 `end -= 1` 会让本检查失效——
+    // 当孤儿高代理的候选恰好落在预算内时（完整对 4 字节、孤儿 3 字节，
+    // 即总字节数恰为 maxBytes+1 的场景），截断结果尾部就是坏的。
+    if (code >= 0xdc00 && code <= 0xdfff) end -= 2;
     else end -= 1;
   }
   return '';
@@ -460,4 +465,32 @@ export function countDroppedPresentationControls(
  */
 export function renderQQBotPresentationFallbackText(presentation: MessagePresentation): string {
   return renderMessagePresentationFallbackText({ presentation });
+}
+
+/**
+ * fallback 模式下回填被框架剥离的正文文本。
+ *
+ * 框架在 `presentationTextMode === "fallback"` 且 presentation 含交互块时，
+ * 会把 `payload.text` 置空后再调通道的 `renderPresentation`（见框架
+ * `renderPresentationForDelivery` 的 adaptedPayload 构造）——它期待通道渲染器
+ * 自行合成文本；Telegram 参照实现即 `currentText || fallbackText`（core
+ * `canonicalizeTelegramPresentationPayload`）。本插件此前直接透传，若该路径
+ * 被触发会发「空文本 + 裸按钮」，无按钮时更会被框架按 no_visible_payload 吞掉。
+ *
+ * 当前 9.1 的全部流程都不触发（ask_user 被 dispatch 的 deliverHandler 拦截、
+ * /status 纯数据块走框架早退分支、审批走插件原生 runtime），本函数是**防御层**：
+ * 一旦未来某条流把 fallback 模式的交互 presentation 送进通道适配器，正文不丢。
+ *
+ * 用已按 QQ 能力适配过的 presentation（钩子入参的 `payload.presentation`）
+ * 生成兜底文本——与 Telegram 用 fallbackBlocks 的口径一致。
+ */
+export function backfillQQBotPresentationFallbackText(
+  payload: Record<string, unknown>,
+  presentation: MessagePresentation,
+): Record<string, unknown> {
+  const text = payload.text;
+  if (typeof text === 'string' && text.trim()) return payload;
+  if (payload.presentationTextMode !== 'fallback') return payload;
+  const fallback = renderMessagePresentationFallbackText({ presentation });
+  return fallback ? { ...payload, text: fallback } : payload;
 }

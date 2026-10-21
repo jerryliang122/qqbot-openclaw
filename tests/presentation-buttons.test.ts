@@ -20,6 +20,7 @@
 import assert from 'node:assert';
 import {
   QQBOT_PRESENTATION_CAPABILITIES,
+  backfillQQBotPresentationFallbackText,
   countDroppedPresentationControls,
   readQQQuestionContext,
   renderQQBotKeyboard,
@@ -351,6 +352,85 @@ async function main() {
       }),
       undefined,
     );
+  });
+
+  // ── 截断的代理对安全 ──────────────────────────────────────────────
+  //
+  // 2026-10-21 审查缺陷的回归锚点：truncateUtf8 的低代理分支曾写成
+  // end -= 1（与普通分支相同，检查失效），当 URL 总字节数恰为上限 +1 且
+  // 末尾是完整 emoji（4 字节）时，会返回以孤儿高代理（编码成 U+FFFD）
+  // 结尾的截断串。修复后低代理分支 end -= 2，整对跳过。
+
+  await test('URL 超限截断恰逢代理对边界：不产生孤儿高代理', () => {
+    // 'https://x/' 10 字节 + 1011 个 'a' + 一个 😀（4 字节）= 1025 = 1024+1
+    const url = `https://x/${'a'.repeat(1011)}\u{1F600}`;
+    assert.strictEqual(Buffer.byteLength(url, 'utf8'), 1025);
+    const keyboard = renderQQBotKeyboard(
+      presentationWithButtons([{ label: '打开', action: { type: 'url', url } }]),
+    );
+    assert.ok(keyboard, '应渲染出键盘');
+    const data = keyboard!.content.rows[0]!.buttons[0]!.action.data;
+    // 期望：整对跳过，干净截到 'a' 串末尾（1021 字节）
+    assert.strictEqual(
+      data,
+      `https://x/${'a'.repeat(1011)}`,
+      `截断应整对跳过代理对，实际得到 ${JSON.stringify(data.slice(-4))}（尾部）`,
+    );
+    assert.ok(!/[\uD800-\uDFFF]/.test(data), '截断结果不应含孤立代理项');
+    assert.ok(Buffer.byteLength(data, 'utf8') <= 1024);
+  });
+
+  await test('URL 截断边界贴代理对中段：仍按对回退（多字节预算场景）', () => {
+    // 10 + 1011 + 3 个 😀（12 字节）= 1033；第 4 个 😀 放不下（会到 1037），
+    // 截断点应停在第 3 个 😀 之后（1033 > 1024 → 再退整对 → 1029 > 1024 →
+    // 再退整对 → 1025 > 1024 → 再退整对 → 1021 ✓），结果以纯 ASCII 结尾
+    const url = `https://x/${'a'.repeat(1011)}\u{1F600}\u{1F600}\u{1F600}`;
+    assert.strictEqual(Buffer.byteLength(url, 'utf8'), 1033);
+    const keyboard = renderQQBotKeyboard(
+      presentationWithButtons([{ label: '打开', action: { type: 'url', url } }]),
+    );
+    const data = keyboard!.content.rows[0]!.buttons[0]!.action.data;
+    assert.strictEqual(data, `https://x/${'a'.repeat(1011)}`);
+    assert.ok(!/[\uD800-\uDFFF]/.test(data));
+  });
+
+  // ── fallback 模式正文回填 ─────────────────────────────────────────
+  //
+  // 框架在 presentationTextMode='fallback' 且含交互块时会把 payload.text
+  // 置空后再调 renderPresentation（期待通道自行合成文本，Telegram 即如此）。
+  // 回填层保证该路径被触发时正文不丢。
+
+  await test('fallback 模式且 text 被剥离：回填 presentation 兜底文本', () => {
+    const presentation = presentationWithButtons([
+      { label: '选项A', action: { type: 'url', url: 'https://example.com/a' } },
+    ]);
+    const out = backfillQQBotPresentationFallbackText(
+      { presentationTextMode: 'fallback' },
+      presentation,
+    );
+    assert.ok(
+      typeof out.text === 'string' && (out.text as string).trim().length > 0,
+      `应回填非空兜底文本，实际 text=${JSON.stringify(out.text)}`,
+    );
+    // 兜底文本须含按钮 label（正文里能看到选项）
+    assert.ok((out.text as string).includes('选项A'));
+  });
+
+  await test('text 已存在（含 fallback 模式）：原样保留不覆盖', () => {
+    const presentation = presentationWithButtons([
+      { label: '选项A', action: { type: 'url', url: 'https://example.com/a' } },
+    ]);
+    const payload = { text: '正文在此', presentationTextMode: 'fallback' };
+    const out = backfillQQBotPresentationFallbackText(payload, presentation);
+    assert.strictEqual(out.text, '正文在此');
+  });
+
+  await test('非 fallback 模式且无 text：不回填（避免改变普通路径语义）', () => {
+    const presentation = presentationWithButtons([
+      { label: '选项A', action: { type: 'url', url: 'https://example.com/a' } },
+    ]);
+    const out = backfillQQBotPresentationFallbackText({}, presentation);
+    assert.strictEqual('text' in out, false);
   });
 
   console.log(`\n${passed} passed, ${failed} failed`);
