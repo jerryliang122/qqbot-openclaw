@@ -525,7 +525,13 @@ export async function dispatchToOpenClaw(
           dlog?.info(`[stream-final] payload received chars=${text.length}`);
           // signal 同时传入：回调入队后、执行前的中止窗口（TOCTOU）在
           // controller 内重查
-          await streamingController.absorbFinalText(text, { signal: combinedAbortSignal });
+          if (streamingController.isStreamAllMode) {
+            // stream-all：终稿走独立打字机消息（滚动道收尾 → 第二条流式会话），
+            // 终稿文本原样下发、无需差量对账（滚动道从未包含终稿内容）
+            await streamingController.handleFinalDeliver(text, { signal: combinedAbortSignal });
+          } else {
+            await streamingController.absorbFinalText(text, { signal: combinedAbortSignal });
+          }
         }
         if (streamingController.isStaticSendMode) {
           // static 模式：flush 主路径由 onToolStart 驱动（工具开始前，绕开 SDK
@@ -536,20 +542,34 @@ export async function dispatchToOpenClaw(
             await streamingController.flushSegment();
           }
           // static 模式不 finalize（finalize 会进入终态并造成后续丢失）
+        } else if (streamingController.isStreamAllMode) {
+          // stream-all：滚动道跨 tool/final 存活，终稿由 handleFinalDeliver 负责；
+          // 仅错误通知（走下方默认路径发独立消息）需要先收尾滚动道
+          if (payload.isError === true) {
+            await streamingController.finalize();
+          }
         } else if (kind !== 'block') {
           // stream 模式：tool/final 时收尾当前打字机流（原行为）
           await streamingController.finalize();
         }
         if (payload.isError === true) {
           dlog?.info(`run-failure notice bypasses streaming dedup (kind=${kind ?? 'none'} textLen=${text.length})`);
-        } else if (!streamingController.shouldFallbackToStatic) {
+        } else if (
+          !streamingController.shouldFallbackToStatic
+          && !streamingController.finalLaneNeedsStaticFallback
+        ) {
           // final 文本暂存：absorbFinalText 未能并入（终态 / stream 无会话 /
           // static 缓冲已 flush 后重算仍有增量等）的残余场景，由 dispatch
-          // 末尾 [stream-final] 段按前缀差量兜底单独补发
-          if (kind === 'final' && text) {
+          // 末尾 [stream-final] 段按前缀差量兜底单独补发。
+          // stream-all 不暂存：终稿已由终稿道全量下发，差量兜底只会重复。
+          if (kind === 'final' && text && !streamingController.isStreamAllMode) {
             pendingStreamFinalText = text;
           }
           return;
+        } else if (streamingController.finalLaneNeedsStaticFallback) {
+          // stream-all 终稿道失败且零字符落地：fall through 走默认路径把终稿
+          // 作为普通消息整段补发（滚动道内容保持可见，不重复）
+          dlog?.warn(`stream-all final lane failed clean, falling back to static final`);
         } else {
           dlog?.warn(`streaming fallback to static`);
         }
@@ -727,16 +747,49 @@ export async function dispatchToOpenClaw(
                       onToolStart: async () => { await streamingController.flushSegment(); },
                     }
                   : {}),
+                ...(streamingController?.isStreamAllMode
+                  ? {
+                      // stream-all：通道自绘工具进度（滚动打字机道）。旗标组合
+                      // 对齐框架自家 answerLane 的做法（bot-message 对流式通道
+                      // 同时设 suppressDefaultToolProgressMessages +
+                      // forceToolResultProgress）：
+                      // - forceToolResultProgress：verbose 关闭时也投递 item 事件
+                      // - suppressDefaultToolProgressMessages：抑制框架默认工具
+                      //   进度文本消息（title 已由滚动道呈现，避免双份）
+                      // 注意：这里**刻意不注册 onToolStart**——运行时会把带
+                      // suppressChannelProgress 的工具 item（command 类工具）从
+                      // onItemEvent 摘掉改走 onToolStart（其无 title），
+                      // 注册两路反而丢标题。onItemEvent 缺席时段落缓冲仍由
+                      // onAssistantMessageStart / final deliver 兜底冲刷，内容完整性不受影响。
+                      forceToolResultProgress: true,
+                      suppressDefaultToolProgressMessages: true,
+                      onItemEvent: async (item: {
+                        itemId?: string;
+                        toolCallId?: string;
+                        kind?: string;
+                        title?: string;
+                        name?: string;
+                        phase?: string;
+                        status?: string;
+                      }) => {
+                        await streamingController.onToolItem(item);
+                        return true; // ProgressCallbackResult：通道已呈现该进度
+                      },
+                    }
+                  : {}),
                 ...(streamingController
                   ? {
                       onPartialReply: async (p: { text?: string }) => {
                         if (p.text) await streamingController.onPartialReply(p.text);
                       },
                       // 兜底：block 信号未覆盖的边界（如部分 provider 不发 text_end）
-                      // 仍由 onAssistantMessageStart 触发分段。stream 模式不传，保持原行为。
+                      // 仍由 onAssistantMessageStart 触发分段。stream 模式不传，保持原行为；
+                      // stream-all 用它把「被后续段落证明是中间段」的缓冲段冲刷进滚动道。
                       onAssistantMessageStart: streamingController.isStaticSendMode
                         ? async () => { await streamingController.flushSegment(); }
-                        : undefined,
+                        : streamingController.isStreamAllMode
+                          ? async () => { await streamingController.beginSegment(); }
+                          : undefined,
                     }
                   : {}),
                 ...(progressPublisher
@@ -880,11 +933,14 @@ function createStreamingController(
     return null;
   }
 
-  // sendMode: 默认 'stream'（QQ 流式打印机），可选 'static'（普通 sendText 收尾）
+  // sendMode: 默认 'stream'（QQ 流式打印机），可选 'static'（普通 sendText 收尾）、
+  // 'stream-all'（双道：中间内容滚动打字机 + 终稿独立打字机，见 streaming-controller.ts）
   const streamingCfg = account.config?.streaming as
-    | { sendMode?: 'stream' | 'static' }
+    | { sendMode?: 'stream' | 'static' | 'stream-all' }
     | undefined;
-  const sendMode = streamingCfg?.sendMode === 'static' ? 'static' : 'stream';
+  const sendMode = streamingCfg?.sendMode === 'static' || streamingCfg?.sendMode === 'stream-all'
+    ? streamingCfg.sendMode
+    : 'stream';
 
   // static 模式：finalize 收尾时用一条普通 sendText 发完整文本。
   // 失败必须抛错——controller 的 completeSession/flushSegment 靠异常把

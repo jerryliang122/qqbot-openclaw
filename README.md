@@ -969,10 +969,27 @@ The bot can stream its reply progressively (typewriter effect) via QQ's streamin
 | Field | Default | Description |
 |-------|---------|-------------|
 | `mode` | *(unset = off)* | `"partial"` enables streaming reception; `"off"` disables |
-| `sendMode` | `"stream"` | `"stream"` — QQ streaming printer (typewriter; the delivered prefix is immutable, tail rewrites are merged into appends). `"static"` — accumulate while the model generates, then send one complete message at the end (no typewriter) |
+| `sendMode` | `"stream"` | `"stream"` — QQ streaming printer (typewriter; the delivered prefix is immutable, tail rewrites are merged into appends). `"static"` — accumulate while the model generates, then send one complete message at the end (no typewriter). `"stream-all"` — dual-lane streaming (see below) |
 
 - Streaming replies (`session.update` frames) still consume the passive-reply quota of the triggering message
 - On stream errors the controller falls back to a single static message automatically
+
+##### `sendMode: "stream-all"` — rolling progress lane + separate final message
+
+All intermediate output of a turn lands in **one rolling typewriter message**: every text segment the model produces between tool calls, plus one `🔧 <tool title>` line per tool execution (titles come from the framework's `onItemEvent` callback; a `✓` is appended when the tool finishes while its title line is still the tail). Once all tools are done, the model's **final answer is delivered as a second, separate typewriter message** (paced in ~64-char slices).
+
+How it maps onto framework callbacks:
+
+- `onItemEvent` (unlocked via `forceToolResultProgress`, so it fires even with verbose progress off) → appends tool title lines and flushes the buffered text segment into the rolling lane
+- After the first tool item, further text segments are **buffered** instead of streamed — whether a segment is the final one is only known when the framework delivers `kind: "final"`, at which point the rolling lane is closed and the final text is typed into a second stream session
+- The framework's default standalone tool-progress messages are suppressed (`suppressDefaultToolProgressMessages`) so tool progress is not rendered twice
+- A turn with no tool calls degrades to plain `stream` behavior (single live-typed message)
+
+Failure semantics: if the final lane fails before any character is accepted, the final text falls back to a single static message (the rolling lane stays visible). Config stays the same shape:
+
+```json
+{ "streaming": { "mode": "partial", "sendMode": "stream-all" } }
+```
 
 #### Progress Card (进度卡片) — checklist snapshots in chat
 

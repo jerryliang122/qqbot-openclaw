@@ -246,14 +246,20 @@ export interface QQBotAccountConfig {
    * 注意：仅 C2C（私聊）支持流式消息 API。
    *
    * sendMode 控制文本下发通道（仅 mode="partial" 时生效）：
-   *   - "stream"  QQ 流式打印机（默认）：同一条消息内容不断变长，打字机效果
-   *   - "static"  流结束时用一条普通 sendText 发送完整文本：无打字机，
-   *               partial 接收逻辑（状态机/串行/去重）保持不变，仅替换下发通道。
-   *               适合不想要打字机效果、只想收到一条完整回复的场景。
+   *   - "stream"     QQ 流式打印机（默认）：同一条消息内容不断变长，打字机效果
+   *   - "static"     流结束时用一条普通 sendText 发送完整文本：无打字机，
+   *                  partial 接收逻辑（状态机/串行/去重）保持不变，仅替换下发通道。
+   *                  适合不想要打字机效果、只想收到一条完整回复的场景。
+   *   - "stream-all"  双道流式：所有中间内容（工具调用之间的每段正文 + 工具
+   *                  执行 title）汇入**一条滚动打字机消息**；全部工具结束后，
+   *                  模型终稿以**另一条打字机消息**下发。工具 title 来自框架
+   *                  onItemEvent 回调（需 forceToolResultProgress 解锁 verbose
+   *                  关闭时的投递），框架默认工具进度文本消息会被抑制以免重复。
+   *                  依赖 onItemEvent（openclaw 2026.9.1 基线已提供）。
    */
   streaming?: {
     mode: 'partial' | 'off';
-    sendMode?: 'stream' | 'static';
+    sendMode?: 'stream' | 'static' | 'stream-all';
   };
   /**
    * Progress Card（进度卡片）配置

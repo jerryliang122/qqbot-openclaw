@@ -10,6 +10,11 @@
  *
  * onPartialReply(text) 输入：模型全量文本，持续增长。
  * finalize()           标记：框架通知回复结束，用 lastAccepted 收尾。
+ *
+ * sendMode='stream-all' 双道模式（见 runFinalDeliver）：
+ *   首段直推（同 stream）；工具出现后段落缓冲，工具 title 以 `🔧 …`
+ *   行追加进同一条滚动消息；final deliver 时滚动道收尾，终稿文本以
+ *   第二条打字机消息（分片节奏）下发。
  */
 
 import type { ReplyTarget, StreamSession } from '@tencent-connect/qqbot-nodejs';
@@ -20,7 +25,7 @@ import type { QQBotGateway } from '../gateway/qqbot-gateway.js';
 
 export type StreamingPhase = 'idle' | 'streaming' | 'done' | 'failed';
 
-export type StreamingSendMode = 'stream' | 'static';
+export type StreamingSendMode = 'stream' | 'static' | 'stream-all';
 
 /**
  * 框架 final payload 文本与「已承接段落」的匹配结果。
@@ -46,7 +51,9 @@ export interface StreamingControllerDeps {
    * 文本下发通道：
    *   - 'stream'（默认）QQ 流式打印机：openStream/update/complete
    *   - 'static'           流结束时用一条普通 sendText 发完整文本
-   * partial 接收逻辑（状态机/串行/去重）在两种模式下完全一致。
+   *   - 'stream-all'       双道流式：中间内容（每段正文 + 工具 title）汇入一条
+   *                        滚动打字机消息；终稿由另一条打字机消息下发。
+   * partial 接收逻辑（状态机/串行/去重）在各模式下保持一致。
    */
   sendMode?: StreamingSendMode;
   /**
@@ -57,6 +64,25 @@ export interface StreamingControllerDeps {
 }
 
 // ── 控制器 ──
+
+/**
+ * stream-all 终稿道打字机分片大小（字符/次 update）
+ *
+ * 终稿文本在 final deliver 时已完整在手（非边生成边推），打字机效果靠
+ * 分片 + 间隔人为制造。64 字/90ms ≈ 每秒 ~700 字的视觉节奏，5000 字满限
+ * 终稿约 8 秒推完。
+ */
+const STREAM_ALL_FINAL_CHUNK_CHARS = 64;
+
+/** stream-all 终稿道打字机分片间隔（ms） */
+const STREAM_ALL_FINAL_CHUNK_DELAY_MS = 90;
+
+/** stream-all 滚动道里的工具标题行前缀 */
+const STREAM_ALL_TOOL_LINE_PREFIX = '\n\n🔧 ';
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
 
 export class StreamingController {
   private phase: StreamingPhase = 'idle';
@@ -97,6 +123,29 @@ export class StreamingController {
   /** 同步标志：收到第一个 onPartialReply 即置 true（不等 async 完成） */
   private _hasStarted = false;
 
+  // ── stream-all 专属状态 ──
+
+  /** 是否观测到任何工具活动（item 事件）——此后新段落进入缓冲而非直推 */
+  private saToolsSeen = false;
+
+  /** 缓冲中的当前段全文（工具出现后、终稿判定前的段落；它可能是终稿段） */
+  private saBufferedSegment: string | null = null;
+
+  /** 当前活跃道：null=尚未定道（首段直推，等价 stream）/ rolling=滚动道 / final=终稿道 */
+  private saLane: 'rolling' | 'final' | null = null;
+
+  /** 已追加过标题行的 item 主键（start/update 重复事件去重） */
+  private saStartedItemKeys = new Set<string>();
+
+  /** item 别名 → 主键映射（同一 item 的事件可能带不同标识组合：itemId / toolCallId / title） */
+  private saItemAliases = new Map<string, string>();
+
+  /** 标题行仍处于滚动道末尾的 item key（此时 end 事件可补 ✓，前缀不可回改） */
+  private saTailItemKey: string | null = null;
+
+  /** 终稿道已被平台接受的字符数（0 = 终稿一个字都没落地，可静态兜底） */
+  private saFinalAcceptedChars = 0;
+
   /** 串行队列 */
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -104,6 +153,9 @@ export class StreamingController {
 
   /** 是否走静态（普通 sendText）下发通道 */
   private get isStaticMode(): boolean { return this.deps.sendMode === 'static'; }
+
+  /** 是否走 stream-all 双道（滚动道 + 终稿道）下发通道 */
+  get isStreamAllMode(): boolean { return this.deps.sendMode === 'stream-all'; }
 
   /**
    * 是否处于 static 下发模式（公开访问器，供 dispatch 协同判断）。
@@ -145,6 +197,19 @@ export class StreamingController {
     if (!this.isStaticMode && this.lastUpdateFailureAmbiguous) return true;
     if (this.isStaticMode) return true;
     return !this.hasSentChunks;
+  }
+
+  /**
+   * stream-all 专属：终稿道启动后失败、且终稿一个字符都没被平台接受
+   * （滚动道可能已有内容）——终稿文本应回落到普通 sendText 整段补发，
+   * 否则用户只见中间过程不见答案。
+   */
+  get finalLaneNeedsStaticFallback(): boolean {
+    return this.isStreamAllMode
+      && this.saLane === 'final'
+      && this.phase === 'failed'
+      && this.saFinalAcceptedChars === 0
+      && !this._deliveredExternally;
   }
 
   /**
@@ -303,70 +368,283 @@ export class StreamingController {
    */
   absorbFinalText(finalText: string, opts?: { signal?: AbortSignal }): Promise<void> {
     const signal = opts?.signal;
-    this.chain = this.chain.then(async () => {
-      if (this.isTerminal) return;
-      if (signal?.aborted) return;
-      const match = this.matchFinalText(finalText);
-      if (match.kind === 'identical') return;
-      if (match.kind === 'extension') {
-        if (this.isStaticMode) {
-          this.lastAcceptedFull = mergeSegmentBoundary(this.lastAcceptedFull, match.remainder);
-          this.lastDeliveredSegmentText = this.lastAcceptedFull;
-          this.deps.log?.info(`absorb final tail into static buffer chars=${match.remainder.length}`);
-          return;
-        }
-        // stream：前缀增长推入当前会话；无会话（异常态）时留给上层兜底
-        if (this.session) {
-          await this.sendUpdate(mergeSegmentBoundary(this.lastAcceptedFull, match.remainder));
-          this.deps.log?.info(`absorb final tail into stream chars=${match.remainder.length}`);
-        }
-        return;
-      }
-      // unrelated：final 与已承接内容毫无关系
-      // 纯空白 final 直接忽略——那是一条空消息，白烧一条被动配额（dispatch 的
-      // [stream-final] 差量兜底同样对 remainder 做 trim，两者口径一致）
-      if (finalText.trim().length === 0) return;
-      if (this.canRescueUndeliveredFinal()) {
-        // issue #44 恢复路径：本段从未流出，整段补发。账本随之推进，上层
-        // [stream-final] 差量兜底自动归零，不会重复补发。
-        const sendStatic = this.deps.sendStatic;
-        if (!sendStatic) return;
-        try {
-          await sendStatic(finalText);
-        } catch (err) {
-          this.deps.log?.error(`final rescue send failed: ${err instanceof Error ? err.message : String(err)}`);
-          this.transition('failed', 'final_rescue_send_error');
-          return;
-        }
-        this.lastDeliveredSegmentText = finalText;
-        this.sentChunkCount++;
-        this._finalRescued = true;
-        this.deps.log?.info(
-          `rescued undelivered final text chars=${finalText.length} segments=${this.sentChunkCount}`,
-        );
-        return;
-      }
-      if (this.isStaticMode) {
-        // 缓冲非空 = 本段已流出内容，final 与其无关属模型重写，维持丢弃
-        this.deps.log?.info(
-          `final text rewritten mid-turn (bufferChars=${this.lastAcceptedFull.length}), dropped finalChars=${finalText.length}`,
-        );
-        return;
-      }
-      this.deps.log?.info(
-        `stream: final text unrelated to streamed content, dropped finalChars=${finalText.length} (model rewrite)`,
-      );
-    }).catch((err) => {
+    this.chain = this.chain.then(() => this.runAbsorbFinalText(finalText, signal)).catch((err) => {
       this.deps.log?.error(`absorbFinalText error: ${err instanceof Error ? err.message : String(err)}`);
       this.transition('failed', 'absorb_error');
     });
     return this.chain as Promise<void>;
   }
 
+  // ── stream-all：滚动道/终稿道入口 ──
+
+  /**
+   * stream-all：工具 item 事件（onItemEvent）。
+   *
+   * phase=start → 先把缓冲段沉淀进滚动道（工具的出现证明它是中间段），
+   * 再追加 `🔧 <title>` 标题行；phase=end → 标题行仍是滚动道末尾时补 ` ✓`
+   * （QQ 流式前缀不可回改，只能追加；其后已有新内容则放弃标记）。
+   * 只认工具类 item（toolCallId / kind ∈ tool|command|patch），preamble、
+   * status 等不进滚动道。
+   */
+  onToolItem(payload: {
+    itemId?: string;
+    toolCallId?: string;
+    kind?: string;
+    title?: string;
+    name?: string;
+    phase?: string;
+    status?: string;
+  }): Promise<void> {
+    this.chain = this.chain.then(() => this.runToolItem(payload)).catch((err) => {
+      this.deps.log?.error(`onToolItem error: ${err instanceof Error ? err.message : String(err)}`);
+      this.transition('failed', 'tool_item_error');
+    });
+    return this.chain as Promise<void>;
+  }
+
+  /**
+   * stream-all：新 assistant 段开始（onAssistantMessageStart）。
+   * 缓冲段非空即被证明是中间段（它后面还有新段）→ 沉淀进滚动道。
+   */
+  beginSegment(): Promise<void> {
+    this.chain = this.chain.then(async () => {
+      if (!this.isStreamAllMode || this.isTerminal || this.saLane === 'final') return;
+      if (this.saToolsSeen) await this.flushBufferedSegment();
+    }).catch((err) => {
+      this.deps.log?.error(`beginSegment error: ${err instanceof Error ? err.message : String(err)}`);
+      this.transition('failed', 'segment_error');
+    });
+    return this.chain as Promise<void>;
+  }
+
+  /**
+   * stream-all：框架 final deliver（终稿文本权威到达）。
+   *
+   * - 无工具出现：整 turn 一段，滚动道即终稿——并入 footer 尾巴后收尾
+   *   （与 stream 模式行为一致）。
+   * - 有工具：终稿段从未进滚动道（一直在缓冲里）→ 收尾滚动道，开第二条
+   *   流式会话，把终稿文本按打字机节奏分片推完再收尾。终稿文本原样下发
+   *   （含 usage footer），无需差量对账——滚动道里从来没有终稿内容。
+   */
+  handleFinalDeliver(text: string, opts?: { signal?: AbortSignal }): Promise<void> {
+    const signal = opts?.signal;
+    this.chain = this.chain.then(() => this.runFinalDeliver(text, signal)).catch((err) => {
+      this.deps.log?.error(`handleFinalDeliver error: ${err instanceof Error ? err.message : String(err)}`);
+      this.transition('failed', 'final_deliver_error');
+    });
+    return this.chain as Promise<void>;
+  }
+  /**
+   * absorbFinalText 的核心实现。供 chain 包装器与 stream-all 的终稿路径
+   * （runFinalDeliver）直接调用——**不得**在 chain 任务内再走 chain 包装
+   * （嵌套 this.chain 赋值会互相等待，死锁）。
+   */
+  private async runAbsorbFinalText(finalText: string, signal?: AbortSignal): Promise<void> {
+    if (this.isTerminal) return;
+    if (signal?.aborted) return;
+    const match = this.matchFinalText(finalText);
+    if (match.kind === 'identical') return;
+    if (match.kind === 'extension') {
+      if (this.isStaticMode) {
+        this.lastAcceptedFull = mergeSegmentBoundary(this.lastAcceptedFull, match.remainder);
+        this.lastDeliveredSegmentText = this.lastAcceptedFull;
+        this.deps.log?.info(`absorb final tail into static buffer chars=${match.remainder.length}`);
+        return;
+      }
+      // stream：前缀增长推入当前会话；无会话（异常态）时留给上层兜底
+      if (this.session) {
+        await this.sendUpdate(mergeSegmentBoundary(this.lastAcceptedFull, match.remainder));
+        this.deps.log?.info(`absorb final tail into stream chars=${match.remainder.length}`);
+      }
+      return;
+    }
+    // unrelated：final 与已承接内容毫无关系
+    // 纯空白 final 直接忽略——那是一条空消息，白烧一条被动配额（dispatch 的
+    // [stream-final] 差量兜底同样对 remainder 做 trim，两者口径一致）
+    if (finalText.trim().length === 0) return;
+    if (this.canRescueUndeliveredFinal()) {
+      // issue #44 恢复路径：本段从未流出，整段补发。账本随之推进，上层
+      // [stream-final] 差量兜底自动归零，不会重复补发。
+      const sendStatic = this.deps.sendStatic;
+      if (!sendStatic) return;
+      try {
+        await sendStatic(finalText);
+      } catch (err) {
+        this.deps.log?.error(`final rescue send failed: ${err instanceof Error ? err.message : String(err)}`);
+        this.transition('failed', 'final_rescue_send_error');
+        return;
+      }
+      this.lastDeliveredSegmentText = finalText;
+      this.sentChunkCount++;
+      this._finalRescued = true;
+      this.deps.log?.info(
+        `rescued undelivered final text chars=${finalText.length} segments=${this.sentChunkCount}`,
+      );
+      return;
+    }
+    if (this.isStaticMode) {
+      // 缓冲非空 = 本段已流出内容，final 与其无关属模型重写，维持丢弃
+      this.deps.log?.info(
+        `final text rewritten mid-turn (bufferChars=${this.lastAcceptedFull.length}), dropped finalChars=${finalText.length}`,
+      );
+      return;
+    }
+    this.deps.log?.info(
+      `stream: final text unrelated to streamed content, dropped finalChars=${finalText.length} (model rewrite)`,
+    );
+  }
+
+  /**
+   * stream-all：onToolItem 的核心实现（滚动道追加标题行 / 补 ✓）。
+   */
+  private async runToolItem(payload: {
+    itemId?: string;
+    toolCallId?: string;
+    kind?: string;
+    title?: string;
+    name?: string;
+    phase?: string;
+    status?: string;
+  }): Promise<void> {
+    if (!this.isStreamAllMode || this.isTerminal || this.saLane === 'final') return;
+    // 只认工具类 item（preamble/status 等不进滚动道）
+    const isToolish = !!payload.toolCallId
+      || payload.kind === 'tool'
+      || payload.kind === 'command'
+      || payload.kind === 'patch';
+    if (!isToolish) return;
+
+    // 主键优先 itemId，退化 toolCallId / title；别名全量登记，
+    // 同一 item 后续事件（可能只带 toolCallId）也能解析回主键
+    const aliases = [payload.itemId, payload.toolCallId, payload.title, payload.name]
+      .map((v) => (typeof v === 'string' ? v.trim() : ''))
+      .filter((v) => v.length > 0);
+    const primary = this.resolveItemPrimary(aliases);
+    if (!primary) return;
+    this.saToolsSeen = true;
+
+    if (payload.phase === 'end' || payload.phase === 'completed') {
+      // 前缀不可回改：仅当该标题行仍是滚动道末尾（其后无新内容）时可补 ✓
+      if (this.saTailItemKey === primary) {
+        await this.appendRolling(' ✓');
+        this.saTailItemKey = null;
+      }
+      return;
+    }
+
+    // start / update：同 key 只追加一次标题行（update 事件可能反复触发）
+    if (this.saStartedItemKeys.has(primary)) return;
+    this.saStartedItemKeys.add(primary);
+    for (const alias of aliases) this.saItemAliases.set(alias, primary);
+
+    // 先把缓冲段沉淀进滚动道（工具出现证明它是中间段），再挂标题行
+    // （时间序：模型正文在前，工具调用在后）
+    await this.flushBufferedSegment();
+    const label = (payload.title || payload.name || 'tool').trim() || 'tool';
+    await this.appendRolling(`${STREAM_ALL_TOOL_LINE_PREFIX}${label}`);
+    this.saTailItemKey = primary;
+  }
+
+  /** 从别名列表解析 item 主键：命中已登记的别名取其主键，否则取首个别名 */
+  private resolveItemPrimary(aliases: string[]): string | null {
+    for (const alias of aliases) {
+      const mapped = this.saItemAliases.get(alias);
+      if (mapped) return mapped;
+    }
+    return aliases[0] ?? null;
+  }
+
+  /**
+   * stream-all：handleFinalDeliver 的核心实现（滚动道收尾 + 终稿道打字机）。
+   */
+  private async runFinalDeliver(finalText: string, signal?: AbortSignal): Promise<void> {
+    if (this.isTerminal) return;
+    if (signal?.aborted) return;
+
+    // 无工具：滚动道即终稿，行为对齐 stream 模式（并入 footer 尾巴后收尾）
+    if (!this.saToolsSeen) {
+      await this.runAbsorbFinalText(finalText, signal);
+      await this.handleFinalize();
+      return;
+    }
+
+    // 有工具：终稿段从未进滚动道（一直在缓冲里）→ 滚动道收尾、终稿走第二条消息
+    this.saLane = 'final';
+    this.saBufferedSegment = null;
+    this.saTailItemKey = null;
+    await this.completeSession('rolling_done');
+    // 对齐 new_reply 路径：收尾后清空账本，终稿道从零起账
+    this.lastAcceptedFull = '';
+
+    const text = finalText.trim();
+    if (!text) {
+      this.transition('done', 'finalize:empty_final');
+      return;
+    }
+
+    // 终稿道打字机：分片 + 间隔推完（首片 lazy-open 第二条流式会话）。
+    // sendUpdate 吞错内部转 failed——每片后查终态，失败即中断，
+    // 不得继续记账（saFinalAcceptedChars 只统计平台已接受的字符）。
+    const total = text.length;
+    let acc = '';
+    for (let off = 0; off < total; off += STREAM_ALL_FINAL_CHUNK_CHARS) {
+      if (this.isTerminal || signal?.aborted) return; // abort() 已收尾当前会话
+      acc += text.slice(off, off + STREAM_ALL_FINAL_CHUNK_CHARS);
+      await this.sendUpdate(acc);
+      if (this.isTerminal) return;
+      this.saFinalAcceptedChars = acc.length;
+      if (off + STREAM_ALL_FINAL_CHUNK_CHARS < total) {
+        await delay(STREAM_ALL_FINAL_CHUNK_DELAY_MS);
+      }
+    }
+
+    await this.completeSession('final_done');
+    if (this.isTerminal) return;
+    this.transition('done', 'finalize');
+    this.deps.log?.info(
+      `stream-all done rolling→final chars=${total} finalChunks=${Math.ceil(total / STREAM_ALL_FINAL_CHUNK_CHARS)}`,
+    );
+  }
+
+  /**
+   * stream-all：向滚动道追加内容（替换式 update 全量推送，QQ 流式的
+   * 「前缀不可回改」约束下等价于尾部追加）。
+   */
+  private async appendRolling(next: string): Promise<void> {
+    if (!next) return;
+    await this.sendUpdate(this.lastAcceptedFull + next);
+  }
+
+  /**
+   * stream-all：把缓冲段沉淀进滚动道。空段跳过；非空段以空行分隔接在
+   * 滚动道末尾，并清除 ✓ 标记资格（标题行后已有新内容）。
+   */
+  private async flushBufferedSegment(): Promise<void> {
+    const seg = this.saBufferedSegment;
+    this.saBufferedSegment = null;
+    const trimmed = seg?.trim();
+    if (!trimmed) return;
+    const sep = this.lastAcceptedFull ? '\n\n' : '';
+    await this.appendRolling(`${sep}${trimmed}`);
+    this.saTailItemKey = null;
+  }
+
   // ── 核心逻辑 ──
 
   private async handleChunk(text: string): Promise<void> {
     if (this.isTerminal || !text) return;
+
+    // stream-all：终稿道启动后的残余 partial 一律忽略（final deliver 已定稿）
+    if (this.isStreamAllMode && this.saLane === 'final') return;
+
+    // stream-all：工具出现后的段落只缓冲不直推——该段是否终稿段要等
+    // final deliver 才知道（终稿走独立消息，不能先流进滚动道）。
+    // 首段（工具未出现）保持直推：若整 turn 无工具，滚动道即终稿，
+    // 行为与 stream 模式完全一致。
+    if (this.isStreamAllMode && this.saToolsSeen) {
+      this.saBufferedSegment = text;
+      return;
+    }
 
     // 正常续写：新文本前缀匹配（含空白归一化）
     if (prefixMatches(this.lastAcceptedFull, text)) {
