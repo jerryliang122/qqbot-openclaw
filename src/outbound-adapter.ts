@@ -18,14 +18,21 @@
 import { checkAndConsumePassiveReplyQuota, checkPassiveReplyQuota, inferQQBotScope } from './features/quota-manager.js';
 import { peekMsgIdReceivedAt } from './features/msgid-cache.js';
 import type { PluginLogger } from './utils/plugin-logger.js';
-import type { ResolvedQQBotAccount } from './types.js';
+import type { InlineKeyboard, ResolvedQQBotAccount } from './types.js';
 import type { SendMediaParams, SendMediaResult } from './outbound/media-send.js';
 import type { SendResult } from './outbound/outbound-service.js';
 import type { OpenClawConfig } from 'openclaw/plugin-sdk';
+import type { MessagePresentation } from 'openclaw/plugin-sdk/interactive-runtime';
 import { resolveQQBotAccount } from './config.js';
 import { parseTarget } from './outbound/target.js';
 import { sanitizeQQBotText } from './outbound/sanitize.js';
 import { chunkQQBotMarkdown } from './outbound/chunker.js';
+import {
+  QQBOT_PRESENTATION_CAPABILITIES,
+  countDroppedPresentationControls,
+  readQQQuestionContext,
+  renderQQBotKeyboard,
+} from './outbound/presentation-buttons.js';
 import { isApprovalPayload } from './features/approval-utils.js';
 import { TEXT_CHUNK_LIMIT } from './constants.js';
 import { tryGetQQBotRuntime } from './runtime.js';
@@ -45,6 +52,8 @@ export type SendTextFn = (params: {
   msgSeq?: number;
   account: ResolvedQQBotAccount;
   quotaReserved?: boolean;
+  /** QQ 原生按钮（keyboard），见 `src/outbound/presentation-buttons.ts` */
+  keyboard?: InlineKeyboard;
 }) => Promise<SendResult>;
 
 export type SendMediaFn = (params: SendMediaParams) => Promise<SendMediaResult>;
@@ -71,6 +80,8 @@ export interface QQBotOutboundAdapter {
     replyToId?: string;
     account: ResolvedQQBotAccount;
     log?: PluginLogger;
+    /** QQ 原生按钮（keyboard），见 `src/outbound/presentation-buttons.ts` */
+    keyboard?: InlineKeyboard;
   }) => Promise<{ messageId?: string; error?: string }>;
   sendMediaWithQuota: (params: {
     to: string;
@@ -126,7 +137,7 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
   } = params;
 
   return {
-    sendTextWithQuota: async ({ to, text, accountId, replyToId, account, log }) => {
+    sendTextWithQuota: async ({ to, text, accountId, replyToId, account, log, keyboard }) => {
       const scope = inferQQBotScope(to);
       const resolvedAccountId = accountId || account.accountId;
 
@@ -149,6 +160,7 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
         msgSeq: canReply ? seq : undefined,
         account,
         quotaReserved: canReply,
+        ...(keyboard ? { keyboard } : {}),
       });
 
       // 发送失败时回滚配额
@@ -237,6 +249,14 @@ export interface ChannelOutboundSendContext {
   cfg: OpenClawConfig;
 }
 
+/** 框架 payload 上下文（带完整 ReplyPayload —— 承载 channelData 里的按钮） */
+export interface ChannelOutboundPayloadContext extends ChannelOutboundSendContext {
+  payload: {
+    text?: string;
+    channelData?: Record<string, unknown>;
+  };
+}
+
 export interface ChannelOutboundDeliveryResult {
   channel: 'qqbot';
   messageId: string;
@@ -263,6 +283,31 @@ function resolveMCPAgentId(
     log?.debug?.(`resolveMCPAgentId to=${to} => agentId=${route?.agentId ?? 'none'}`);
     return route?.agentId;
   } catch { return undefined; }
+}
+
+/**
+ * 从 payload 的 channelData 里读回 QQ 原生按钮。
+ *
+ * 与 Telegram 的 `channelData.telegram.buttons` 同构：渲染层
+ * （`renderPresentation`）把按钮写进 `channelData.qqbot.keyboard`，
+ * 发送层（本函数的使用方）再取出来下发。
+ *
+ * 形状校验：必须是 `{ content: { rows: [...] } }`，否则视为无按钮
+ * （宁可降级为纯文本，也不把畸形结构发给平台）。
+ */
+function readQQBotKeyboardFromChannelData(
+  channelData: Record<string, unknown> | undefined,
+): InlineKeyboard | undefined {
+  if (!channelData) return undefined;
+  const qqbot = channelData.qqbot;
+  if (!qqbot || typeof qqbot !== 'object') return undefined;
+  const keyboard = (qqbot as Record<string, unknown>).keyboard;
+  if (!keyboard || typeof keyboard !== 'object') return undefined;
+  const content = (keyboard as Record<string, unknown>).content;
+  if (!content || typeof content !== 'object') return undefined;
+  const rows = (content as Record<string, unknown>).rows;
+  if (!Array.isArray(rows) || rows.length === 0) return undefined;
+  return keyboard as InlineKeyboard;
 }
 
 /**
@@ -302,23 +347,29 @@ function peekReceivedAtFor(scope: 'c2c' | 'group', to: string, msgId?: string | 
 export function createQQBotChannelOutbound(params: QQBotOutboundAdapterParams = {}) {
   const quotaAdapter = createQQBotOutboundAdapter(params);
 
+  /** 纯文本发送（sendText 与 sendPayload 无键盘分支共用） */
+  const sendPlainText = async (
+    ctx: ChannelOutboundSendContext,
+  ): Promise<ChannelOutboundDeliveryResult> => {
+    const account = resolveQQBotAccount(ctx.cfg, ctx.accountId ?? undefined);
+    const result = await quotaAdapter.sendTextWithQuota({
+      to: ctx.to,
+      text: ctx.text ?? '',
+      accountId: ctx.accountId ?? undefined,
+      replyToId: resolveExplicitReplyToId(ctx.replyToId),
+      account,
+      log: alog,
+    });
+    if (result.error) throw new Error(result.error);
+    return { channel: 'qqbot', messageId: result.messageId ?? '' };
+  };
+
   return {
     ...quotaAdapter,
     deliveryMode: 'direct' as const,
 
-    sendText: async (ctx: ChannelOutboundSendContext): Promise<ChannelOutboundDeliveryResult> => {
-      const account = resolveQQBotAccount(ctx.cfg, ctx.accountId ?? undefined);
-      const result = await quotaAdapter.sendTextWithQuota({
-        to: ctx.to,
-        text: ctx.text ?? '',
-        accountId: ctx.accountId ?? undefined,
-        replyToId: resolveExplicitReplyToId(ctx.replyToId),
-        account,
-        log: alog,
-      });
-      if (result.error) throw new Error(result.error);
-      return { channel: 'qqbot', messageId: result.messageId ?? '' };
-    },
+    sendText: async (ctx: ChannelOutboundSendContext): Promise<ChannelOutboundDeliveryResult> =>
+      sendPlainText(ctx),
 
     sendMedia: async (ctx: ChannelOutboundSendContext): Promise<ChannelOutboundDeliveryResult> => {
       const account = resolveQQBotAccount(ctx.cfg, ctx.accountId ?? undefined);
@@ -337,11 +388,107 @@ export function createQQBotChannelOutbound(params: QQBotOutboundAdapterParams = 
       return { channel: 'qqbot', messageId: result.messageId ?? '' };
     },
 
+    /**
+     * 带原生按钮的 payload 发送。
+     *
+     * 框架在 payload 含 `channelData` 时走本路径（见框架
+     * `payloadRequiresDurablePayloadTransport` → `hasReplyPayloadContent`
+     * 对 `channelData` 的判定），因此 QQ 原生按钮由这里下发。
+     *
+     * 无 keyboard 的 payload 退化为普通文本发送（等价于 `sendText`），
+     * 保证该路径对普通消息完全透明。
+     */
+    sendPayload: async (ctx: ChannelOutboundPayloadContext): Promise<ChannelOutboundDeliveryResult> => {
+      const payload = ctx.payload;
+      const keyboard = readQQBotKeyboardFromChannelData(payload.channelData);
+      const text = payload.text ?? ctx.text ?? '';
+
+      // 无按钮 → 走普通文本路径（不引入行为差异）
+      if (!keyboard) {
+        return sendPlainText(ctx);
+      }
+
+      const account = resolveQQBotAccount(ctx.cfg, ctx.accountId ?? undefined);
+      const resolvedAccountId = ctx.accountId ?? account.accountId;
+      const result = await quotaAdapter.sendTextWithQuota({
+        to: ctx.to,
+        text,
+        accountId: resolvedAccountId,
+        replyToId: resolveExplicitReplyToId(ctx.replyToId),
+        account,
+        keyboard,
+        log: alog,
+      });
+      if (result.error) throw new Error(result.error);
+      return { channel: 'qqbot', messageId: result.messageId ?? '' };
+    },
+
     sanitizeText: ({ text }: { text: string }) => sanitizeQQBotText(text),
     chunker: (text: string, limit: number) => chunkQQBotMarkdown(text, limit),
     chunkerMode: 'markdown' as const,
     textChunkLimit: TEXT_CHUNK_LIMIT,
     shouldSuppressLocalPayloadPrompt: ({ payload }: { payload: unknown }) => isApprovalPayload(payload),
+
+    // ── presentation → QQ 原生按钮 ──────────────────────────────────
+    // 框架在 deliver-prepare 装配这两个钩子（契约见 openclaw 的
+    // `ChannelOutboundAdapter.presentationCapabilities` /
+    // `.renderPresentation`）。缺失时框架会把模型的按钮块降级成
+    // **纯文本列表**——这就是此前「声明了 inlineButtons 却落地不了」
+    // 的根因。提供后模型生成的按钮在 QQ 客户端真实可点。
+    presentationCapabilities: QQBOT_PRESENTATION_CAPABILITIES,
+
+    /**
+     * 把框架的 presentation 渲染为 QQ 原生 keyboard。
+     *
+     * 产物挂在 `payload.channelData.qqbot.keyboard`（与 Telegram 的
+     * `channelData.telegram.buttons` 同构），由出站层取出发给平台。
+     *
+     * 失败语义：**绝不抛错**。任何映射异常都降级为「保留文本、丢弃按钮」，
+     * 因为 QQ 消息一旦因异常丢失不可恢复。
+     */
+    renderPresentation: ({ payload, presentation }: {
+      payload: Record<string, unknown>;
+      presentation: MessagePresentation;
+    }) => {
+      try {
+        const channelData = payload.channelData as Record<string, unknown> | undefined;
+        // ask_user 上下文：把框架 question action 的 optionValue 映射回
+        // QQ 回调所需的选项索引（无此上下文时 question 按钮被丢弃）。
+        const questionContext = readQQQuestionContext(channelData);
+        const keyboard = renderQQBotKeyboard(presentation, questionContext);
+        if (!keyboard) {
+          // 没有可落地的按钮 → 丢弃 presentation，保留正文。
+          const { presentation: _p, ...rest } = payload;
+          return rest as typeof payload;
+        }
+        const dropped = countDroppedPresentationControls(presentation, questionContext);
+        if (dropped.dropped > 0) {
+          alog.debug?.(
+            `[qqbot] presentation: ${dropped.dropped} control(s) not renderable on QQ ` +
+            `(${JSON.stringify(dropped.reasons)})`,
+          );
+        }
+        const { presentation: _p, ...rest } = payload;
+        return {
+          ...rest,
+          channelData: {
+            ...channelData,
+            qqbot: {
+              ...(channelData?.qqbot as Record<string, unknown> | undefined),
+              keyboard,
+            },
+          },
+        } as typeof payload;
+      } catch (err) {
+        alog.warn?.(
+          `[qqbot] renderPresentation failed, degrading to plain text: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        const { presentation: _p, ...rest } = payload;
+        return rest as typeof payload;
+      }
+    },
   };
 }
 

@@ -32,10 +32,29 @@ export function createQQBotPluginBase(params: QQBotPluginBaseParams = {}) {
       threads: false,
       // 平台无投票
       polls: false,
-      // 平台不支持撤回/编辑 bot 自身消息（message adapter 亦声明 finalEdit: false）
+      // 撤回：**平台支持但本插件未实现**。
+      //
+      // QQ 开放平台有 `DELETE /v2/users/{openid}/messages/{msg_id}`
+      // （限 2 分钟内、仅限机器人自己发的消息），SDK 也已封装
+      // `bot.recallMessage()`。但本插件**没有实现** message 工具的
+      // `unsend` 动作处理器（全仓无该 action 的执行路径），因此此处
+      // 如实声明为 false——框架据此不会把 `unsend` 动作开放给模型。
+      //
+      // 语义澄清：该字段表达的是「本插件已实现该动作」，而非「平台是否
+      // 支持」。若将来接上 `recallMessage` + message action 处理器，
+      // 应连同实现一起改为 true。
+      //
+      // `edit` 则是**平台真的不支持**（QQ 无编辑消息接口，只有撤回），
+      // 两者原因不同，勿混为一谈。
       unsend: false,
       edit: false,
-      // 支持引用回复（被动回复 msg_id 锚点 + quote 渲染）
+      // 引用回复：支持。
+      //
+      // 实际表现分两条路径：被动回复用 `msg_id` 锚定（客户端显示为
+      // 「回复」）；SDK 在**非 markdown 模式**（`msg_type=0` 纯文本）下
+      // 额外下发 `message_reference` 字段，客户端渲染为带引用原文的
+      // 引用块。markdown 模式（`msg_type=2`，插件默认）下不下发该字段，
+      // 只有锚定回复。框架的 `reply` 语义是「能回复」，故为 true。
       reply: true,
       // 平台无消息特效
       effects: false,

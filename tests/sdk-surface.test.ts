@@ -113,9 +113,19 @@ const SPECIFIER = /['"](openclaw\/plugin-sdk\/[a-z0-9-]+)['"]/g;
  * 静态具名导入的**值**导出名（用于名级断言）。
  * 只认两种形态：静态 import 与 re-export，两者都是非 type 才算数——
  * 动态 import() 与字面量 require() 没有可静态提取的名字，只做子路径级断言。
+ *
+ * ⚠️ `{...}` 的匹配体**必须排除 `}`**（原为 `[\s\S]*?`）。惰性匹配 +
+ * 允许跨越 `}` 会让正则从一个 `import {` 一直吃到后面某个
+ * `} from 'openclaw/plugin-sdk/…'`，把中间**其它 import 语句的具名子句
+ * 误记到本子路径名下**——实测触发过：`src/outbound-adapter.ts` 里
+ * `import { checkAndConsumePassiveReplyQuota, … } from './features/quota-manager.js'`
+ * 的三个名字被算到了 `openclaw/plugin-sdk/interactive-runtime` 头上，
+ * 守卫误报「子路径缺少运行时值」，把人引去查一个并不存在的 SDK 缺陷。
+ *
+ * 改为 `[^}]*` 后，匹配体不会越过本条 import 语句自己的闭合花括号。
  */
 const NAMED_IMPORT_STMT =
-  /(?:^|\n)\s*(?:import|export)\s+(type\s+)?\{([\s\S]*?)\}\s*from\s*['"](openclaw\/plugin-sdk\/[a-z0-9-]+)['"]/g;
+  /(?:^|\n)\s*(?:import|export)\s+(type\s+)?\{([^}]*)\}\s*from\s*['"](openclaw\/plugin-sdk\/[a-z0-9-]+)['"]/g;
 
 const scannedFiles = [...collectSourceFiles(join(ROOT, 'src')), join(ROOT, 'index.ts')];
 
@@ -524,6 +534,57 @@ await test('已安装版本满足 peer 范围', () => {
   const min = minVersion.split('.').map(Number);
   const ok = cmp[0] > min[0] || (cmp[0] === min[0] && (cmp[1] > min[1] || (cmp[1] === min[1] && cmp[2] >= min[2])));
   assert.ok(ok, `已安装 openclaw@${openclawPkg.version} 低于 peer 最低版本 ${minVersion}`);
+});
+
+// ── 5. 通道能力声明与落地实现的一致性 ──
+
+group('能力声明与实现一致性');
+
+await test('声明 inlineButtons 则必须存在落地实现（renderPresentation）', async () => {
+  const { qqbotAgentPromptAdapter } = await import('../src/agent-prompt-adapter.js');
+  const { qqbotMessageAdapter } = await import('../src/message-adapter.js');
+  const caps = qqbotAgentPromptAdapter.messageToolCapabilities({
+    cfg: undefined,
+    accountId: null,
+  }) as string[];
+  const outbound = qqbotMessageAdapter.outbound as unknown as Record<string, unknown>;
+  if (caps.includes('inlineButtons')) {
+    assert.equal(
+      typeof outbound.renderPresentation,
+      'function',
+      '声明了 inlineButtons 就必须有 renderPresentation 实现——否则框架会把模型生成的' +
+        '按钮块降级成纯文本列表（用户看到「- 选项A」而不是可点的按钮），' +
+        '形成「声明了但落地不了」的错配。',
+    );
+    assert.equal(
+      typeof outbound.sendPayload,
+      'function',
+      '声明了 inlineButtons 就必须有 sendPayload——按钮经 payload.channelData 传到' +
+        '发送层，缺它按钮到不了平台。',
+    );
+    const presentationCaps = outbound.presentationCapabilities as { buttons?: boolean } | undefined;
+    assert.equal(
+      presentationCaps?.buttons,
+      true,
+      'presentationCapabilities.buttons 应为 true（QQ 支持原生 keyboard）。',
+    );
+  }
+});
+
+await test('openclaw/plugin-sdk/interactive-runtime 提供按钮渲染所需原语', () => {
+  // 这两个原语是 QQ 按钮落地的直接依赖：前者按通道能力适配 presentation
+  // （把平台不支持的块降级为文本），后者生成纯文本兜底。
+  const mod = require('openclaw/plugin-sdk/interactive-runtime') as Record<string, unknown>;
+  assert.equal(
+    typeof mod.adaptMessagePresentationForChannel,
+    'function',
+    '缺少 adaptMessagePresentationForChannel：无法按 QQ 能力裁剪 presentation。',
+  );
+  assert.equal(
+    typeof mod.renderMessagePresentationFallbackText,
+    'function',
+    '缺少 renderMessagePresentationFallbackText：按钮被丢弃时无文本兜底。',
+  );
 });
 
 // ── 汇总 ──

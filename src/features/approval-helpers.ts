@@ -19,6 +19,7 @@ import type {
 import { resolveExecApprovalCommandDisplay } from "openclaw/plugin-sdk/approval-runtime";
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { InlineKeyboard, KeyboardButton } from "../types.js";
+import { KEYBOARD_PERMISSION_EVERYONE } from "../types.js";
 
 // ============ Types ============
 
@@ -190,7 +191,7 @@ export function buildApprovalKeyboard(
     action: {
       type: 1,
       data,
-      permission: { type: 2 },
+      permission: { type: KEYBOARD_PERMISSION_EVERYONE },
       click_limit: 1,
     },
     group_id: "approval",
