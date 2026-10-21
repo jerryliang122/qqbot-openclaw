@@ -253,6 +253,8 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 回答「这个群为什么没上下文」这类排障问题：推送模式由**群主**拉 bot 进群时选择（仅 @ / @+最近N / 全量），此指令展示插件实际观测到的模式与所有生效配置值。
 
+同时展示**裁决后**的未 @ 消息入站策略——来自哪一层（群级 / 按 agent / 全局）、以及是否因 `message` 工具不可用被自动降级。「我开了 room_event 但群里一直没反应」时先看这里。
+
 ---
 
 ---
@@ -542,7 +544,9 @@ openclaw message send --channel "qqbot" \
 | `prompt` | `string` | 内置默认提示词 | 该群专属的系统提示词，会追加到全局 systemPrompt 之后 |
 | `historyLimit` | `number` | `20` | 群历史消息缓存条数（0 禁用） |
 | `historyMode` | `"clear" \| "rolling"` | `"clear"` | `clear`：每次回复后清空历史（旧行为）。`rolling`：bot 自己的发言也计入历史，回复后裁剪到 bot 最后一条发言之后（AI 能看到自己上次说到哪） |
-| `unmentionedInbound` | `"user_request" \| "room_event"` | `"user_request"` | `room_event`：像普通群成员一样读到所有消息，未 @ 的作为被动房间事件（详见下文；需群主开启全量推送模式） |
+| `unmentionedInbound` | `"user_request" \| "room_event"` | `"user_request"` | `room_event`：像普通群成员一样读到所有消息，未 @ 的作为被动房间事件（详见下文；需群主开启全量推送模式）。也可在 `agents.entries.<id>.groupChat.unmentionedInbound`（按 agent）或 `messages.groupChat.unmentionedInbound`（全局）声明 |
+| `roomEventRequireMessageTool` | `boolean` | `true` | room_event 下是否强制要求 `message` 工具可用。`true`（默认）：工具确定不可用时该群**自动降级为 `user_request`**（恢复正常回复权）并打一条 WARN；`false`：不降级，保持严格静默语义（由用户自行保证工具面） |
+| `tools` | `object` | — | 群级工具白名单（`allow` / `alsoAllow` / `deny`），显式声明时原样透传给框架，优先级高于 `toolPolicy`。⚠️ room_event 群若在此排除 `message`，该群将失去唯一发声通道（插件会自动降级并告警） |
 | `coalesce` | `object` | `{enabled: true}` | 群消息排队配置，完全交给框架队列（`enabled=true`→collect 合并批处理；`false`→followup 排队不合并） |
 
 #### 房间事件模式（全量模式群，可选）
@@ -555,20 +559,64 @@ openclaw message send --channel "qqbot" \
 }
 ```
 
+该开关的回落链与其他通道一致（群级最具体，框架级兜底）：
+
+```
+channels.qqbot.groups.<id>.unmentionedInbound          （群级，最高）
+  > agents.entries.<id>.groupChat.unmentionedInbound    （按 agent）
+    > messages.groupChat.unmentionedInbound             （全局）
+      > "user_request"                                   （默认）
+```
+
 开启后的行为：
 
 - **被 @ / 被称呼 / 引用 bot 消息** → 正常回复（完整回复权）
 - **其余所有消息** → 被动房间事件：AI 只读上下文，最终文本**不投递**（结构性沉默），想发言必须主动调用 `message` 工具
 - 房间事件绝不打断正在处理的任务，只排队
+- 房间事件若以错误告终，**不会**往群里发失败提示（保持安静，错误只落日志）；同群里被 @ 的那条仍按正常 turn 走失败提示
 - ⚠️ 成本提示：每条消息跑一次推理（「读」消息），活跃群请按群显式开启
+
+**`message` 工具是唯一的声音出口，且插件会替你把关**：房间事件的最终文本永远不投递，能说话的唯一通道是 `message` 工具。若该群的有效工具面里没有 `message`，群里就会**永久沉默**——这正是 2026-10-06 线上事故的形态（空允许清单把工具集清空）。
+
+因此插件在进入房间事件模式前会检查有效工具面，**确定不可用时自动把该群降级回 `user_request`**（恢复正常回复权），每群只告警一次：
+
+```
+[room-event] group=GROUP_X 降级为 user_request：群工具白名单不含 message 工具。…
+```
+
+判定刻意保守，只在**确定**缺失时降级：
+
+| 工具面 | 判定 |
+|---|---|
+| `groups.<id>.tools.allow`（非空）不含 `message`（且 `alsoAllow` 也不含） | 不可用 → 降级 |
+| `groups.<id>.tools.deny` 命中 `message`（精确或通配，如 `mess*`） | 不可用 → 降级 |
+| agent / 全局显式 `allow` 白名单不含 `message` | 不可用 → 降级 |
+| agent / 全局显式 `deny` 含 `message` 或 `*` | 不可用 → 降级 |
+| `allow` 缺失/为空 + `alsoAllow` 非空 | **不限制**（框架会把它合成隐式全放行） |
+| agent `tools.profile`（含 `minimal` / `coding`） | **不算阻塞**——框架在房间事件 turn 会强制授予 `message` |
+| 其余情况（含未知 profile） | 视为可用 |
+
+想主动保持严格静默语义，关掉降级即可：
+
+```json
+{ "groups": { "GROUP_OPENID": { "unmentionedInbound": "room_event", "roomEventRequireMessageTool": false } } }
+```
+
+**可见回复模式**：`messages.groupChat.visibleReplies` 决定群 turn 的最终文本是否自动投递（`"automatic"`，默认）或只走 `message` 工具（`"message_tool"`）。房间事件恒为 `"message_tool"`——即上面的结构性沉默；同一群里被 @ 的那条仍自动投递。
+
+`messages.groupChat.*` **只作用于群/频道会话**；私聊读的是 `messages.visibleReplies`——群里配的可见回复模式不会把私聊也压成静默。
 
 **称呼唤醒**（群友不打 @、直接叫名字）：在 `agents` 段（不在 `channels.qqbot` 下）配置：
 
 ```json
 "agents": {
-  "list": [{ "id": "default", "groupChat": { "mentionPatterns": ["沈处"] } }]
+  "entries": { "default": { "groupChat": { "mentionPatterns": ["沈处"] } } }
 }
 ```
+
+（旧的 `agents.list` 数组形态同样兼容。）
+
+称呼命中在**门控层**同样算「在叫 bot」——消息不会在到达 agent 之前被丢掉，房间事件群与普通群都生效。
 
 误唤醒有兜底：LLM 判断「只是在聊我、不是在叫我」时可输出 `NO_REPLY` 保持沉默（框架自动注入该指引，无需改提示词）。
 

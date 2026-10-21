@@ -28,6 +28,7 @@ import { getPersistedRefIndexStore } from '../features/ref-index-store.js';
 import { recordOutboundMessageId } from '../features/outbound-echo-store.js';
 import { recordOutboundToGroupHistory } from '../features/history-store.js';
 import { resolveGroupConfigFromAccount } from '../config.js';
+import { resolveGroupRoomEventPolicy } from '../features/room-event.js';
 import { checkAndConsumePassiveReplyQuota, invalidateMsgIdQuota } from '../features/quota-manager.js';
 import { recordProactiveSend } from '../features/proactive-budget.js';
 import { selectMsgIdForPassiveReply, evictMsgId, peekMsgIdReceivedAt } from '../features/msgid-cache.js';
@@ -453,6 +454,24 @@ export class QQBotGateway {
     notifyOutboundMessageSent(this.account.accountId, target.scope, target.targetId);
   }
 
+  /**
+   * 该群是否处于 room_event（被动房间事件）模式。
+   *
+   * 走裁决后的策略（群级 > per-agent > 全局），与 dispatch 的入站分类、
+   * middleware 的历史缓冲跳过同源——三处若各算各的，会出现"群里既是
+   * room_event 又记历史快照"的双份上下文。
+   */
+  private isRoomEventGroup(groupOpenid: string): boolean {
+    try {
+      const { policy } = resolveGroupRoomEventPolicy(this.account, groupOpenid, () => this.runtime);
+      return policy.effectiveMode === 'room_event';
+    } catch {
+      // 裁决失败时按"非 room_event"处理：多记一份历史快照不会破坏功能，
+      // 漏记才会（room_event 群多记历史 = 双份上下文）
+      return false;
+    }
+  }
+
   private wrapBotSendForRefIndex(): void {
     const { accountId, appId } = this.account;
     const senderName = this.account.config.name ?? appId;
@@ -494,10 +513,15 @@ export class QQBotGateway {
       // rolling 历史模式：群出站记入 historyBuffer（isBot 标记，
       // 供"裁剪到最后一条 bot 发言"定位；historyLimit=0 或 room_event 群
       // ——上下文以框架 transcript 为准——时 no-op）
+      //
+      // room_event 判定走**裁决后的策略**（群级 > per-agent > 全局），
+      // 与 dispatch / historyBuffer 同源：只看群级配置会漏掉「per-agent /
+      // 全局配置开启 room_event」的群，导致该群同时存在 transcript 与
+      // 历史快照两份上下文。
       if (
         target.scope === 'group' &&
         target.targetId &&
-        resolveGroupConfigFromAccount(this.account, target.targetId).unmentionedInbound !== 'room_event'
+        !this.isRoomEventGroup(target.targetId)
       ) {
         recordOutboundToGroupHistory(accountId, target.targetId, {
           messageId: msg.id,

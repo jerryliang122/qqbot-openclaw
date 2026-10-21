@@ -256,6 +256,8 @@ Toggle group @trigger behavior at runtime — changes persist instantly, no rest
 
 Answers "why does this group have no context" diagnostics: the push mode is chosen by the **group owner** when adding the bot (AT only / AT + recent N / full), and this command shows what the plugin actually observes plus every effective config value.
 
+It also reports the **resolved** unmentioned-message policy — which layer it came from (per group / per agent / global) and whether it was auto-downgraded because the `message` tool was unavailable. That is the first place to look when "I enabled `room_event` but the group stays quiet".
+
 ---
 
 ## 🚀 Getting Started
@@ -753,22 +755,68 @@ By default, un-@'d group messages only land in the history buffer. With `unmenti
 }
 ```
 
+The setting resolves with the same precedence the framework uses for other channels, so it can also be declared once for every group:
+
+```
+channels.qqbot.groups.<id>.unmentionedInbound          (per group — highest)
+  > agents.entries.<id>.groupChat.unmentionedInbound    (per agent)
+    > messages.groupChat.unmentionedInbound             (global)
+      > "user_request"                                   (default)
+```
+
 Behavior once enabled:
 
 - **@mention / name pattern / quote-of-bot** → normal turn with full reply rights (wake modes, see below)
 - **Everything else** → passive room event: the AI reads it as context, its natural text output is **not delivered** (structural silence — the framework doesn't even inject the NO_REPLY instruction), and it can only speak by proactively calling the `message` tool
 - Room events never steer or interrupt an active turn — they queue behind it
 - Room-event speech goes out through the passive-first outbound path (see below)
+- A room event that ends in an error does **not** post a failure notice to the room (the bot stays quiet; the error is logged instead). An @-mentioned turn in the same group still gets the normal failure notice.
 
 > ⚠️ **Cost note**: each room event runs one inference pass ("reading" the message). In an active group this adds real token spend — enable per group deliberately.
+
+#### The `message` tool is the only voice — and it is checked for you
+
+A room event's final text is never delivered, so the **only** way the bot can speak in a room is the `message` tool. If the effective tool surface for that group does not contain `message`, the room would be **permanently silent** — the failure mode behind the 2026-10-06 production incident (an empty group tool allow-list wiped the tool set).
+
+The plugin therefore checks the effective tool surface before entering room-event mode, and **automatically downgrades that group to `user_request`** (normal reply rights) when `message` is definitely unavailable, logging one warning per group:
+
+```
+[room-event] group=GROUP_X 降级为 user_request：群工具白名单不含 message 工具。…
+```
+
+The check is deliberately conservative — it only downgrades when the tool is *definitely* missing:
+
+| Tool surface | Verdict |
+|---|---|
+| `groups.<id>.tools.allow` (non-empty) without `message` (and no `alsoAllow`) | unavailable → downgrade |
+| `groups.<id>.tools.deny` matching `message` (exact or glob, e.g. `mess*`) | unavailable → downgrade |
+| agent / global explicit `allow` list without `message` | unavailable → downgrade |
+| agent / global explicit `deny` containing `message` or `*` | unavailable → downgrade |
+| `allow` missing/empty with a non-empty `alsoAllow` | **not limiting** (the framework turns it into an implicit allow-all) |
+| agent `tools.profile` (including `minimal` / `coding`) | **not** a blocker — the framework force-grants `message` for room-event turns |
+| anything else (including unknown profiles) | assumed available |
+
+To keep the strict silence semantics on purpose, opt out of the downgrade:
+
+```json
+{ "groups": { "GROUP_OPENID": { "unmentionedInbound": "room_event", "roomEventRequireMessageTool": false } } }
+```
+
+#### Visible replies
+
+`messages.groupChat.visibleReplies` controls whether a group turn's final text is posted automatically (`"automatic"`, the default) or only through the `message` tool (`"message_tool"`). Room events always use `"message_tool"` — that is the structural silence described above. A normal (mentioned) turn in a room-event group is still delivered automatically.
+
+`messages.groupChat.*` applies to **group and channel conversations only** — direct messages read `messages.visibleReplies` instead, so a group-only setting never silences your DMs.
 
 #### Wake Modes (what counts as "being addressed")
 
 | Wake mode | Mechanism | Config |
 |-----------|-----------|--------|
 | @mention | `GROUP_AT_MESSAGE_CREATE` event / `mentions[].is_you` / content markers | built-in |
-| **Name patterns** | Content matches a configured pattern (e.g. group members call the bot "沈处") | `agents.list.<id>.groupChat.mentionPatterns: ["沈处"]` — note this lives in the `agents` section, not `channels.qqbot`; effective in full-mode groups only |
+| **Name patterns** | Content matches a configured pattern (e.g. group members call the bot "沈处") | `agents.entries.<id>.groupChat.mentionPatterns: ["沈处"]` (legacy `agents.list` also supported) — note this lives in the `agents` section, not `channels.qqbot`; needs a full-push-mode group, since AT-mode groups never deliver un-@'d messages |
 | **Quote of bot message** | User quotes/replies to a bot outbound (resolved via ref-index) | built-in (`isImplicitMention`) |
+
+A name-pattern hit is treated as "the bot is being addressed" **at the gate as well** — the message is not dropped before it reaches the agent, in room-event groups *and* in ordinary ones.
 
 Name-pattern false positives ("people talking *about* the bot") are handled gracefully: the turn runs with normal reply rights, and the LLM can output `NO_REPLY` to stay silent (the framework injects this guidance automatically — no prompt changes needed).
 

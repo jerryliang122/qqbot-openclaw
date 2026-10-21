@@ -112,6 +112,29 @@ function makeGroupMsgAndCtx(overrides: {
   return { msg, ctx };
 }
 
+function makeC2cMsgAndCtx(overrides: { content?: string } = {}) {
+  const msg = {
+    kind: 'c2c' as const,
+    messageId: `msg-${Math.random().toString(36).slice(2, 10)}`,
+    content: overrides.content ?? '在吗',
+    senderId: 'USER_A',
+    senderName: 'UserA',
+    attachments: [],
+    replyTarget: { scope: 'c2c' as const, targetId: 'USER_A' },
+    groupOpenid: undefined,
+    rawEventType: 'C2C_MESSAGE_CREATE',
+    mentions: [],
+    timestamp: Date.now(),
+    raw: {},
+  } as any;
+  const ctx = {
+    state: {},
+    message: { content: msg.content },
+    signal: undefined,
+  } as any;
+  return { msg, ctx };
+}
+
 function makeAccount(groups?: Record<string, any>): any {
   return {
     accountId: 'test-account',
@@ -404,6 +427,188 @@ await test('出站适配器接受限定目标（message 工具 to=qqbot:group:X 
   const parsed = parseTarget('qqbot:group:GROUP_ROOM');
   assert.equal(parsed.scope, 'group');
   assert.equal(parsed.targetId, 'GROUP_ROOM');
+});
+
+group('入站策略回落链（端到端）');
+
+await test('全局 messages.groupChat.unmentionedInbound=room_event → 群未显式配置也走 room_event', async () => {
+  const { msg, ctx } = makeGroupMsgAndCtx({ content: '闲聊' });
+  const account = makeAccount(); // 群级没有任何配置
+  _resetAdaptersCache();
+  let captured: CapturedDispatch = {};
+  const runtime = makeFakeRuntime();
+  const patchedRuntime = {
+    ...runtime,
+    config: {
+      current: () => ({ messages: { groupChat: { unmentionedInbound: 'room_event' } } }),
+    },
+  } as any;
+  patchedRuntime.channel.inbound.run = async (params: any) => {
+    const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+    captured.ctxPayload = plan;
+    await plan.runDispatch();
+    return { dispatched: true };
+  };
+  patchedRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = (params2: any) => {
+    captured = { ...captured, replyOptions: params2.replyOptions, ctxPayload: params2.ctx };
+    return { queuedFinal: true, counts: { final: 1 } };
+  };
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, patchedRuntime);
+  assert.equal(captured.ctxPayload?.InboundEventKind, 'room_event', '全局配置应生效');
+  assert.equal(captured.replyOptions?.sourceReplyDeliveryMode, 'message_tool_only');
+});
+
+await test('群工具白名单不含 message → 自动降级为 user_request（不静默）', async () => {
+  const { msg, ctx } = makeGroupMsgAndCtx({ content: '闲聊' });
+  const account = makeAccount({ GROUP_ROOM: { unmentionedInbound: 'room_event' } });
+  _resetAdaptersCache();
+  let captured: CapturedDispatch = {};
+  const runtime = makeFakeRuntime();
+  const patchedRuntime = {
+    ...runtime,
+    config: {
+      current: () => ({
+        channels: { qqbot: { groups: { GROUP_ROOM: { tools: { allow: ['web_search'] } } } } },
+      }),
+    },
+  } as any;
+  patchedRuntime.channel.inbound.run = async (params: any) => {
+    const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+    captured.ctxPayload = plan;
+    await plan.runDispatch();
+    return { dispatched: true };
+  };
+  patchedRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = (params2: any) => {
+    captured = { ...captured, replyOptions: params2.replyOptions, ctxPayload: params2.ctx };
+    return { queuedFinal: true, counts: { final: 1 } };
+  };
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, patchedRuntime);
+  assert.equal(captured.ctxPayload?.InboundEventKind, 'user_request', '工具不可用时必须降级（防永久沉默）');
+  assert.equal(captured.replyOptions?.sourceReplyDeliveryMode, undefined, '降级后恢复自动投递');
+});
+
+await test('room_event 群里被 @ 的 turn 仍是 user_request（不压成静默）', async () => {
+  const { msg, ctx } = makeGroupMsgAndCtx({
+    rawEventType: 'GROUP_AT_MESSAGE_CREATE',
+    mentionState: { wasMentioned: true },
+  });
+  const account = makeAccount({ GROUP_ROOM: { unmentionedInbound: 'room_event' } });
+  const captured = await runDispatch({ account, msg, ctx });
+  assert.equal(captured.ctxPayload?.InboundEventKind, 'user_request');
+  assert.equal(captured.replyOptions?.sourceReplyDeliveryMode, undefined, '被 @ 的 turn 必须能正常回话');
+});
+
+group('称呼唤醒穿门控');
+
+await test('mentionPatterns 命中时门控放行（普通群也能被称呼唤醒）', async () => {
+  const { mentionGate } = await import('@tencent-connect/qqbot-nodejs');
+  const { buildMentionGateResolveConfig } = await import('../src/gateway/middleware-setup.ts');
+  const middleware = mentionGate({ resolveConfig: buildMentionGateResolveConfig() });
+  const ctx: any = {
+    message: {
+      kind: 'group',
+      content: '沈处帮我看下这个',
+      rawEventType: 'GROUP_MESSAGE_CREATE',
+    },
+    state: {
+      policy: { group: { requireMention: true } },
+      mentionPatterns: ['沈处'],
+    },
+    bot: { appId: 'TEST_APP_ID' },
+    log: { debug: () => {} },
+    stop: () => { (ctx as any).stopped = 'mention-gate'; },
+  };
+  let nextCalled = false;
+  await middleware(ctx, async () => { nextCalled = true; });
+  assert.ok(nextCalled, '称呼唤醒的消息必须穿过门控');
+  assert.equal(ctx.state.nameMentioned, true, '门控判定结果落 state 供 dispatch 复用');
+  assert.equal(ctx.state.mention.wasMentioned, false, 'SDK 层面仍算未被 @（不是 SDK 的信号）');
+});
+
+await test('未命中 mentionPatterns 时门控照常拦截', async () => {
+  const { mentionGate } = await import('@tencent-connect/qqbot-nodejs');
+  const { buildMentionGateResolveConfig } = await import('../src/gateway/middleware-setup.ts');
+  const middleware = mentionGate({ resolveConfig: buildMentionGateResolveConfig() });
+  const ctx: any = {
+    message: { kind: 'group', content: '闲聊', rawEventType: 'GROUP_MESSAGE_CREATE' },
+    state: { policy: { group: { requireMention: true } }, mentionPatterns: ['沈处'] },
+    bot: { appId: 'TEST_APP_ID' },
+    log: { debug: () => {} },
+    stop: () => { (ctx as any).stopped = 'mention-gate'; },
+  };
+  let nextCalled = false;
+  await middleware(ctx, async () => { nextCalled = true; });
+  assert.ok(!nextCalled, '没命中称呼的普通消息仍应被拦下');
+  assert.ok((ctx as any).stopped?.includes('mention-gate'));
+});
+
+group('可见回复模式按会话类型隔离');
+
+await test('私聊 turn 不受 messages.groupChat.visibleReplies 影响（DM 终稿照常投递）', async () => {
+  const { msg, ctx } = makeC2cMsgAndCtx();
+  const account = makeAccount();
+  _resetAdaptersCache();
+  let captured: CapturedDispatch = {};
+  const runtime = makeFakeRuntime();
+  const patchedRuntime = {
+    ...runtime,
+    config: {
+      current: () => ({ messages: { groupChat: { visibleReplies: 'message_tool' } } }),
+    },
+  } as any;
+  patchedRuntime.channel.inbound.run = async (params: any) => {
+    const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+    captured.ctxPayload = plan;
+    await plan.runDispatch();
+    return { dispatched: true };
+  };
+  patchedRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = (params2: any) => {
+    captured = { ...captured, replyOptions: params2.replyOptions, ctxPayload: params2.ctx };
+    return { queuedFinal: true, counts: { final: 1 } };
+  };
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, patchedRuntime);
+  assert.equal(
+    captured.replyOptions?.sourceReplyDeliveryMode,
+    undefined,
+    '私聊不得被群级 visibleReplies 压成 message_tool_only（否则 DM 里 bot 看起来死了）',
+  );
+});
+
+await test('群 turn 在 messages.groupChat.visibleReplies=message_tool 时走严格投递', async () => {
+  const { msg, ctx } = makeGroupMsgAndCtx({
+    rawEventType: 'GROUP_AT_MESSAGE_CREATE',
+    mentionState: { wasMentioned: true },
+  });
+  const account = makeAccount({ GROUP_ROOM: { unmentionedInbound: 'room_event' } });
+  _resetAdaptersCache();
+  let captured: CapturedDispatch = {};
+  const runtime = makeFakeRuntime();
+  const patchedRuntime = {
+    ...runtime,
+    config: {
+      current: () => ({ messages: { groupChat: { visibleReplies: 'message_tool' } } }),
+    },
+  } as any;
+  patchedRuntime.channel.inbound.run = async (params: any) => {
+    const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+    captured.ctxPayload = plan;
+    await plan.runDispatch();
+    return { dispatched: true };
+  };
+  patchedRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = (params2: any) => {
+    captured = { ...captured, replyOptions: params2.replyOptions, ctxPayload: params2.ctx };
+    return { queuedFinal: true, counts: { final: 1 } };
+  };
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, patchedRuntime);
+  assert.equal(
+    captured.replyOptions?.sourceReplyDeliveryMode,
+    'message_tool_only',
+    '群内 user_request turn 按 groupChat.visibleReplies 走严格投递',
+  );
 });
 
 // ── 结果 ──
