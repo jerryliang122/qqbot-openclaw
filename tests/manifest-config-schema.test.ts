@@ -62,6 +62,15 @@ function readAccountConfigKeys(): string[] {
   return [...seg.matchAll(/^\s{2}([a-zA-Z][a-zA-Z0-9]*)\??:/gm)].map((m) => m[1]);
 }
 
+/** 从 src/types.ts 提取任意具名 interface 的键清单 */
+function readInterfaceKeys(iface: string): string[] {
+  const src = readFileSync(join(process.cwd(), 'src', 'types.ts'), 'utf8');
+  const start = src.indexOf(`export interface ${iface}`);
+  assert.ok(start > 0, `应能在 src/types.ts 找到 ${iface}`);
+  const seg = src.slice(start, src.indexOf('\n}', start));
+  return [...seg.matchAll(/^\s{2}([a-zA-Z][a-zA-Z0-9]*)\??:/gm)].map((m) => m[1]);
+}
+
 // ── manifest 加载 ───────────────────────────────────────────────────
 
 type Manifest = {
@@ -138,6 +147,64 @@ async function main() {
     );
   });
 
+  // ── 嵌套字段名正确性 ──────────────────────────────────────────────
+  //
+  // 顶层只查「键在不在」是不够的：`deliverDebounce` 的**子字段**写错名字
+  // （曾把 windowMs 写成 debounceMs）时，顶层差集检查照样通过，但用户在
+  // Control UI 里配 `windowMs` 会被 additionalProperties=false 拒掉。
+  // 故对每个嵌套配置块，用其 TS 接口的键清单逐项核对。
+
+  await test('嵌套配置块的子字段与 TS 接口一致', () => {
+    const checks: Array<[string, string]> = [
+      ['deliverDebounce', 'DeliverDebounceConfig'],
+      ['progressCard', 'ProgressCardConfig'],
+      ['typing', 'TypingIndicatorConfig'],
+      ['inboundDebounce', 'InboundDebounceConfig'],
+      ['groupCoalesce', 'GroupCoalesceConfig'],
+      ['commands', 'CommandsConfig'],
+    ];
+    for (const [key, iface] of checks) {
+      const truth = readInterfaceKeys(iface);
+      const schema = (topProps[key] as { properties?: Record<string, unknown> } | undefined)
+        ?.properties ?? {};
+      const missing = truth.filter((k) => !(k in schema));
+      const extra = Object.keys(schema).filter((k) => !truth.includes(k));
+      assert.strictEqual(
+        missing.length,
+        0,
+        `schema.${key} 缺少子字段：${missing.join(', ')}（${iface}）。` +
+          `additionalProperties=false 下用户配了会被拒。`,
+      );
+      assert.strictEqual(
+        extra.length,
+        0,
+        `schema.${key} 有 ${iface} 里不存在的子字段：${extra.join(', ')}（配了会被静默忽略）。`,
+      );
+    }
+  });
+
+  await test('顶层与 accounts 段的嵌套 schema 逐字一致', () => {
+    for (const key of [
+      'groups',
+      'rateLimit',
+      'audioFormatPolicy',
+      'groupCoalesce',
+      'deliverDebounce',
+      'typing',
+      'inboundDebounce',
+      'commands',
+      'streaming',
+      'progressCard',
+    ]) {
+      assert.deepStrictEqual(
+        accountProps[key],
+        topProps[key],
+        `schema.${key} 在顶层与 accounts 段不一致——` +
+          `两者读的是同一个 QQBotAccountConfig，不一致会出现「顶层能配、账号里配不了」的割裂。`,
+      );
+    }
+  });
+
   await test('schema 的 accounts 段不是 catchall（应逐字段列举以获得 UI 表单）', () => {
     const truth = readAccountConfigKeys();
     // accounts 段应覆盖大部分字段；若只列少数几个说明漏补
@@ -160,6 +227,79 @@ async function main() {
       n: (params: { schema: unknown; value: unknown }) => void;
     };
     validator.n({ schema: qqbotSchema, value: {} });
+  });
+
+  await test('框架的通道配置校验路径能接受 setup 产出的配置', async () => {
+    // 用框架**真实**的通道配置校验器（validatePluginSchemaValue，与 Control UI
+    // 打开/保存配置、以及 config validate 走的是同一条路径）验证。
+    //
+    // 注意：不能用 validateJsonSchemaValue 代替——它只校验 schema 本身的
+    // 形状，不做**实例值**校验（对 additionalProperties:false 完全不敏感），
+    // 那样测出来的「通过」是假的。
+    const validator = require('./node_modules/openclaw/dist/schema-validator-CLfGeb79.js') as {
+      r: (params: {
+        origin: string;
+        schema: unknown;
+        cacheKey: string;
+        value: unknown;
+        applyDefaults: boolean;
+      }) => { ok: boolean; errors?: unknown[] };
+    };
+    const { applyAccountDefaults } = await import('../src/setup/finalize.js');
+
+    const withDefault = applyAccountDefaults({ channels: { qqbot: {} } } as never, 'default');
+    const defaultCfg = (withDefault as any).channels.qqbot;
+    const r1 = validator.r({
+      origin: 'external',
+      schema: qqbotSchema,
+      cacheKey: 'channel:qqbot',
+      value: defaultCfg,
+      applyDefaults: true,
+    });
+    assert.ok(
+      r1.ok,
+      `setup 产出的默认账号配置被通道 schema 拒绝：${JSON.stringify(r1.errors ?? [], null, 2)}`,
+    );
+
+    const withNamed = applyAccountDefaults(
+      { channels: { qqbot: {} } } as never,
+      'second',
+      'openid-abc',
+    );
+    const namedCfg = (withNamed as any).channels.qqbot;
+    const r2 = validator.r({
+      origin: 'external',
+      schema: qqbotSchema,
+      cacheKey: 'channel:qqbot',
+      value: namedCfg,
+      applyDefaults: true,
+    });
+    assert.ok(
+      r2.ok,
+      `setup 产出的命名账号配置被通道 schema 拒绝：${JSON.stringify(r2.errors ?? [], null, 2)}`,
+    );
+  });
+
+  await test('通道 schema 确实会拒未知字段（否则以上断言是假的）', () => {
+    // 反向断言：确认校验路径对 additionalProperties 敏感。
+    // 若这条红了，说明框架换了校验路径，上面的「通过」不再有保证。
+    const validator = require('./node_modules/openclaw/dist/schema-validator-CLfGeb79.js') as {
+      r: (params: {
+        origin: string;
+        schema: unknown;
+        cacheKey: string;
+        value: unknown;
+        applyDefaults: boolean;
+      }) => { ok: boolean; errors?: unknown[] };
+    };
+    const r = validator.r({
+      origin: 'external',
+      schema: qqbotSchema,
+      cacheKey: 'channel:qqbot',
+      value: { appId: '1', clientSecret: 's', totallyBogusField: 1 },
+      applyDefaults: true,
+    });
+    assert.strictEqual(r.ok, false, '未知字段应被 additionalProperties:false 拒绝');
   });
 
   await test('典型配置能通过框架校验器', () => {

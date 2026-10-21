@@ -33,7 +33,13 @@
   - **schema 顶层 30 个字段** + **`accounts` 段 27 个字段**（逐字段列举而非 catchall，好让 UI 渲染出对应控件），`additionalProperties: false`（与 Telegram 一致，作用是**挡住拼错的字段**而非放行）
   - **24 条 `uiHints`**（label + help），覆盖私聊准入、群策略、群配置、限流、传输方式、流式、进度卡片、防抖、指令面板、多账号等，help 文本写明默认值与 QQ 平台的特殊约束（如「群主在客户端选的推送模式插件不可控」「openid 按账号隔离」「防抖窗口钳制范围 [0, 60000]」「卡片只走被动回复不烧主动预算」）
   - `capabilities.inlineButtons` 声明为与 Telegram 同款语义（`off` / `dm` / `group` / `all` / `allowlist`）——**注意**：配置侧 `capabilities` 在框架语义下是「只增不减」的并集项，插件侧的 `messageToolCapabilities` 才是提示词侧的实际开关，故该字段目前是**声明位**而非生效开关（生效开关见上方「私聊（C2C）能力声明与平台真实语义对齐」的插件侧实现）
-  - 新增 `tests/manifest-config-schema.test.ts`（11 例）——锁定「manifest 能被框架 `loadPluginManifest` 解析」「schema 覆盖 `QQBotAccountConfig` 的**全部**键（顶层 + accounts 段）」「schema 通过框架的 JSON Schema 合法性校验」「典型/多账号配置能通过校验」「uiHints 每条都有 label + help」。**字段覆盖完整性是硬断言**：`additionalProperties: false` 下漏一个键，用户写了就会被拒——测试直接以 `src/types.ts` 的 `QQBotAccountConfig` 为权威源做差集核对，新增配置项忘了补 schema 会立刻红。
+  - 新增 `tests/manifest-config-schema.test.ts`（15 例）——锁定「manifest 能被框架 `loadPluginManifest` 解析」「schema 覆盖 `QQBotAccountConfig` 的**全部**键（顶层 + accounts 段）」「**嵌套配置块的子字段**与对应 TS 接口逐项一致」「顶层与 accounts 段的嵌套 schema 逐字一致」「**框架真实的通道配置校验路径**能接受 setup 产出的配置」「uiHints 每条都有 label + help」。
+- **修正 manifest schema 的四处不匹配（Sourcery 评审发现）**。`additionalProperties: false` 下 schema 与真实配置结构的偏差会**直接拒掉用户的配置**（框架的通道配置校验走 `validatePluginSchemaValue`，与 Control UI 打开/保存配置同一条路径），故以下四处不是「描述不准」而是**功能缺陷**：
+  - **`deliverDebounce` 的子字段名写错**：schema 写的是 `debounceMs`，运行时实际读 `windowMs` / `maxWaitMs` / `separator`（`DeliverDebounceConfig`）。用户按 schema 配 `windowMs` 会被拒，按 schema 配 `debounceMs` 会被静默忽略。
+  - **`progressCard` 漏 `maxLines` / `reserveQuota`**：这两个字段是实打实在用的（`maxLines` 控制 checklist 渲染行数，`reserveQuota` 为最终回复保留被动配额槽），漏了就没法配。
+  - **漏 `mediaMaxMb`**：`src/setup/finalize.ts` 的 `applyAccountDefaults` **自己**就会往配置里写 `mediaMaxMb: 200`（扫码/手动登录流程都会调用），schema 不认它 → **用户跑完 setup 就得到一份 schema 拒绝的配置**。
+  - **`accounts` 段的嵌套字段全是裸壳**（`{"type": "object"}`）：UI 渲染不出子控件，且拼错的键被接受。现改为与顶层**逐字一致**的完整定义。
+  相应的测试也加严了：字段覆盖检查从「顶层键在不在」扩展到「**嵌套子字段**逐项对照 TS 接口」+「顶层与 accounts 段逐字一致」+「用框架**真实**的 `validatePluginSchemaValue` 验证 setup 产出的配置可被接受」+ 一条**反向断言**（确认该校验路径对 `additionalProperties: false` 确实敏感，否则上面的「通过」是假的）。**注**：不能用 `validateJsonSchemaValue` 做这件事——它只校验 schema 本身的形状，不做实例值校验，对 `additionalProperties: false` 完全不敏感，测出来的「通过」是假的。
 
 ### 变更
 
