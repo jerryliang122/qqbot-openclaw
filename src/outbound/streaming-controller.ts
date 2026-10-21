@@ -11,10 +11,12 @@
  * onPartialReply(text) 输入：模型全量文本，持续增长。
  * finalize()           标记：框架通知回复结束，用 lastAccepted 收尾。
  *
- * sendMode='stream-all' 双道模式（见 runFinalDeliver）：
- *   首段直推（同 stream）；工具出现后段落缓冲，工具 title 以 `🔧 …`
- *   行追加进同一条滚动消息；final deliver 时滚动道收尾，终稿文本以
- *   第二条打字机消息（分片节奏）下发。
+ * sendMode='stream-all' 双道模式（v2，块驱动）：
+ *   文本段经框架 deliver(kind:'block') 按**完成段**进入滚动道（token 级
+ *   partial 不注册不处理）；每个中间条目（正文段 / 🔧 工具标题行）以
+ *   markdown 分隔线隔开离散追加；final deliver 时滚动道收尾，终稿文本
+ *   以第二条打字机消息（分片节奏）原样下发。终稿段从不进滚动道——
+ *   held 块被 final 取代，无需差量对账。
  */
 
 import type { ReplyTarget, StreamSession } from '@tencent-connect/qqbot-nodejs';
@@ -77,8 +79,8 @@ const STREAM_ALL_FINAL_CHUNK_CHARS = 64;
 /** stream-all 终稿道打字机分片间隔（ms） */
 const STREAM_ALL_FINAL_CHUNK_DELAY_MS = 90;
 
-/** stream-all 滚动道里的工具标题行前缀 */
-const STREAM_ALL_TOOL_LINE_PREFIX = '\n\n🔧 ';
+/** stream-all 滚动道条目间的 markdown 分隔线（正文段 / 🔧 工具标题行） */
+const STREAM_ALL_ITEM_SEPARATOR = '\n\n---\n\n';
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -125,13 +127,17 @@ export class StreamingController {
 
   // ── stream-all 专属状态 ──
 
-  /** 是否观测到任何工具活动（item 事件）——此后新段落进入缓冲而非直推 */
-  private saToolsSeen = false;
+  /**
+   * held 块（lookahead）：最新一个尚无法定性的文本块。
+   *
+   * 块到达时无法知道它是不是终稿段（终稿的身份是回溯性的——turn 结束时
+   * 恰好是最后一块）。故每块先扣住；后继块 / 工具事件 / 新 assistant 段
+   * 的出现都证明它是中间段 → 提交进滚动道；final deliver 到达则直接被
+   * 终稿全文取代（丢弃，从未展示过故无重复）。
+   */
+  private saHeldBlock: string | null = null;
 
-  /** 缓冲中的当前段全文（工具出现后、终稿判定前的段落；它可能是终稿段） */
-  private saBufferedSegment: string | null = null;
-
-  /** 当前活跃道：null=尚未定道（首段直推，等价 stream）/ rolling=滚动道 / final=终稿道 */
+  /** 当前活跃道：null=尚未定道 / rolling=滚动道 / final=终稿道 */
   private saLane: 'rolling' | 'final' | null = null;
 
   /** 已追加过标题行的 item 主键（start/update 重复事件去重） */
@@ -378,11 +384,26 @@ export class StreamingController {
   // ── stream-all：滚动道/终稿道入口 ──
 
   /**
+   * stream-all：文本块到达（deliver kind:'block' 的文本部分）。
+   *
+   * 后继块的存在证明 held 块是中间段 → 先提交进滚动道，新块进入 held
+   * 扣住待定性（可能是终稿段）。滚动道以 markdown 分隔线隔开各条目，
+   * 离散追加（不做 token 级打字机）。
+   */
+  onTextBlock(text: string): Promise<void> {
+    this.chain = this.chain.then(() => this.runTextBlock(text)).catch((err) => {
+      this.deps.log?.error(`onTextBlock error: ${err instanceof Error ? err.message : String(err)}`);
+      this.transition('failed', 'text_block_error');
+    });
+    return this.chain as Promise<void>;
+  }
+
+  /**
    * stream-all：工具 item 事件（onItemEvent）。
    *
-   * phase=start → 先把缓冲段沉淀进滚动道（工具的出现证明它是中间段），
-   * 再追加 `🔧 <title>` 标题行；phase=end → 标题行仍是滚动道末尾时补 ` ✓`
-   * （QQ 流式前缀不可回改，只能追加；其后已有新内容则放弃标记）。
+   * phase=start → 先把 held 块提交进滚动道（工具的出现证明它是中间段），
+   * 再以分隔线隔开追加 `🔧 <title>` 标题行；phase=end → 标题行仍是滚动道
+   * 末尾时补 ` ✓`（QQ 流式前缀不可回改，只能追加；其后已有新内容则放弃）。
    * 只认工具类 item（toolCallId / kind ∈ tool|command|patch），preamble、
    * status 等不进滚动道。
    */
@@ -404,12 +425,14 @@ export class StreamingController {
 
   /**
    * stream-all：新 assistant 段开始（onAssistantMessageStart）。
-   * 缓冲段非空即被证明是中间段（它后面还有新段）→ 沉淀进滚动道。
+   * held 块非空即被证明是中间段（它后面还有新段）→ 提交进滚动道。
+   * 块投递经 SDK coalescer 有延迟时，这里是更早的提交触发点；即使本
+   * 信号早于块到达（held 尚空），后继块到达时仍会正确提交。
    */
   beginSegment(): Promise<void> {
     this.chain = this.chain.then(async () => {
       if (!this.isStreamAllMode || this.isTerminal || this.saLane === 'final') return;
-      if (this.saToolsSeen) await this.flushBufferedSegment();
+      await this.commitHeldBlock();
     }).catch((err) => {
       this.deps.log?.error(`beginSegment error: ${err instanceof Error ? err.message : String(err)}`);
       this.transition('failed', 'segment_error');
@@ -420,11 +443,9 @@ export class StreamingController {
   /**
    * stream-all：框架 final deliver（终稿文本权威到达）。
    *
-   * - 无工具出现：整 turn 一段，滚动道即终稿——并入 footer 尾巴后收尾
-   *   （与 stream 模式行为一致）。
-   * - 有工具：终稿段从未进滚动道（一直在缓冲里）→ 收尾滚动道，开第二条
-   *   流式会话，把终稿文本按打字机节奏分片推完再收尾。终稿文本原样下发
-   *   （含 usage footer），无需差量对账——滚动道里从来没有终稿内容。
+   * held 块被终稿全文取代（从未展示，直接丢弃）。滚动道（若有）收尾后，
+   * 开第二条流式会话把终稿按打字机节奏分片推完再收尾。终稿文本原样
+   * 下发（含 usage footer）——滚动道里从来没有终稿内容，无需差量对账。
    */
   handleFinalDeliver(text: string, opts?: { signal?: AbortSignal }): Promise<void> {
     const signal = opts?.signal;
@@ -521,7 +542,6 @@ export class StreamingController {
       .filter((v) => v.length > 0);
     const primary = this.resolveItemPrimary(aliases);
     if (!primary) return;
-    this.saToolsSeen = true;
 
     if (payload.phase === 'end' || payload.phase === 'completed') {
       // 前缀不可回改：仅当该标题行仍是滚动道末尾（其后无新内容）时可补 ✓
@@ -537,12 +557,24 @@ export class StreamingController {
     this.saStartedItemKeys.add(primary);
     for (const alias of aliases) this.saItemAliases.set(alias, primary);
 
-    // 先把缓冲段沉淀进滚动道（工具出现证明它是中间段），再挂标题行
+    // 先把 held 块提交进滚动道（工具的出现证明它是中间段），再挂标题行
     // （时间序：模型正文在前，工具调用在后）
-    await this.flushBufferedSegment();
+    await this.commitHeldBlock();
     const label = (payload.title || payload.name || 'tool').trim() || 'tool';
-    await this.appendRolling(`${STREAM_ALL_TOOL_LINE_PREFIX}${label}`);
+    await this.appendRollingItem(`🔧 ${label}`);
     this.saTailItemKey = primary;
+  }
+
+  /**
+   * stream-all：onTextBlock 的核心实现（held 块轮转）。
+   */
+  private async runTextBlock(text: string): Promise<void> {
+    if (!this.isStreamAllMode || this.isTerminal || this.saLane === 'final') return;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    // 后继块的存在证明 held 块是中间段 → 提交进滚动道；新块进入 held 待定性
+    await this.commitHeldBlock();
+    this.saHeldBlock = trimmed;
   }
 
   /** 从别名列表解析 item 主键：命中已登记的别名取其主键，否则取首个别名 */
@@ -561,16 +593,9 @@ export class StreamingController {
     if (this.isTerminal) return;
     if (signal?.aborted) return;
 
-    // 无工具：滚动道即终稿，行为对齐 stream 模式（并入 footer 尾巴后收尾）
-    if (!this.saToolsSeen) {
-      await this.runAbsorbFinalText(finalText, signal);
-      await this.handleFinalize();
-      return;
-    }
-
-    // 有工具：终稿段从未进滚动道（一直在缓冲里）→ 滚动道收尾、终稿走第二条消息
+    // held 块被终稿全文取代（从未展示，丢弃不重复）；滚动道收尾、终稿走第二条消息
     this.saLane = 'final';
-    this.saBufferedSegment = null;
+    this.saHeldBlock = null;
     this.saTailItemKey = null;
     await this.completeSession('rolling_done');
     // 对齐 new_reply 路径：收尾后清空账本，终稿道从零起账
@@ -616,16 +641,23 @@ export class StreamingController {
   }
 
   /**
-   * stream-all：把缓冲段沉淀进滚动道。空段跳过；非空段以空行分隔接在
-   * 滚动道末尾，并清除 ✓ 标记资格（标题行后已有新内容）。
+   * stream-all：以 markdown 分隔线为界向滚动道追加一个中间条目
+   * （正文段 / 🔧 工具标题行）。首条目不带前导分隔线。
    */
-  private async flushBufferedSegment(): Promise<void> {
-    const seg = this.saBufferedSegment;
-    this.saBufferedSegment = null;
-    const trimmed = seg?.trim();
-    if (!trimmed) return;
-    const sep = this.lastAcceptedFull ? '\n\n' : '';
-    await this.appendRolling(`${sep}${trimmed}`);
+  private async appendRollingItem(content: string): Promise<void> {
+    const sep = this.lastAcceptedFull ? STREAM_ALL_ITEM_SEPARATOR : '';
+    await this.appendRolling(`${sep}${content}`);
+  }
+
+  /**
+   * stream-all：把 held 块提交进滚动道（它已被后继事件证明是中间段）。
+   * held 为空时 no-op；提交后 ✓ 标记资格清零（标题行后已有新内容）。
+   */
+  private async commitHeldBlock(): Promise<void> {
+    const seg = this.saHeldBlock;
+    this.saHeldBlock = null;
+    if (!seg) return;
+    await this.appendRollingItem(seg);
     this.saTailItemKey = null;
   }
 
@@ -634,17 +666,9 @@ export class StreamingController {
   private async handleChunk(text: string): Promise<void> {
     if (this.isTerminal || !text) return;
 
-    // stream-all：终稿道启动后的残余 partial 一律忽略（final deliver 已定稿）
-    if (this.isStreamAllMode && this.saLane === 'final') return;
-
-    // stream-all：工具出现后的段落只缓冲不直推——该段是否终稿段要等
-    // final deliver 才知道（终稿走独立消息，不能先流进滚动道）。
-    // 首段（工具未出现）保持直推：若整 turn 无工具，滚动道即终稿，
-    // 行为与 stream 模式完全一致。
-    if (this.isStreamAllMode && this.saToolsSeen) {
-      this.saBufferedSegment = text;
-      return;
-    }
+    // stream-all v2：文本经 deliver(kind:'block') 按完成段进入滚动道，
+    // token 级 partial 不注册也不处理（防御：被误连时静默忽略）
+    if (this.isStreamAllMode) return;
 
     // 正常续写：新文本前缀匹配（含空白归一化）
     if (prefixMatches(this.lastAcceptedFull, text)) {

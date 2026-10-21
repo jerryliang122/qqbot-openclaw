@@ -976,14 +976,14 @@ The bot can stream its reply progressively (typewriter effect) via QQ's streamin
 
 ##### `sendMode: "stream-all"` — rolling progress lane + separate final message
 
-All intermediate output of a turn lands in **one rolling typewriter message**: every text segment the model produces between tool calls, plus one `🔧 <tool title>` line per tool execution (titles come from the framework's `onItemEvent` callback; a `✓` is appended when the tool finishes while its title line is still the tail). Once all tools are done, the model's **final answer is delivered as a second, separate typewriter message** (paced in ~64-char slices).
+All intermediate output of a turn lands in **one rolling message**, appended in discrete chunks as events complete (not token-by-token): every completed text segment plus one `🔧 <tool title>` line per tool execution, separated by markdown dividers (`---`). Tool titles come from the framework's `onItemEvent` callback (unlocked via `forceToolResultProgress`, so it fires even with verbose progress off); a `✓` is appended when the tool finishes while its title line is still the tail. Once all tools are done, the model's **final answer is delivered as a second, separate typewriter message** (paced in ~64-char slices every ~90ms).
 
 How it maps onto framework callbacks:
 
-- `onItemEvent` (unlocked via `forceToolResultProgress`, so it fires even with verbose progress off) → appends tool title lines and flushes the buffered text segment into the rolling lane
-- After the first tool item, further text segments are **buffered** instead of streamed — whether a segment is the final one is only known when the framework delivers `kind: "final"`, at which point the rolling lane is closed and the final text is typed into a second stream session
+- Text segments arrive as complete blocks via `deliver(kind: "block")` — the plugin does **not** register `onPartialReply` in this mode, so no token-level streaming
+- Each new block/tool/start-of-segment proves the previous held block was intermediate, at which point it is committed to the rolling lane; the **last** block is never committed — it is superseded by the `kind: "final"` deliver, which closes the rolling lane and types the full final text (usage footer included) into a second stream session. No prefix-dedup machinery is needed because the final text never entered the rolling lane
 - The framework's default standalone tool-progress messages are suppressed (`suppressDefaultToolProgressMessages`) so tool progress is not rendered twice
-- A turn with no tool calls degrades to plain `stream` behavior (single live-typed message)
+- A turn whose text arrives in a single block and never calls tools degrades to a single final-lane typewriter message
 
 Failure semantics: if the final lane fails before any character is accepted, the final text falls back to a single static message (the rolling lane stays visible). Config stays the same shape:
 
