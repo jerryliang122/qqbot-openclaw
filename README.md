@@ -180,7 +180,7 @@ Measures end-to-end latency from QQ server push to plugin response, broken down 
 
 > **You**: `/bot-version`
 >
-> **QQBot**: 🦞 Framework: OpenClaw 2026.10.5 / 🤖 Plugin: v3.0.0 / 🌟 GitHub repo
+> **QQBot**: 🦞 Framework: OpenClaw 2026.10.5 / 🤖 Plugin: v3.0.1 / 🌟 GitHub repo
 
 Shows framework version, plugin version, and a direct link to the official repository.
 
@@ -293,7 +293,7 @@ It also reports the **resolved** unmentioned-message policy — which layer it c
 openclaw plugins install @jerryliang122/openclaw-qqbot
 
 # Or a specific version
-openclaw plugins install @jerryliang122/openclaw-qqbot@3.0.0
+openclaw plugins install @jerryliang122/openclaw-qqbot@3.0.1
 ```
 
 **Option B: Install from GitHub**
