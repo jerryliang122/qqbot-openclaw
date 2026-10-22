@@ -28,7 +28,7 @@
  */
 
 import assert from 'node:assert';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 
@@ -388,33 +388,57 @@ async function main() {
   // 故：① TS 内联联合类型 ↔ schema enum 集合相等（双向）；
   //    ② 每个枚举成员经**真实校验器**验证可被接受。
 
-  /** 从 src/types.ts 提取内联字符串联合类型的成员（如 sendMode?: 'a' | 'b'） */
+  /**
+   * 提取配置字段的字符串联合类型成员：内联联合（`sendMode?: 'a' | 'b'`）与
+   * 具名别名（`sendMode?: StreamingSendMode` + `type StreamingSendMode = 'a' | 'b'`）
+   * 都支持——字段日后重构成具名别名时守卫不得误报（别名声明可能在
+   * types.ts 之外的 src 文件里，如 streaming-controller.ts）。
+   */
   function readInlineUnion(field: string): string[] {
-    const src = readFileSync(join(process.cwd(), 'src', 'types.ts'), 'utf8');
-    const m = src.match(new RegExp(`${field}\\??:\\s*((?:'[^']+'\\s*\\|\\s*)+'[^']+')`));
-    assert.ok(m, `应能在 src/types.ts 找到 ${field} 的内联联合类型`);
-    return [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]);
+    const typesSrc = readFileSync(join(process.cwd(), 'src', 'types.ts'), 'utf8');
+    const inlineRe = new RegExp(`${field}\\??:\\s*((?:'[^']+'\\s*\\|\\s*)+'[^']+')`);
+    const aliasRe = new RegExp(`${field}\\??:\\s*([A-Za-z][A-Za-z0-9]*)`);
+
+    const inline = typesSrc.match(inlineRe);
+    if (inline) return [...inline[1].matchAll(/'([^']+)'/g)].map((x) => x[1]);
+
+    // 具名别名：到 src/**/*.ts 里找 `type <Name> = 'a' | 'b'` 声明
+    const alias = typesSrc.match(aliasRe)?.[1];
+    assert.ok(alias, `应能在 src/types.ts 找到 ${field} 的内联联合类型或具名别名`);
+    const defRe = new RegExp(`type ${alias}\\s*=\\s*((?:'[^']+'\\s*\\|\\s*)+'[^']+')`);
+    const srcFiles = readdirSync(join(process.cwd(), 'src'), { recursive: true })
+      .filter((f) => typeof f === 'string' && f.endsWith('.ts'))
+      .map((f) => join(process.cwd(), 'src', f as string));
+    for (const file of [join(process.cwd(), 'src', 'types.ts'), ...srcFiles]) {
+      const def = readFileSync(file, 'utf8').match(defRe);
+      if (def) return [...def[1].matchAll(/'([^']+)'/g)].map((x) => x[1]);
+    }
+    assert.fail(`字段 ${field} 的具名别名 ${alias} 未在 src/**/*.ts 中找到字符串联合声明`);
   }
 
-  await test('streaming.sendMode：TS 联合类型与 schema enum 逐值一致', () => {
+  await test('streaming.sendMode：TS 联合类型与两份 schema enum 逐值一致', () => {
     const tsUnion = readInlineUnion('sendMode');
-    const schemaEnum = (
-      (topProps.streaming as { properties?: { sendMode?: { enum?: string[] } } })
-        ?.properties?.sendMode?.enum ?? []
-    );
-    const missingInSchema = tsUnion.filter((v) => !schemaEnum.includes(v));
-    const extraInSchema = schemaEnum.filter((v) => !tsUnion.includes(v));
-    assert.strictEqual(
-      missingInSchema.length,
-      0,
-      `schema.streaming.sendMode.enum 缺少 TS 联合类型的值：${missingInSchema.join(', ')}——` +
-        `additionalProperties/enum 校验下用户配了会被直接拒（v2.8.0 前的 stream-all 事故）`,
-    );
-    assert.strictEqual(
-      extraInSchema.length,
-      0,
-      `schema.streaming.sendMode.enum 有 TS 联合类型之外的值：${extraInSchema.join(', ')}——配了会被运行时静默当 'stream' 处理`,
-    );
+    // 顶层与 accounts 段两份 enum 都对照（另有逐字一致用例兜底整体同步，
+    // 值级对照两份都查可直接定位漂移发生在哪一份）
+    const schemaEnumOf = (source: Record<string, unknown>) =>
+      ((source.streaming as { properties?: { sendMode?: { enum?: string[] } } })
+        ?.properties?.sendMode?.enum ?? []);
+    for (const [where, source] of [['顶层', topProps], ['accounts 段', accountProps]] as const) {
+      const schemaEnum = schemaEnumOf(source);
+      const missingInSchema = tsUnion.filter((v) => !schemaEnum.includes(v));
+      const extraInSchema = schemaEnum.filter((v) => !tsUnion.includes(v));
+      assert.strictEqual(
+        missingInSchema.length,
+        0,
+        `${where} schema.streaming.sendMode.enum 缺少 TS 联合类型的值：${missingInSchema.join(', ')}——` +
+          `additionalProperties/enum 校验下用户配了会被直接拒（v2.8.0 前的 stream-all 事故）`,
+      );
+      assert.strictEqual(
+        extraInSchema.length,
+        0,
+        `${where} schema.streaming.sendMode.enum 有 TS 联合类型之外的值：${extraInSchema.join(', ')}——配了会被运行时静默当 'stream' 处理`,
+      );
+    }
   });
 
   await test('streaming.sendMode：每个枚举成员都能通过真实校验器', () => {
@@ -427,7 +451,8 @@ async function main() {
         applyDefaults: boolean;
       }) => { ok: boolean; errors?: unknown[] };
     };
-    for (const member of ['stream', 'static', 'stream-all'] as const) {
+    // 遍历提取出的 TS 联合类型而非硬编码清单——新增成员自动纳入验证
+    for (const member of readInlineUnion('sendMode')) {
       const r = validator.r({
         origin: 'test',
         schema: qqbotSchema,
