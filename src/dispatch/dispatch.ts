@@ -672,8 +672,16 @@ export async function dispatchToOpenClaw(
             await streamingController.flushSegment();
           }
           // static 模式不 finalize（finalize 会进入终态并造成后续丢失）
-        } else if (kind !== 'block') {
-          // stream 模式：tool/final 时收尾当前打字机流（原行为）
+        } else if (kind === 'tool') {
+          // stream 模式：工具调用 = **段边界**（工具执行前模型的文本已经说完）
+          // → 封口当前段（收尾这条消息），**不终止整轮**：工具返回后的正文
+          // 另起一条消息完整送达。旧实现在这里直接 finalize（进入终态），
+          // 工具后的整段正文既不进缓冲又算不出差量 → 静默丢失
+          // （issue #67 的丢内容面）。
+          await streamingController.closeSegment('tool_call');
+        } else if (kind === 'final') {
+          // stream 模式：**仅**在终稿时收尾整轮。段边界由框架
+          // onAssistantMessageStart（+ 工具调用）驱动。
           await streamingController.finalize();
         }
         if (payload.isError === true) {
@@ -869,10 +877,13 @@ export async function dispatchToOpenClaw(
                         if (p.text) await streamingController.onPartialReply(p.text);
                       },
                       // 兜底：block 信号未覆盖的边界（如部分 provider 不发 text_end）
-                      // 仍由 onAssistantMessageStart 触发分段。stream 模式不传，保持原行为。
+                      // 仍由 onAssistantMessageStart 触发分段。
+                      // static 模式 = 固化上一段；stream 模式 = 封口上一段
+                      // （整段保留、拼进同一条消息），两种模式都不再靠长度
+                      // 启发式猜边界（issue #67）。
                       onAssistantMessageStart: streamingController.isStaticSendMode
                         ? async () => { await streamingController.flushSegment(); }
-                        : undefined,
+                        : async () => { await streamingController.beginSegment(); },
                     }
                   : {}),
                 ...(progressPublisher
@@ -1022,24 +1033,25 @@ function createStreamingController(
     | undefined;
   const sendMode = streamingCfg?.sendMode === 'static' ? 'static' : 'stream';
 
-  // static 模式：finalize 收尾时用一条普通 sendText 发完整文本。
+  // 普通消息通道（sendText）：
+  // - static 模式：finalize 收尾时用一条普通 sendText 发完整文本（主通道）；
+  // - stream 模式：仅兜底补发通道——终稿与已流出内容无关且本段从未流出时，
+  //   整段补发（否则那段正文会静默丢失，issue #67）。
   // 失败必须抛错——controller 的 completeSession/flushSegment 靠异常把
   // 终态转为 failed（吞错会让它把失败的正文记为已投递，进而照常补发
   // footer，用户只见 footer 不见正文）
-  const sendStatic = sendMode === 'static'
-    ? async (fullText: string) => {
-        const result = await sendText({
-          to: envelope.senderId,
-          text: fullText,
-          accountId: account.accountId,
-          replyToId: envelope.messageId,
-          account,
-        });
-        if (result.error) {
-          throw new Error(`static sendText failed: ${result.error}`);
-        }
-      }
-    : undefined;
+  const sendStatic = async (fullText: string) => {
+    const result = await sendText({
+      to: envelope.senderId,
+      text: fullText,
+      accountId: account.accountId,
+      replyToId: envelope.messageId,
+      account,
+    });
+    if (result.error) {
+      throw new Error(`static sendText failed: ${result.error}`);
+    }
+  };
 
   return new StreamingController({
     gateway: gw,
