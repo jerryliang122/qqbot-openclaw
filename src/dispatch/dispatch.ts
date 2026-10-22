@@ -493,60 +493,6 @@ export async function dispatchToOpenClaw(
         }
       }
 
-      // ── 0c. stream-all：块级中间态拦截（滚动道）+ 终稿道 ──
-      // v2 设计：文本段经 deliver(kind:'block') 按**完成段**到达（token 级
-      // partial 不注册），滚动道只在块/工具事件到达时离散追加（条目间
-      // markdown 分隔线）；终稿 kind:'final' 收尾滚动道后走独立打字机消息。
-      // 必须先于 section 1/2：section 2 依赖 hasStarted（stream-all 不注册
-      // partial、恒为 false），且 block 文本不能再落默认投递（会变成独立消息）。
-      if (streamingController?.isStreamAllMode) {
-        if (kind === 'block') {
-          if (text) {
-            await streamingController.onTextBlock(text);
-          }
-          // 媒体/语音不进滚动道，与 section 1 同口径立即投递
-          if (payload.audioAsVoice) {
-            await deliverReply(payload, info, deliverCtx);
-          } else if (hasMedia) {
-            await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
-          }
-          return;
-        }
-        if (kind === 'final') {
-          if (payload.isError === true) {
-            // 错误通知走下方默认路径发独立消息；先收尾滚动道
-            await streamingController.finalize();
-          } else if (combinedAbortSignal.aborted) {
-            // 已取消的 turn 不投递终稿（对齐 stream 模式：absorb 跳过 +
-            // footer 兜底被 aborted 守卫拦截），只收尾滚动道
-            await streamingController.finalize();
-            return;
-          } else {
-            dlog?.info(`[stream-all final] payload received chars=${text.length}`);
-            await streamingController.handleFinalDeliver(text, { signal: combinedAbortSignal });
-            // final 附带媒体（罕见）：文本已进终稿道，媒体立即转发
-            if (hasMedia) {
-              await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
-            }
-            if (!streamingController.finalLaneNeedsStaticFallback) {
-              // 终稿道中途失败（首片已落地、后续分片失败）：已接受前缀之后的
-              // 尾部交由 dispatch 末尾 [stream-final] 段按前缀差量补发（复用
-              // stream 模式的兜底机制与抑制口径——结果不明的失败不补发）
-              if (streamingController.finalLaneNeedsTailFallback) {
-                dlog?.warn(`stream-all final lane failed mid-delivery, tail goes to [stream-final] rescue`);
-                pendingStreamFinalText = text;
-              }
-              return;
-            }
-            // 终稿道零字符落地：fall through 走默认路径把终稿静态补发
-            // （滚动道内容保持可见，不重复）
-            dlog?.warn(`stream-all final lane failed clean, falling back to static final`);
-          }
-        }
-        // kind 'tool'：文本由滚动道标题行呈现（onItemEvent），媒体落到
-        // section 4 转发；其他 kind 走默认路径。
-      }
-
       // ── 1. block: 媒体/语音立即发送，文本留给流式 ──
       // 注：static 模式已显式 disableBlockStreaming:true，kind:'block' 不会再触发；
       // 此分支保留以兼容 stream 模式与未来变化。
@@ -781,64 +727,18 @@ export async function dispatchToOpenClaw(
                       onToolStart: async () => { await streamingController.flushSegment(); },
                     }
                   : {}),
-                ...(streamingController?.isStreamAllMode
-                  ? {
-                      // stream-all v2（块驱动）：文本段走 deliver(kind:'block')，
-                      // 工具标题行走 onItemEvent，终稿走 deliver(kind:'final') 的
-                      // 独立打字机消息——token 级 partial 不注册。旗标组合对齐
-                      // 框架自家 answerLane 的做法（bot-message 对流式通道同时设
-                      // suppressDefaultToolProgressMessages + forceToolResultProgress）：
-                      // - forceToolResultProgress：verbose 关闭时也投递 item 事件
-                      // - suppressDefaultToolProgressMessages：抑制框架默认工具
-                      //   进度文本消息（title 已由滚动道呈现，避免双份）
-                      // - disableBlockStreaming: false：**显式开启** block streaming。
-                      //   框架的启用条件是 disableBlockStreaming===false，或
-                      //   agents.defaults.blockStreamingDefault==="on"（用户级配置，
-                      //   默认未设）。不显式开启时文本永不按 kind:'block' 投递，
-                      //   滚动道只剩工具标题行——与 static 模式显式传 true 对称。
-                      // 注意：这里**刻意不注册 onToolStart**——运行时会把带
-                      // suppressChannelProgress 的工具 item（command 类工具）从
-                      // onItemEvent 摘掉改走 onToolStart（其无 title），
-                      // 注册两路反而丢标题。
-                      disableBlockStreaming: false,
-                      forceToolResultProgress: true,
-                      suppressDefaultToolProgressMessages: true,
-                      onItemEvent: async (item: {
-                        itemId?: string;
-                        toolCallId?: string;
-                        kind?: string;
-                        title?: string;
-                        name?: string;
-                        phase?: string;
-                        status?: string;
-                      }) => {
-                        await streamingController.onToolItem(item);
-                        return true; // ProgressCallbackResult：通道已呈现该进度
-                      },
-                    }
-                  : {}),
-                ...(streamingController && !streamingController.isStreamAllMode
+                ...(streamingController
                   ? {
                       onPartialReply: async (p: { text?: string }) => {
                         if (p.text) await streamingController.onPartialReply(p.text);
                       },
                       // 兜底：block 信号未覆盖的边界（如部分 provider 不发 text_end）
                       // 仍由 onAssistantMessageStart 触发分段。stream 模式不传，保持原行为。
-                      // stream-all 不注册 partial（文本按完成段经 deliver 进滚动道），
-                      // 用 onAssistantMessageStart 提前提交 held 块。
                       onAssistantMessageStart: streamingController.isStaticSendMode
                         ? async () => { await streamingController.flushSegment(); }
-                        : streamingController.isStreamAllMode
-                          ? async () => { await streamingController.beginSegment(); }
-                          : undefined,
+                        : undefined,
                     }
-                  : streamingController?.isStreamAllMode
-                    ? {
-                        onAssistantMessageStart: async () => {
-                          await streamingController.beginSegment();
-                        },
-                      }
-                    : {}),
+                  : {}),
                 ...(progressPublisher
                   ? {
                       // progress_card 卡片快照：每次步骤更新发一条独立消息
@@ -980,14 +880,11 @@ function createStreamingController(
     return null;
   }
 
-  // sendMode: 默认 'stream'（QQ 流式打印机），可选 'static'（普通 sendText 收尾）、
-  // 'stream-all'（双道：中间内容滚动打字机 + 终稿独立打字机，见 streaming-controller.ts）
+  // sendMode: 默认 'stream'（QQ 流式打印机），可选 'static'（普通 sendText 收尾）
   const streamingCfg = account.config?.streaming as
-    | { sendMode?: 'stream' | 'static' | 'stream-all' }
+    | { sendMode?: 'stream' | 'static' }
     | undefined;
-  const sendMode = streamingCfg?.sendMode === 'static' || streamingCfg?.sendMode === 'stream-all'
-    ? streamingCfg.sendMode
-    : 'stream';
+  const sendMode = streamingCfg?.sendMode === 'static' ? 'static' : 'stream';
 
   // static 模式：finalize 收尾时用一条普通 sendText 发完整文本。
   // 失败必须抛错——controller 的 completeSession/flushSegment 靠异常把
