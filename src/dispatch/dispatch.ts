@@ -80,8 +80,7 @@ function warnRoomEventDegraded(
 }
 
 /** 测试用：清空降级告警去重集合 */
-export function _resetRoomEventDegradedWarnings(): void {
-  roomEventDegradedGroups.clear();
+export function _resetRoomEventDegradedWarnings(): void {  roomEventDegradedGroups.clear();
 }
 
 /**
@@ -180,6 +179,26 @@ export interface DispatchToOpenClawOptions {
 /**
  * 将经过中间件处理的入站消息转发给 OpenClaw AI
  */
+/**
+ * 兜底路由 sessionKey（runtime 缺 `channel.routing.resolveAgentRoute` 时的安全网）。
+ *
+ * 必须满足 openclaw 2026.10.x 的 canonical session 文法（实测 2026-10-22）：
+ * - `agent:<agentId>:<rest...>` 文法（parseAgentSessionKey 非 null）
+ * - key === 其全小写折叠形（normalizeStoreSessionKey）
+ * 旧版 `qqbot:<account>:...` 兜底在 10.x 会被 SessionCanonicalKeyMigrationRequiredError
+ * 拒写，等于全量静默瘫痪。agentId 取 'main'（对齐 resolveAgentRoute 的框架默认）。
+ */
+export function buildFallbackRouteSessionKey(
+  isGroup: boolean,
+  accountId: string,
+  peerId: string,
+): string {
+  return (isGroup
+    ? `agent:main:qqbot:group:${accountId}:${peerId}:coalescing`
+    : `agent:main:qqbot:dm:${accountId}:${peerId}`
+  ).toLowerCase();
+}
+
 export async function dispatchToOpenClaw(
   ctx: MiddlewareContext,
   msg: QQBotInboundMessage,
@@ -223,11 +242,9 @@ export async function dispatchToOpenClaw(
       kind: envelope.chatScope === 'group' ? 'group' : 'direct',
       id: peerId,
     },
-  }) ?? { 
-    sessionKey: isGroup 
-      ? `qqbot:${account.accountId}:group:${peerId}:coalescing`
-      : `qqbot:${account.accountId}:${peerId}`, 
-    accountId: account.accountId 
+  }) ?? {
+    sessionKey: buildFallbackRouteSessionKey(isGroup, account.accountId, peerId),
+    accountId: account.accountId,
   };
 
   const qualifiedTarget = envelope.targetId;

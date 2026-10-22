@@ -8,6 +8,22 @@
 
 ---
 
+## [Unreleased]
+
+### 变更（Breaking：运行要求）
+
+- **OpenClaw 最低版本抬至 `2026.10.5`**（peer `>=2026.10.5`，devDependency 精确钉版 `2026.10.5`；此前基线 2026.9.1）。触发信号：上游 10.x 系列语义代差（10.2 删除 9 个 plugin-sdk 子路径、10.5 重构投递/会话语义）使「同时支持 9.x 与 10.x」的兼容成本超过收益，且主要部署环境已切 10.x。按 SemVer 规则这属运行要求变更（发版时建议升 major）。换版后 typecheck / lint:runtime / build / sdk-surface 守卫（37 用例）/ dispatch 系与 c2c 防抖系单测全绿。
+
+### 修复
+
+- **兜底路由 sessionKey 改用 canonical 文法（10.x 硬门槛，实测复现）**。openclaw 2026.10.x 的 state worker 对 session 写入做 canonical 校验：key 必须满足 `agent:<agentId>:<rest>` 文法且等于其全小写折叠形，否则抛 `SessionCanonicalKeyMigrationRequiredError`、该会话一切读写瘫痪。插件旧兜底（runtime 缺 `channel.routing.resolveAgentRoute` 时的安全网）拼的是 `qqbot:<account>:...` 形状——在 10.x 下等于把「路由 API 缺失」从可见错误放大成全量静默瘫痪。现改为 `buildFallbackRouteSessionKey()`（`agent:main:qqbot:group|dm:...` 文法 + 全小写），并由 `tests/fallback-route-key.test.ts` 用**已安装 openclaw 的真实解析/折叠函数**（`parseAgentSessionKey` / `normalizeSessionKeyPreservingOpaquePeerIds`）锁定——不靠形状猜测。
+
+### 调查结论（不改行为的实证记录）
+
+- **openclaw 2026.10.5 的命令层与本插件 dispatch 契约完全兼容**（harness 驱动真实 10.5 dist 实测）：空闲会话 `/status` 正常解释并经 `dispatcherOptions.deliver`（返回 void 的旧契约形状）送达；忙碌会话 `/stop` 走 dispatch 层 fast-abort（`tryFastAbortFromMessage`，先于 admission ticket）约 4 秒中止活动 turn 并回复 `⚙️ Agent was aborted.`。生产上若复现「/stop 停不掉、/status 无回复」，应优先排查部署侧（已装插件版本、网关日志、`commands.ownerAllowFrom`/`commands.allowFrom` 授权名单），而非框架兼容性。
+- **10.5 忙碌会话语义变化**：admission ticket 现在发生在 replyResolver 之前（实测 `wait_admission_ticket` 9.9s）——活动 turn 期间到达的非 abort 类指令会排队等待，turn 结束后才解释执行（这是预期行为，不是丢消息）。
+- **9.1 与 10.5 对 qqbot 的 `resolveAgentRoute` 输出完全一致**（c2c → `agent:main:main`，群 → `agent:main:qqbot:group:<id>`）：升级不改变会话 key 形状、不产生遗留行迁移需求。另实测确认框架 `dmScope` 默认 `"main"`（两版相同）：所有 c2c 用户共享 `agent:main:main` 一个会话（与 CLI 主会话同 key），需要按用户隔离请配 `session.dmScope: "per-peer"`。
+
 ## [2.8.0] - 2026-10-22
 
 ### 修复

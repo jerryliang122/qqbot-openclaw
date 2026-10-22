@@ -519,12 +519,12 @@ await test('devDependency 精确钉在 peer 范围允许的最低版本', () => 
   assert.ok(pinned, 'devDependencies.openclaw 应存在（typecheck 依赖它）');
   assert.equal(
     pinned,
-    '2026.9.1',
-    `devDependency 钉版应为基线 2026.9.1（实际 ${pinned}）。` +
+    '2026.10.5',
+    `devDependency 钉版应为基线 2026.10.5（实际 ${pinned}）。` +
       `\n    钉版语义=验证最旧受支持 API 面：改钉版前必须重新评估兼容性，` +
       `\n    并在 CHANGELOG/AGENTS.md 记录结论。`,
   );
-  assert.equal(peerRange, '>=2026.9.1', `peer 范围应保持 >=2026.9.1（实际 ${peerRange}）`);
+  assert.equal(peerRange, '>=2026.10.5', `peer 范围应保持 >=2026.10.5（实际 ${peerRange}）`);
 });
 
 await test('已安装版本满足 peer 范围', () => {
