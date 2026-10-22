@@ -30,9 +30,71 @@
 import assert from 'node:assert';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 
-const require = createRequire(join(process.cwd(), 'index.js'));
+/**
+ * 按模式发现并加载框架 dist 内部模块（跨 openclaw 版本）。
+ * 2026-10-22 抬地板 9.1→10.5 时引入：框架 dist 文件名带构建哈希且
+ * 10.x 起后缀 .js→.mjs，硬编码路径每版必碎。绑定字母（minified exports）
+ * 两版恰好一致（manifest.r=loadPluginManifest、validator.n=validateJsonSchemaValue、
+ * validator.r=validatePluginSchemaValue），但仍按行为探测兜底：
+ * - manifest：r(root) 返回含 ok:boolean 的结果对象
+ * - validator：n/r 均为函数（named-export 版文件会被跳过）
+ */
+async function loadFrameworkModules(): Promise<{
+  manifest: { r: (root: string) => { ok: boolean; manifest?: unknown; error?: unknown } };
+  validator: {
+    n: (params: { schema: unknown; value: unknown }) => void;
+    r: (params: {
+      origin: string;
+      schema: unknown;
+      cacheKey: string;
+      value: unknown;
+      applyDefaults: boolean;
+    }) => { ok: boolean; errors?: unknown[] };
+  };
+}> {
+  const distDir = join(process.cwd(), 'node_modules/openclaw/dist');
+  const importAll = async (stemRe: RegExp): Promise<Array<Record<string, unknown>>> => {
+    const files = readdirSync(distDir).filter((f) => stemRe.test(f));
+    const mods: Array<Record<string, unknown>> = [];
+    for (const f of files) {
+      try {
+        mods.push(await import(pathToFileURL(join(distDir, f)).href));
+      } catch {
+        /* 个别内部模块可能因缺可选依赖加载失败——跳过，找得到目标即可 */
+      }
+    }
+    return mods;
+  };
+
+  let manifest: { r: (root: string) => { ok: boolean } } | undefined;
+  for (const m of await importAll(/^manifest-{1,2}[A-Za-z0-9_-]+\.(mjs|js)$/)) {
+    const fn = m.r;
+    if (typeof fn !== 'function') continue;
+    try {
+      const res = fn(process.cwd());
+      if (res && typeof (res as { ok?: unknown }).ok === 'boolean') {
+        manifest = m as typeof manifest;
+        break;
+      }
+    } catch {
+      /* 继续探测下一个候选 */
+    }
+  }
+  assert.ok(manifest, '未能在 openclaw dist 中按行为探测到 loadPluginManifest（manifest.r）');
+
+  let validator: { n: unknown; r: unknown } | undefined;
+  for (const m of await importAll(/^schema-validator-[A-Za-z0-9_-]+\.(mjs|js)$/)) {
+    if (typeof m.n === 'function' && typeof m.r === 'function') {
+      validator = m as typeof validator;
+      break;
+    }
+  }
+  assert.ok(validator, '未能在 openclaw dist 中探测到 schema-validator（n=validateJsonSchemaValue, r=validatePluginSchemaValue）');
+
+  return { manifest: manifest as never, validator: validator as never };
+}
 
 let passed = 0;
 let failed = 0;
@@ -101,13 +163,12 @@ const accountsProp = topProps.accounts as
 const accountProps = accountsProp?.additionalProperties?.properties ?? {};
 
 async function main() {
+  const fw = await loadFrameworkModules();
+
   // ── manifest 可被框架解析 ─────────────────────────────────────────
 
   await test('manifest 能被框架的 loadPluginManifest 正常解析', () => {
-    const manifestModule = require('./node_modules/openclaw/dist/manifest-DAqWVneG.js') as {
-      r: (root: string) => { ok: boolean; manifest?: Manifest; error?: unknown };
-    };
-    const res = manifestModule.r(process.cwd());
+    const res = fw.manifest.r(process.cwd()) as { ok: boolean; manifest?: Manifest; error?: unknown };
     assert.ok(res.ok, `manifest 解析失败：${JSON.stringify(res.error ?? {}, null, 2)}`);
     assert.strictEqual(res.manifest?.id, 'openclaw-qqbot');
     assert.ok(res.manifest?.channels?.includes('qqbot'), '应声明 qqbot 通道');
@@ -284,10 +345,7 @@ async function main() {
   // ── schema 本身合法 ───────────────────────────────────────────────
 
   await test('schema 通过框架的 JSON Schema 合法性校验', () => {
-    const validator = require('./node_modules/openclaw/dist/schema-validator-CLfGeb79.js') as {
-      n: (params: { schema: unknown; value: unknown }) => void;
-    };
-    validator.n({ schema: qqbotSchema, value: {} });
+    fw.validator.n({ schema: qqbotSchema, value: {} });
   });
 
   await test('框架的通道配置校验路径能接受 setup 产出的配置', async () => {
@@ -297,15 +355,7 @@ async function main() {
     // 注意：不能用 validateJsonSchemaValue 代替——它只校验 schema 本身的
     // 形状，不做**实例值**校验（对 additionalProperties:false 完全不敏感），
     // 那样测出来的「通过」是假的。
-    const validator = require('./node_modules/openclaw/dist/schema-validator-CLfGeb79.js') as {
-      r: (params: {
-        origin: string;
-        schema: unknown;
-        cacheKey: string;
-        value: unknown;
-        applyDefaults: boolean;
-      }) => { ok: boolean; errors?: unknown[] };
-    };
+    const validator = fw.validator;
     const { applyAccountDefaults } = await import('../src/setup/finalize.js');
 
     const withDefault = applyAccountDefaults({ channels: { qqbot: {} } } as never, 'default');
@@ -344,15 +394,7 @@ async function main() {
   await test('通道 schema 确实会拒未知字段（否则以上断言是假的）', () => {
     // 反向断言：确认校验路径对 additionalProperties 敏感。
     // 若这条红了，说明框架换了校验路径，上面的「通过」不再有保证。
-    const validator = require('./node_modules/openclaw/dist/schema-validator-CLfGeb79.js') as {
-      r: (params: {
-        origin: string;
-        schema: unknown;
-        cacheKey: string;
-        value: unknown;
-        applyDefaults: boolean;
-      }) => { ok: boolean; errors?: unknown[] };
-    };
+    const validator = fw.validator;
     const r = validator.r({
       origin: 'external',
       schema: qqbotSchema,
@@ -364,10 +406,7 @@ async function main() {
   });
 
   await test('典型配置能通过框架校验器', () => {
-    const validator = require('./node_modules/openclaw/dist/schema-validator-CLfGeb79.js') as {
-      n: (params: { schema: unknown; value: unknown }) => void;
-    };
-    validator.n({
+    fw.validator.n({
       schema: qqbotSchema,
       value: {
         appId: '123',
@@ -442,15 +481,7 @@ async function main() {
   });
 
   await test('streaming.sendMode：每个枚举成员都能通过真实校验器', () => {
-    const validator = require('./node_modules/openclaw/dist/schema-validator-CLfGeb79.js') as {
-      r: (params: {
-        origin: string;
-        schema: unknown;
-        cacheKey: string;
-        value: unknown;
-        applyDefaults: boolean;
-      }) => { ok: boolean; errors?: unknown[] };
-    };
+    const validator = fw.validator;
     // 遍历提取出的 TS 联合类型而非硬编码清单——新增成员自动纳入验证
     for (const member of readInlineUnion('sendMode')) {
       const r = validator.r({
@@ -473,15 +504,7 @@ async function main() {
     // （降级 WARN 的第一条修法就是 groups.<id>.tools.allow），曾因 schema
     // 漏声明被 validatePluginSchemaValue 直接拒掉。必须用真实校验器
     // （r 实例校验）而非 validateJsonSchemaValue（n 只查 schema 形状）。
-    const validator = require('./node_modules/openclaw/dist/schema-validator-CLfGeb79.js') as {
-      r: (params: {
-        origin: string;
-        schema: unknown;
-        cacheKey: string;
-        value: unknown;
-        applyDefaults: boolean;
-      }) => { ok: boolean; errors?: unknown[] };
-    };
+    const validator = fw.validator;
     const r = validator.r({
       origin: 'external',
       schema: qqbotSchema,
@@ -521,10 +544,7 @@ async function main() {
   });
 
   await test('多账号配置能通过框架校验器', () => {
-    const validator = require('./node_modules/openclaw/dist/schema-validator-CLfGeb79.js') as {
-      n: (params: { schema: unknown; value: unknown }) => void;
-    };
-    validator.n({
+    fw.validator.n({
       schema: qqbotSchema,
       value: {
         appId: '1',

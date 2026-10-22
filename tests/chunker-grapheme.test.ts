@@ -2,8 +2,8 @@
  * 回归测试：字形簇安全分块 + 10.5 新原语接入
  *
  * 背景：openclaw 2026.10.5 新增 `openclaw/plugin-sdk/text-grapheme`
- * （findGraphemeChunkEnd，按字形簇切块）。2026.9.1 基线无该子路径且发布包
- * 不带 .d.ts → 插件侧带能力探测 + 本地 Intl.Segmenter 回退。
+ * （findGraphemeChunkEnd，按字形簇切块）。地板抬至 2026.10.5 后该子路径恒在，
+ * 但发布包不带 .d.ts → 插件侧仍带能力探测 + 本地 Intl.Segmenter 回退（守住"加载期不炸"）。
  *
  * 覆盖：
  *  1. 本地 findGraphemeChunkEnd 不切碎代理对 / emoji
@@ -180,9 +180,10 @@ test('能力探测：解析出的切点函数始终可用', () => {
   assert.strictEqual(resolveFindGraphemeChunkEnd(), fn);
 });
 
-test('能力探测：9.1 基线无该子路径时回退到本地实现且行为正确', () => {
-  // 2026.9.1 的 exports 里没有 ./plugin-sdk/text-grapheme —— 探测必然失败，
-  // 必须回退到本地 Intl.Segmenter 实现（sdk-surface 测试的豁免理由依赖这条保证）
+test('能力探测：子路径不可用时回退到本地实现且行为正确', () => {
+  // 子路径被上游移除（或加载失败）时探测必然失败，必须回退到本地 Intl.Segmenter
+  // 实现——这条保证与 sdk-surface 守卫互补：守卫防"子路径被删"，本用例防"回退路径本身坏掉"。
+  // 注：地板已抬至 2026.10.5（该子路径恒在），本用例守的是"加载期不炸"这条底线。
   const fn = resolveFindGraphemeChunkEnd();
   const emoji = '😀';
   const text = `abc${emoji}def`;

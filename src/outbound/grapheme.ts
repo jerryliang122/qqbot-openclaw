@@ -16,12 +16,12 @@
  * openclaw 2026.10.5 新增 `openclaw/plugin-sdk/text-grapheme` 子路径，提供
  * `findGraphemeChunkEnd`（基于 `Intl.Segmenter`）。但：
  *
- * - 2026.9.1 基线**没有**该子路径 → 运行时 require 会抛 ERR_PACKAGE_PATH_NOT_EXPORTED
  * - 该子路径在 openclaw 发布包里**没有 .d.ts** → 类型靠本仓库的 ambient stub
+ * - 仍保留能力探测 + 本地等价回退：子路径被上游移除时插件照常加载、照常分块
+ *   （地板已抬至 2026.10.5，但守住"加载期不炸"这条底线仍有价值）
  *
  * 故：优先用官方原语，取不到时回退到本地的 `Intl.Segmenter` 等价实现
  * （语义与官方一致：优先期望断点，吸附到字形簇边界，必要时代理对安全兜底）。
- * 这符合 AGENTS.md 的「不得使用仅存在于更新版本中的 API，除非带能力探测与回退」。
  */
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -63,7 +63,7 @@ export function resolveFindGraphemeChunkEnd(): FindGraphemeChunkEnd {
       official = mod.findGraphemeChunkEnd;
     }
   } catch {
-    // 9.1 基线无该子路径（ERR_PACKAGE_PATH_NOT_EXPORTED）→ 永久回退本地实现
+    // 子路径不存在（ERR_PACKAGE_PATH_NOT_EXPORTED）→ 永久回退本地实现
     official = null;
   }
 

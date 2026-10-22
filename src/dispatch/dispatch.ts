@@ -24,7 +24,7 @@ import { DeliverDebouncer } from '../outbound/debounce.js';
 import { StreamingController, shouldUseStreaming } from '../outbound/streaming-controller.js';
 import { ProgressCardPublisher } from '../outbound/progress-card-publisher.js';
 import { getPassiveReplyQuotaRemaining } from '../features/quota-manager.js';
-import { getAdapters } from '../adapter/resolve.js';
+import { getAdapters, type RuntimeAdapters } from '../adapter/resolve.js';
 import { clearGroupHistory, trimGroupHistoryAfterLastBot } from '../features/history-store.js';
 import {
   isAskUserPayload,
@@ -177,6 +177,151 @@ export interface DispatchToOpenClawOptions {
   onTurnSubmitted?: () => void;
 }
 
+/** 框架 canonical agent id（非法值回退 'main'）——与 openclaw normalizeAgentId 同形。 */
+function normalizeFallbackIdStrict(value: string | undefined): string | undefined {
+  const trimmed = (value ?? '').trim();
+  const normalized = trimmed.toLowerCase();
+  if (/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(trimmed)) return normalized;
+  const sanitized = normalized
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+/, '')
+    .replace(/-+$/, '')
+    .slice(0, 64);
+  return sanitized || undefined;
+}
+
+/** 框架 canonical account id（非法/空值回退 'default'）——与 openclaw normalizeAccountId 同形。 */
+function normalizeFallbackAccountId(value: string | undefined): string {
+  const sanitized = normalizeFallbackIdStrict(value);
+  // 框架额外排除原型污染键（__proto__ / constructor / prototype）
+  if (!sanitized || sanitized === '__proto__' || sanitized === 'constructor' || sanitized === 'prototype') {
+    return 'default';
+  }
+  return sanitized;
+}
+
+/** 兜底路由 sessionKey 的入参（与框架 buildAgentSessionKey 的参数一一对应）。 */
+export interface FallbackRouteSessionKeyParams {
+  /** 群聊（true）还是私聊（false） */
+  isGroup: boolean;
+  accountId: string;
+  peerId: string;
+  /** agent id（框架默认 'main'） */
+  agentId?: string;
+  /** 会话主键（框架默认 'main'） */
+  mainKey?: string;
+  /** 框架 cfg.session.dmScope（默认 'main'） */
+  dmScope?: string;
+  /** 框架 cfg.session.groupScope（默认 'per-group'） */
+  groupScope?: string;
+}
+
+/**
+ * 兜底路由 sessionKey（runtime 缺 `channel.routing.resolveAgentRoute` 时的安全网）。
+ *
+ * 必须与框架 `buildAgentPeerSessionKey` 的产物**逐字同形**——两条硬约束：
+ *
+ * 1. **canonical**（openclaw 2026.10.x state worker 写 session 时校验）：
+ *    `parseAgentSessionKey(key)` 非 null（`agent:<agentId>:<rest>` 文法）且
+ *    `normalizeStoreSessionKey(key) === key`（key 等于其全小写折叠形）。
+ *    违反即抛 `SessionCanonicalKeyMigrationRequiredError`，该 session 读写瘫痪。
+ *    旧版 `qqbot:<account>:...` 兜底在 10.x 下等于全量静默瘫痪（已实测复现）。
+ *
+ * 2. **route 文法**：框架反解投递目标用的是 `<channel>[:<accountId>]:<peerKind>:<peerId>`
+ *    （`parseSessionDeliveryRoute`）。把 accountId 或历史遗留的 `:coalescing` 后缀
+ *    塞进 peer 段，框架会把它们当成 peerId 的一部分 → 框架自发回复 / 投递恢复 /
+ *    子代理路由全部指向不存在的 peer。
+ *
+ * 作用域语义也必须与框架一致（dmScope / groupScope 取自 `cfg.session`），
+ * 否则兜底与主路径（框架 resolveAgentRoute）会话粒度不同：c2c 默认
+ * `dmScope="main"` 共享 `agent:main:main`，兜底却按 peer 分裂。
+ *
+ * 优先用框架自己的 `runtime.channel.routing.buildAgentSessionKey`（见 adapter/resolve.ts），
+ * 本函数只作为「框架原语也缺失」时的等价镜像。
+ */
+export function buildFallbackRouteSessionKey(params: FallbackRouteSessionKeyParams): string {
+  const agentId = normalizeFallbackIdStrict(params.agentId) ?? 'main';
+  const mainKey = (params.mainKey ?? '').trim().toLowerCase() || 'main';
+  const channel = 'qqbot';
+  const accountId = normalizeFallbackAccountId(params.accountId);
+  // qqbot 非 signal/matrix，框架的 normalizeSessionPeerId 一律折叠为小写
+  const peerId = (params.peerId ?? '').trim().toLowerCase();
+
+  if (!params.isGroup) {
+    const dmScope = params.dmScope ?? 'main';
+    if (dmScope === 'per-account-channel-peer' && peerId) {
+      return `agent:${agentId}:${channel}:${accountId}:direct:${peerId}`;
+    }
+    if (dmScope === 'per-channel-peer' && peerId) {
+      return `agent:${agentId}:${channel}:direct:${peerId}`;
+    }
+    if (dmScope === 'per-peer' && peerId) {
+      return `agent:${agentId}:direct:${peerId}`;
+    }
+    return `agent:${agentId}:${mainKey}`;
+  }
+
+  const groupScope = params.groupScope ?? 'per-group';
+  if (groupScope === 'main') return `agent:${agentId}:${mainKey}`;
+  return `agent:${agentId}:${channel}:group:${peerId || 'unknown'}`;
+}
+
+/**
+ * 路由 peerId：群聊用 groupId（群内不同用户共享同一 session lane，避免同群
+ * 并发触发 QQ 平台 500），私聊用 senderId。
+ */
+export function resolveDispatchPeerId(
+  chatScope: 'direct' | 'group',
+  groupId: string | undefined,
+  senderId: string,
+): string {
+  return chatScope === 'group' ? (groupId ?? senderId) : senderId;
+}
+
+/**
+ * 兜底路由对象（runtime 缺 `channel.routing.resolveAgentRoute` 时的安全网）。
+ *
+ * 优先用框架自己的 `runtime.channel.routing.buildAgentSessionKey`——它与
+ * resolveAgentRoute 同源，文法/作用域语义永远跟随框架；框架原语也缺失时
+ * 才退到本地等价镜像（buildFallbackRouteSessionKey）。
+ *
+ * agentId 取框架默认 'main'（DEFAULT_AGENT_ID）——必须与 sessionKey 的 agent 段
+ * 一致，否则 session key 说 main、turn 却按别的 agent 跑。
+ */
+function buildFallbackRoute(
+  adapters: RuntimeAdapters,
+  cfg: any,
+  accountId: string,
+  isGroup: boolean,
+  peerId: string,
+): { sessionKey: string; agentId: string; accountId: string } {
+  const agentId = 'main';
+  const sessionCfg = (cfg as { session?: { mainKey?: string; dmScope?: string; groupScope?: string } }).session;
+  const peer = { kind: isGroup ? ('group' as const) : ('direct' as const), id: peerId };
+  const frameworkKey = adapters.buildAgentSessionKey?.({
+    agentId,
+    channel: 'qqbot',
+    accountId,
+    peer,
+    mainKey: sessionCfg?.mainKey,
+    dmScope: sessionCfg?.dmScope,
+    groupScope: sessionCfg?.groupScope,
+  });
+  return {
+    sessionKey: frameworkKey ?? buildFallbackRouteSessionKey({
+      isGroup,
+      accountId,
+      peerId,
+      agentId,
+      mainKey: sessionCfg?.mainKey,
+      dmScope: sessionCfg?.dmScope,
+      groupScope: sessionCfg?.groupScope,
+    }),
+    agentId,
+    accountId,
+  };
+}
+
 /**
  * 将经过中间件处理的入站消息转发给 OpenClaw AI
  */
@@ -195,7 +340,7 @@ export async function dispatchToOpenClaw(
   dlog?.debug(`received sender=${envelope.senderId} scope=${envelope.chatScope} msgId=${envelope.messageId}`);
 
   if (!adapters.inboundRun || !adapters.dispatchReply) {
-    dlog?.error(`runtime adapter inboundRun/dispatchReply not available (openclaw=${adapters.version}, requires >=2026.9.1)`);
+    dlog?.error(`runtime adapter inboundRun/dispatchReply not available (openclaw=${adapters.version}, requires >=2026.10.5)`);
     return;
   }
 
@@ -207,13 +352,9 @@ export async function dispatchToOpenClaw(
 
   const isGroup = envelope.chatScope === 'group';
 
-  // 群聊/私聊差异化 sessionKey：
-  // - 群聊：group:{groupId}:coalescing 后缀（历史遗留命名，保留以延续存量群会话 lane；
-  //   排队/合并现已由框架 followup 队列按该 sessionKey 处理）
-  // - 私聊：保持原有格式，允许用户"插嘴"（新消息取消旧消息）
-  const peerId = envelope.chatScope === 'group' 
-    ? (envelope.groupId ?? envelope.senderId) 
-    : envelope.senderId;
+  // 路由 peerId：群聊用 groupId（群内不同用户共享同一 session lane，避免同群
+  // 并发触发 QQ 平台 500），私聊用 senderId（允许用户"插嘴"，新消息取消旧消息）。
+  const peerId = resolveDispatchPeerId(envelope.chatScope, envelope.groupId, envelope.senderId);
 
   const route = adapters.resolveAgentRoute?.({
     cfg,
@@ -223,12 +364,7 @@ export async function dispatchToOpenClaw(
       kind: envelope.chatScope === 'group' ? 'group' : 'direct',
       id: peerId,
     },
-  }) ?? { 
-    sessionKey: isGroup 
-      ? `qqbot:${account.accountId}:group:${peerId}:coalescing`
-      : `qqbot:${account.accountId}:${peerId}`, 
-    accountId: account.accountId 
-  };
+  }) ?? buildFallbackRoute(adapters, cfg, account.accountId, isGroup, peerId);
 
   const qualifiedTarget = envelope.targetId;
   const agentId = route.agentId ?? 'default';
