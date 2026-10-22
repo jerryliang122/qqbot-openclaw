@@ -3,13 +3,30 @@
  *
  * 核心约束：QQ 流式 API 替换模式下，已下发文本的**前缀不可变更**。
  *
- * 状态机：
- *   IDLE → (first chunk) → STREAMING → (complete) → DONE
- *                                      → (prefix changed) → DONE
- *                                      → (new reply) → IDLE → …
+ * stream 模式的「段」模型（issue #67）：
+ * - **段** = openclaw 发来的一段 assistant 文本（框架每次 assistant 消息开始
+ *   时触发 onAssistantMessageStart）。同一轮内的多次模型调用（工具调用续写 /
+ *   provider 断流后 core 的 visible-answer 重试）会产生多段，段与段之间
+ *   **没有公共前缀**。
+ * - **一段 = 一条 QQ 流式消息**：段边界处收尾当前流式会话（DONE 帧）并另起
+ *   一条，**每段内容原样送达、互不重叠**（对齐 telegram 的「每个 assistant
+ *   消息一条气泡」）。这是本插件一直以来的形态，不得改成多段合并成一条。
+ * - **绝不跨段截断拼接**：旧实现把「前缀不匹配的新文本」截断后拼到已发文本
+ *   后面（`prefix retry` 支），产出两次尝试缝合的「草稿」——用户看到的是
+ *   「第一条是第二条的一部分」「同一条回复被重发了一遍」。现场 A 的两条 QQ
+ *   消息（收尾帧与开流帧相隔 343ms）就是这么来的。
+ * - 长度启发式（"chunk 变短 ⇒ 新回复"）已废除：它把同轮重发误判成新回复，
+ *   且对「新段比旧段长」完全失效（那种情况旧代码会走拼接支）。段边界改由
+ *   框架信号 + 「新块不延续当前段」兜底判定。
  *
- * onPartialReply(text) 输入：模型全量文本，持续增长。
- * finalize()           标记：框架通知回复结束，用 lastAccepted 收尾。
+ * 状态机：
+ *   IDLE → (first chunk) → STREAMING → (finalize) → DONE
+ *                                      → (update failed) → FAILED
+ *
+ * onPartialReply(text) 输入：当前段的文本，段内持续增长。
+ * beginSegment()        输入：框架 onAssistantMessageStart——新段开始，封口上一段。
+ * closeSegment()        输入：段边界（工具调用等）——封口当前段，不终止整轮。
+ * finalize()            标记：框架通知回复结束，用已下发文本收尾。
  */
 
 import type { ReplyTarget, StreamSession } from '@tencent-connect/qqbot-nodejs';
@@ -50,8 +67,12 @@ export interface StreamingControllerDeps {
    */
   sendMode?: StreamingSendMode;
   /**
-   * static 模式专用：在 finalize 收尾时把累积的完整文本一次性发出。
-   * stream 模式下不使用。未提供时 static 模式将降级为 shouldFallbackToStatic。
+   * 普通消息下发通道（sendText）：
+   *   - 'static' 模式下是**主通道**——流结束时把累积的完整文本一次性发出；
+   *   - 'stream' 模式下仅作**兜底补发**通道——终稿与已流出内容无关且本段
+   *     从未流出时，整段补发（绝不静默丢弃，issue #67 的「内容丢失」面）。
+   * 未提供时上述路径降级（static → shouldFallbackToStatic；stream → 交由
+   * 上层兜底）。
    */
   sendStatic?: (fullText: string) => Promise<void>;
 }
@@ -64,6 +85,17 @@ export class StreamingController {
 
   /** QQ 已接受的最新文本 — 单源真理 */
   private lastAcceptedFull = '';
+
+  /**
+   * stream 模式：当前段的忠实文本（框架 partial 逐块增长，段内单调）。
+   * 段边界由 beginSegment()/closeSegment()（框架 onAssistantMessageStart /
+   * 工具调用）或「新块不延续当前段」兜底判定，**不再**用长度启发式猜
+   * （issue #67 的根因）。
+   */
+  private currentSegmentText = '';
+
+  /** stream 模式：当前段是否已推送到平台（false = 本段从未流出） */
+  private currentSegmentPushed = false;
 
   /**
    * 最后一次流式 update 失败是否「结果不明」（网络层失败：超时/连接中断，
@@ -108,7 +140,8 @@ export class StreamingController {
   /**
    * 是否处于 static 下发模式（公开访问器，供 dispatch 协同判断）。
    * static 模式下 dispatch 不应在 tool/final 事件提前 finalize，
-   * 由 controller 靠 new_reply 检测自主分段，避免终态与发送延迟。
+   * 分段由框架 onAssistantMessageStart 驱动（controller 的 flushSegment
+   * 固化上一段），避免终态与发送延迟。
    */
   get isStaticSendMode(): boolean { return this.isStaticMode; }
 
@@ -206,19 +239,22 @@ export class StreamingController {
   }
 
   /**
-   * 是否可以把「与已承接内容无关」的 final 文本整段补发（issue #44）。
+   * 是否可以把「与已承接内容无关」的 final 文本整段补发。
    *
-   * 四条同时成立才动手：static 下发通道可用 / **当前缓冲为空**（= 本段一条
-   * partial 都没流出来，缓冲有内容说明本段已流出、final 与其无关属模型重写，
-   * 那是 stream 模式同款的有意丢弃语义）/ 至少已发出一段（否则 final 压根
-   * 不会走到流式分支）/ 未走外部投递通道。
+   * - static 模式：四条同时成立才动手——普通消息通道可用 / **当前缓冲为空**
+   *   （= 本段一条 partial 都没流出来，缓冲有内容说明本段已流出、final 与其
+   *   无关属模型重写）/ 至少已发出一段 / 未走外部投递通道（issue #44）。
+   * - stream 模式：**当前段从未推送到平台**（= 终稿是这一段的唯一文本，
+   *   用户还没看到任何这段内容）→ 必须整段补发，绝不静默丢弃
+   *   （issue #67 的「内容丢失」面）。当前段已推送时 final 与其无关 =
+   *   同段内模型改写尾段，流内内容即答案，维持丢弃（补发会重复）。
    */
   private canRescueUndeliveredFinal(): boolean {
-    return this.isStaticMode
-      && !!this.deps.sendStatic
-      && !this.lastAcceptedFull
-      && this.sentChunkCount > 0
-      && !this._deliveredExternally;
+    if (!this.deps.sendStatic) return false;
+    if (this._deliveredExternally) return false;
+    if (this.sentChunkCount === 0) return false;
+    if (this.isStaticMode) return !this.lastAcceptedFull;
+    return !this.currentSegmentPushed;
   }
 
   // ── 入口 ──
@@ -230,6 +266,52 @@ export class StreamingController {
       this.transition('failed', 'chunk_error');
     });
     return this.chain as Promise<void>;
+  }
+
+  /**
+   * 框架 onAssistantMessageStart：新一段 assistant 文本开始。
+   *
+   * stream 模式：封口上一段——收尾当前流式会话（DONE 帧）并另起一条，
+   * **每段一条 QQ 消息、内容原样送达**（issue #67）。段结束 ≠ 整轮结束。
+   * static 模式：语义不变（分段由 flushSegment 负责），此方法为空操作。
+   *
+   * 与 onPartialReply 共用同一条串行队列，避免与增量处理交叉。
+   */
+  beginSegment(): Promise<void> {
+    return this.closeSegment('assistant_message_start');
+  }
+
+  /**
+   * 封口当前段：收尾当前流式会话（DONE 帧），**不终止整轮**。
+   *
+   * 段边界有两个来源：
+   * - 框架 onAssistantMessageStart（新一段 assistant 文本开始）；
+   * - 工具调用（deliver(kind:'tool')）——工具执行前模型的文本已经说完。
+   *
+   * 旧实现是在工具事件上直接 `finalize()`（进入终态），于是工具调用之后的
+   * 正文既不进缓冲又算不出差量 → **整段正文静默丢失**（issue #67 的丢内容面）。
+   * 现在这里只封口「段」，整轮由 finalize() 收尾。
+   */
+  closeSegment(reason: string): Promise<void> {
+    this.chain = this.chain.then(() => this.doCloseSegment(reason)).catch((err) => {
+      this.deps.log?.error(`closeSegment error: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return this.chain as Promise<void>;
+  }
+
+  /**
+   * 封口当前段的实际动作——**必须在控制器串行队列内执行**。
+   * 不可在此再入队（chain.then），否则队列内的调用方 await 自己排队的任务
+   * → 自锁（handleChunk → closeSegment → 等待排在 handleChunk 之后的自己）。
+   */
+  private async doCloseSegment(reason: string): Promise<void> {
+    if (this.isTerminal || this.isStaticMode) return;
+    if (!this.currentSegmentText) return;
+    this.deps.log?.info(`segment sealed chars=${this.currentSegmentText.length} reason=${reason}`);
+    await this.completeSession(`segment_boundary:${reason}`);
+    this.currentSegmentText = '';
+    this.currentSegmentPushed = false;
+    this.lastAcceptedFull = '';
   }
 
   finalize(): Promise<void> {
@@ -317,7 +399,15 @@ export class StreamingController {
         }
         // stream：前缀增长推入当前会话；无会话（异常态）时留给上层兜底
         if (this.session) {
-          await this.sendUpdate(mergeSegmentBoundary(this.lastAcceptedFull, match.remainder));
+          const merged = mergeSegmentBoundary(this.lastAcceptedFull, match.remainder);
+          await this.sendUpdate(merged);
+          // 推送失败（phase=failed）时**不推进基准**——尾巴仍未进流，
+          // 交由上层 [stream-final] 差量兜底补发（否则正文/footer 会丢）
+          if (this.isTerminal) return;
+          // 终稿是本段的权威文本 → 段基准推进到终稿（避免上层重复补发尾巴）
+          this.currentSegmentText = finalText;
+          this.currentSegmentPushed = true;
+          this.lastDeliveredSegmentText = finalText;
           this.deps.log?.info(`absorb final tail into stream chars=${match.remainder.length}`);
         }
         return;
@@ -349,12 +439,12 @@ export class StreamingController {
       if (this.isStaticMode) {
         // 缓冲非空 = 本段已流出内容，final 与其无关属模型重写，维持丢弃
         this.deps.log?.info(
-          `final text rewritten mid-turn (bufferChars=${this.lastAcceptedFull.length}), dropped finalChars=${finalText.length}`,
+          `final text rewritten mid-turn (final match=unrelated → action=dropped, bufferChars=${this.lastAcceptedFull.length}) dropped finalChars=${finalText.length}`,
         );
         return;
       }
       this.deps.log?.info(
-        `stream: final text unrelated to streamed content, dropped finalChars=${finalText.length} (model rewrite)`,
+        `stream: final text unrelated to streamed content (final match=unrelated → action=dropped, currentSegmentChars=${this.currentSegmentText.length}) dropped finalChars=${finalText.length} (model rewrite)`,
       );
     }).catch((err) => {
       this.deps.log?.error(`absorbFinalText error: ${err instanceof Error ? err.message : String(err)}`);
@@ -368,24 +458,23 @@ export class StreamingController {
   private async handleChunk(text: string): Promise<void> {
     if (this.isTerminal || !text) return;
 
-    // 正常续写：新文本前缀匹配（含空白归一化）
-    if (prefixMatches(this.lastAcceptedFull, text)) {
-      if (text.length !== this.lastAcceptedFull.length) {
-        await this.sendUpdate(text);
-      }
-      return;
-    }
-
-    // 无已下发内容 → 首发
-    if (!this.lastAcceptedFull) {
-      await this.sendUpdate(text);
-      return;
-    }
-
-    // static 模式：分段由框架 onAssistantMessageStart 明确驱动（flushSegment）。
-    // 前缀不匹配时视为新一段开始 → 直接覆盖累积（不发送，发送由 flushSegment 负责）。
-    // 不依赖"长度回退"启发式（长度相等时会误判为追加导致文本粘连）。
     if (this.isStaticMode) {
+      // ── static 模式（语义不变）──
+      // 正常续写：新文本前缀匹配（含空白归一化）
+      if (prefixMatches(this.lastAcceptedFull, text)) {
+        if (text.length !== this.lastAcceptedFull.length) {
+          await this.sendUpdate(text);
+        }
+        return;
+      }
+      // 无已下发内容 → 首发
+      if (!this.lastAcceptedFull) {
+        await this.sendUpdate(text);
+        return;
+      }
+      // 分段由框架 onAssistantMessageStart 明确驱动（flushSegment）。
+      // 前缀不匹配时视为新一段开始 → 直接覆盖累积（不发送，发送由 flushSegment 负责）。
+      // 不依赖"长度回退"启发式（长度相等时会误判为追加导致文本粘连）。
       this.deps.log?.info(`static new segment: lastAccepted=${this.lastAcceptedFull.length}→chunk=${text.length}`);
       this.lastAcceptedFull = text;
       this.lastDeliveredSegmentText = text;
@@ -393,23 +482,27 @@ export class StreamingController {
       return;
     }
 
-    // stream 模式：前缀不匹配 — 长度回退 → 新回复（工具调用后）
-    if (text.length < this.lastAcceptedFull.length) {
-      this.deps.log?.info(`new reply: lastAccepted=${this.lastAcceptedFull.length}→chunk=${text.length}`);
-      await this.completeSession('new_reply');
-      this.lastAcceptedFull = '';
+    // ── stream 模式（段模型，issue #67）──
+    // 段内增长：新文本延续当前段 → 同一条消息继续增长
+    if (this.currentSegmentText && prefixMatches(this.currentSegmentText, text)) {
+      this.currentSegmentText = text;
       await this.sendUpdate(text);
       return;
     }
-
-    // 前缀不匹配但长度增长 → 模型重写尾部，同一条流追加
-    const commonLen = longestCommonPrefix(this.lastAcceptedFull, text);
-    const extra = text.slice(Math.max(commonLen, 0));
-    const merged = this.lastAcceptedFull + extra;
-    this.deps.log?.warn(
-      `prefix retry: lastAccepted=${this.lastAcceptedFull.length}→chunk=${text.length} common=${commonLen} extra=${extra.length}, appending`,
-    );
-    await this.sendUpdate(merged);
+    // 段边界：新文本不延续当前段（同轮第二次模型调用 / 模型重写整段 / 工具
+    //   调用后开启新一段）→ 封口当前段（收尾旧消息）并**另起一条消息**，
+    //   新段内容原样送达。
+    // 绝不把新文本截断后拼到旧文本后面——那会产生「草稿」式内容重叠
+    // （用户看到两次尝试被缝在一起），且前缀不可变更的约束下也无法回改。
+    if (this.currentSegmentText) {
+      this.deps.log?.info(
+        `new segment detected: prevChars=${this.currentSegmentText.length} newChars=${text.length} (new message, verbatim, no splicing)`,
+      );
+      await this.doCloseSegment('new_segment');
+    }
+    this.currentSegmentText = text;
+    this.currentSegmentPushed = false;
+    await this.sendUpdate(text);
   }
 
   private async handleFinalize(): Promise<void> {
@@ -480,8 +573,9 @@ export class StreamingController {
     }
     try {
       await this.session.update(text);
-      this.lastAcceptedFull = text;
-      this.lastDeliveredSegmentText = text;
+      this.lastAcceptedFull = text;                              // 平台已见正文（整段拼接结果）
+      this.lastDeliveredSegmentText = this.currentSegmentText;   // 差量基准 = 当前段
+      if (this.currentSegmentText) this.currentSegmentPushed = true;
       this.sentChunkCount++;
     } catch (err) {
       this.deps.log?.error(`update failed (len=${text.length}): ${err instanceof Error ? err.message : String(err)}`);
@@ -547,12 +641,6 @@ function normalizeWs(s: string): string {
 function prefixMatches(accepted: string, incoming: string): boolean {
   if (incoming.startsWith(accepted)) return true;
   return normalizeWs(incoming).startsWith(normalizeWs(accepted));
-}
-
-function longestCommonPrefix(a: string, b: string): number {
-  let i = 0;
-  while (i < a.length && i < b.length && a[i] === b[i]) i++;
-  return i;
 }
 
 /**

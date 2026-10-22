@@ -146,27 +146,42 @@ await test("hasStarted 同步置位（不等异步发送）", async () => {
   await p;
 });
 
-await test("文本缩短 → 新回复：complete 旧会话后开新会话", async () => {
+await test("文本缩短 → 判定新段：收尾旧消息 + 另起一条（原样送达）", async () => {
   const { ctrl, sessions } = createController();
 
   await ctrl.onPartialReply("第一段回复");
-  await ctrl.onPartialReply("新"); // 前缀不匹配且更短 → new_reply
+  await ctrl.onPartialReply("新"); // 前缀不匹配 → 新段（不再按长度猜边界）
 
-  assert.strictEqual(sessions.length, 2, "应开了第二个会话");
-  assert.ok(sessions[0]!.completed >= 1, "旧会话应已 complete");
-  assert.strictEqual(sessions[1]!.updates[0]!.text, "新", "新会话首片为新文本");
+  assert.strictEqual(sessions.length, 2, "新段应另起一条消息");
+  assert.ok(sessions[0]!.completed >= 1, "旧消息应已收尾（DONE 帧）");
+  assert.deepStrictEqual(
+    sessions[0]!.updates.map((u) => u.text),
+    ["第一段回复"],
+    "旧消息只含本段内容，不含下一段的任何字符",
+  );
+  assert.strictEqual(sessions[1]!.updates[0]!.text, "新", "新消息首片为新段原文");
 });
 
-await test("前缀不匹配但增长（模型重写尾部）→ 同会话合并追加", async () => {
+await test("前缀不匹配但增长 → 仍是新段：另起一条，绝不跨段截断拼接（issue #67）", async () => {
   const { ctrl, sessions } = createController();
 
   await ctrl.onPartialReply("abcdefg");
-  await ctrl.onPartialReply("abcXYZ!"); // 公共前缀 abc，尾部重写
+  await ctrl.onPartialReply("abcXYZ!"); // 公共前缀 abc，但整段不是延续 → 新段
 
-  assert.strictEqual(sessions.length, 1, "不应开新会话");
-  assert.strictEqual(sessions[1 - 1]!.updates.length, 2);
-  // 合并语义：保留已接受前缀 + 追加重写的尾部（前缀不可变更约束）
-  assert.strictEqual(sessions[0]!.updates[1]!.text, "abcdefgXYZ!", "下发合并后的完整文本");
+  // 红线：新段**原样**作为一条新消息，绝不把新段截断后拼到旧文本后面
+  // （旧行为会产出 "abcdefgXYZ!" 这种两次尝试的缝合体——用户看到的内容重叠）
+  assert.strictEqual(sessions.length, 2, "新段应另起一条消息");
+  assert.deepStrictEqual(
+    sessions[0]!.updates.map((u) => u.text),
+    ["abcdefg"],
+    "旧消息只含本段内容",
+  );
+  assert.strictEqual(sessions[1]!.updates[0]!.text, "abcXYZ!", "新消息首片为新段原文");
+  for (const s of sessions) {
+    for (const u of s.updates) {
+      assert.ok(!u.text.includes("abcdefgXYZ!"), `不得出现跨段截断的缝合体：${JSON.stringify(u.text)}`);
+    }
+  }
 });
 
 await test("update 失败 → failed 终态 + 降级标记", async () => {

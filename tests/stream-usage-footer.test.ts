@@ -89,7 +89,7 @@ await test('stream: final 与已流出一致 → 空串（纯去重）', async (
 
 await test('stream: 多段 turn（final 拼接全部段落）→ 定位最后一段之后的增量', async () => {
   const ctrl = makeController({ sendMode: 'stream' });
-  // 段A 流出后，段B 更短且前缀不匹配 → new_reply 轮转
+  // 段A 流出后，段B 与之无公共前缀 → 判为新段 → 另起一条消息（原样送达）
   await ctrl.onPartialReply('第一段较长的开头文本');
   await ctrl.onPartialReply('第二段结论');
   await ctrl.finalize();
@@ -412,7 +412,7 @@ await test('stream 模式: 多段 turn → footer 并入最后一段的流式会
     streaming: { mode: 'stream' },
     simulate: async (c) => {
       await c.replyOptions?.onPartialReply?.({ text: '第一段较长的开头' });
-      await c.replyOptions?.onPartialReply?.({ text: '第二段结论' }); // 更短 → new_reply 轮转
+      await c.replyOptions?.onPartialReply?.({ text: '第二段结论' }); // 新段 → 另起一条消息
       await c.dispatcherOptions?.deliver?.(
         { text: `第一段较长的开头\n\n第二段结论\n${FOOTER}` },
         { kind: 'final' },
@@ -439,13 +439,15 @@ await test('stream 模式: final 与流出内容一致 → 不补发（无重复
   assert.deepStrictEqual(gw.sentTexts, [], 'final 完全被流式覆盖时不应补发');
 });
 
-await test('stream 模式: final 前已被 tool payload 收尾（终态）→ 兜底单独补发 footer', async () => {
+await test('stream 模式: tool payload 封口当前段后到达的 final → 兜底单独补发 footer', async () => {
   const gw = await runDispatch({
     streaming: { mode: 'stream' },
     simulate: async (c) => {
       await c.replyOptions?.onPartialReply?.({ text: '这是回答全文' });
-      // verbose 开启时框架会投递 tool payload → stream 模式收尾流（终态），
-      // 之后到达的 final 无法再并入 → 走 [stream-final] 兜底
+      // verbose 开启时框架会投递 tool payload = 段边界 → 当前段收尾（会话关闭），
+      // 之后到达的 final 无法再并入 → 走 [stream-final] 兜底单独补发。
+      // 注意：段收尾**不**终止整轮（issue #67：旧实现在此 finalize，工具后的
+      // 整段正文被静默丢弃）。
       await c.dispatcherOptions?.deliver?.({ text: '' }, { kind: 'tool' });
       await c.dispatcherOptions?.deliver?.(
         { text: `这是回答全文\n${FOOTER}` },

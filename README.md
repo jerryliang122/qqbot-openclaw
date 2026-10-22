@@ -969,7 +969,7 @@ The bot can stream its reply progressively (typewriter effect) via QQ's streamin
 | Field | Default | Description |
 |-------|---------|-------------|
 | `mode` | *(unset = off)* | `"partial"` enables streaming reception; `"off"` disables |
-| `sendMode` | `"stream"` | `"stream"` — QQ streaming printer (typewriter; the delivered prefix is immutable, tail rewrites are merged into appends). `"static"` — accumulate while the model generates, then send one complete message at the end (no typewriter) |
+| `sendMode` | `"stream"` | `"stream"` — QQ streaming printer (typewriter; **one segment = one message**: every assistant message the model produces in a turn — pre-tool text, post-tool answer — is delivered as its own message, verbatim, never spliced mid-text; a tool call ends the current segment but not the turn). `"static"` — accumulate while the model generates, then send one complete message at the end (no typewriter) |
 
 - Streaming replies (`session.update` frames) still consume the passive-reply quota of the triggering message
 - On stream errors the controller falls back to a single static message automatically
