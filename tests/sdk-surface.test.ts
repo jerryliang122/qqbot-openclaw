@@ -244,36 +244,13 @@ function probeRuntime(sub: string, names: string[]): { error?: string; missing: 
  * 吞成"webhook 入站功能静默失效"，比直接抛错更难发现；这恰恰是守卫最该管的场景。
  * 已实测 9.1 上可正常 require（34 个导出），无豁免必要。
  * 将来确有必要豁免时，在此登记并写明理由，让遗漏变成显式决定。
+ *
+ * 说明：text-grapheme 曾在此豁免（当时地板是 9.1、该子路径 9.1 不存在）。
+ * 2026-10-22 地板抬至 2026.10.5 后该子路径**恒在**，豁免的前提消失——
+ * 故改为纳入正常守卫：子路径被删即变红。src/outbound/grapheme.ts 仍保留
+ * 能力探测 + 本地等价回退（守住"加载期不炸"这条底线），但那不再是豁免理由。
  */
-const EXEMPT_SUBPATHS: Record<string, string> = {
-  /**
-   * text-grapheme（openclaw 2026.10.5 新增，9.1 基线不存在）
-   *
-   * 豁免理由（与 webhook-ingress 的情况**本质不同**，故可豁免）：
-   *
-   * 1. **不构成加载期炸裂**。守卫要防的是「子路径被删 → dist/index.cjs 在加载期
-   *    抛 ERR_PACKAGE_PATH_NOT_EXPORTED → 插件整体加载失败、功能全灭」。
-   *    text-grapheme 的引用在 src/outbound/grapheme.ts 里，且 req() 调用**被包在
-   *    try/catch 内、且是懒调用**（首次分块时才触发，不在模块顶层）——
-   *    子路径不存在时只是回退本地实现，插件照常加载、照常工作。
-   *
-   * 2. **回退是功能等价的，不是静默失效**。本地实现用 `Intl.Segmenter` 按字形簇
-   *    切块，与官方 `findGraphemeChunkEnd` 语义一致（优先期望断点 → 吸附字形簇
-   *    边界 → 代理对安全兜底）。子路径被删后唯一变化是「不再用官方原语」，
-   *    **分块行为不变**——这与 webhook-ingress 的「功能静默失效」有本质区别。
-   *
-   * 3. **地板不抬**。按 AGENTS.md 的地板判据，本适配在新旧两版都成立，
-   *    抬地板会打断存量用户却换零能力收益。开放平台 ≥ 2026.10.5 的用户
-   *    自动走官方原语，9.1 用户走本地等价实现。
-   *
-   * 4. **豁免有行为测试兜底**：tests/chunker-grapheme.test.ts 断言
-   *    「能力探测失败时回退函数仍可用」+「切分不切碎 emoji/ZWJ/代理对」
-   *    +「超限块必被切开且内容不丢」——即回退路径是被验证过的，不是想当然。
-   */
-  'openclaw/plugin-sdk/text-grapheme':
-    '2026.10.5 新增的可选能力，懒调用 + try/catch + 本地 Intl.Segmenter 等价回退；' +
-    '子路径缺失不影响插件加载与分块行为（回退见 tests/chunker-grapheme.test.ts）',
-};
+const EXEMPT_SUBPATHS: Record<string, string> = {};
 
 // ── 1 & 2. 子路径存在性 + 运行时可 require + 值导出存在性 ──
 
@@ -312,6 +289,29 @@ for (const rec of [...subpaths.values()].sort((a, b) => a.sub.localeCompare(b.su
     );
   });
 }
+
+/**
+ * 字面量 require 的子路径补一条**名级**断言。
+ *
+ * 通用扫描器只对静态具名 import 提取导出名；src/outbound/grapheme.ts 是
+ * `req('openclaw/plugin-sdk/text-grapheme')` 后再取 `mod.findGraphemeChunkEnd`，
+ * 扫描器看不到属性访问 → 通用守卫只能证明"子路径能 require"，
+ * 证不了"那个原语还在"。这里补齐后者（分块正确性依赖它）。
+ */
+await test('text-grapheme 的 findGraphemeChunkEnd 仍是运行时值', () => {
+  const probe = probeRuntime('openclaw/plugin-sdk/text-grapheme', ['findGraphemeChunkEnd']);
+  assert.equal(
+    probe.error,
+    undefined,
+    `openclaw@${openclawPkg.version} 无法 require text-grapheme: ${probe.error}`,
+  );
+  assert.equal(
+    probe.missing.length,
+    0,
+    `openclaw@${openclawPkg.version} 的 text-grapheme 缺少运行时值: ${probe.missing.join(', ')}。` +
+      `\n    该原语是字形簇安全分块的承重件（src/outbound/grapheme.ts）。`,
+  );
+});
 
 await test('具名子句的值/类型分类正确（inline type 标记不得记为值导出）', () => {
   const cases: Array<{ clause: string; expected: Array<[string, boolean]> }> = [

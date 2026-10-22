@@ -2,7 +2,7 @@
  * Runtime Adapters — 一次 resolve，全程复用。
  *
  * Capability Probe 模式：按候选 API 路径探测，选出第一个可用函数。
- * 构建基线为 openclaw 2026.9.1（peer >=2026.9.1），不再保留对更旧版本的回退。
+ * 构建基线为 openclaw 2026.10.5（peer >=2026.10.5），不再保留对更旧版本的回退。
  *
  * 调用方通过 `resolveRuntimeAdapters(runtime)` 获取适配层对象，
  * 后续所有 dispatch / channel 代码只使用 adapters 上的方法。
@@ -20,6 +20,11 @@ export interface RuntimeAdapters {
   dispatchReply: ((params: any) => Promise<any>) | null;
   /** Agent 路由解析 */
   resolveAgentRoute: ((params: any) => any) | null;
+  /**
+   * 构建 agent 作用域 session key（框架原语，与 resolveAgentRoute 同源）。
+   * 缺失时调用方退到本地等价镜像——key 文法必须与框架逐字同形。
+   */
+  buildAgentSessionKey: ((params: any) => string) | null;
   /** 构建入站上下文 */
   buildInboundContext: ((params: any) => any) | null;
   /** Session store path 解析 */
@@ -112,6 +117,10 @@ export function resolveRuntimeAdapters(
     ['channel', 'routing', 'resolveAgentRoute'],
   ]);
 
+  const buildAgentSessionKey = probeFunction(rt, [
+    ['channel', 'routing', 'buildAgentSessionKey'],
+  ]);
+
   const rawBuildContext = probeFunction(rt, [
     ['channel', 'inbound', 'buildContext'],
   ]);
@@ -164,6 +173,7 @@ export function resolveRuntimeAdapters(
     inboundRun && 'inboundRun',
     dispatchReply && 'dispatchReply',
     resolveAgentRoute && 'resolveAgentRoute',
+    buildAgentSessionKey && 'buildAgentSessionKey',
     buildInboundContext && 'buildInboundContext',
     resolveStorePath && 'resolveStorePath',
     recordInboundSession && 'recordInboundSession',
@@ -182,6 +192,7 @@ export function resolveRuntimeAdapters(
     inboundRun,
     dispatchReply,
     resolveAgentRoute,
+    buildAgentSessionKey,
     buildInboundContext,
     resolveStorePath,
     recordInboundSession,
@@ -237,7 +248,7 @@ export async function persistAuthConfig(
   const config: Record<string, unknown> | undefined = runtime.config as any;
 
   if (typeof config?.mutateConfigFile !== 'function') {
-    throw new Error('persistAuthConfig: runtime.config.mutateConfigFile is unavailable (requires openclaw >= 2026.9.1)');
+    throw new Error('persistAuthConfig: runtime.config.mutateConfigFile is unavailable (requires openclaw >= 2026.10.5)');
   }
   await (config.mutateConfigFile as Function)({
     mutate: () => cfg,

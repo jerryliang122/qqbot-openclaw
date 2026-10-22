@@ -581,8 +581,8 @@ declare module "openclaw/plugin-sdk/text-utility-runtime" {
 // 2026.10.5 新增子路径。openclaw 发布包同样显式排除其 .d.ts（exports 里也没有
 // "types" 条件），故 TS 消费方必须自带 ambient 声明，否则 typecheck 报 TS7016。
 // 运行时导出：findGraphemeChunkEnd（按字形簇切块，emoji/ZWJ/组合符号不被切开）。
-// 仅 2026.10.5+ 存在；2026.9.1 基线无此子路径 → 运行时须能力探测 + 回退
-// （见 src/outbound/grapheme.ts）。
+// 地板已抬至 2026.10.5（该子路径恒在），但运行时仍保留能力探测 + 回退，
+// 见 src/outbound/grapheme.ts。
 declare module "openclaw/plugin-sdk/text-grapheme" {
   /**
    * 在 [start, maxEnd] 内选一个整字形簇的切点。

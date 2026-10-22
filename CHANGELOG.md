@@ -12,11 +12,19 @@
 
 ### 变更（Breaking：运行要求）
 
-- **OpenClaw 最低版本抬至 `2026.10.5`**（peer `>=2026.10.5`，devDependency 精确钉版 `2026.10.5`；此前基线 2026.9.1）。触发信号：上游 10.x 系列语义代差（10.2 删除 9 个 plugin-sdk 子路径、10.5 重构投递/会话语义）使「同时支持 9.x 与 10.x」的兼容成本超过收益，且主要部署环境已切 10.x。按 SemVer 规则这属运行要求变更（发版时建议升 major）。换版后 typecheck / lint:runtime / build / sdk-surface 守卫（37 用例）/ dispatch 系与 c2c 防抖系单测全绿。
+- **OpenClaw 最低版本抬至 `2026.10.5`**（peer `>=2026.10.5`，devDependency 精确钉版 `2026.10.5`；此前基线 2026.9.1）。触发信号：上游 10.x 系列语义代差（10.2 删除 9 个 plugin-sdk 子路径、10.5 重构投递/会话语义）使「同时支持 9.x 与 10.x」的兼容成本超过收益，且主要部署环境已切 10.x。按 SemVer 规则这属运行要求变更（发版时建议升 major）。换版后 typecheck / lint:runtime / build / sdk-surface 守卫（38 用例）/ dispatch 系与 c2c 防抖系单测全绿。
 
 ### 修复
 
-- **兜底路由 sessionKey 改用 canonical 文法（10.x 硬门槛，实测复现）**。openclaw 2026.10.x 的 state worker 对 session 写入做 canonical 校验：key 必须满足 `agent:<agentId>:<rest>` 文法且等于其全小写折叠形，否则抛 `SessionCanonicalKeyMigrationRequiredError`、该会话一切读写瘫痪。插件旧兜底（runtime 缺 `channel.routing.resolveAgentRoute` 时的安全网）拼的是 `qqbot:<account>:...` 形状——在 10.x 下等于把「路由 API 缺失」从可见错误放大成全量静默瘫痪。现改为 `buildFallbackRouteSessionKey()`（`agent:main:qqbot:group|dm:...` 文法 + 全小写），并由 `tests/fallback-route-key.test.ts` 用**已安装 openclaw 的真实解析/折叠函数**（`parseAgentSessionKey` / `normalizeSessionKeyPreservingOpaquePeerIds`）锁定——不靠形状猜测。
+- **兜底路由 sessionKey 改用 canonical 文法（10.x 硬门槛，实测复现）**。openclaw 2026.10.x 的 state worker 对 session 写入做 canonical 校验：key 必须满足 `agent:<agentId>:<rest>` 文法且等于其全小写折叠形，否则抛 `SessionCanonicalKeyMigrationRequiredError`、该会话一切读写瘫痪。插件旧兜底（runtime 缺 `channel.routing.resolveAgentRoute` 时的安全网）拼的是 `qqbot:<account>:...` 形状——在 10.x 下等于把「路由 API 缺失」从可见错误放大成全量静默瘫痪。现改为 `buildFallbackRouteSessionKey()`（`agent:<agentId>:<channel>[:<accountId>]:<peerKind>:<peerId>` 文法 + 全小写），并由 `tests/fallback-route-key.test.ts` 用**已安装 openclaw 的真实解析/折叠函数**（`parseAgentSessionKey` / `normalizeStoreSessionKey`）锁定——不靠形状猜测。
+
+- **兜底 sessionKey 同时满足框架的 route 文法（评审修复）**。canonical 校验只保证「key 能被写进 state DB」，**不保证「框架能反解出投递目标」**：框架反解用的是 `parseSessionDeliveryRoute`，文法为 `<channel>[:<accountId>]:<peerKind>:<peerId>`，peer 段之后的冒号分段都会被并进 peerId。上一版兜底 `agent:main:qqbot:group:<acct>:<peer>:coalescing` 过了 canonical 校验，却被解析成 peerId = `<acct>:<peer>:coalescing`（accountId 与历史遗留 `:coalescing` 后缀一起混进 peer 段）→ 框架自发回复 / 投递恢复 / 子代理路由全部指向不存在的 peer；私聊兜底同理（peerId = `<acct>:<peer>`），且与框架默认 `dmScope="main"`（全体 c2c 共享 `agent:main:main`）的会话粒度也不一致。现改为：**优先用框架原语 `runtime.channel.routing.buildAgentSessionKey`**（与 `resolveAgentRoute` 同源，文法永远跟随上游），框架原语缺失时才退到本地等价镜像；群 key 不含 accountId（框架自身即不按账号隔离群会话），作用域（dmScope / groupScope）取自 `cfg.session`，与主路径同形。兜底 route 的 `agentId` 同步为框架默认 `'main'`——此前 key 的 agent 段是 `main`、turn 却按 `'default'` 走，两边不自洽。
+
+- **兜底 sessionKey 守卫升级为三层差分（评审修复）**。`tests/fallback-route-key.test.ts` 此前只断言 canonical 两条规则——那个「过了校验却解不出 peer」的 key 同样能过，守卫形同虚设。现补三层：① **差分**——本地镜像与框架 `buildAgentPeerSessionKey` 在 dmScope × groupScope 全矩阵上逐字相同（上游改文法即变红）；② canonical（用 state worker 同款的 `normalizeStoreSessionKey` + `parseAgentSessionKey`）；③ route（`parseSessionDeliveryRoute` 解出的 peerId 就是目标 peer，不含 accountId 污染）。断言全部走**已安装 openclaw 的真实函数**（子进程加载 dist 内部模块，按具名导出探测，不硬编码带哈希的文件名）。
+
+- **旧的 `tests/session-key-fallback.test.ts` 改为断言真实代码（评审修复）**。该文件此前自带一份「影子实现」（`qqbot:${accountId}:${peerId}`）却宣称「导入真实代码而不是重新实现」——生产兜底形状改过两轮后，它断言的形状在代码库里已不存在，且永远绿。现改为直接 import `resolveDispatchPeerId` / `buildFallbackRouteSessionKey`，保留原回归意图（群聊用 groupId 而非 senderId、同群同 key、群聊缺 groupId 降级 senderId），并按框架 dmScope 语义补齐私聊分流断言。
+
+- **`text-grapheme` 纳入 SDK 守卫（评审修复）**。该子路径此前登记在 `tests/sdk-surface.test.ts` 的 `EXEMPT_SUBPATHS` 里（理由「9.1 基线不存在」），地板抬至 10.5 后前提消失——现纳入正常守卫：子路径被删即变红。因它是字面量 require（扫描器看不到属性访问），另补一条名级断言兜住 `findGraphemeChunkEnd`；`src/outbound/grapheme.ts` 的能力探测 + 本地等价回退保留（守住「加载期不炸」这条底线）。
 
 ### 调查结论（不改行为的实证记录）
 
