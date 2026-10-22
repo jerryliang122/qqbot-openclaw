@@ -969,27 +969,10 @@ The bot can stream its reply progressively (typewriter effect) via QQ's streamin
 | Field | Default | Description |
 |-------|---------|-------------|
 | `mode` | *(unset = off)* | `"partial"` enables streaming reception; `"off"` disables |
-| `sendMode` | `"stream"` | `"stream"` — QQ streaming printer (typewriter; the delivered prefix is immutable, tail rewrites are merged into appends). `"static"` — accumulate while the model generates, then send one complete message at the end (no typewriter). `"stream-all"` — dual-lane streaming (see below) |
+| `sendMode` | `"stream"` | `"stream"` — QQ streaming printer (typewriter; the delivered prefix is immutable, tail rewrites are merged into appends). `"static"` — accumulate while the model generates, then send one complete message at the end (no typewriter) |
 
 - Streaming replies (`session.update` frames) still consume the passive-reply quota of the triggering message
 - On stream errors the controller falls back to a single static message automatically
-
-##### `sendMode: "stream-all"` — rolling progress lane + separate final message
-
-All intermediate output of a turn lands in **one rolling message**, appended in discrete chunks as events complete (not token-by-token): every completed text segment plus one `🔧 <tool title>` line per tool execution, separated by markdown dividers (`---`). Tool titles come from the framework's `onItemEvent` callback (unlocked via `forceToolResultProgress`, so it fires even with verbose progress off); a `✓` is appended when the tool finishes successfully while its title line is still the tail (`✗` when it failed). Once all tools are done, the model's **final answer is delivered as a second, separate typewriter message** (paced in ~64-char slices every ~90ms).
-
-How it maps onto framework callbacks:
-
-- Text segments arrive as complete blocks via `deliver(kind: "block")` — the plugin does **not** register `onPartialReply` in this mode, so no token-level streaming. The plugin also passes `disableBlockStreaming: false` to force block streaming on; without it you'd need `agents.defaults.blockStreamingDefault: "on"` in your OpenClaw config, and on a stock config no text would ever reach the rolling lane
-- Each new block/tool/start-of-segment proves the previous held block was intermediate, at which point it is committed to the rolling lane. At `kind: "final"` the held block is classified by prefix containment: the last segment is always a **prefix** of the final text (the framework appends the usage footer at the end), so a matching held block is dropped and superseded — the final deliver closes the rolling lane and types the full final text (usage footer included) into a second stream session, with no prefix-dedup machinery needed. A held block that is *not* a final prefix (a pre-tool segment whose block delivery was delayed past the tool event by the SDK coalescer) is committed to the rolling lane instead of dropped, so its content is never silently lost
-- The framework's default standalone tool-progress messages are suppressed (`suppressDefaultToolProgressMessages`) so tool progress is not rendered twice
-- A turn whose text arrives in a single block and never calls tools degrades to a single final-lane typewriter message
-
-Failure semantics: if the final lane fails **before any character is accepted**, the final text falls back to a single static message (the rolling lane stays visible). If it fails **mid-delivery** (the first slice landed, a later slice was rejected), the accepted prefix stays as a completed message and the unaccepted tail is re-sent as a plain follow-up message via the same differential rescue as `sendMode: "stream"`; network-level failures with an unclear outcome suppress the rescue to avoid duplicates. Config stays the same shape:
-
-```json
-{ "streaming": { "mode": "partial", "sendMode": "stream-all" } }
-```
 
 #### Progress Card (进度卡片) — checklist snapshots in chat
 

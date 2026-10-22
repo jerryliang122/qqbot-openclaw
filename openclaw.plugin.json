@@ -424,10 +424,9 @@
                 "type": "string",
                 "enum": [
                   "stream",
-                  "static",
-                  "stream-all"
+                  "static"
                 ],
-                "description": "文本下发通道（仅 mode=partial 生效）：stream=流式打印机 | static=结束时整条发送 | stream-all=双道块驱动（中间态一条滚动消息+工具标题行，终稿独立打字机消息）"
+                "description": "文本下发通道（仅 mode=partial 生效）：stream=流式打印机 | static=结束时整条发送"
               }
             }
           },
@@ -874,10 +873,9 @@
                       "type": "string",
                       "enum": [
                         "stream",
-                        "static",
-                        "stream-all"
+                        "static"
                       ],
-                      "description": "文本下发通道（仅 mode=partial 生效）：stream=流式打印机 | static=结束时整条发送 | stream-all=双道块驱动（中间态一条滚动消息+工具标题行，终稿独立打字机消息）"
+                      "description": "文本下发通道（仅 mode=partial 生效）：stream=流式打印机 | static=结束时整条发送"
                     }
                   }
                 },

@@ -24,6 +24,16 @@
 - **10.5 忙碌会话语义变化**：admission ticket 现在发生在 replyResolver 之前（实测 `wait_admission_ticket` 9.9s）——活动 turn 期间到达的非 abort 类指令会排队等待，turn 结束后才解释执行（这是预期行为，不是丢消息）。
 - **9.1 与 10.5 对 qqbot 的 `resolveAgentRoute` 输出完全一致**（c2c → `agent:main:main`，群 → `agent:main:qqbot:group:<id>`）：升级不改变会话 key 形状、不产生遗留行迁移需求。另实测确认框架 `dmScope` 默认 `"main"`（两版相同）：所有 c2c 用户共享 `agent:main:main` 一个会话（与 CLI 主会话同 key），需要按用户隔离请配 `session.dmScope: "per-peer"`。
 
+## [2.8.1] - 2026-10-22
+
+### 变更
+
+- **移除 `streaming.sendMode: "stream-all"` 双道流式模式（v2.8.0 引入，回退）**。QQ 平台对单个 `stream_msg_id` 的续写窗口实测约 **10 分钟（600s）**：stream-all 的滚动道把整个 turn（多工具 + 终稿）汇入同一条流式消息，工具链一长必然超窗——超窗后**续写与收尾帧一并被平台 400 拒收**（「同一流式消息发送超过时间限制」，错误码未在官方文档登记），且控制器的静态兜底条件 `sentChunkCount === 0` 在已发出若干片后不成立，**整轮正文从头到尾未送达用户**（表现为「机器人没回复」，日志无明显错误信号）。平台约束与该模式的根本设计冲突，无平台侧规避手段，故整体移除（详见 [jerryliang122/openclaw-qqbot#11](https://github.com/jerryliang122/openclaw-qqbot/issues/11)）。
+  - **配置迁移（Breaking）**：已配置 `"sendMode": "stream-all"` 的用户升级后该值会被配置校验直接拒绝（schema enum 已同步移除）——请改回 `"stream"`（流式打印机）或 `"static"`（整条发送）。
+  - 移除范围：`sendMode` 联合类型与 manifest schema 两处 enum（顶层 + `accounts` 段）、`StreamingController` 的滚动道/终稿道实现（held 块轮转、`onTextBlock` / `onToolItem` / `handleFinalDeliver`、终稿道失败兜底）、dispatch 的 stream-all 拦截段与 `disableBlockStreaming:false` / `forceToolResultProgress` / `suppressDefaultToolProgressMessages` / `onItemEvent` 旗标组合、`tests/stream-all.test.ts`（19 例）、README 的 stream-all 章节。
+  - **保留**：v2.8.0 同批合入的 manifest 配置 schema（其余 30+ 字段）、schema 守卫测试（`tests/manifest-config-schema.test.ts` 的枚举值级对照**动态读取 TS 联合类型**，自动随本次收窄，无需改动）、「改配置面必须同步 manifest schema」的纪律条目（事故教训仍成立）。`stream` / `static` 两种下发模式不受影响。
+  - 后续：QQ 流式会话的 10 分钟窗口对长 turn 的 `stream` 模式同样存在理论风险（issue #11 的期望 2「接近临界时主动重开 stream_msg_id」），待平台侧或后续版本单独处理。
+
 ## [2.8.0] - 2026-10-22
 
 ### 修复
