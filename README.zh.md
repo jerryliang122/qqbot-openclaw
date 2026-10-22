@@ -177,7 +177,7 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 
 > **你**：`/bot-version`
 >
-> **QQBot**：🦞框架版本：OpenClaw 2026.10.5 / 🤖QQBot 插件版本：v3.0.0 / 🌟GitHub 仓库
+> **QQBot**：🦞框架版本：OpenClaw 2026.10.5 / 🤖QQBot 插件版本：v3.0.1 / 🌟GitHub 仓库
 
 一目了然查看框架版本、插件版本，并可直接跳转官方仓库。
 
@@ -292,7 +292,7 @@ AI 可直接发送视频，支持本地文件和公网 URL。
 openclaw plugins install @jerryliang122/openclaw-qqbot
 
 # 或安装指定版本
-openclaw plugins install @jerryliang122/openclaw-qqbot@3.0.0
+openclaw plugins install @jerryliang122/openclaw-qqbot@3.0.1
 ```
 
 **方式 B：从 GitHub 安装**
