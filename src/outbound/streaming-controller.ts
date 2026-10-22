@@ -140,7 +140,8 @@ export class StreamingController {
   /**
    * 是否处于 static 下发模式（公开访问器，供 dispatch 协同判断）。
    * static 模式下 dispatch 不应在 tool/final 事件提前 finalize，
-   * 由 controller 靠 new_reply 检测自主分段，避免终态与发送延迟。
+   * 分段由框架 onAssistantMessageStart 驱动（controller 的 flushSegment
+   * 固化上一段），避免终态与发送延迟。
    */
   get isStaticSendMode(): boolean { return this.isStaticMode; }
 

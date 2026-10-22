@@ -89,7 +89,7 @@ await test('stream: final 与已流出一致 → 空串（纯去重）', async (
 
 await test('stream: 多段 turn（final 拼接全部段落）→ 定位最后一段之后的增量', async () => {
   const ctrl = makeController({ sendMode: 'stream' });
-  // 段A 流出后，段B 更短且前缀不匹配 → new_reply 轮转
+  // 段A 流出后，段B 与之无公共前缀 → 判为新段 → 另起一条消息（原样送达）
   await ctrl.onPartialReply('第一段较长的开头文本');
   await ctrl.onPartialReply('第二段结论');
   await ctrl.finalize();
