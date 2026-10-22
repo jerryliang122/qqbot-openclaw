@@ -8,7 +8,7 @@
 
 ---
 
-## [Unreleased]
+## [2.8.0] - 2026-10-22
 
 ### 修复
 
@@ -28,6 +28,13 @@
 - **`tests/sdk-surface.test.ts` 的具名导入扫描正则跨语句误匹配**：`{...}` 的匹配体原为 `[\s\S]*?`，惰性匹配且允许跨越 `}`，会从一个 `import {` 一直吃到后面某个 `} from 'openclaw/plugin-sdk/…'`，把**中间其它 import 语句的具名子句误记到本子路径名下**。实测触发过：`src/outbound-adapter.ts` 里 `import { checkAndConsumePassiveReplyQuota, … } from './features/quota-manager.js'` 的三个名字被算到 `openclaw/plugin-sdk/interactive-runtime` 头上，守卫误报「子路径缺少运行时值」，把人引去查一个并不存在的 SDK 缺陷。改为 `[^}]*` 后匹配体不再越过本条 import 语句自己的闭合花括号。
 
 ### 新增
+
+- **`streaming.sendMode: "stream-all"`——双道块驱动流式：滚动进度道 + 独立终稿打字机**（PR #61）。`stream` / `static` 之外的第三种下发模式：turn 的全部中间态（工具调用之间的每段正文 + 每个工具执行的 `🔧 <title>` 标题行）以 markdown 分隔线隔开、离散追加进**一条滚动消息**；全部工具结束后，模型终稿以**另一条打字机消息**（约 64 字 / 90ms 分片）独立下发（含 usage footer）。无工具单段 turn 自动退化为单条终稿打字机，配置形态不变（`{"streaming": {"mode": "partial", "sendMode": "stream-all"}}`）。
+  - 数据面：文本段经 `deliver(kind:'block')` 按完成段到达、工具标题行经 `onItemEvent`（`forceToolResultProgress` 解锁 verbose 关闭时的投递）、终稿经 `deliver(kind:'final')`；token 级 `onPartialReply` 不注册。**显式传 `disableBlockStreaming: false` 开启 block streaming**——框架的启用条件是显式 false 或用户配置 `agents.defaults.blockStreamingDefault: "on"`（默认未设），不显式开启时滚动道将收不到任何正文（分支评审发现的缺陷，已修）。
+  - **held 块轮转**：块到达时无法定性（终稿的身份是回溯性的），先扣住；后继块 / 工具事件 / 新段开始（`onAssistantMessageStart`）证明其为中间段才提交。final deliver 时按**前缀包含性**定性：终稿段恒为终稿文本的前缀（footer 追加在尾部）→ 取代丢弃（终稿道原样重新呈现，无需差量对账）；不是前缀（块投递被 SDK coalescer 拖到 final 之后、held 扣的是工具前文本）→ 提交进滚动道防内容彻底丢失（时序倒置为已知残留）。
+  - **✓/✗ 收尾标记**受 QQ 流式「前缀不可回改」约束：仅当标题行仍是滚动道末尾时可补，成功 `✓`、失败 `✗`。item 去重按强弱 id 分层：`itemId` / `toolCallId` 优先，强 id 未命中即视为新 item、不回退 `title` 别名（否则同名工具的后续调用被折叠、滚动道缺行）；exec 的 tool/command 双 item 仍按共享 `toolCallId` 去重为一行。
+  - 失败语义：终稿道**首片即失败** → 终稿整段回落普通消息补发（滚动道保持可见）；**中途失败**（首片已落地、后续分片被拒）→ 已接受前缀收尾可见，未接受尾巴复用 stream 模式的 `[stream-final]` 前缀差量补发（结果不明的网络层失败照旧抑制补发，防与流内内容重复）。
+  - 测试：`tests/stream-all.test.ts` 19 例（含同名调用不折叠 / exec 双 item 去重 / 中途失败尾部差量 / 迟到块防丢失 / ✗ 标记）。
 
 - **声明 `live.capabilities.nativeStreaming`（QQ 私聊原生流式）**：`src/message-adapter.ts` 此前**未声明**该能力，框架不会把 QQ 的原生流式当作通道能力。`draftPreview` **保持 false**（**不是漏声明**）：该能力在框架语义下是「先发一条可编辑的草稿消息占位」（Telegram 的 edit-preview 模型），而 QQ 私聊原生流式是 `openStream → update(前缀增长) → complete` 的**单消息流式**，平台约束「已下发文本的前缀不可变更」，没有「草稿占位 + 原地改写为终稿」的两阶段结构。`nativeStreaming` 是通道级声明而 QQ 流式**仅 C2C 开放**（SDK `openStream` 对非 c2c 直接 throw），群聊实际走进度卡片——真正的 scope 判断仍由插件内 `StreamingController` 把关。
 - **回归测试**：`tests/presentation-buttons.test.ts`（22 例：框架 action → QQ `action.type` 映射 / 不可落地控件丢弃保留文本 / `presentationCapabilities` 取值 / id 唯一 / 拆行 / label 截断 / ask_user 上下文解析）、`tests/message-adapter-capabilities.test.ts`（9 例：能力声明取值 + **「声明 inlineButtons 则必须存在落地实现」的一致性守卫**）、`tests/keyboard-permission-semantics.test.ts`（5 例：权限常量取值与官方一致 / 全仓不再有裸数字权限值 / `specify_user_ids` 当前未使用）。`tests/sdk-surface.test.ts` 另加**能力声明与实现一致性**分组（2 例）。
