@@ -529,6 +529,13 @@ export async function dispatchToOpenClaw(
               await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
             }
             if (!streamingController.finalLaneNeedsStaticFallback) {
+              // 终稿道中途失败（首片已落地、后续分片失败）：已接受前缀之后的
+              // 尾部交由 dispatch 末尾 [stream-final] 段按前缀差量补发（复用
+              // stream 模式的兜底机制与抑制口径——结果不明的失败不补发）
+              if (streamingController.finalLaneNeedsTailFallback) {
+                dlog?.warn(`stream-all final lane failed mid-delivery, tail goes to [stream-final] rescue`);
+                pendingStreamFinalText = text;
+              }
               return;
             }
             // 终稿道零字符落地：fall through 走默认路径把终稿静态补发
@@ -784,10 +791,16 @@ export async function dispatchToOpenClaw(
                       // - forceToolResultProgress：verbose 关闭时也投递 item 事件
                       // - suppressDefaultToolProgressMessages：抑制框架默认工具
                       //   进度文本消息（title 已由滚动道呈现，避免双份）
+                      // - disableBlockStreaming: false：**显式开启** block streaming。
+                      //   框架的启用条件是 disableBlockStreaming===false，或
+                      //   agents.defaults.blockStreamingDefault==="on"（用户级配置，
+                      //   默认未设）。不显式开启时文本永不按 kind:'block' 投递，
+                      //   滚动道只剩工具标题行——与 static 模式显式传 true 对称。
                       // 注意：这里**刻意不注册 onToolStart**——运行时会把带
                       // suppressChannelProgress 的工具 item（command 类工具）从
                       // onItemEvent 摘掉改走 onToolStart（其无 title），
                       // 注册两路反而丢标题。
+                      disableBlockStreaming: false,
                       forceToolResultProgress: true,
                       suppressDefaultToolProgressMessages: true,
                       onItemEvent: async (item: {

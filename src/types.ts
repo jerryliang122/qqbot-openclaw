@@ -256,7 +256,9 @@ export interface QQBotAccountConfig {
    *                  终稿由 kind:'final' 触发，以**另一条打字机消息**（64 字/
    *                  90ms 分片）独立下发。工具 title 来自框架 onItemEvent 回调
    *                  （forceToolResultProgress 解锁 verbose 关闭时的投递），
-   *                  框架默认工具进度文本消息被抑制以免重复。
+   *                  框架默认工具进度文本消息被抑制以免重复；插件同时显式
+   *                  开启 block streaming（disableBlockStreaming:false），无需
+   *                  用户再设 agents.defaults.blockStreamingDefault。
    *                  依赖 onItemEvent（openclaw 2026.9.1 基线已提供）。
    */
   streaming?: {

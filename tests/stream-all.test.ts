@@ -5,9 +5,12 @@
  * - 文本段经 onTextBlock（deliver kind:'block'）按完成段进入滚动道，
  *   条目间以 markdown 分隔线隔开；token 级 partial 被防御性忽略
  * - 工具 item 事件追加 🔧 标题行（held 块随之提交进滚动道）
- * - final deliver：滚动道收尾 + 终稿道独立打字机（held 块被终稿取代）
- * - ✓ 收尾标记的前缀不可回改约束 / item 别名去重
- * - 终稿道失败 → finalLaneNeedsStaticFallback 静态兜底信号
+ * - final deliver：滚动道收尾 + 终稿道独立打字机；held 块按「是否终稿
+ *   前缀」定性——前缀成立被取代，非前缀（迟到块）提交进滚动道防丢失
+ * - ✓/✗ 收尾标记的前缀不可回改约束 / item 别名去重（强 id 优先于 title，
+ *   同名调用不折叠；exec 的 tool/command 双发仍按 toolCallId 折叠）
+ * - 终稿道失败：首片即败 → finalLaneNeedsStaticFallback 整段静态兜底；
+ *   中途失败 → finalLaneNeedsTailFallback + computeUnsentRemainder 尾部差量
  *
  * 运行方式: npx tsx tests/stream-all.test.ts
  */
@@ -25,10 +28,14 @@ interface FakeSession {
 }
 
 /**
- * @param failUpdatesFromSession 从第 N 个会话（0-based）起 update 全部失败；
+ * @param failUpdatesFromSession 从第 N 个会话（0-based）起 update 失败；
  *                               undefined = 永不失败
+ * @param failUpdatesFromIndex   失败会话内、已成功 update 数达到 N 后才开始失败
+ *                               （模拟终稿道第 N+1 片起失败的中途故障）；默认 0
  */
-function makeFakeGateway(opts: { failUpdatesFromSession?: number } = {}) {
+function makeFakeGateway(
+  opts: { failUpdatesFromSession?: number; failUpdatesFromIndex?: number } = {},
+) {
   const sessions: FakeSession[] = [];
   const gateway: any = {
     openStream: () => {
@@ -38,7 +45,10 @@ function makeFakeGateway(opts: { failUpdatesFromSession?: number } = {}) {
         completed: 0,
         update: async (text: string) => {
           if (opts.failUpdatesFromSession !== undefined && index >= opts.failUpdatesFromSession) {
-            throw Object.assign(new Error("update API error"), { httpStatus: 400 });
+            const fromIndex = opts.failUpdatesFromIndex ?? 0;
+            if (s.updates.length >= fromIndex) {
+              throw Object.assign(new Error("update API error"), { httpStatus: 400 });
+            }
           }
           s.updates.push(text);
         },
@@ -55,9 +65,9 @@ function makeFakeGateway(opts: { failUpdatesFromSession?: number } = {}) {
 
 const logs: string[] = [];
 
-function createController(opts: { failUpdatesFromSession?: number } = {}) {
+function createController(opts: { failUpdatesFromSession?: number; failUpdatesFromIndex?: number } = {}) {
   logs.length = 0;
-  const { gateway, sessions } = makeFakeGateway({ failUpdatesFromSession: opts.failUpdatesFromSession });
+  const { gateway, sessions } = makeFakeGateway(opts);
   const ctrl = new StreamingController({
     gateway,
     target: { scope: "c2c", targetId: "USER_1" } as any,
@@ -147,17 +157,33 @@ await test("分隔线只在条目之间：首条目无前导 ---", async () => {
   await ctrl.handleFinalDeliver("完成");
 });
 
-await test("多段无工具：后继块证明前块是中间段，最后 held 被终稿取代", async () => {
+await test("多段无工具：最后 held 是终稿前缀（正文+footer）→ 被取代不进滚动道", async () => {
   const { ctrl, sessions } = createController();
   await ctrl.onTextBlock("第一段。");
   await ctrl.onTextBlock("第二段。"); // 第一段被证明中间段 → 提交；第二段 held
-  await ctrl.handleFinalDeliver("第二段的终稿文本。"); // held（第二段）被取代
+  // 真实形态：final = 最后一段正文 + usage footer（前缀扩展）
+  await ctrl.handleFinalDeliver("第二段。\nUsage: 1.2k in / 300 out");
 
   assert.strictEqual(sessions.length, 2);
   const rolling = sessions[0].updates.at(-1)!;
   assert.ok(rolling.includes("第一段。"), "滚动道含第一段");
-  assert.ok(!rolling.includes("第二段"), "最后一段不进滚动道");
-  assert.strictEqual(sessions[1].updates.at(-1), "第二段的终稿文本。");
+  assert.ok(!rolling.includes("第二段"), "最后一段（终稿前缀）不进滚动道");
+  assert.strictEqual(sessions[1].updates.at(-1), "第二段。\nUsage: 1.2k in / 300 out");
+});
+
+await test("迟到块非终稿前缀 → final 时提交进滚动道（防前置文本丢失）", async () => {
+  const { ctrl, sessions } = createController();
+  // 模拟 coalescer 延迟：工具 item 事件先到（标题行立即上道），其后前置正文块才到
+  await ctrl.onToolItem({ itemId: "tool:1", toolCallId: "call_1", kind: "tool", title: "web_search 天气", phase: "start" });
+  await ctrl.onTextBlock("我先查一下天气。"); // held（其内容不在终稿里）
+  await ctrl.onToolItem({ itemId: "tool:1", toolCallId: "call_1", kind: "tool", phase: "end", status: "completed" });
+  await ctrl.handleFinalDeliver("今天晴，空气优。");
+
+  const rolling = sessions[0].updates.at(-1)!;
+  assert.ok(rolling.includes("我先查一下天气。"), "非前缀 held 块被提交进滚动道（不丢失）");
+  assert.ok(rolling.includes("🔧 web_search 天气 ✓"), "工具标题行保持可见");
+  assert.ok(!rolling.includes("今天晴"), "终稿文本不进滚动道");
+  assert.strictEqual(sessions[0].completed, 1, "滚动道已收尾");
 });
 
 await test("beginSegment：新段开始提前提交 held 块", async () => {
@@ -201,11 +227,11 @@ await test("非工具 item（preamble/status）不进滚动道", async () => {
   await ctrl.onTextBlock("段一。");
   await ctrl.onToolItem({ itemId: "cmt-1", kind: "preamble", title: "Preamble", phase: "start" });
   await ctrl.onToolItem({ itemId: "fast-1", kind: "status", title: "Fast", phase: "update" });
-  await ctrl.handleFinalDeliver("终稿。");
-  const rolling = sessions[0].updates.at(-1)!;
-  assert.ok(!rolling.includes("Preamble") && !rolling.includes("Fast"), "非工具 item 不产生条目");
-  // held（段一）仍被 final 正确取代
+  // 终稿 = held 本身（无工具单段的真实形态）→ held 被取代，无中间条目
+  await ctrl.handleFinalDeliver("段一。");
   assert.strictEqual(sessions.length, 1, "无中间条目 → 只有终稿道");
+  const finalLane = sessions[0].updates.at(-1)!;
+  assert.ok(!finalLane.includes("Preamble") && !finalLane.includes("Fast"), "非工具 item 不产生条目");
 });
 
 await test("同一工具的重复 start/update 只追加一次标题行（别名去重）", async () => {
@@ -217,6 +243,62 @@ await test("同一工具的重复 start/update 只追加一次标题行（别名
   const rolling = sessions[0].updates.at(-1)!;
   assert.strictEqual(rolling.split("🔧").length - 1, 1, "只有一行工具标题");
   await ctrl.handleFinalDeliver("完成");
+});
+
+await test("同名工具的两次调用各得一行标题（强 id 优先，不被 title 别名折叠）", async () => {
+  const { ctrl, sessions } = createController();
+  await ctrl.onTextBlock("段一。");
+  // 框架 title = toolName[+meta]；无 meta 时两次同名调用 title 完全相同
+  await ctrl.onToolItem({ itemId: "tool:callA", toolCallId: "callA", kind: "tool", title: "web_search", name: "web_search", phase: "start" });
+  await ctrl.onToolItem({ itemId: "tool:callA", toolCallId: "callA", kind: "tool", phase: "end", status: "completed" });
+  await ctrl.onToolItem({ itemId: "tool:callB", toolCallId: "callB", kind: "tool", title: "web_search", name: "web_search", phase: "start" });
+  await ctrl.onToolItem({ itemId: "tool:callB", toolCallId: "callB", kind: "tool", phase: "end", status: "completed" });
+  await ctrl.handleFinalDeliver("终稿。");
+
+  const rolling = sessions[0].updates.at(-1)!;
+  assert.strictEqual(rolling.split("🔧").length - 1, 2, "两次调用各一行标题");
+  assert.ok(rolling.includes("🔧 web_search ✓\n\n---\n\n🔧 web_search ✓"), "两次调用的标题行按序呈现");
+});
+
+await test("exec 的 tool/command 双 item 共享 toolCallId → 仍去重为一行", async () => {
+  const { ctrl, sessions } = createController();
+  await ctrl.onTextBlock("段一。");
+  // 框架对 exec/bash 同时发 kind:tool（itemId tool:callA）与 kind:command（itemId command:callA）
+  await ctrl.onToolItem({ itemId: "tool:callA", toolCallId: "callA", kind: "tool", title: "bash ls", name: "bash", phase: "start" });
+  await ctrl.onToolItem({ itemId: "command:callA", toolCallId: "callA", kind: "command", title: "command ls", name: "bash", phase: "start" });
+  const rolling = sessions[0].updates.at(-1)!;
+  assert.strictEqual(rolling.split("🔧").length - 1, 1, "command item 经 toolCallId 别名折叠，只有一行");
+  await ctrl.handleFinalDeliver("完成");
+});
+
+await test("终稿道中途失败：已接受前缀之外的尾部可差量补发（[stream-final] 口径）", async () => {
+  // 第 1 片（64 字）成功、第 2 片起失败
+  const { ctrl, sessions } = createController({ failUpdatesFromSession: 1, failUpdatesFromIndex: 1 });
+  await ctrl.onTextBlock("段一。");
+  await ctrl.onToolItem({ itemId: "t1", kind: "tool", title: "exec npm test", phase: "start" });
+  const finalText = "A".repeat(64) + "B".repeat(64); // 128 字 → 2 片
+  await ctrl.handleFinalDeliver(finalText);
+
+  assert.strictEqual(ctrl.currentPhase, "failed");
+  assert.ok(!ctrl.finalLaneNeedsStaticFallback, "已有字符落地，不走整段静态兜底");
+  assert.ok(ctrl.finalLaneNeedsTailFallback, "中途失败 → 需要尾部差量补发");
+  // dispatch 末尾 [stream-final] 段用 computeUnsentRemainder 计算补发内容
+  assert.strictEqual(ctrl.computeUnsentRemainder(finalText), "B".repeat(64), "差量 = 未接受的后 64 字");
+  assert.strictEqual(sessions[1].updates.length, 1, "终稿道只落地了第 1 片");
+  assert.strictEqual(sessions[1].completed, 1, "失败时已接受的分片被 complete 收尾（可见）");
+  assert.strictEqual(sessions[0].completed, 1, "滚动道不受影响");
+});
+
+await test("失败的工具打 ✗ 而非 ✓", async () => {
+  const { ctrl, sessions } = createController();
+  await ctrl.onTextBlock("段一。");
+  await ctrl.onToolItem({ itemId: "t1", kind: "tool", title: "exec boom", phase: "start" });
+  await ctrl.onToolItem({ itemId: "t1", kind: "tool", phase: "end", status: "failed" });
+  assert.ok(sessions[0].updates.at(-1)!.endsWith("🔧 exec boom ✗"), "失败工具标 ✗");
+  await ctrl.onToolItem({ itemId: "t2", kind: "tool", title: "exec ok", phase: "start" });
+  await ctrl.onToolItem({ itemId: "t2", kind: "tool", phase: "end", status: "completed" });
+  assert.ok(sessions[0].updates.at(-1)!.endsWith("🔧 exec ok ✓"), "成功工具仍标 ✓");
+  await ctrl.handleFinalDeliver("完成。");
 });
 
 await test("终稿道首片即失败：finalLaneNeedsStaticFallback 置位，滚动道保持可见", async () => {

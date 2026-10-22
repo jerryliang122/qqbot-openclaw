@@ -15,8 +15,10 @@
  *   文本段经框架 deliver(kind:'block') 按**完成段**进入滚动道（token 级
  *   partial 不注册不处理）；每个中间条目（正文段 / 🔧 工具标题行）以
  *   markdown 分隔线隔开离散追加；final deliver 时滚动道收尾，终稿文本
- *   以第二条打字机消息（分片节奏）原样下发。终稿段从不进滚动道——
- *   held 块被 final 取代，无需差量对账。
+ *   以第二条打字机消息（分片节奏）原样下发。终稿段从不进滚动道——held
+ *   块按「是否终稿文本前缀」定性：前缀成立即被终稿取代（无需差量对账）；
+ *   不是前缀（块被 coalescer 拖到 final 之后才到、held 扣的是工具前文本）
+ *   则提交进滚动道，防内容彻底丢失。
  */
 
 import type { ReplyTarget, StreamSession } from '@tencent-connect/qqbot-nodejs';
@@ -86,6 +88,13 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
+/** 可选字符串列表 → 去空白非空别名列表 */
+function normalizeAliases(values: Array<string | undefined>): string[] {
+  return values
+    .map((v) => (typeof v === 'string' ? v.trim() : ''))
+    .filter((v) => v.length > 0);
+}
+
 export class StreamingController {
   private phase: StreamingPhase = 'idle';
   private session: StreamSession | null = null;
@@ -132,8 +141,10 @@ export class StreamingController {
    *
    * 块到达时无法知道它是不是终稿段（终稿的身份是回溯性的——turn 结束时
    * 恰好是最后一块）。故每块先扣住；后继块 / 工具事件 / 新 assistant 段
-   * 的出现都证明它是中间段 → 提交进滚动道；final deliver 到达则直接被
-   * 终稿全文取代（丢弃，从未展示过故无重复）。
+   * 的出现都证明它是中间段 → 提交进滚动道；final deliver 到达时按**前缀
+   * 包含性**定性：是终稿前缀（最后一段正文恒为 final 的前缀，footer 追加
+   * 在尾部）→ 丢弃，终稿道原样重新呈现；不是前缀（块迟到、held 扣的是
+   * 工具前文本）→ 提交进滚动道，防内容丢失（时序倒置为已知残留）。
    */
   private saHeldBlock: string | null = null;
 
@@ -215,6 +226,22 @@ export class StreamingController {
       && this.saLane === 'final'
       && this.phase === 'failed'
       && this.saFinalAcceptedChars === 0
+      && !this._deliveredExternally;
+  }
+
+  /**
+   * stream-all 专属：终稿道**中途**失败（首片已被平台接受，后续分片失败）。
+   * 已接受部分是一条被 complete 收尾的可见消息，但剩余正文还悬着——应由
+   * 上层按前缀差量把未接受尾巴作为独立消息补发（复用 [stream-final] 机制，
+   * computeUnsentRemainder 的基准 lastDeliveredSegmentText 在终稿道中恰好
+   * 跟踪已接受前缀）。结果不明的失败（网络层）由 shouldSuppressFinalTailFallback
+   * 抑制补发，防与流内内容重复，口径与 stream 模式一致。
+   */
+  get finalLaneNeedsTailFallback(): boolean {
+    return this.isStreamAllMode
+      && this.saLane === 'final'
+      && this.phase === 'failed'
+      && this.saFinalAcceptedChars > 0
       && !this._deliveredExternally;
   }
 
@@ -535,18 +562,23 @@ export class StreamingController {
       || payload.kind === 'patch';
     if (!isToolish) return;
 
-    // 主键优先 itemId，退化 toolCallId / title；别名全量登记，
-    // 同一 item 后续事件（可能只带 toolCallId）也能解析回主键
-    const aliases = [payload.itemId, payload.toolCallId, payload.title, payload.name]
-      .map((v) => (typeof v === 'string' ? v.trim() : ''))
-      .filter((v) => v.length > 0);
-    const primary = this.resolveItemPrimary(aliases);
+    // 主键解析分强弱 id：itemId / toolCallId 是强 id（框架 item 事件恒带），
+    // title / name 是弱 id（title = toolName[+meta]，同名工具调用会重复）。
+    // 强 id 存在但未命中映射 → 新 item，绝不回退弱 id 解析——否则同名工具的
+    // 后续调用会被 title 别名折叠进第一次的调用，滚动道缺行。
+    // 弱 id 仍全量登记：不带强 id 的事件（防御性兼容）也能解析回已登记主键。
+    const strongIds = normalizeAliases([payload.itemId, payload.toolCallId]);
+    const weakIds = normalizeAliases([payload.title, payload.name]);
+    const primary = this.resolveItemPrimary(strongIds, weakIds);
     if (!primary) return;
 
-    if (payload.phase === 'end' || payload.phase === 'completed') {
-      // 前缀不可回改：仅当该标题行仍是滚动道末尾（其后无新内容）时可补 ✓
+    if (payload.phase === 'end') {
+      // 前缀不可回改：仅当该标题行仍是滚动道末尾（其后无新内容）时可补收尾标记。
+      // 成功打 ✓，失败打 ✗（框架 end 事件 status: completed | failed/...）
       if (this.saTailItemKey === primary) {
-        await this.appendRolling(' ✓');
+        const failed = typeof payload.status === 'string' && payload.status.length > 0
+          && payload.status !== 'completed';
+        await this.appendRolling(failed ? ' ✗' : ' ✓');
         this.saTailItemKey = null;
       }
       return;
@@ -555,7 +587,7 @@ export class StreamingController {
     // start / update：同 key 只追加一次标题行（update 事件可能反复触发）
     if (this.saStartedItemKeys.has(primary)) return;
     this.saStartedItemKeys.add(primary);
-    for (const alias of aliases) this.saItemAliases.set(alias, primary);
+    for (const alias of [...strongIds, ...weakIds]) this.saItemAliases.set(alias, primary);
 
     // 先把 held 块提交进滚动道（工具的出现证明它是中间段），再挂标题行
     // （时间序：模型正文在前，工具调用在后）
@@ -577,13 +609,24 @@ export class StreamingController {
     this.saHeldBlock = trimmed;
   }
 
-  /** 从别名列表解析 item 主键：命中已登记的别名取其主键，否则取首个别名 */
-  private resolveItemPrimary(aliases: string[]): string | null {
-    for (const alias of aliases) {
+  /**
+   * 从强弱 id 解析 item 主键：
+   * 1. 任一强 id（itemId / toolCallId）命中已登记映射 → 取其主键（exec 工具
+   *    的 tool/command 双 item 共享 toolCallId，靠这一步去重）；
+   * 2. 强 id 存在但全部未命中 → 视为新 item，取首个强 id（不回退弱 id）；
+   * 3. 无强 id → 弱 id（title / name）命中映射取主键，否则取首个弱 id。
+   */
+  private resolveItemPrimary(strongIds: string[], weakIds: string[]): string | null {
+    for (const id of strongIds) {
+      const mapped = this.saItemAliases.get(id);
+      if (mapped) return mapped;
+    }
+    if (strongIds.length > 0) return strongIds[0];
+    for (const alias of weakIds) {
       const mapped = this.saItemAliases.get(alias);
       if (mapped) return mapped;
     }
-    return aliases[0] ?? null;
+    return weakIds[0] ?? null;
   }
 
   /**
@@ -593,15 +636,28 @@ export class StreamingController {
     if (this.isTerminal) return;
     if (signal?.aborted) return;
 
-    // held 块被终稿全文取代（从未展示，丢弃不重复）；滚动道收尾、终稿走第二条消息
-    this.saLane = 'final';
+    // held 块定性（前缀包含性）：终稿段的身份是「终稿文本的前缀」——框架把
+    // usage footer 追加在 final 尾部，最后一段正文恒为 final 的前缀。
+    //   - 前缀成立 → 丢弃（终稿道会原样重新呈现，无需对账）；
+    //   - 前缀不成立 → 它是**工具前文本**（典型：块投递被 SDK coalescer 拖到
+    //     final 之后才到达，held 里扣的是先于工具的段落），终稿文本里没有它，
+    //     丢弃即彻底丢失 → 提交进滚动道再收尾。已知残留：此时它在滚动道里
+    //     排在工具标题行之后（到达序使然），内容可见但时序倒置。
+    const text = finalText.trim();
+    const held = this.saHeldBlock;
     this.saHeldBlock = null;
+    if (held && !prefixMatches(held, text)) {
+      this.deps.log?.info(`stream-all: held block is not final-prefix, committing to rolling lane chars=${held.length}`);
+      await this.appendRollingItem(held);
+    }
     this.saTailItemKey = null;
+
+    // 滚动道收尾、终稿走第二条消息
+    this.saLane = 'final';
     await this.completeSession('rolling_done');
     // 对齐 new_reply 路径：收尾后清空账本，终稿道从零起账
     this.lastAcceptedFull = '';
 
-    const text = finalText.trim();
     if (!text) {
       this.transition('done', 'finalize:empty_final');
       return;
