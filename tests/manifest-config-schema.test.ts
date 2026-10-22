@@ -380,6 +380,69 @@ async function main() {
     });
   });
 
+  // ── 字符串枚举的「值」逐项对照（2026-10-22 补）─────────────────────
+  //
+  // 上方的键名对照救不了枚举成员：给 TS 联合类型加一个值（stream-all）
+  // 而 manifest enum 不跟，字段名检查照样全绿，但用户配新值会被
+  // validatePluginSchemaValue 直接拒掉——v2.8.0 之前的实际事故。
+  // 故：① TS 内联联合类型 ↔ schema enum 集合相等（双向）；
+  //    ② 每个枚举成员经**真实校验器**验证可被接受。
+
+  /** 从 src/types.ts 提取内联字符串联合类型的成员（如 sendMode?: 'a' | 'b'） */
+  function readInlineUnion(field: string): string[] {
+    const src = readFileSync(join(process.cwd(), 'src', 'types.ts'), 'utf8');
+    const m = src.match(new RegExp(`${field}\\??:\\s*((?:'[^']+'\\s*\\|\\s*)+'[^']+')`));
+    assert.ok(m, `应能在 src/types.ts 找到 ${field} 的内联联合类型`);
+    return [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]);
+  }
+
+  await test('streaming.sendMode：TS 联合类型与 schema enum 逐值一致', () => {
+    const tsUnion = readInlineUnion('sendMode');
+    const schemaEnum = (
+      (topProps.streaming as { properties?: { sendMode?: { enum?: string[] } } })
+        ?.properties?.sendMode?.enum ?? []
+    );
+    const missingInSchema = tsUnion.filter((v) => !schemaEnum.includes(v));
+    const extraInSchema = schemaEnum.filter((v) => !tsUnion.includes(v));
+    assert.strictEqual(
+      missingInSchema.length,
+      0,
+      `schema.streaming.sendMode.enum 缺少 TS 联合类型的值：${missingInSchema.join(', ')}——` +
+        `additionalProperties/enum 校验下用户配了会被直接拒（v2.8.0 前的 stream-all 事故）`,
+    );
+    assert.strictEqual(
+      extraInSchema.length,
+      0,
+      `schema.streaming.sendMode.enum 有 TS 联合类型之外的值：${extraInSchema.join(', ')}——配了会被运行时静默当 'stream' 处理`,
+    );
+  });
+
+  await test('streaming.sendMode：每个枚举成员都能通过真实校验器', () => {
+    const validator = require('./node_modules/openclaw/dist/schema-validator-CLfGeb79.js') as {
+      r: (params: {
+        origin: string;
+        schema: unknown;
+        cacheKey: string;
+        value: unknown;
+        applyDefaults: boolean;
+      }) => { ok: boolean; errors?: unknown[] };
+    };
+    for (const member of ['stream', 'static', 'stream-all'] as const) {
+      const r = validator.r({
+        origin: 'test',
+        schema: qqbotSchema,
+        cacheKey: `qqbot-streaming-${member}`,
+        value: { appId: '123', clientSecret: 'sec', streaming: { mode: 'partial', sendMode: member } },
+        applyDefaults: true,
+      });
+      assert.strictEqual(
+        r.ok,
+        true,
+        `sendMode='${member}' 应能通过真实校验器（errors=${JSON.stringify(r.errors)}）`,
+      );
+    }
+  });
+
   await test('room_event 群的 tools / roomEventRequireMessageTool 配置能通过真实校验器', () => {
     // 2026-10-21 审查缺陷的回归锚点：这两个键是 room_event 的核心配置面
     // （降级 WARN 的第一条修法就是 groups.<id>.tools.allow），曾因 schema
