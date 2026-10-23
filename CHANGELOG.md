@@ -8,7 +8,31 @@
 
 ---
 
-## [3.0.1] - 2026-10-22
+## [Unreleased]
+
+### 变更
+
+- **群消息合并改为插件侧实现：agent 忙时到达的群消息攒成一批，turn 结束后一次性发给框架（可跨发言人合并）**。此前群消息合并完全交给框架 followup 队列的 `collect` 模式，但**框架的 collect 合批对「同群不同发言人」无效**——它的分组键含 `execution.senderId`（core 的 `resolveFollowupAuthorizationKey` → `resolveFollowupDeliveryStorageKey` → `prepareNextDeliveryGroup`），且该函数**遇到第一个 key 不同就 break** ⇒ 只有「连续同 key」的消息才成一批。群里几个人同时问、bot 忙完一次性回（群聊最常见的诉求）因此永远做不到：每条消息各自成轮、各自回一次。
+  - **忙碌信号由插件自建**：框架没有向通道插件暴露「某会话是否正在工作」的查询 API（SDK 导出面已逐一核对），但插件自己知道——`dispatchToOpenClaw` 里 `await adapters.inboundRun!(...)` 覆盖整个 turn（提交到结束才 resolve；typing 中间件与 c2c 防抖都依赖这一点）。新增 `src/features/group-session-busy.ts` 维护 per-群 in-flight 计数，`finally` 归零（ingest 丢弃 / dispatch 抛错 / adapters 缺失都不会让批次被永久压住）。
+  - **合批原语用框架现成的**：复用 `openclaw/plugin-sdk/channel-inbound` 的 `createInboundDebouncer`（与 c2c 防抖同款）——`shouldHoldFlush` 在静默期到点后再检查、true 则继续压住并重排定时器（**无限期持有**），`flushKey` 是**显式冲刷、绕过 hold 检查**。turn 结束（计数归零）→ 显式冲刷 ⇒ 攒下的消息一次性发出。批次键**按群**（不是按人）⇒ 同群不同发言人可同批。
+  - **合并内容逐条归属 + 单份历史**：新增 `assembleMergedGroupBody`（`src/dispatch/body-assembler.ts`）。不能直接拼 N 条现成 agentBody——`buildAgentBody` 在「群被@且有历史」时给**每条**各加一份 `[Chat history begins]…`，拼起来历史会重复 N 份；改为整批共享**最新成员**的历史快照 + 每条一段 `[消息 i/N]` 与各条自带的 `[sender (openid)]` 前缀。合批允许混入不同发言人，模型必须能分清每条是谁说的。
+  - **批内 turn 语义**：只要批内有一条是「在叫 bot」（@ / 引用 bot / 称呼唤醒），整批按 `user_request` 投递（载体消息的 mention 标志置位，让 dispatch 走同一条分类路径）；全是被动消息则按 `room_event`。否则「用户 @ 了 bot 却没回音」。
+  - **旁路不合并**（立即直发，框架 debouncer 保证先冲刷同 key 的 pending buffer 再执行，顺序保持）：控制命令（stop/esc/abort/exit）、斜杠命令（合并会破坏 `buildCtxPayload` 的命令标记）、多问题 `ask_user` 的 keyed 答案文本（合并会改写答案导致认领失败）、含语音的 turn（对齐框架 `requiresIndividualCollectDrain` 的 `currentInboundAudio` 约束）。
+  - **容量与丢弃**：默认最多 10 条（`maxBatchSize`）。超出时**丢弃较早的消息**（保留最新 10 条），并在合并正文前置一行 `[已丢弃 N 条较早的群消息（批次上限 10）]`——与框架 `[Queue overflow] Dropped N messages due to cap.` 同样式，避免模型静默缺内容；丢弃时打 INFO 留痕。
+  - **空闲零延迟**：群空闲时消息立即直发（不缓冲、不等待窗口），与合批前的行为一致。
+  - **安全阀（对「直到 turn 结束才一次性全发」的显式偏离）**：框架 debouncer 的 `maxWaitMs` 兜底——持有超过 `maxHoldMs`（默认 5 分钟）后强制冲刷。turn 永久挂起时批次会滞留内存且随进程重启丢失。`maxHoldMs: 0` = 永不强制（只在 turn 结束时发）。
+  - **配置面**：`channels.qqbot.groupCoalesce` / `groups.<id>.coalesce`（账号段同形）扩展 `strategy`（`'plugin'` 默认 / `'framework'` 回退到框架队列）、`maxBatchSize`、`maxHoldMs`；manifest schema 同步（`additionalProperties: false` 下少一个字段 = 用户配了被拒）。
+  - **守卫**：新增 `tests/group-merge.test.ts`（18 例）——忙碌信号计数与归零回调、配置回落链、合批装配（逐条归属 + 单份历史 + 丢弃说明）、集成（空闲直发 / 跨发言人合批 / 容量丢弃 / 旁路保序 / 跨群隔离 / 前缀归位 / 失败不丢批 / 退出冲刷）；`tests/group-c2c-differential.test.ts` 中「插件内建 coalescer 已删除」的断言改为「插件侧合批存在且 strategy 双档可切换」；`tests/manifest-config-schema.test.ts` 补 `groups.<id>.coalesce` 嵌套块的逐字段守卫。
+
+### 修复
+
+- **群消息正文头部不再出现 `#ROBOT1.0_<id>! ` 前缀（消息 id 与正文本是分开的，混进正文的是框架而非平台）**。现场：Web UI 上群消息气泡正文形如 `#ROBOT1.0_chM80PvMt-…! 土豆马铃薯: 大肥鱼`——消息 id 被打头拼进正文。
+  - **根因不在插件、也不在 QQ 平台**：官方《群消息（全量模式）》的事件体里，消息 id 是独立的 `id` 字段（被动回复锚点 `msg_id` 同形），`content` 字段的定义**不含**任何 id 前缀；QQ SDK 原样透传 `ev.content`，插件与框架都没有注入过这个前缀。真正的注入点是 **openclaw 框架的 `formatRoomEventLine`**（core：`prefix = [messageId ? \`#${messageId}\` : undefined, sender].join(" ")` → `` `${prefix}: ${body}` ``）——它把 room_event 的 transcript 正文渲染成「id + 发送者 + 正文」一行。
+  - **修复方向是改写格式而非剥离入站正文**（入站 content 里本来就没有它，剥是剥错地方）：插件经 ctxPayload 的 `extra` 传入 `AmbientTranscriptBody` / `AmbientTranscriptMessageId` / `AmbientTranscriptTimestampMs`（框架 `buildChannelInboundEventContextValue` 末尾的 `...params.extra` 会展开进 ctx；core 的 `resolveRoomEventTranscriptBody` 优先取 `ctx.AmbientTranscriptBody`）⇒ room_event 的 transcript 行改用插件自定义正文（`[sender (openid)] 正文`，合批时是合并正文），**不再含 id**；消息 id 仍由 `AmbientTranscriptMessageId` 保留可追溯。
+  - **未改动 ambient watermark 机制**：框架的 ambient transcript watermark 是 telegram 专属路径（`bot-message` 里 `resolveAmbientTranscriptWatermarkKey({channel: "telegram", …})` 硬编码），generic channel 路径不设这些字段 ⇒ 插件侧同样**不设** `AmbientTranscriptWatermarkKey`（设了会把一条 telegram 口径的去重路径激活到 qqbot 上，副作用未知），保持现状不变。
+
+---
+
 
 ### 修复
 
