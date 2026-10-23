@@ -136,6 +136,27 @@ export function buildCtxPayload(params: CtxPayloadParams): any {
     extra: {
       ...(isSlashCommand ? { CommandSource: 'text' } : {}),
       ...(groupId ? { QQGroupOpenid: groupId } : {}),
+      // ── room_event 环境行的 transcript 正文（2026-10-23）──
+      // 框架默认把 room_event 的 transcript 正文渲染成
+      // `#<messageId> <sender>: <body>`（core 的 formatRoomEventLine）——
+      // 消息 id 与正文被合并成一行，Web UI 上表现为群消息正文头部带
+      // `#ROBOT1.0_<id>! ` 前缀。id 在平台层与正文本是分开的（id 是事件体
+      // 的 `id` 字段 / 被动回复锚点 msg_id），不该混进正文。
+      //
+      // 框架的 resolveRoomEventTranscriptBody 优先取 ctx.AmbientTranscriptBody
+      // （再退到 formatRoomEventLine），且 ctxPayload 的 extra 会被框架
+      // 展开进 ctx（core 的 buildChannelInboundEventContextValue 末尾
+      // `...params.extra`）——插件据此**覆盖**该行的格式，不做入站剥离
+      // （入站 content 里本来就没有这个前缀，剥了是剥错地方）。
+      // 合批时 assembled.agentBody 已是合并正文（逐条归属 + 单份历史），
+      // 无需额外处理。
+      ...(groupId
+        ? {
+            AmbientTranscriptBody: assembled.agentBody,
+            AmbientTranscriptMessageId: envelope.messageId,
+            AmbientTranscriptTimestampMs: msgTimestamp ? new Date(msgTimestamp).getTime() : Date.now(),
+          }
+        : {}),
       ...(processed?.localMediaPaths?.length
         ? {
             MediaPaths: processed.localMediaPaths,
