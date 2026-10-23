@@ -21,8 +21,24 @@ import {
 } from '../src/config.js';
 import { qqbotPlugin } from '../src/channel.js';
 
-function test(name: string, fn: () => void) {
-  try {
+/**
+ * 缺凭据时 `inspectAccount` 应上报的 secretStatus。
+ *
+ * 取决于**本机是否留有真实凭据备份**
+ * （~/.openclaw/qqbot/data/credential-backup/current.json，路径全局固定）：
+ *   没有备份 → missing（未配置任何凭据来源）
+ *   有备份   → configured_unavailable（已配置、但只读巡检路径不 materialize）
+ * 两者语义一致（都表示「当前路径取不到凭据」），故按环境取值断言，而不是硬编码
+ * 'missing' —— 否则在装过真实凭据的机器上必然红。
+ */
+function expectedSecretStatus(): 'missing' | 'configured_unavailable' {
+  const backupFile = path.join(
+    os.homedir(), '.openclaw', 'qqbot', 'data', 'credential-backup', 'current.json',
+  );
+  return fs.existsSync(backupFile) ? 'configured_unavailable' : 'missing';
+}
+
+function test(name: string, fn: () => void) {  try {
     fn();
     console.log(`✓ ${name}`);
   } catch (err) {
@@ -86,7 +102,7 @@ test('inspectAccount：缺凭据上报 missing 且不抛错', () => {
   const inspection = inspectQQBotAccount(cfg, undefined);
   assert.strictEqual(inspection.configured, false);
   assert.strictEqual(inspection.appIdStatus, 'missing');
-  assert.strictEqual(inspection.secretStatus, 'missing');
+  assert.strictEqual(inspection.secretStatus, expectedSecretStatus());
   assert.strictEqual(inspection.appIdSource, 'none');
 });
 
@@ -134,7 +150,8 @@ test('inspectAccount：插件已挂载该只读面（且真的返回巡检结果
     secretStatus?: string;
   };
   assert.strictEqual(missing?.configured, false);
-  assert.strictEqual(missing?.secretStatus, 'missing');
+  // 同上：secretStatus 按本机是否留有真实凭据备份取值（missing / configured_unavailable）
+  assert.strictEqual(missing?.secretStatus, expectedSecretStatus());
 });
 
 // ── 3. clientSecretFile ──
