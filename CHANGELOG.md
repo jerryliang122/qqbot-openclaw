@@ -8,21 +8,21 @@
 
 ---
 
-## [Unreleased]
+## [3.1.0] - 2026-10-23
 
 ### 变更
 
 - **群消息合并改为插件侧实现：agent 忙时到达的群消息攒成一批，turn 结束后一次性发给框架（可跨发言人合并）**。此前群消息合并完全交给框架 followup 队列的 `collect` 模式，但**框架的 collect 合批对「同群不同发言人」无效**——它的分组键含 `execution.senderId`（core 的 `resolveFollowupAuthorizationKey` → `resolveFollowupDeliveryStorageKey` → `prepareNextDeliveryGroup`），且该函数**遇到第一个 key 不同就 break** ⇒ 只有「连续同 key」的消息才成一批。群里几个人同时问、bot 忙完一次性回（群聊最常见的诉求）因此永远做不到：每条消息各自成轮、各自回一次。
-  - **忙碌信号由插件自建**：框架没有向通道插件暴露「某会话是否正在工作」的查询 API（SDK 导出面已逐一核对），但插件自己知道——`dispatchToOpenClaw` 里 `await adapters.inboundRun!(...)` 覆盖整个 turn（提交到结束才 resolve；typing 中间件与 c2c 防抖都依赖这一点）。新增 `src/features/group-session-busy.ts` 维护 per-群 in-flight 计数，`finally` 归零（ingest 丢弃 / dispatch 抛错 / adapters 缺失都不会让批次被永久压住）。
+  - **忙碌信号由插件自建**：框架没有向通道插件暴露「某会话是否正在工作」的查询 API（SDK 导出面已逐一核对），但插件自己知道——`dispatchToOpenClaw` 里 `await adapters.inboundRun!(...)` 在**该 turn 被采纳并跑完**时 resolve。新增 `src/features/group-session-busy.ts` 维护 per-群 in-flight 计数，`finally` 归零（ingest 丢弃 / dispatch 抛错 / adapters 缺失都不会让批次被永久压住）。⚠️ 被框架**排队**（defer）的 turn 在仅入队时就 resolve ⇒ busy 提前归零（已知限制，见下方「已知限制」）。
   - **合批原语用框架现成的**：复用 `openclaw/plugin-sdk/channel-inbound` 的 `createInboundDebouncer`（与 c2c 防抖同款）——`shouldHoldFlush` 在静默期到点后再检查、true 则继续压住并重排定时器（**无限期持有**），`flushKey` 是**显式冲刷、绕过 hold 检查**。turn 结束（计数归零）→ 显式冲刷 ⇒ 攒下的消息一次性发出。批次键**按群**（不是按人）⇒ 同群不同发言人可同批。
-  - **合并内容逐条归属 + 单份历史**：新增 `assembleMergedGroupBody`（`src/dispatch/body-assembler.ts`）。不能直接拼 N 条现成 agentBody——`buildAgentBody` 在「群被@且有历史」时给**每条**各加一份 `[Chat history begins]…`，拼起来历史会重复 N 份；改为整批共享**最新成员**的历史快照 + 每条一段 `[消息 i/N]` 与各条自带的 `[sender (openid)]` 前缀。合批允许混入不同发言人，模型必须能分清每条是谁说的。
-  - **批内 turn 语义**：只要批内有一条是「在叫 bot」（@ / 引用 bot / 称呼唤醒），整批按 `user_request` 投递（载体消息的 mention 标志置位，让 dispatch 走同一条分类路径）；全是被动消息则按 `room_event`。否则「用户 @ 了 bot 却没回音」。
-  - **旁路不合并**（立即直发，框架 debouncer 保证先冲刷同 key 的 pending buffer 再执行，顺序保持）：控制命令（stop/esc/abort/exit）、斜杠命令（合并会破坏 `buildCtxPayload` 的命令标记）、多问题 `ask_user` 的 keyed 答案文本（合并会改写答案导致认领失败）、含语音的 turn（对齐框架 `requiresIndividualCollectDrain` 的 `currentInboundAudio` 约束）。
-  - **容量与丢弃**：默认最多 10 条（`maxBatchSize`）。超出时**丢弃较早的消息**（保留最新 10 条），并在合并正文前置一行 `[已丢弃 N 条较早的群消息（批次上限 10）]`——与框架 `[Queue overflow] Dropped N messages due to cap.` 同样式，避免模型静默缺内容；丢弃时打 INFO 留痕。
+  - **合并内容逐条归属 + 单份历史**：新增 `assembleMergedGroupBody`（`src/dispatch/body-assembler.ts`）。不能直接拼 N 条现成 agentBody——`buildAgentBody` 在「群被@且有历史」时给**每条**各加一份 `[Chat history begins]…`，拼起来历史会重复 N 份；且 SDK `historyBuffer` 暴露的历史快照是「不含当前消息、但含此前所有消息」⇒ 历史必须取**批前基线**（最早成员的快照），否则批次内非最后一条成员会被说两遍。整批共享这一份历史 + 每条一段 `[消息 i/N]` 与各条自带的 `[sender (openid)]` 前缀。合批允许混入不同发言人，模型必须能分清每条是谁说的。
+  - **批内 turn 语义**：只要批内有一条是「在叫 bot」（@ / 引用 bot / 称呼唤醒），整批按 `user_request` 投递（载体消息的 mention 标志在**装配之后**置位——先置位会把没叫 bot 的载体虚标成 `(@you)`）；全是被动消息则按 `room_event`。否则「用户 @ 了 bot 却没回音」。
+  - **旁路不合并**（立即直发，框架 debouncer 保证先冲刷同 key 的 pending buffer 再执行，顺序保持）：控制命令（stop/esc/abort/exit）、斜杠命令（**同时看原始与清洗后两份文本**——单条路径的命令直通用清洗后的 userContent，只看原始会漏 `@bot /cmd`）、多问题 `ask_user` 的 keyed 答案文本（合并会改写答案导致认领失败）、含语音的 turn（对齐框架 `requiresIndividualCollectDrain` 的 `currentInboundAudio` 约束）。
+  - **容量与丢弃**：默认**最多 10 条 + 8000 字**双上限（条数 `maxBatchSize`、字数 `GROUP_MERGE_MAX_BODY_CHARS`）。超出时**丢弃较早的消息**（保留最新），并在合并正文前置一行 `[已丢弃 N 条较早的群消息…]`——与框架 `[Queue overflow] Dropped N messages due to cap.` 同样式，避免模型静默缺内容；丢弃时打 INFO 留痕。
   - **空闲零延迟**：群空闲时消息立即直发（不缓冲、不等待窗口），与合批前的行为一致。
   - **安全阀（对「直到 turn 结束才一次性全发」的显式偏离）**：框架 debouncer 的 `maxWaitMs` 兜底——持有超过 `maxHoldMs`（默认 5 分钟）后强制冲刷。turn 永久挂起时批次会滞留内存且随进程重启丢失。`maxHoldMs: 0` = 永不强制（只在 turn 结束时发）。
   - **配置面**：`channels.qqbot.groupCoalesce` / `groups.<id>.coalesce`（账号段同形）扩展 `strategy`（`'plugin'` 默认 / `'framework'` 回退到框架队列）、`maxBatchSize`、`maxHoldMs`；manifest schema 同步（`additionalProperties: false` 下少一个字段 = 用户配了被拒）。
-  - **守卫**：新增 `tests/group-merge.test.ts`（18 例）——忙碌信号计数与归零回调、配置回落链、合批装配（逐条归属 + 单份历史 + 丢弃说明）、集成（空闲直发 / 跨发言人合批 / 容量丢弃 / 旁路保序 / 跨群隔离 / 前缀归位 / 失败不丢批 / 退出冲刷）；`tests/group-c2c-differential.test.ts` 中「插件内建 coalescer 已删除」的断言改为「插件侧合批存在且 strategy 双档可切换」；`tests/manifest-config-schema.test.ts` 补 `groups.<id>.coalesce` 嵌套块的逐字段守卫。
+  - **守卫**：新增 `tests/group-merge.test.ts`（27 例）——忙碌信号计数与归零回调、配置回落链、合批装配（逐条归属 + 单份历史 + 丢弃说明）、集成（空闲直发 / 跨发言人合批 / 容量丢弃 / 旁路保序 / 跨群隔离 / 前缀归位 / 失败不丢批 / 退出冲刷）；`tests/group-c2c-differential.test.ts` 中「插件内建 coalescer 已删除」的断言改为「插件侧合批存在且 strategy 双档可切换」；`tests/manifest-config-schema.test.ts` 补 `groups.<id>.coalesce` 嵌套块的逐字段守卫。
 
 ### 修复
 
@@ -50,6 +50,7 @@
 
 ---
 
+## [3.0.1] - 2026-10-22
 
 ### 修复
 
