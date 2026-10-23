@@ -22,7 +22,19 @@ import { subscribeOutboundMessage } from '../features/typing-refresh.js';
 
 /** QPS 约束：续期间隔不得低于 20s */
 export const MIN_TYPING_INTERVAL_MS = 20_000;
-const DEFAULT_TYPING_INTERVAL_MS = 20_000;
+/**
+ * 默认续期间隔 45s。
+ *
+ * **为什么不是 20s**：typing 通知（input_notify）**与回复消息共享同一份被动配额**
+ * （QQ 对每条用户消息的被动回复条数有限：c2c 4 条 / 群 5 条），而一次 notify 的
+ * `input_second` 是 60s（见 `TYPING_DURATION_SEC`）——**一次 notify 已经覆盖 60 秒**。
+ * 每 20s 续一次等于把同一份覆盖窗口重复消耗 3 遍：模型首字节慢时（实测 42s）
+ * typing 就先吃掉 3 条额度，回复只剩 1 条 → 正文块被配额挤掉。
+ *
+ * 45s 间隔 + 60s 窗口 → 首字节 42s 只吃 1 条，且指示器覆盖不中断
+ * （45 < 60，续期发生在窗口到期前）。
+ */
+const DEFAULT_TYPING_INTERVAL_MS = 45_000;
 /** 服务端输入状态窗口（秒），QQ 平台窗口上限约 60s */
 const TYPING_DURATION_SEC = 60;
 /** 出站消息后延迟多久补发续期 */
@@ -34,7 +46,7 @@ export function resolveTypingIntervalMs(input: number | undefined): number {
 
 export interface TypingIndicatorMiddlewareOptions {
   accountId: string;
-  /** 续期间隔 ms，默认 20_000，低于 20_000 会被钳制到 20_000 */
+  /** 续期间隔 ms，默认 45_000，低于 20_000 会被钳制到 20_000 */
   intervalMs?: number;
 }
 

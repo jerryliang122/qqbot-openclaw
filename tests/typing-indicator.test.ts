@@ -81,8 +81,11 @@ function makeCtx(kind: 'c2c' | 'group', msgId: string, calls: string[]): CtxMock
 
 group('续期间隔钳制（QPS 约束）');
 
-await test('默认间隔为 20s', () => {
-  assert.strictEqual(resolveTypingIntervalMs(undefined), 20_000);
+await test('默认间隔为 45s（一次 notify 覆盖 60s，20s 续期会把同一窗口重复消耗 3 遍）', () => {
+  // 2026-10-23 真机事故：typing 与回复共享同一份被动配额（c2c 4 条/msg_id），
+  // 每 20s 续一次而一次 notify 的 input_second 就是 60s → 首字节 42s 就吃掉 3 条，
+  // 回复只剩 1 条 → 正文块被挤掉。默认改为 45s（< 60s 窗口，续期不中断指示器）。
+  assert.strictEqual(resolveTypingIntervalMs(undefined), 45_000);
 });
 
 await test('低于 20s 的配置被钳制到 20s', () => {
@@ -187,7 +190,7 @@ await test('续期定时器间隔为 20s，续期不因配额耗尽而中断', a
     const chainPromise = mw(makeCtx('c2c', 'cm3', calls) as any, () => nextDone);
 
     assert.ok(captured, '应创建续期定时器');
-    assert.strictEqual(captured!.ms, 20_000, '续期间隔应被钳制到 20000ms');
+    assert.strictEqual(captured!.ms, 20_000, '续期间隔应被钳制到 20000ms（下限不变）');
     assert.strictEqual(calls.length, 1, '初始发送一次');
 
     // 连续触发 5 次续期回调：limit=4，前 3 次被动（带 msgId），之后降级主动（无 msgId）
@@ -282,12 +285,13 @@ await test('中间消息发出后 5s 补发续期，受 QPS 间距保护顺延',
     assert.strictEqual(timeouts.length, 1, '应安排一次补发');
     assert.strictEqual(timeouts[0].ms, POST_MESSAGE_REFRESH_DELAY_MS, `补发延迟应为 ${POST_MESSAGE_REFRESH_DELAY_MS}ms`);
 
-    // 5s 到期：与初始发送间距不足 20s（QPS），应顺延而非立即发送
+    // 5s 到期：与初始发送间距不足（QPS/续期间隔），应顺延而非立即发送
+    const intervalMs = resolveTypingIntervalMs(undefined);
     timeouts[0].cb();
     assert.strictEqual(calls.length, 1, '间距不足时不应立即补发');
     assert.strictEqual(timeouts.length, 2, '应顺延剩余间距');
-    assert.ok(timeouts[1].ms > 0 && timeouts[1].ms <= MIN_TYPING_INTERVAL_MS,
-      `顺延时长应在 (0, ${MIN_TYPING_INTERVAL_MS}]，实际 ${timeouts[1].ms}`);
+    assert.ok(timeouts[1].ms > 0 && timeouts[1].ms <= intervalMs,
+      `顺延时长应在 (0, ${intervalMs}]，实际 ${timeouts[1].ms}`);
 
     // 顺延到期 → 补发（配额内仍走被动）
     timeouts[1].cb();

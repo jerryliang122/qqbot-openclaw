@@ -28,7 +28,8 @@ import {
   resolveQQBotStreamMode,
   resolveDisableBlockStreaming,
 } from '../outbound/streaming-controller.js';
-import { shouldDeliverBlockText, BLOCK_QUOTA_RESERVE, BlockNotDeliveredError } from '../outbound/block-quota.js';
+import { hasPassiveBlockSlot, isDefinitelyNotDispatched } from '../outbound/block-quota.js';
+import { PlatformMessageNotDispatchedError } from 'openclaw/plugin-sdk/error-runtime';
 import { ProgressCardPublisher } from '../outbound/progress-card-publisher.js';
 import { getPassiveReplyQuotaRemaining } from '../features/quota-manager.js';
 import { getAdapters, type RuntimeAdapters } from '../adapter/resolve.js';
@@ -332,6 +333,22 @@ function buildFallbackRoute(
 /**
  * 将经过中间件处理的入站消息转发给 OpenClaw AI
  */
+// ── 入口判断 ──
+
+/**
+ * 文本指纹（长度 + 简易 hash）。
+ *
+ * 仅用于**同一轮内**判断「这段文本是否已经作为块投递过」，防止工具调用前置
+ * 说明与框架块双投。不是安全用途。
+ */
+function textFingerprint(text: string): string {
+  let h = 0;
+  for (let i = 0; i < text.length; i++) {
+    h = (h * 31 + text.charCodeAt(i)) | 0;
+  }
+  return `${text.length}:${h >>> 0}`;
+}
+
 export async function dispatchToOpenClaw(
   ctx: MiddlewareContext,
   msg: QQBotInboundMessage,
@@ -550,9 +567,9 @@ export async function dispatchToOpenClaw(
   let outboundSendOk = 0;
   let outboundSendFail = 0;
   const trackOutbound = <T extends { error?: string }>(result: T, via: string): T => {
-    // 被动配额守卫**刻意丢弃**的中间块不是「发送失败」——它既没送达（不计 ok）
-    // 也不是错误（不计 fail）。否则块被丢 + final 真失败时会误发失败兜底文案
-    // （用户其实已经看过部分内容）。
+    // 被动配额**刻意降级主动**的中间块不是「发送失败」——它既没走被动（不计 ok）
+    // 也不是错误（不计 fail）。否则块降级 + final 真失败时会误发失败兜底文案
+    // （用户其实已经看到部分内容）。
     if (result.error === 'passive-quota-exhausted') {
       dlog?.debug(`outbound dropped by passive quota via ${via}`);
       return result;
@@ -567,15 +584,28 @@ export async function dispatchToOpenClaw(
   };
 
   /**
+   * partial 态的「工具调用前置说明」收集区。
+   *
+   * - `partialPreambleText`：当前 assistant 消息的累积文本（由 `onPartialReply` 写入），
+   *   等工具调用真正发生时（`deliver(kind:'tool')`）才作为独立消息发出。
+   * - `sentBlockFingerprints`：已被框架块投递过的文本指纹 —— 避免前置说明与
+   *   框架块双投（同一段文本两条消息）。
+   */
+  let partialPreambleText = '';
+  const sentBlockFingerprints = new Set<string>();
+
+  /**
    * partial 态的**块文本**投递（框架 block streaming 产出的中间消息）。
    *
-   * 被动回复配额守卫：QQ 平台对**每条用户消息**的被动回复条数有限
-   * （c2c 4 条 / 群 5 条），且配额耗尽后会**降级为主动发送**（不带 msg_id），
-   * 烧掉每日主动预算。这里为最终回复保留 1 条槽位，额度不足时直接丢弃该
-   * 中间块——最终回复仍会携带完整内容送达，用户不会缺内容。
+   * 块承载的是**正文**（final 与块的合并源文本相等时框架会自动丢弃 final，
+   * 不额外占配额），所以**块绝不能丢**：丢掉承载全文的终态块，携带全文的
+   * final 会被一并丢弃（静默丢 → 框架记 delivered → `hasSentPayload` 丢 final；
+   * 抛错上报 → 框架记 failed-deliver → 「仍有投递托管权」→ final 被
+   * retry-block 丢）——两条路实测都导致用户完全收不到回复。
    *
-   * `passiveOnly: true` 兜住「探测 → 发送」之间的 TOCTOU 竞态：即使额度
-   * 在探测后被抢占，也绝不落到主动通道。
+   * 因此：被动配额不足时**降级为主动发送**（不带 msg_id），不丢块。
+   * 代价是烧一点每日主动预算；内容送达优先于预算。
+   * （progress card 是可选提示，仍保持 `passiveOnly` + 直接丢弃。）
    */
   const deliverBlockText = async (
     payload: DeliverPayload,
@@ -585,30 +615,99 @@ export async function dispatchToOpenClaw(
     if (!text) return;
     const remaining = getPassiveReplyQuotaRemaining({
       // 与 sendText 预留配额同一账号键（含单账号回退），否则回退场景下
-      // 探测与记账错位（探测乐观、实际耗尽），中间块会吃掉最终回复的被动槽
+      // 探测与记账错位（探测乐观、实际耗尽）
       accountId: resolveQuotaAccountId(account.accountId),
       msgId: envelope.messageId,
       scope: targetScope === 'group' ? 'group' : 'c2c',
     });
-    if (!shouldDeliverBlockText(remaining)) {
-      // 抛错而不是静默返回：框架默认把未 settlement 的块记为「已送达」，
-      // 一旦静默丢弃，它会把携带全文的 final 一并丢弃 → 正文永久丢失。
-      // 抛错让框架记为 failed-deliver，final 就会补发全文兜底。
+    if (!hasPassiveBlockSlot(remaining)) {
       dlog?.warn(
-        `[block] not delivered by passive quota remaining=${remaining} reserve=${BLOCK_QUOTA_RESERVE} scope=${targetScope}`,
-      );
-      throw new BlockNotDeliveredError(
-        `passive quota exhausted (remaining=${remaining}, reserve=${BLOCK_QUOTA_RESERVE})`,
+        `[block] passive quota exhausted (remaining=${remaining}) → 降级为主动发送以保内容送达 scope=${targetScope}`,
       );
     }
-    // 直接走 ctx.sendText（块是纯文本，deliverReply 的文本路径与此等价）——
-    // 需要拿到发送结果：**发送时才发现没槽位**（探测→发送之间的 TOCTOU）
-    // 同样必须报「未送达」，否则框架记为已送达 → final 被丢 → 正文丢失。
-    const result = await deliverCtx.sendText(deliverCtx.qualifiedTarget, text, { passiveOnly: true });
+    // 不传 passiveOnly：有被动槽就被动发（锚定 msg_id），没有就自动降级主动
+    // —— 绝不能因为配额不足而让正文消失。
+    const result = await deliverCtx.sendText(deliverCtx.qualifiedTarget, text);
     if (result.error) {
-      dlog?.warn(`[block] send failed: ${result.error}`);
-      throw new BlockNotDeliveredError(`send failed: ${result.error}`);
+      if (isDefinitelyNotDispatched(result)) {
+        // **确定未投递**（平台明确拒绝 / 网关未注册）→ 用框架的带类型错误上报。
+        // 框架据此把 attempt 记为 'failed-before-deliver'（在
+        // shouldRetryReplyDispatch 的可重试集合内 → 该块**无投递托管权**）
+        // → 携带全文的 final **不会被丢弃** → 正文必达。
+        //
+        // 注意 retryable 必须为 true：false 会让框架判定为
+        // 'failed-deliver'（不可重试 → 有托管权 → final 被 retry-block 丢弃），
+        // 那正是 2026-10-23 真机事故的根因。
+        //
+        // 歧义失败（网络中断 / 超时，可能已发出）**不得**用这个类型——
+        // 上报「未投递」会让上游重投 → 用户收到两条。
+        dlog?.warn(
+          `[block] not dispatched (${result.error}) → 上报未送达，让 final 补发全文`,
+        );
+        throw new PlatformMessageNotDispatchedError(result.error, {
+          cause: new Error(result.error),
+          retryable: true,
+        });
+      }
+      dlog?.error(`[block] send failed: ${result.error}`);
+      return;
     }
+    // 记指纹：这段文本已作为块投递过 → 工具调用前置说明不得再发一遍
+    sentBlockFingerprints.add(textFingerprint(text));
+  };
+
+  /**
+   * partial 态：把「工具调用前置说明」作为一条独立消息发出。
+   *
+   * ## 背景
+   *
+   * 框架的块流式**只在 assistant 消息完成时**产块（`onCompletedReply`，
+   * openclaw dist `agent-runner-run-*.mjs`）。带工具调用的消息**不是**
+   * completed reply，其文本（"我先调用 X 看看"）走 `onAssistantText` →
+   * `onPartialReply` 回调。而 partial 态不消费该回调（那是 stream 态的
+   * preview 模型专用）→ 这段前置说明**整段丢失**。
+   *
+   * 框架自带的 `onCommentaryText` 桥接救不了非 Claude provider：
+   * `classifyClaudeCommentary` 要求 `supportsCliJsonlToolEvents(params)`
+   * ——只有 Claude 的 CLI JSONL tool events 会被分类为 commentary。
+   *
+   * ## 判据
+   *
+   * 用**工具调用事件**（`deliver(kind:'tool')` 到达 = 工具真的被调用了），
+   * **不是文本长度启发式**（issue #67 那类误判：同轮重发会被当成新回复）。
+   *
+   * ## 配额
+   *
+   * 前置说明是**过程叙述、不是答案** → 被动额度不足时**直接丢弃**，
+   * 不降级主动（不烧每日主动预算）；答案本身走块/最终回复，不受影响。
+   */
+  const flushPartialPreamble = async (): Promise<void> => {
+    if (!frameworkBlockStreaming) return;
+    const text = partialPreambleText.trim();
+    partialPreambleText = '';
+    if (!text) return;
+    // 已被框架块投递过（模型把前置说明与工具调用拆成两条 assistant 消息）→ 不重复发
+    if (sentBlockFingerprints.has(textFingerprint(text))) return;
+    const remaining = getPassiveReplyQuotaRemaining({
+      accountId: resolveQuotaAccountId(account.accountId),
+      msgId: envelope.messageId,
+      scope: targetScope === 'group' ? 'group' : 'c2c',
+    });
+    if (!hasPassiveBlockSlot(remaining)) {
+      dlog?.warn(
+        `[preamble] dropped by passive quota remaining=${remaining} scope=${targetScope}`,
+      );
+      return;
+    }
+    // passiveOnly：额度在探测后被抢占时**不发送**，不降级主动烧预算
+    const result = await deliverCtx.sendText(deliverCtx.qualifiedTarget, text, {
+      passiveOnly: true,
+    });
+    if (result.error) {
+      dlog?.warn(`[preamble] not sent: ${result.error}`);
+      return;
+    }
+    dlog?.debug(`[preamble] sent len=${text.length}`);
   };
 
   /**
@@ -702,7 +801,7 @@ export async function dispatchToOpenClaw(
 
       // ── 1. block: 渐进中间块 / 框架系统通知的投递 ──
       // partial 态的**渐进中间块**（框架 block streaming 产出）：走配额守卫，
-      // 额度不足就丢弃（final 仍携带完整内容，且绝不降级主动烧每日预算）。
+      // 额度不足不丢块——降级为主动发送（保内容送达，代价是烧一点每日主动预算）。
       //
       // 其余 kind:'block' 是**框架系统通知**（上下文压缩 / 准入 / 推理轨迹等，
       // openclaw dist agent-runner 的 deliverProgress(…, "block")）——它们与
@@ -722,7 +821,7 @@ export async function dispatchToOpenClaw(
         }
         if (frameworkBlockStreaming && !isSystemNoticePayload(payload)) {
           await deliverBlockText(payload, info);
-          // 已投递（或被守卫丢弃），不能再落默认路径——否则块文本发两遍
+          // 已投递（或已上报未送达），不能再落默认路径——否则块文本发两遍
           return;
         }
         // 系统通知 / off 态 / stream 态：继续往下走默认路径
@@ -795,6 +894,9 @@ export async function dispatchToOpenClaw(
 
       // ── 4. tool 媒体：立即转发（static 流式路径已在上方 flush 文本）──
       if (kind === 'tool') {
+        // partial 态：工具真的被调用了 → 此刻 pending 的 partial 文本就是
+        // 「工具调用前置说明」，作为一条独立消息发出（配额不足则丢弃）。
+        await flushPartialPreamble();
         await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
         return;
       }
@@ -804,10 +906,10 @@ export async function dispatchToOpenClaw(
       await deliverReply(filteredPayload, info, deliverCtx);
       if (text) deliveredTexts.add(text);
     } catch (err) {
-      // 中间块未送达：必须让框架知道（否则它记为「已送达」并把携带全文的
-      // final 一并丢弃 → 正文永久丢失）。框架的块回复管线会 catch 住这个错误
-      // 并继续，turn 不受影响。
-      if (err instanceof BlockNotDeliveredError) {
+      // 「确定未投递」必须让框架知道：框架据此把块记为 'failed-before-deliver'
+      // （该 attempt 无投递托管权）→ 携带全文的 final 不会被丢弃 → 正文必达。
+      // 框架的块回复管线会 catch 住这个错误并继续，turn 不受影响。
+      if (err instanceof PlatformMessageNotDispatchedError) {
         throw err;
       }
       deliverErrorCount++;
@@ -969,6 +1071,20 @@ export async function dispatchToOpenClaw(
                       // stream 态 = 封口上一段（整段保留、拼进同一条消息），
                       // 不再靠长度启发式猜边界（issue #67）。
                       onAssistantMessageStart: async () => { await streamingController.beginSegment(); },
+                    }
+                  : {}),
+                ...(frameworkBlockStreaming
+                  ? {
+                      // partial 态收集「工具调用前置说明」文本。
+                      // **不在这里发**：① 同一段文本还会作为框架块到达 → 双投；
+                      // ② 逐 token 发会打爆被动配额（c2c 仅 4 条/msg_id）。
+                      // 等工具调用真正发生（deliver(kind:'tool')）再作为一条独立
+                      // 消息发出——判据是框架的**工具调用事件**，不是文本长度启发式。
+                      onPartialReply: async (p: { text?: string }) => {
+                        if (p.text) partialPreambleText = p.text;
+                      },
+                      // 新 assistant 消息开始 → 上一段的收集作废
+                      onAssistantMessageStart: async () => { partialPreambleText = ''; },
                     }
                   : {}),
                 ...(progressPublisher

@@ -12,7 +12,7 @@
 import assert from "node:assert";
 import { qqbotPlugin } from "../src/channel.js";
 import {
-  shouldDeliverBlockText,
+  hasPassiveBlockSlot,
   BLOCK_QUOTA_RESERVE,
 } from "../src/outbound/block-quota.js";
 import {
@@ -60,21 +60,19 @@ await test("coalesce 默认值不等于框架默认（800/1000），否则延迟
 
 console.log("\n=== 2. 中间块被动回复配额守卫 ===");
 
-await test("BLOCK_QUOTA_RESERVE = 1（为 final 留一条槽位）", () => {
-  assert.strictEqual(BLOCK_QUOTA_RESERVE, 1);
+await test("BLOCK_QUOTA_RESERVE = 0（partial 态的 final 由框架自动丢，不额外占配额）", () => {
+  assert.strictEqual(BLOCK_QUOTA_RESERVE, 0);
 });
 
-await test("额度充足时投递中间块", () => {
-  // c2c 配额 4 条：remaining 4/3/2 都还能投（最多 3 条中间块 + final = 4）
-  assert.strictEqual(shouldDeliverBlockText(4), true);
-  assert.strictEqual(shouldDeliverBlockText(3), true);
-  assert.strictEqual(shouldDeliverBlockText(2), true);
+await test("额度充足时有被动槽", () => {
+  assert.strictEqual(hasPassiveBlockSlot(4), true);
+  assert.strictEqual(hasPassiveBlockSlot(3), true);
+  assert.strictEqual(hasPassiveBlockSlot(1), true);
 });
 
-await test("额度只剩 final 槽位时丢弃中间块", () => {
-  assert.strictEqual(shouldDeliverBlockText(1), false, "remaining=1 → 留给 final");
-  assert.strictEqual(shouldDeliverBlockText(0), false, "remaining=0 → 丢弃");
-  assert.strictEqual(shouldDeliverBlockText(-1), false, "负值 → 丢弃");
+await test("额度耗尽时无被动槽（降级主动发送，内容仍必达）", () => {
+  assert.strictEqual(hasPassiveBlockSlot(0), false);
+  assert.strictEqual(hasPassiveBlockSlot(-1), false);
 });
 
 // ============ 3. deliverReply 的 passiveOnly ============

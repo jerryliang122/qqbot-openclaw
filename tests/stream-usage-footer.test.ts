@@ -291,13 +291,16 @@ function makeFakeRuntime(opts: { onInboundRun?: (params: any) => Promise<any> } 
 
 function installFakeGateway(opts: { failSendText?: boolean; failSecondUpdate?: 'definitive' | 'ambiguous' } = {}) {
   const sentTexts: string[] = [];
+  /** 每次发送实际带的 msgId：有值=被动回复（锚定），undefined=降级主动 */
+  const sentMsgIds: Array<string | undefined> = [];
   const streamUpdates: string[] = [];
   // 注意：complete 次数用数组记录（原始类型 number 在闭包内自增不会
   // 反映到返回对象的属性快照上）
   const streamCompletes: number[] = [];
   const gw = {
-    sendText: async (_target: any, text: string) => {
+    sendText: async (_target: any, text: string, sendOpts: any) => {
       sentTexts.push(text);
+      sentMsgIds.push(sendOpts?.msgId);
       if (opts.failSendText) throw new Error('QQ API unavailable');
       return { id: `out-${sentTexts.length}` };
     },
@@ -318,7 +321,9 @@ function installFakeGateway(opts: { failSendText?: boolean; failSecondUpdate?: '
     }),
   } as any;
   registerGateway('test-account', gw);
-  return { sentTexts, streamUpdates, streamCompletes };
+  // 一并返回 gateway 本身：runDispatch 的「单账号回退」场景需要把它注册到
+  // 另一个账号键下（此前误把本容器注册进去，导致 resolved.gw.sendText 不存在）。
+  return { sentTexts, sentMsgIds, streamUpdates, streamCompletes, gateway: gw };
 }
 
 /**
@@ -392,7 +397,7 @@ async function runDispatch(opts: {
     // 复现**单账号回退**场景：配置账号没网、只有另一个账号在跑。
     // 配额记账键 = 回退到的账号键（resolveGatewayForSend），探测必须同键。
     unregisterGateway('test-account');
-    registerGateway(opts.gatewayAccountId, gw);
+    registerGateway(opts.gatewayAccountId, gw.gateway);
   }
   await dispatchToOpenClaw(ctx, msg, account, runtime);
   return gw;
@@ -763,6 +768,56 @@ await test('partial: 块文本（kind:block）作为中间消息发出，final �
   assert.strictEqual(gw.sentTexts[1], `最终正文\n${FOOTER}`, 'final 应整条发出并带 footer');
 });
 
+await test('partial: 工具调用前置说明作为独立消息发出（判据=工具调用事件）', async () => {
+  // 框架的块流式只在 assistant 消息「完成时」产块；带工具调用的消息不是
+  // completed reply，其文本走 onAssistantText → onPartialReply。partial 态
+  // 收集该文本，等 deliver(kind:'tool') 到达（工具真的被调用）时发出。
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '我先调用 session_status 看看' });
+      // 工具调用事件到达 → 前置说明应作为独立消息发出
+      await c.dispatcherOptions?.deliver?.({ text: '工具结果' }, { kind: 'tool' });
+    },
+  });
+  assert.ok(
+    gw.sentTexts.includes('我先调用 session_status 看看'),
+    `前置说明应作为独立消息发出，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
+await test('partial: 最终答案的 partial 文本不单独发（由框架块/最终回复承载）', async () => {
+  // 收集但不发送：最终答案会作为框架块到达，partial 文本再发一遍就是双投。
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '最终答案正文' });
+      // 没有工具调用 → 不触发前置说明 flush
+    },
+  });
+  assert.ok(
+    !gw.sentTexts.includes('最终答案正文'),
+    `最终答案的 partial 文本不应单独发（会与框架块双投），实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
+await test('partial: 前置说明与框架块不双投（同一文本只发一次）', async () => {
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async (c) => {
+      // 模型把前置说明与工具调用拆成两条 assistant 消息 → 前置说明已作为块到达
+      await c.dispatcherOptions?.deliver?.({ text: '前置说明' }, { kind: 'block' });
+      await c.replyOptions?.onPartialReply?.({ text: '前置说明' });
+      await c.dispatcherOptions?.deliver?.({ text: '工具结果' }, { kind: 'tool' });
+    },
+  });
+  assert.strictEqual(
+    gw.sentTexts.filter((t) => t === '前置说明').length,
+    1,
+    `同一文本只能发一次，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+});
+
 await test('partial: 块文本不重复发（kind:block 分支收口，不落默认路径）', async () => {
   const gw = await runDispatch({
     streaming: { mode: 'partial', sendMode: 'static' },
@@ -777,9 +832,9 @@ await test('partial: 块文本不重复发（kind:block 分支收口，不落默
   );
 });
 
-await test('partial: 被动配额耗尽 → 块向框架报「未送达」（抛错），且绝不发消息', async () => {
+await test('partial: 被动配额耗尽 → 块降级为主动发送（内容必达，绝不丢块）', async () => {
   const msgId = 'msg-quota-exhausted';
-  // 预占该 msg_id 的全部被动配额（c2c 4 条），让块发送时只剩 final 的槽位
+  // 预占该 msg_id 的全部被动配额（c2c 4 条）
   registerMsgIdWindow({ accountId: 'test-account', msgId, scope: 'c2c' });
   for (let i = 0; i < 4; i++) {
     checkAndConsumePassiveReplyQuota({ accountId: 'test-account', msgId, scope: 'c2c' });
@@ -788,28 +843,51 @@ await test('partial: 被动配额耗尽 → 块向框架报「未送达」（抛
     streaming: { mode: 'partial', sendMode: 'static' },
     msgId,
     simulate: async (c) => {
-      // 插件必须**抛错**告诉框架「这块没送达」——静默返回会被框架记为
-      // 「已送达」，进而把携带全文的 final 一并丢弃（正文永久丢失）。
-      await assert.rejects(
-        () => c.dispatcherOptions?.deliver?.({ text: '块一' }, { kind: 'block' }) as Promise<void>,
-        (err: any) => err?.name === 'BlockNotDeliveredError',
-        '配额耗尽时块必须抛 BlockNotDeliveredError（向框架报未送达）',
-      );
+      // 块承载的是正文，**绝不能丢**：丢掉承载全文的终态块，携带全文的 final
+      // 会被一并丢弃（静默丢 → 记 delivered → hasSentPayload 丢 final；
+      // 抛错 → 记 failed-deliver → 仍有投递托管权 → final 被 retry-block 丢）。
+      // 两条路实测都导致用户完全收不到回复 → 正确做法是降级为主动发送。
+      await c.dispatcherOptions?.deliver?.({ text: '块一' }, { kind: 'block' });
     },
   });
   assert.strictEqual(
     gw.sentTexts.filter((t) => t === '块一').length,
-    0,
-    `配额耗尽时块绝不能发出（更不能降级主动），实际: ${JSON.stringify(gw.sentTexts)}`,
+    1,
+    `配额耗尽时块必须仍然发出（降级主动），内容不能丢，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+  assert.strictEqual(
+    gw.sentMsgIds[0],
+    undefined,
+    '配额耗尽时该条应降级为主动发送（不带 msg_id）',
   );
   clearQuotaCache();
+});
+
+await test('partial: 块发送确定性失败（网关未注册）→ 上报未送达，final 不被丢', async () => {
+  // 「确定未投递」必须用框架的带类型错误上报（PlatformMessageNotDispatchedError，
+  // retryable:true）→ 框架记 'failed-before-deliver'（无投递托管权）→
+  // 携带全文的 final 不会被丢弃 → 正文必达。
+  // 若静默返回：框架记 'delivered' → hasSentPayload 丢 final → 正文永久丢失。
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async (c) => {
+      unregisterGateway('test-account');
+      await assert.rejects(
+        () => c.dispatcherOptions?.deliver?.({ text: '块一' }, { kind: 'block' }) as Promise<void>,
+        (err: any) => err?.code === 'OPENCLAW_PLATFORM_MESSAGE_NOT_DISPATCHED',
+        '确定性未投递必须抛 PlatformMessageNotDispatchedError（否则框架记 delivered → final 被丢）',
+      );
+    },
+  });
+  assert.strictEqual(gw.sentTexts.length, 0, '网关未注册时不该有任何发送');
+  registerGateway('test-account', gw.gateway);
 });
 
 await test('partial: 配额探测用回退后的账号键（单账号回退场景）', async () => {
   const msgId = 'msg-quota-fallback-key';
   // 网关在 'gw-account'，配置账号 'test-account' 没网 → 单账号回退。
   // 配额记账发生在 'gw-account' 名下 → 探测必须同键，否则探测乐观、
-  // 块会吃掉 final 的被动预留槽。
+  // 会白白降级主动（多烧每日主动预算）。
   registerMsgIdWindow({ accountId: 'gw-account', msgId, scope: 'c2c' });
   for (let i = 0; i < 3; i++) {
     checkAndConsumePassiveReplyQuota({ accountId: 'gw-account', msgId, scope: 'c2c' });
@@ -819,18 +897,18 @@ await test('partial: 配额探测用回退后的账号键（单账号回退场�
     msgId,
     gatewayAccountId: 'gw-account',
     simulate: async (c) => {
-      // 'gw-account' 名下只剩 1 条（= final 的槽位）→ 守卫应判定不可投递
-      await assert.rejects(
-        () => c.dispatcherOptions?.deliver?.({ text: '块一' }, { kind: 'block' }) as Promise<void>,
-        (err: any) => err?.name === 'BlockNotDeliveredError',
-        '探测必须用回退后的账号键（否则探测乐观、块会发出去吃掉 final 的槽）',
-      );
+      await c.dispatcherOptions?.deliver?.({ text: '块一' }, { kind: 'block' });
     },
   });
   assert.strictEqual(
     gw.sentTexts.filter((t) => t === '块一').length,
-    0,
-    `回退场景下块不应发出，实际: ${JSON.stringify(gw.sentTexts)}`,
+    1,
+    `回退场景下块必须仍然发出，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+  assert.strictEqual(
+    gw.sentMsgIds[0],
+    msgId,
+    '探测键与记账键一致 → 仍走被动回复（不多烧主动预算）',
   );
   clearQuotaCache();
 });
