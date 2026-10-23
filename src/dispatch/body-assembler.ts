@@ -183,8 +183,13 @@ export function assembleMergedGroupBody(
   // 丢弃说明放在最前（与框架 `[Queue overflow] …` 同样式：让模型知道有内容缺失）
   const body = opts?.droppedNote ? `${opts.droppedNote}\n\n${mergedBody}` : mergedBody;
 
-  // 整批只一份历史：取**最新**成员的非空历史快照
-  const history = pickLatestHistory(layers);
+  // 整批只一份历史：取**批前基线**（最早成员的快照）。
+  //
+  // ⚠️ 不能取「最新成员」的快照：SDK 的 historyBuffer 暴露的是
+  // 「不含当前消息、但含此前所有消息」的快照 ⇒ 批次内**非最后一条**成员
+  // 会同时出现在历史块与自己的分节里（消息被说两遍）。最早成员的快照
+  // 恰好是「批次开始之前」的群历史，是正确的基线。
+  const history = pickBatchBaselineHistory(layers);
   // 批内只要有一条是"在叫 bot"（user_request），整批就带历史 + (@you) 语义
   const anyMentioned = layers.some((l) => l.wasMentioned);
   const isGroup = layers[0]?.isGroup === true;
@@ -206,13 +211,16 @@ export function assembleMergedGroupBody(
   return { webBody, agentBody, rawBody, systemPrompt };
 }
 
-/** 取最新成员的非空历史快照 */
-function pickLatestHistory(layers: MemberLayers[]): HistoryEntry[] | undefined {
-  for (let i = layers.length - 1; i >= 0; i -= 1) {
-    const history = layers[i]?.history;
-    if (history && history.length > 0) return history;
-  }
-  return undefined;
+/**
+ * 取批前基线历史 = **最早成员**的快照。
+ *
+ * SDK 的 historyBuffer 在暴露 `ctx.state.history` 时**排除当前消息**、
+ * 但**包含此前所有消息** ⇒ 最新成员的快照里已含批次内的其它成员（重复）。
+ * 最早成员的快照恰好是「批次开始之前」的群历史。
+ */
+function pickBatchBaselineHistory(layers: MemberLayers[]): HistoryEntry[] | undefined {
+  const history = layers[0]?.history;
+  return history && history.length > 0 ? history : undefined;
 }
 
 /** 历史块文本（每条一行 `[sender] content`） */

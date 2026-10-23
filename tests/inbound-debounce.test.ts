@@ -291,6 +291,33 @@ await test('多条：分节头 + 拼接 + systemPrompt 取首个非空', () => {
   assert.equal(merged.systemPrompt, 'SP');
 });
 
+await test('历史块只保留第 1 条那份（批次内的消息不被说两遍）', () => {
+  // 回归（2026-10-23）：SDK 的 historyBuffer 暴露的快照「不含当前消息、
+  // 但含此前所有消息」⇒ 第 2 条的 agentBody 里的历史块含第 1 条的内容，
+  // 直接拼起来第 1 条会被说两遍、历史块还重复 N 份。第 1 条的历史块
+  // 才是「批次开始之前」的基线，保留它、剥掉其余的。
+  const merged = mergeAssembledBodies([
+    {
+      webBody: 'w1',
+      agentBody: '[Chat history begins]\n批次前的旧消息\n\n[Chat history ends]\n[Current message]\n第一条内容',
+      rawBody: '第一条内容',
+    },
+    {
+      webBody: 'w2',
+      agentBody: '[Chat history begins]\n批次前的旧消息\n第一条内容\n\n[Chat history ends]\n[Current message]\n第二条内容',
+      rawBody: '第二条内容',
+    },
+  ]);
+  const firstCount = merged.agentBody.split('第一条内容').length - 1;
+  assert.equal(firstCount, 1, `第一条应只出现一次，实际 ${firstCount} 次`);
+  const historyBlocks = merged.agentBody.split('[Chat history begins]').length - 1;
+  assert.equal(historyBlocks, 1, `历史块应只出现一次，实际 ${historyBlocks} 次`);
+  const baselineCount = merged.agentBody.split('批次前的旧消息').length - 1;
+  assert.equal(baselineCount, 1, `批前基线应只出现一次，实际 ${baselineCount} 次`);
+  assert.ok(merged.agentBody.includes('[Current message]'), '应保留当前消息标记');
+  assert.ok(merged.agentBody.includes('第二条内容'), '第二条内容不应丢');
+});
+
 group('mergeProcessedAttachments');
 
 await test('media 顺序 concat、平行数组配对、URL 去重、文本行拼接', () => {

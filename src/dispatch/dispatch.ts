@@ -345,15 +345,7 @@ export async function dispatchToOpenClaw(
     return;
   }
 
-  // ── 群 turn 在途标记（"正在工作"信号，2026-10-23）──
-  // 框架没有向通道插件暴露"某会话是否正在工作"的查询 API，但插件自己知道：
-  // 下面的 `await adapters.inboundRun!(...)` 覆盖整个 turn（提交到结束）。
-  // 计数供 features/group-merge.ts 判定"该攒批还是直发"，并在归零时
-  // 触发合批冲刷（turn 结束 → 攒下的消息一次性发出）。
-  // 计数在 finally 里归零：ingest 丢弃 / dispatch 抛错 / adapters 缺失
-  // 都不会让批次被永久压住。
   const groupTurnOpenid = envelope.chatScope === 'group' ? envelope.groupId : undefined;
-  if (groupTurnOpenid) markGroupTurnStarted(account.accountId, groupTurnOpenid);
 
   const assembled: AssembledBody =
     ((ctx.state as Record<string, unknown>).assembledBody as AssembledBody | undefined) ??
@@ -821,6 +813,22 @@ export async function dispatchToOpenClaw(
 
   let dispatchError: unknown;
   const hadDispatchError = () => dispatchError !== undefined;
+
+  // ── 群 turn 在途标记（"正在工作"信号，2026-10-23）──
+  // 框架没有向通道插件暴露"某会话是否正在工作"的查询 API，但插件自己知道：
+  // 下面的 `await adapters.inboundRun!(...)` 在**该 turn 被采纳并跑完**时
+  // resolve。计数供 features/group-merge.ts 判定"该攒批还是直发"，并在归零
+  // 时触发合批冲刷（turn 结束 → 攒下的消息一次性发出）。
+  // ⚠️ 被框架**排队**（defer）的 turn 会在仅入队时就 resolve ⇒ busy 提前
+  //    归零（口径失真，详见 features/group-session-busy.ts 头注释）。
+  //
+  // **标记点必须紧贴 try/finally**（评审修复）：早前放在函数入口，与
+  // 归零点之间隔着数百行同步代码——其中任一处同步抛错都会让异常直接
+  // 传播出本函数、finally 根本不执行 ⇒ 该群 busy 永久为 1 ⇒ 之后所有
+  // 群消息全部进批、且只能靠 maxHoldMs 兜底放出（系统性延迟 5 分钟，
+  // 静默无感）。挪到 try 前无行为差异：此处到 try 之间全是同步代码
+  // （无顶层 await），单线程下不会有别的入站消息在此窗口被处理。
+  if (groupTurnOpenid) markGroupTurnStarted(account.accountId, groupTurnOpenid);
 
   try {
     await adapters.inboundRun!({

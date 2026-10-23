@@ -3,17 +3,26 @@
  *
  * 背景（2026-10-23）：框架没有向通道插件暴露「某会话当前是否有 turn 在跑」的
  * 查询 API（SDK 导出面已逐一核对，无此类能力）。但插件自己知道——
- * `dispatchToOpenClaw` 里 `await adapters.inboundRun!(...)` 覆盖整个 turn
- * （turn 提交到结束才 resolve；typing 中间件的「处理链完成 = 会话结束」与
- * c2c 防抖的「载体项在 dispatch 完成后 resolve」都依赖这一点）。
+ * `dispatchToOpenClaw` 里 `await adapters.inboundRun!(...)` 在**该 turn 被
+ * 采纳并跑完**时 resolve。
  *
  * 因此本模块在 dispatch 侧维护 per-群的 in-flight 计数：
  * - `markGroupTurnStarted` —— dispatch 进入时 +1
  * - `markGroupTurnFinished` —— dispatch 退出时 -1（finally 兜底，异常路径也归零）
  * - 归零时通知订阅者 → 冲刷群合批队列（见 features/group-merge.ts）
  *
- * 计数语义含框架 followup 队列中排队的 turn：排队中的 dispatch promise
- * 同样未结束，故 busy=true。这正是「正在工作」的真实含义。
+ * ⚠️ **信号口径的已知失真（评审发现，2026-10-23）**：框架在同 session 已有
+ * 活动 turn 时会把新 turn **defer**（`agent-runner-run-*.mjs` 的
+ * `activeRunQueueAction === "enqueue-followup"` 分支：`enqueueFollowupRun` +
+ * `scheduleFollowupDrain` 后直接 return，turn 的实际执行由 drain 调度器
+ * **脱离该 promise 链**）⇒ 此时 `await inboundRun` 在**仅入队**时就 resolve，
+ * 计数提前归零。影响面：旁路项（控制命令 / 斜杠命令 / keyed 答案 / 语音）
+ * 在忙时直发却被框架排队时，其 dispatch promise 提前 resolve → busy 提前
+ * 归零 → 那一小段窗口内到达的群消息**不会**被插件合批（退化为框架队列的
+ * 逐条排队）。
+ * ⇒ 这是**行为退化而非正确性破坏**：消息仍全部送达、顺序不变（框架队列
+ * 保证），只是没有被合成一轮。要根治需要框架暴露 drain 完成的观测信号，
+ * 当前 openclaw 未提供（成本另议，勿"修"成猜测式实现）。
  *
  * 本模块是**纯状态**，不 import dispatch —— dispatch.ts 反向 import 本模块，
  * 若本模块再 import dispatch 会形成循环引用。

@@ -331,6 +331,28 @@ await test('历史块只出现一次（不重复 N 份）', () => {
   assert.ok(merged.agentBody.includes('旧消息'), '历史内容缺失');
 });
 
+await test('历史块不重复批次自身的消息（历史快照取批前基线）', () => {
+  // 回归：SDK 的 historyBuffer 暴露的是「不含当前消息、但含此前所有消息」
+  // 的快照 ⇒ 批次内**非最后一条**成员会同时出现在历史块与自己的分节里
+  // （消息被说两遍）。合并正文的历史必须是**批前基线**（最早成员的快照）。
+  const m1 = makeGroupMsgAndCtx({ content: '批次内第一条', senderId: 'UA', mentioned: true, history: [] });
+  const m2 = makeGroupMsgAndCtx({
+    content: '批次内第二条',
+    senderId: 'UB',
+    mentioned: true,
+    // 第二条到达时，第一条已被记入群历史
+    history: [{ senderId: 'UA', senderName: 'UA', content: '批次内第一条' }],
+  });
+  const merged = assembleMergedGroupBody(
+    [{ ctx: m1.ctx, msg: m1.msg }, { ctx: m2.ctx, msg: m2.msg }],
+    makeAccount(),
+  );
+  const firstOccurrences = merged.agentBody.split('批次内第一条').length - 1;
+  assert.equal(firstOccurrences, 1, `批次内第一条应只出现一次，实际 ${firstOccurrences} 次（历史块与分节重复）`);
+  const secondOccurrences = merged.agentBody.split('批次内第二条').length - 1;
+  assert.equal(secondOccurrences, 1, `批次内第二条应只出现一次，实际 ${secondOccurrences} 次`);
+});
+
 await test('丢弃说明前置在正文最前', () => {
   const a = makeGroupMsgAndCtx({ content: '问题一' });
   const merged = assembleMergedGroupBody(
@@ -470,16 +492,20 @@ await test('两个群的批次互不干扰', async () => {
 
 await test('前缀归位：transcript 体不含 #<messageId>，且 messageId 仍可追溯', async () => {
   const scenario = setupScenario();
-  const one = makeGroupMsgAndCtx({ content: '你好', senderId: 'A', mentioned: true });
+  // 正文里带 '#'，确保断言不是恒真
+  const one = makeGroupMsgAndCtx({ content: '你好 #标签', senderId: 'U_ALICE', senderName: 'Alice', mentioned: true });
   await keepAlive(fire(scenario, one));
   assert.equal(scenario.captured.length, 1);
 
   const { ctxPayload, params } = scenario.captured[0]!;
   const ambient = ctxPayload?.extra?.AmbientTranscriptBody ?? ctxPayload?.AmbientTranscriptBody;
   assert.ok(typeof ambient === 'string' && ambient.length > 0, '未设置 AmbientTranscriptBody');
-  assert.ok(!ambient.includes('#'), `transcript 体不应含 # 前缀：${ambient}`);
-  assert.ok(!ambient.includes(params.raw.messageId), 'transcript 体不应含消息 id');
-  assert.ok(ambient.includes('你好'), 'transcript 体应含正文');
+  assert.ok(!ambient.includes(params.raw.messageId), `transcript 体不应含消息 id：${ambient}`);
+  assert.ok(
+    !ambient.trimStart().startsWith('#'),
+    `transcript 体不应以 # 开头（消息 id 被拼进正文）：${ambient}`,
+  );
+  assert.ok(ambient.includes('你好 #标签'), 'transcript 体应含完整正文');
 
   const ambientId = ctxPayload?.extra?.AmbientTranscriptMessageId ?? ctxPayload?.AmbientTranscriptMessageId;
   assert.equal(ambientId, params.raw.messageId, 'AmbientTranscriptMessageId 应等于真实消息 id');
@@ -576,6 +602,142 @@ await test('room_event 群：全是被动消息 → 整批按 room_event（严�
     'message_tool_only',
     '全被动消息的批次应保持 room_event 语义',
   );
+});
+
+await test('dispatch 在同步段抛错 → busy 不泄漏（标记点紧贴 try/finally）', async () => {
+  // 回归（评审发现）：busy 标记若与 finally 隔着一大段同步代码，其中任一处
+  // 同步抛错都会让异常直接传播出 dispatchToOpenClaw、finally 不执行 ⇒ 该群
+  // busy 永久为 1 ⇒ 之后所有群消息只能靠 maxHoldMs 兜底放出（延迟 5 分钟）。
+  const scenario = setupScenario();
+  const bad = makeGroupMsgAndCtx({ content: '会炸', senderId: 'UA', mentioned: true });
+  // 让装配阶段同步抛错（processedAttachments 的 getter 抛）
+  Object.defineProperty(bad.ctx.state, 'processedAttachments', {
+    get() { throw new Error('boom-sync'); },
+    configurable: true,
+  });
+  await assert.rejects(
+    () => enqueueGroupInboundMessage(bad.ctx, bad.msg, scenario.account, scenario.runtime),
+    /boom-sync/,
+    '同步异常应向上传播',
+  );
+  assert.equal(isGroupBusy('test-account', 'GROUP_X'), false, 'busy 不得泄漏');
+
+  // 后续消息应能正常直发（未被永久压住）
+  const ok = makeGroupMsgAndCtx({ content: '正常消息', senderId: 'UB', mentioned: true });
+  await keepAlive(fire(scenario, ok));
+  assert.equal(scenario.captured.length, 1, '失败后应仍能 dispatch');
+});
+
+await test('正文字符上限：超限时保留最新消息并留丢弃说明', async () => {
+  let release!: () => void;
+  const hang = new Promise<void>((r) => { release = r; });
+  const scenario = setupScenario({ hang });
+
+  const a = makeGroupMsgAndCtx({ content: '起手', senderId: 'UA', mentioned: true });
+  const pa = fire(scenario, a);
+  await sleep(30);
+
+  // 三条各 5000 字（QQ 单条上限量级），累计超 8000 字上限
+  for (const tag of ['X', 'Y', 'Z']) {
+    await fire(scenario, makeGroupMsgAndCtx({ content: `${tag}${'长'.repeat(5000)}`, senderId: `U${tag}` }));
+  }
+  await sleep(20);
+
+  release();
+  await keepAlive(pa);
+  await keepAlive(sleep(150));
+
+  assert.equal(scenario.captured.length, 2, `expected 2 dispatches, got ${scenario.captured.length}`);
+  const body = scenario.captured[1]!.ingest.textForAgent;
+  assert.ok(body.includes('[已丢弃'), '超限应留丢弃说明');
+  assert.ok(body.includes('Z'), '应保留最新一条');
+  assert.ok(!body.includes('X'), '最早一条应被丢弃');
+});
+
+await test('批内有人叫 bot 时，载体未被虚标 (@you)', async () => {
+  let release!: () => void;
+  const hang = new Promise<void>((r) => { release = r; });
+  const scenario = setupScenario({ hang });
+
+  // 起手：被叫 bot
+  const a = makeGroupMsgAndCtx({ content: '起手', senderId: 'UA', mentioned: true });
+  const pa = fire(scenario, a);
+  await sleep(30);
+
+  // 批次：先一条被叫 bot，后一条**没叫**（载体 = 后者）
+  await fire(scenario, makeGroupMsgAndCtx({ content: '被问的', senderId: 'UB', mentioned: true }));
+  await fire(scenario, makeGroupMsgAndCtx({ content: '只是闲聊', senderId: 'U_CAROL', senderName: 'Carol' }));
+  await sleep(20);
+
+  release();
+  await keepAlive(pa);
+  await keepAlive(sleep(150));
+
+  assert.equal(scenario.captured.length, 2, `expected 2 dispatches, got ${scenario.captured.length}`);
+  const merged = scenario.captured[1]!;
+  const body = merged.ingest.textForAgent;
+  assert.ok(body.includes('[Carol (U_CAROL)] 只是闲聊'), '载体段应存在');
+  assert.ok(
+    !body.includes('[Carol (U_CAROL)] 只是闲聊 (@you)'),
+    '载体本人没叫 bot，不应被虚标 (@you)',
+  );
+  assert.ok(body.includes('(@you)'), '真正叫 bot 的成员应保留 (@you)');
+  // 整批仍按 user_request 投递（有回复权）
+  assert.equal(merged.replyOptions?.sourceReplyDeliveryMode, undefined, '整批应有回复权');
+});
+
+await test('清洗后以 / 开头的成员也旁路（命令语义不丢）', async () => {
+  let release!: () => void;
+  const hang = new Promise<void>((r) => { release = r; });
+  const scenario = setupScenario({ hang });
+
+  const a = makeGroupMsgAndCtx({ content: '起手', senderId: 'UA', mentioned: true });
+  const pa = fire(scenario, a);
+  await sleep(30);
+  await fire(scenario, makeGroupMsgAndCtx({ content: '普通消息', senderId: 'UB' }));
+  await sleep(20);
+
+  // 原文以 @ 开头（不触发旁路），但清洗后以 / 开头（单条路径会命令直通）
+  const cmd = makeGroupMsgAndCtx({ content: '@bot /status', senderId: 'UC' });
+  cmd.ctx.message.content = '/status';
+  await keepAlive(fire(scenario, cmd));
+
+  const bodies = scenario.captured.map((c) => c.ingest.textForAgent);
+  const flushIdx = bodies.findIndex((b) => b.includes('普通消息'));
+  const cmdIdx = bodies.findIndex((b) => b.includes('/status'));
+  assert.ok(cmdIdx >= 0, '斜杠命令应被 dispatch');
+  assert.ok(flushIdx >= 0, 'pending buffer 应被冲刷');
+  assert.ok(flushIdx < cmdIdx, 'buffer 应先于旁路项发出（保序）');
+  assert.ok(!bodies[cmdIdx]!.includes('[消息 '), '旁路项不应带分节头（未被合批）');
+
+  release();
+  await keepAlive(pa);
+});
+
+await test('框架 defer（入队即 resolve）时 busy 提前归零——锁定已知退化', async () => {
+  // 框架在同 session 有活动 turn 时会把新 turn defer：`enqueueFollowupRun` +
+  // scheduleFollowupDrain 后直接 return ⇒ `await inboundRun` 仅入队就 resolve。
+  // 此时插件的 busy 提前归零 → 后续群消息不再被合批（退化为框架队列逐条排队，
+  // 消息不丢、顺序不变）。本用例把该已知退化固化，避免被误当成回归。
+  const scenario = setupScenario();
+  const earlyResolveRuntime = {
+    ...scenario.runtime,
+    channel: {
+      ...scenario.runtime.channel,
+      inbound: {
+        ...scenario.runtime.channel.inbound,
+        run: async (params: any) => {
+          scenario.captured.push({ params, ingest: params.adapter.ingest({}), ctxPayload: undefined });
+          return { dispatched: true }; // 不跑 turn，立即 resolve（模拟 defer）
+        },
+      },
+    },
+  } as any;
+
+  const a = makeGroupMsgAndCtx({ content: '被 defer 的', senderId: 'UA', mentioned: true });
+  await keepAlive(enqueueGroupInboundMessage(a.ctx, a.msg, scenario.account, earlyResolveRuntime));
+  await sleep(30);
+  assert.equal(isGroupBusy('test-account', 'GROUP_X'), false, 'defer 后 busy 应提前归零');
 });
 
 await test('dispatch 抛错 → busy 归零 → 批次仍被冲刷', async () => {

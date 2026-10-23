@@ -4,7 +4,7 @@
 
 # QQ Bot Channel Plugin for OpenClaw
 
-**Independently maintained fork — framework-delegated group queueing, room-event ingestion for full-mode groups, and passive-first outbound delivery**
+**Independently maintained fork — plugin-side group message batching, room-event ingestion for full-mode groups, and passive-first outbound delivery**
 
 **Connect your AI assistant to QQ — private chat, group chat, and rich media, all in one plugin.**
 
@@ -648,24 +648,29 @@ Control which groups are allowed via `groupPolicy`:
 
 The plugin implements different message handling strategies for group and private chats:
 
-#### Group Chat (Framework Queue Strategy)
+#### Group Chat (Plugin-Side Batch Strategy)
 
 - **All messages are processed** — nothing is dropped
-- **Immediate dispatch** — messages go straight to the framework; no plugin-side waiting room
-- **Queueing by the framework** — while a turn is active, subsequent messages queue behind it (`collect` mode: merged into one batch after the active turn finishes; 500ms debounce absorbs bursts, queue cap with overflow summarizing)
+- **Immediate dispatch when idle** — a group with no active turn dispatches straight away (no added latency)
+- **Batched while the agent is busy** — while a turn is active, incoming group messages accumulate in a plugin-side batch and are sent as **one** turn when the active turn finishes. The batch may mix **different senders** (each message keeps its own `[sender (openid)]` attribution)
 - **Never interrupts** — an active turn always completes; new messages wait their turn
+- **Framework queue as a fallback** — the OpenClaw followup queue still backs the plugin (same-sender `collect` merging) when the plugin's busy signal misses a case
 - **SessionKey format**: `qqbot:{accountId}:group:{groupId}:coalescing` (legacy naming, kept for session continuity)
 - **Admission strategy**: `exclusive` (framework durable-ingress convention) with **no abort signal** — interruption is structurally impossible
 
 **Example behavior**:
 
 ```
-User A: "Question 1"  → Start processing
-User B: "Question 2"  → Queued in framework followup queue
-User C: "Question 3"  → Queued in framework followup queue
+User A: "Question 1"  → Start processing (group is idle → immediate dispatch)
+User B: "Question 2"  → Batched (agent is busy)
+User C: "Question 3"  → Batched (agent is busy)
 
-Question 1 completes → [Q2, Q3] drain as one merged batch → AI sees combined context, single reply
+Question 1 completes → [Q2, Q3] flush as ONE turn → AI sees combined context, single reply
 ```
+
+> See [Group Message Queueing Configuration](#group-message-queueing-configuration-coalesce--groupcoalesce) for `strategy` / `maxBatchSize` / `maxHoldMs`.
+>
+> **Known limitation**: when a turn is *deferred* by the framework (queued behind an active turn), the plugin's dispatch promise resolves at enqueue time rather than at turn completion, so the busy signal drops early for that window. Messages are still delivered in order — they just aren't merged into one turn in that window.
 
 #### C2C Private Chat (Exclusive Strategy)
 
