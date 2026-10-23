@@ -81,8 +81,9 @@
  * per-message 记账（msgid-cache 被动锚点登记、recordKnownUser、群模式
  * 推断）在 enqueue 之前由 handleMessage 照常逐条立即执行，不受防抖影响。
  *
- * 群聊不经过本模块（框架 followup 队列已承担群合并，且群有 mention
- * 门控语义，合并会破坏唤醒判定）。
+ * 群聊不经过本模块（群走 features/group-merge.ts 的插件侧合批：忙时攒批、
+ * turn 结束一次性发出，可跨发言人合并——框架的 collect 队列按 senderId
+ * 分组、遇首个不同键即断，跨发言人合并不了）。
  */
 import type { MiddlewareContext, QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { PluginRuntime } from 'openclaw/plugin-sdk';
@@ -201,11 +202,19 @@ function shouldDebounceC2CItem(item: C2CInboundDebounceItem): boolean {
  * agentBody/webBody 加 [消息 i/N] 分节头按序拼接；rawBody 按行拼接
  * （下游斜杠命令判定只看首字符，拼接后语义与首条一致——斜杠命令本身
  * 已经旁路防抖，不会进入合并路径）。
+ *
+ * **历史块只保留第 1 条的那一份**（2026-10-23 修复）：SDK 的 historyBuffer
+ * 暴露的 `ctx.state.history` 是「不含当前消息、但含此前所有消息」的快照
+ * ⇒ 第 2..N 条各自的 agentBody 里带的历史块**包含批次内的前面几条**
+ * （与分节重复，消息被说两遍，且历史块重复 N 份）。第 1 条的历史块恰好
+ * 是「批次开始之前」的基线，保留它、剥掉其余的即可。
  */
 export function mergeAssembledBodies(list: AssembledBody[]): AssembledBody {
   if (list.length === 1) return list[0]!;
   const header = (i: number) => `[消息 ${i + 1}/${list.length}]`;
-  const agentBody = list.map((b, i) => `${header(i)}\n${b.agentBody}`).join('\n\n');
+  const agentBody = list
+    .map((b, i) => `${header(i)}\n${i === 0 ? b.agentBody : stripHistoryBlock(b.agentBody)}`)
+    .join('\n\n');
   const webBody = list.map((b, i) => `${header(i)}\n${b.webBody}`).join('\n\n');
   const rawBody = list
     .map((b) => (b.rawBody ?? '').trim())
@@ -213,6 +222,11 @@ export function mergeAssembledBodies(list: AssembledBody[]): AssembledBody {
     .join('\n');
   const systemPrompt = list.map((b) => b.systemPrompt).find((v) => v !== undefined);
   return { webBody, agentBody, rawBody, systemPrompt };
+}
+
+/** 剥掉 agentBody 里的 `[Chat history begins]…[Chat history ends]` 块（保留其后的 `[Current message]` 标记） */
+function stripHistoryBlock(body: string): string {
+  return body.replace(/\[Chat history begins\][\s\S]*?\[Chat history ends\]\n?/g, '');
 }
 
 /**

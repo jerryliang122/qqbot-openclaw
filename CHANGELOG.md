@@ -31,6 +31,23 @@
   - **修复方向是改写格式而非剥离入站正文**（入站 content 里本来就没有它，剥是剥错地方）：插件经 ctxPayload 的 `extra` 传入 `AmbientTranscriptBody` / `AmbientTranscriptMessageId` / `AmbientTranscriptTimestampMs`（框架 `buildChannelInboundEventContextValue` 末尾的 `...params.extra` 会展开进 ctx；core 的 `resolveRoomEventTranscriptBody` 优先取 `ctx.AmbientTranscriptBody`）⇒ room_event 的 transcript 行改用插件自定义正文（`[sender (openid)] 正文`，合批时是合并正文），**不再含 id**；消息 id 仍由 `AmbientTranscriptMessageId` 保留可追溯。
   - **未改动 ambient watermark 机制**：框架的 ambient transcript watermark 是 telegram 专属路径（`bot-message` 里 `resolveAmbientTranscriptWatermarkKey({channel: "telegram", …})` 硬编码），generic channel 路径不设这些字段 ⇒ 插件侧同样**不设** `AmbientTranscriptWatermarkKey`（设了会把一条 telegram 口径的去重路径激活到 qqbot 上，副作用未知），保持现状不变。
 
+- **合批正文里批次自身的消息不再被说两遍（群侧 + c2c 侧，评审发现）**。SDK 的 `historyBuffer` 暴露的 `ctx.state.history` 是「**不含当前消息、但含此前所有消息**」的快照 ⇒ 批次内**非最后一条**成员会同时出现在历史块与自己的分节里（消息被说两遍），且历史块重复 N 份。
+  - **群侧**：合并正文的历史改为取**批前基线**（最早成员的快照，恰好是「批次开始之前」的群历史），而非最新成员的快照。
+  - **c2c 侧（既有缺陷，本次一并修）**：`mergeAssembledBodies` 只保留第 1 条的那份历史块，其余的剥掉（`[Current message]` 标记保留）。
+  - 触发面：非 room_event 群（默认 `unmentionedInbound: user_request`）在忙时攒批即命中——是默认路径，不是边角。
+
+- **群 turn 的「正在工作」计数不再泄漏（评审发现，中危）**。busy 标记早前放在 `dispatchToOpenClaw` 入口、与归零的 `finally` 隔着数百行同步代码——其中任一处同步抛错都会让异常直接传播出该函数、`finally` 根本不执行 ⇒ 该群 busy **永久为 1** ⇒ 之后所有群消息全部进批、只能靠 `maxHoldMs` 兜底放出（系统性延迟 5 分钟，且只有一行 dispatch error 日志可循）。现将标记挪到 `try` 之前（与 `finally` 紧贴）：该处到 `try` 之间全是同步代码（无顶层 await），单线程下不会有别的入站消息在此窗口被处理 ⇒ 行为等价且泄漏窗口消失。
+
+- **合批正文字数上限落地（评审发现：原为死常量）**。`GROUP_MERGE_MAX_BODY_CHARS`（8000）此前只声明未接线，注释承诺的「防上下文膨胀」是空的。一批 10 条各接近 QQ 单条 5000 字上限时，agentBody 可膨胀到数万字。现按**条数 + 正文字数**双上限裁剪（保留最新、丢弃较早并留说明）；单条超限仍保留（不因超限而整批丢弃）。
+
+- **合批载体不再被虚标 `(@you)`（评审发现）**。此前「批内有人叫 bot ⇒ 整批按 user_request」的置位发生在**装配之前**，装配器读到的载体 mention 已被污染 ⇒ 载体（最后一条）被挂上 `(@you)`，而实际叫 bot 的是批内更早的成员（对模型是归因误导）。现改为**装配后再置位**：正文已定，置位只影响 dispatch 侧的入站分类。
+
+- **「@bot /cmd」这类消息的命令语义在合批中不丢（评审发现）**。旁路判定原先只看**原始** content 的首字符，而单条路径的 agentBody 直通用的是**清洗后**的 userContent（`body-assembler` 的 `buildAgentBody`）⇒ 原文以 `@` 开头、清洗后以 `/` 开头的成员会被当成普通文本埋进 `[消息 i/N]`。现旁路同时看原始与清洗后两份文本。
+
+### 已知限制
+
+- **busy 信号在被框架「排队」的 turn 上失真（评审发现）**。框架在同 session 已有活动 turn 时会把新 turn **defer**（core `agent-runner-run-*.mjs` 的 `activeRunQueueAction === "enqueue-followup"` 分支：`enqueueFollowupRun` + `scheduleFollowupDrain` 后直接 return，turn 的实际执行由 drain 调度器**脱离该 promise 链**）⇒ `await inboundRun` 在**仅入队**时就 resolve，busy 提前归零。影响面：旁路项（控制命令 / 斜杠命令 / keyed 答案 / 语音）在忙时直发却被框架排队时，其 promise 提前 resolve → 那一小段窗口内到达的群消息**不会**被插件合批。⇒ 这是**行为退化而非正确性破坏**（消息仍全部送达、顺序不变，由框架队列保证），只是没被合成一轮。要根治需框架暴露 drain 完成的观测信号，当前 openclaw 未提供（成本另议）。已在源码注释与 README 中明示，并有回归用例固化该退化。
+
 ---
 
 

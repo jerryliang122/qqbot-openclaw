@@ -135,13 +135,19 @@ function hasAudio(item: GroupMergeItem): boolean {
  * 旁路判定：返回 true 表示**不参与合批**（立即直发）。
  */
 function isBypassItem(item: GroupMergeItem): boolean {
-  const text = String(item.msg?.content ?? '').trim();
-
-  // 斜杠命令：合并会破坏命令标记（rawBody 拼接后可能不以 '/' 开头）
-  if (text.startsWith('/')) return true;
+  // 斜杠命令：合并会破坏命令标记（rawBody 拼接后可能不以 '/' 开头）。
+  // 判定同时看**原始**与**清洗后**两份文本：单条路径的 agentBody 直通
+  // 用的是清洗后的 userContent（body-assembler 的 buildAgentBody），
+  // 而 ctxPayload 的命令标记用原始 rawBody（ctx-builder）——任一份以
+  // '/' 开头都要旁路，否则「@bot /cmd」这类（原文以 @ 开头、清洗后以
+  // / 开头）在合并路径里会退化成普通文本、命令语义丢失。
+  const rawText = String(item.msg?.content ?? '').trim();
+  const sanitizedText = String((item.ctx.message as { content?: string } | undefined)?.content ?? '').trim();
+  if (rawText.startsWith('/') || sanitizedText.startsWith('/')) return true;
 
   // 控制命令（stop/esc/abort/exit 等）：hasMedia 刻意传 false——框架默认策略
   // 不防抖媒体，本插件场景相反，仅借它的控制命令判定
+  const text = rawText || sanitizedText;
   if (text && !shouldDebounceTextInbound({ text, cfg: item.cfg as never, hasMedia: false })) return true;
 
   // 多问题 ask_user 的 keyed 答案文本：合并会改写答案、认领失败。
@@ -248,11 +254,35 @@ async function dispatchItem(
   );
 }
 
-/** 按容量上限裁剪批次：保留最新 N 条，返回被丢弃的条数 */
-function trimToCapacity(items: GroupMergeItem[], maxBatchSize: number): { kept: GroupMergeItem[]; dropped: number } {
-  if (items.length <= maxBatchSize) return { kept: items, dropped: 0 };
-  // 丢弃较早的消息，保留最新 maxBatchSize 条
-  return { kept: items.slice(items.length - maxBatchSize), dropped: items.length - maxBatchSize };
+/**
+ * 按容量上限裁剪批次：保留**最新**的消息，超限的较早消息被丢弃。
+ *
+ * 两个上限同时生效：
+ * - 条数上限 `maxBatchSize`（默认 10）
+ * - 正文字符上限 `maxBodyChars`（默认 8000）——一批 10 条各接近 QQ 单条
+ *   5000 字上限时，agentBody 可膨胀到数万字（上下文爆炸）。以消息正文
+ *   长度作代价度量（正文的支配项），从最新往最旧累加。
+ *
+ * 单条超限的消息**仍会保留**（不因超上限而整批丢弃），只在加入下一条
+ * 会超限时停止。
+ */
+function trimToCapacity(
+  items: GroupMergeItem[],
+  maxBatchSize: number,
+  maxBodyChars: number,
+): { kept: GroupMergeItem[]; dropped: number } {
+  const sizeOf = (i: GroupMergeItem) => (i.msg.content ?? '').length;
+  const keptReversed: GroupMergeItem[] = [];
+  let total = 0;
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    if (keptReversed.length >= maxBatchSize) break;
+    const size = sizeOf(items[i]!);
+    if (maxBodyChars > 0 && keptReversed.length > 0 && total + size > maxBodyChars) break;
+    keptReversed.push(items[i]!);
+    total += size;
+  }
+  const kept = keptReversed.reverse();
+  return { kept, dropped: items.length - kept.length };
 }
 
 function getOrCreateDebouncer(item: GroupMergeItem): Debouncer {
@@ -294,17 +324,17 @@ function getOrCreateDebouncer(item: GroupMergeItem): Debouncer {
         ? [...rawItems].sort((a, b) => arrivalMs(a) - arrivalMs(b))
         : rawItems;
 
-      // 容量裁剪：超出上限丢弃较早的消息
+      // 容量裁剪：超出上限（条数 / 正文字数）丢弃较早的消息
       const last = sorted[sorted.length - 1]!;
       const groupCfg = resolveGroupConfigFromAccount(last.account, groupOpenidOf(last));
       const maxBatchSize = groupCfg.coalesce.maxBatchSize ?? DEFAULT_GROUP_MERGE_MAX_BATCH_SIZE;
-      const { kept, dropped } = trimToCapacity(sorted, Math.max(1, maxBatchSize));
+      const { kept, dropped } = trimToCapacity(sorted, Math.max(1, maxBatchSize), GROUP_MERGE_MAX_BODY_CHARS);
       const droppedNote = dropped > 0
-        ? `[已丢弃 ${dropped} 条较早的群消息（批次上限 ${maxBatchSize}）]`
+        ? `[已丢弃 ${dropped} 条较早的群消息（批次上限 ${maxBatchSize} 条 / ${GROUP_MERGE_MAX_BODY_CHARS} 字）]`
         : undefined;
       if (dropped > 0) {
         dlog?.info(
-          `[group-merge] dropped ${dropped} older group message(s) (cap=${maxBatchSize}, group=${groupOpenidOf(last)}, kept=${kept.length})`,
+          `[group-merge] dropped ${dropped} older group message(s) (cap=${maxBatchSize} msgs / ${GROUP_MERGE_MAX_BODY_CHARS} chars, group=${groupOpenidOf(last)}, kept=${kept.length})`,
         );
       }
 
@@ -329,10 +359,14 @@ function getOrCreateDebouncer(item: GroupMergeItem): Debouncer {
           dlog?.info(
             `[group-merge] merged ${kept.length} group messages group=${groupOpenidOf(carrier)} anchorMsgId=${carrier.msg.messageId}`,
           );
-          // 批内任一条"在叫 bot" ⇒ 整批按 user_request 投递
+          // 批内任一条"在叫 bot" ⇒ 整批按 user_request 投递。
+          // ⚠️ 置位必须在**装配之后**：装配器按各成员自己的 mention 状态渲染
+          // `(@you)`，先置位会把载体（最后一条）虚标成"叫了 bot"（实际叫 bot
+          // 的是批内更早的成员）——对模型是归因误导。装配后再置位，载体
+          // 的正文已定，置位只影响 dispatch 侧的入站分类。
           const anyWoken = kept.some((i) => isExplicitlyWoken(i));
-          if (anyWoken) forceUserRequestOnCarrier(carrier);
           const ctx = buildMergedCarrier(kept, dropped, droppedNote);
+          if (anyWoken) forceUserRequestOnCarrier(carrier);
           await dispatchItem({ ...carrier, ctx }, { onTurnSubmitted: admit });
         } finally {
           admit();
