@@ -8,7 +8,7 @@
 
 **Connect your AI assistant to QQ — private chat, group chat, and rich media, all in one plugin.**
 
-### 🚀 Current Version: `v2.6.0`
+### 🚀 Current Version: `v3.1.0`
 
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![QQ Bot](https://img.shields.io/badge/QQ_Bot-API_v2-red)](https://bot.q.qq.com/wiki/)
@@ -671,6 +671,37 @@ Question 1 completes → [Q2, Q3] flush as ONE turn → AI sees combined context
 > See [Group Message Queueing Configuration](#group-message-queueing-configuration-coalesce--groupcoalesce) for `strategy` / `maxBatchSize` / `maxHoldMs`.
 >
 > **Known limitation**: when a turn is *deferred* by the framework (queued behind an active turn), the plugin's dispatch promise resolves at enqueue time rather than at turn completion, so the busy signal drops early for that window. Messages are still delivered in order — they just aren't merged into one turn in that window.
+
+**What a merged batch looks like in the Web UI**:
+
+```
+Carol                          ← bubble label = the carrier (last message of the batch)
+[消息 1/3]
+[Alice (U_ALICE)] Question 1 (@you)
+
+[消息 2/3]
+[Bob (U_BOB)] Question 2
+
+[消息 3/3]
+[Carol (U_CAROL)] Question 3
+```
+
+- The batch is **one** user bubble, not one per message: the merged body carries a `[消息 i/N]` section per message, and each message keeps its own `[sender (openid)]` attribution.
+- The bubble's **sender label is the carrier's** (the last message of the batch) — the per-message attribution *inside* the body is what keeps the senders distinguishable. The label is deliberately not rewritten to a synthetic "3 messages" marker, because that same field feeds the model's `Conversation info.sender` and a synthetic label would misattribute the author.
+- While a batch is pending its messages **have not reached the framework yet**, so the Web UI does not echo them one by one. (In QQ itself the members' messages stay visible to the group, of course.)
+
+**Framework queue capacity**: the OpenClaw followup queue still backs the plugin and caps at `messages.queue.cap` (default 20). On overflow the oldest queued message is dropped and the transcript shows `[Queue overflow] Dropped N messages due to cap.`. Plugin-side batching reduces how many entries reach that queue, but raising the cap is still worth doing for busy groups:
+
+```json
+{
+  "messages": {
+    "queue": {
+      "cap": 60,
+      "drop": "summarize"
+    }
+  }
+}
+```
 
 #### C2C Private Chat (Exclusive Strategy)
 
