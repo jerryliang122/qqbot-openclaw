@@ -38,6 +38,7 @@ import {
 } from '../features/question-helpers.js';
 import { tryGetBotForAccount } from '../bot-instance.js';
 import { resolveGroupConfigFromAccount, resolveMentionPatterns, resolveProgressCardConfig } from '../config.js';
+import { markGroupTurnFinished, markGroupTurnStarted } from '../features/group-session-busy.js';
 import { detectEventMention, matchesNamePattern } from '../utils/mention.js';
 import {
   classifyInboundEventKind,
@@ -344,6 +345,16 @@ export async function dispatchToOpenClaw(
     return;
   }
 
+  // ── 群 turn 在途标记（"正在工作"信号，2026-10-23）──
+  // 框架没有向通道插件暴露"某会话是否正在工作"的查询 API，但插件自己知道：
+  // 下面的 `await adapters.inboundRun!(...)` 覆盖整个 turn（提交到结束）。
+  // 计数供 features/group-merge.ts 判定"该攒批还是直发"，并在归零时
+  // 触发合批冲刷（turn 结束 → 攒下的消息一次性发出）。
+  // 计数在 finally 里归零：ingest 丢弃 / dispatch 抛错 / adapters 缺失
+  // 都不会让批次被永久压住。
+  const groupTurnOpenid = envelope.chatScope === 'group' ? envelope.groupId : undefined;
+  if (groupTurnOpenid) markGroupTurnStarted(account.accountId, groupTurnOpenid);
+
   const assembled: AssembledBody =
     ((ctx.state as Record<string, unknown>).assembledBody as AssembledBody | undefined) ??
     assembleBody(ctx, msg, account);
@@ -369,10 +380,16 @@ export async function dispatchToOpenClaw(
   const qualifiedTarget = envelope.targetId;
   const agentId = route.agentId ?? 'default';
 
-  // ── 群聊排队策略（排队/合并交给框架 followup 队列）──
-  // - enabled=true  → collect：活动 turn 期间到达的消息排队并在其后合并批处理
-  // - enabled=false → followup：排队但不合并（尊重「关闭合并」的意图，
-  //                   仍保证不打断活动 turn——远比框架默认 steer 插嘴安全）
+  // ── 群消息合并的归属分工（2026-10-23）──
+  // - strategy='plugin'（默认）：插件侧合批——该群 agent 忙时到达的消息
+  //   （含不同发言人）攒成一批，turn 结束后一次性作为**一条**消息发给
+  //   框架。框架队列在此只是**兜底**（插件漏判 busy 时接管），单条消息
+  //   对 collect 无副作用，故仍传 'collect'。
+  // - strategy='framework'：交回框架 followup 队列的 collect 模式。
+  //   注意框架 collect 的分组键含 senderId 且遇首个不同键即断——同群
+  //   不同发言人**永远合并不了**（这是插件侧合批存在的原因）。
+  // - enabled=false：followup——排队但不合并（尊重「关闭合并」的意图，
+  //   仍保证不打断活动 turn——远比框架默认 steer 插嘴安全）。
   const groupCfg = isGroup && envelope.groupId
     ? resolveGroupConfigFromAccount(account, envelope.groupId)
     : undefined;
@@ -458,7 +475,10 @@ export async function dispatchToOpenClaw(
 
   if (queueModeOverride && !frameworkQueueAnnounced) {
     frameworkQueueAnnounced = true;
-    dlog?.info(`[queue] group turn queueing delegated to framework followup queue (mode=${queueModeOverride}); plugin coalescer bypassed`);
+    dlog?.info(
+      `[queue] group turn queueing delegated to framework followup queue (mode=${queueModeOverride}, ` +
+      `mergeStrategy=${groupCfg?.coalesce.strategy ?? 'framework'}); plugin-side batching handles cross-sender merges`,
+    );
   }
   const storePath = adapters.resolveStorePath?.((cfg as any)?.session?.store, { agentId }) ?? '';
 
@@ -916,6 +936,9 @@ export async function dispatchToOpenClaw(
   } catch (err) {
     dispatchError = err;
     dlog?.error(`dispatch failed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    // 群 turn 在途计数归零 → 触发合批冲刷（攒批的消息一次性发出）
+    if (groupTurnOpenid) markGroupTurnFinished(account.accountId, groupTurnOpenid);
   }
 
   dlog?.debug(`dispatch completed sessionKey=${route.sessionKey}`);

@@ -57,7 +57,49 @@ export function assembleBody(
   account: ResolvedQQBotAccount,
   getRuntime?: () => any,
 ): AssembledBody {
-  const rawBody = msg.content ?? '';
+  const layers = buildMemberLayers(ctx, msg);
+
+  // ── Layer 5: agentBody（命令直通 / 群被@时前置历史） ──
+  const agentBody = buildAgentBody({
+    userContent: layers.userContent,
+    base: layers.base,
+    isGroup: layers.isGroup,
+    wasMentioned: layers.wasMentioned,
+    history: layers.history,
+  });
+
+  // ── webBody ──
+  const bodyContent = `${layers.quotePart}${layers.userContent}`;
+
+  // ── webBody 外层 envelope 渲染（用 formatInboundEnvelope 包装） ──
+  const webBody = getRuntime
+    ? renderWebBody(getRuntime, bodyContent, msg, layers.isGroup)
+    : bodyContent;
+
+  const systemPrompt = account.systemPrompt?.trim() || undefined;
+
+  return { webBody, agentBody, rawBody: msg.content ?? '', systemPrompt };
+}
+
+/** 单条消息的分层产物（单条装配与合批装配共用的复用单元） */
+interface MemberLayers {
+  /** 清洗后的正文（不含 sender 前缀） */
+  userContent: string;
+  /** 引用块 */
+  quotePart: string;
+  /** 带 [sender] 前缀与 (@you) 的用户消息 */
+  userMessage: string;
+  /** 媒体元数据块 + msg_elements 上下文 */
+  dynamicCtx: string;
+  /** dynamicCtx + userMessage（**不含** history 前缀） */
+  base: string;
+  isGroup: boolean;
+  wasMentioned: boolean;
+  history: HistoryEntry[] | undefined;
+}
+
+/** 分层装配单条消息（assembleBody 与 assembleMergedGroupBody 共用） */
+function buildMemberLayers(ctx: MiddlewareContext, msg: QQBotInboundMessage): MemberLayers {
   const isGroup = msg.kind === 'group';
 
   // 唤醒判定唯一口径（features/room-event.ts 的 resolveWakeDecision）：
@@ -96,26 +138,91 @@ export function assembleBody(
   // ── Layer 4: dynamicCtx（媒体元数据块 + msg_elements 上下文） ──
   const dynamicCtx = buildDynamicCtx(processed, msg, quote);
 
-  // ── Layer 5: agentBody（命令直通 / 群被@时前置历史） ──
-  const agentBody = buildAgentBody({
+  return {
     userContent,
+    quotePart,
+    userMessage,
+    dynamicCtx,
     base: dynamicCtx + userMessage,
     isGroup,
     wasMentioned,
     history,
-  });
+  };
+}
 
-  // ── webBody ──
-  const bodyContent = `${quotePart}${userContent}`;
+// ── 群消息合批装配 ───────────────────────────────────────────
 
-  // ── webBody 外层 envelope 渲染（用 formatInboundEnvelope 包装） ──
-  const webBody = getRuntime
-    ? renderWebBody(getRuntime, bodyContent, msg, isGroup)
-    : bodyContent;
+/** 合批成员（一条待合并的群消息） */
+export interface MergedGroupMember {
+  ctx: MiddlewareContext;
+  msg: QQBotInboundMessage;
+}
+
+/**
+ * 把 N 条群消息装配成**一个** turn 的 body（插件侧合批用）。
+ *
+ * 与「直接拼 N 条 agentBody」的关键差别：历史块**只出现一次**。
+ * `buildAgentBody` 在「群被@且有历史」时会给每条各加一份
+ * `[Chat history begins]…[Chat history ends]`，直接拼接会让历史重复 N 次；
+ * 这里改为整批共享**最新成员**的历史快照。
+ *
+ * 逐条归属（`[消息 i/N]` + 各条自带的 `[sender (openid)]` 前缀）是必须的：
+ * 合批允许混入**不同发言人**的消息，模型必须能分清每条是谁说的。
+ */
+export function assembleMergedGroupBody(
+  members: MergedGroupMember[],
+  account: ResolvedQQBotAccount,
+  getRuntime?: () => any,
+  opts?: { droppedNote?: string },
+): AssembledBody {
+  const layers = members.map((m) => buildMemberLayers(m.ctx, m.msg));
+  const total = layers.length;
+
+  const sections = layers.map((l, i) => `[消息 ${i + 1}/${total}]\n${l.base}`);
+  const mergedBody = sections.join('\n\n');
+  // 丢弃说明放在最前（与框架 `[Queue overflow] …` 同样式：让模型知道有内容缺失）
+  const body = opts?.droppedNote ? `${opts.droppedNote}\n\n${mergedBody}` : mergedBody;
+
+  // 整批只一份历史：取**最新**成员的非空历史快照
+  const history = pickLatestHistory(layers);
+  // 批内只要有一条是"在叫 bot"（user_request），整批就带历史 + (@you) 语义
+  const anyMentioned = layers.some((l) => l.wasMentioned);
+  const isGroup = layers[0]?.isGroup === true;
+  const agentBody = isGroup && anyMentioned && history && history.length > 0
+    ? [HISTORY_BEGIN, buildHistoryText(history), '', HISTORY_END, CURRENT_MSG, body].join('\n')
+    : body;
+
+  // rawBody：各条原始 content 按行拼接（斜杠命令已旁路，不会进入合并路径）
+  const rawBody = members.map((m) => m.msg.content ?? '').join('\n');
+
+  // webBody：合并正文，from 用**群**（批次跨发言人，单 sender 标签会误导）
+  const lastMsg = members[members.length - 1]?.msg;
+  const webBody = getRuntime && lastMsg
+    ? renderWebBody(getRuntime, body, lastMsg, true, lastMsg.replyTarget?.targetId)
+    : body;
 
   const systemPrompt = account.systemPrompt?.trim() || undefined;
 
   return { webBody, agentBody, rawBody, systemPrompt };
+}
+
+/** 取最新成员的非空历史快照 */
+function pickLatestHistory(layers: MemberLayers[]): HistoryEntry[] | undefined {
+  for (let i = layers.length - 1; i >= 0; i -= 1) {
+    const history = layers[i]?.history;
+    if (history && history.length > 0) return history;
+  }
+  return undefined;
+}
+
+/** 历史块文本（每条一行 `[sender] content`） */
+function buildHistoryText(history: HistoryEntry[]): string {
+  return history
+    .map((h) => {
+      const label = formatSenderLabel(h.senderName, h.senderId);
+      return `[${label}] ${h.content}`;
+    })
+    .join('\n');
 }
 
 // ── 局部组装函数 ─────────────────────────────────────────────
@@ -279,13 +386,7 @@ function buildAgentBody(input: {
 
   // 群被@ + 有历史 → 叠历史前缀
   if (isGroup && wasMentioned && history && history.length > 0) {
-    const historyText = history
-      .map((h) => {
-        const label = formatSenderLabel(h.senderName, h.senderId);
-        return `[${label}] ${h.content}`;
-      })
-      .join('\n');
-    return [HISTORY_BEGIN, historyText, '', HISTORY_END, CURRENT_MSG, base].join('\n');
+    return [HISTORY_BEGIN, buildHistoryText(history), '', HISTORY_END, CURRENT_MSG, base].join('\n');
   }
 
   return base;
@@ -303,13 +404,15 @@ function renderWebBody(
   bodyContent: string,
   msg: QQBotInboundMessage,
   isGroup: boolean,
+  fromOverride?: string,
 ): string {
   try {
     const { formatEnvelope } = getAdapters(getRuntime());
     if (!formatEnvelope) return bodyContent;
     return formatEnvelope({
       channel: 'qqbot',
-      from: msg.senderName ?? msg.senderId,
+      // 合批时用群 id（批次跨发言人，单 sender 标签会误导）；单条时用发送者
+      from: fromOverride ?? msg.senderName ?? msg.senderId,
       timestamp: normalizeTimestamp(msg.timestamp),
       body: bodyContent,
       chatType: isGroup ? 'group' : 'direct',

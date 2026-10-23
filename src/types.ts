@@ -59,11 +59,30 @@ export interface GroupToolPolicy {
 export interface GroupCoalesceConfig {
   /**
    * 是否启用消息合并（默认 true）：
-   * - true：框架 collect 合并批处理
+   * - true：按 `strategy` 决定合并执行位置
    * - false：followup 排队不合并
-   * 排队/合并完全由 OpenClaw 框架的 followup 队列承担。
    */
   enabled?: boolean;
+  /**
+   * 合并执行位置（默认 'plugin'）：
+   * - 'plugin'：插件侧合批——该群 agent 正在工作时到达的消息（含不同
+   *   发言人）攒成一批，turn 结束后一次性发给框架。框架的 collect 队列
+   *   做不到跨发言人合并（其分组键含 senderId 且遇首个不同键即断）。
+   * - 'framework'：交回框架 followup 队列的 collect 模式（同 sender
+   *   连续消息可合并，跨发言人不可）。
+   */
+  strategy?: 'framework' | 'plugin';
+  /**
+   * 单批最多合并多少条群消息（默认 10）。超出时丢弃较早的消息，
+   * 并在合并正文里留一行丢弃说明（避免模型静默缺内容）。
+   */
+  maxBatchSize?: number;
+  /**
+   * 单批最长持有时长（毫秒，默认 300000 = 5 分钟）。这是对"直到 turn
+   * 结束才一次性全发"的兜底：turn 永久挂起时批次会滞留内存且随进程
+   * 重启丢失。0 = 永不强制冲刷（只在 turn 结束时发）。
+   */
+  maxHoldMs?: number;
 }
 
 /** 指令面板配置 */

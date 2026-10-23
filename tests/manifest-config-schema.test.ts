@@ -308,6 +308,31 @@ async function main() {
     );
   });
 
+  await test('groups.<id>.coalesce 子字段与 GroupCoalesceConfig 接口一致', () => {
+    // groups.<id>.coalesce 是**映射值型**嵌套块（按 openid 索引），
+    // 上方 checks 只覆盖顶层 groupCoalesce，这里单独穿透一层取。
+    // 2026-10-23 新增 strategy / maxBatchSize / maxHoldMs 时补上这条防线：
+    // 少写一个字段 → 用户配了被 additionalProperties=false 直接拒掉。
+    const truth = readInterfaceKeys('GroupCoalesceConfig');
+    for (const [label, source] of [['顶层', topProps], ['accounts 段', accountProps]] as const) {
+      const coalesceSchema = (groupEntryProps(source as Record<string, unknown>).coalesce as
+        | { properties?: Record<string, unknown> }
+        | undefined)?.properties ?? {};
+      const missing = truth.filter((k) => !(k in coalesceSchema));
+      assert.strictEqual(
+        missing.length,
+        0,
+        `schema.groups.<id>.coalesce（${label}）缺少子字段：${missing.join(', ')}（GroupCoalesceConfig）。`,
+      );
+      const extra = Object.keys(coalesceSchema).filter((k) => !truth.includes(k));
+      assert.strictEqual(
+        extra.length,
+        0,
+        `schema.groups.<id>.coalesce（${label}）有 GroupCoalesceConfig 里不存在的子字段：${extra.join(', ')}（配了会被静默忽略）。`,
+      );
+    }
+  });
+
   await test('groups.<id>.tools 子字段与 GroupToolPolicy 接口一致', () => {
     const truth = readInterfaceKeys('GroupToolPolicy');
     const toolsSchema = (groupEntryProps(topProps).tools as

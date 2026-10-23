@@ -201,6 +201,21 @@
                     "enabled": {
                       "type": "boolean",
                       "description": "是否启用群消息合并（默认 true）"
+                    },
+                    "strategy": {
+                      "type": "string",
+                      "enum": ["framework", "plugin"],
+                      "description": "合并执行位置：plugin=插件侧合批（该群 agent 忙时到达的消息攒成一批，turn 结束后一次性发出，可跨发言人合并）；framework=交回框架 followup 队列的 collect 模式（默认 plugin）"
+                    },
+                    "maxBatchSize": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "description": "单批最多合并多少条群消息（默认 10）。超出时丢弃较早的消息，并在正文留一行丢弃说明"
+                    },
+                    "maxHoldMs": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "单批最长持有时长（毫秒，默认 300000=5 分钟）。turn 永久挂起时的兜底强制冲刷；0=只在 turn 结束时发"
                     }
                   },
                   "description": "群消息合并配置（覆盖账号级）"
@@ -335,6 +350,21 @@
               "enabled": {
                 "type": "boolean",
                 "description": "是否启用群消息合并（默认 true）"
+              },
+              "strategy": {
+                "type": "string",
+                "enum": ["framework", "plugin"],
+                "description": "合并执行位置：plugin=插件侧合批（该群 agent 忙时到达的消息攒成一批，turn 结束后一次性发出，可跨发言人合并）；framework=交回框架 followup 队列的 collect 模式（默认 plugin）"
+              },
+              "maxBatchSize": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "单批最多合并多少条群消息（默认 10）。超出时丢弃较早的消息，并在正文留一行丢弃说明"
+              },
+              "maxHoldMs": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "单批最长持有时长（毫秒，默认 300000=5 分钟）。turn 永久挂起时的兜底强制冲刷；0=只在 turn 结束时发"
               }
             }
           },
@@ -672,6 +702,21 @@
                           "enabled": {
                             "type": "boolean",
                             "description": "是否启用群消息合并（默认 true）"
+                          },
+                          "strategy": {
+                            "type": "string",
+                            "enum": ["framework", "plugin"],
+                            "description": "合并执行位置：plugin=插件侧合批（该群 agent 忙时到达的消息攒成一批，turn 结束后一次性发出，可跨发言人合并）；framework=交回框架 followup 队列的 collect 模式（默认 plugin）"
+                          },
+                          "maxBatchSize": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "单批最多合并多少条群消息（默认 10）。超出时丢弃较早的消息，并在正文留一行丢弃说明"
+                          },
+                          "maxHoldMs": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "单批最长持有时长（毫秒，默认 300000=5 分钟）。turn 永久挂起时的兜底强制冲刷；0=只在 turn 结束时发"
                           }
                         },
                         "description": "群消息合并配置（覆盖账号级）"
@@ -784,6 +829,21 @@
                     "enabled": {
                       "type": "boolean",
                       "description": "是否启用群消息合并（默认 true）"
+                    },
+                    "strategy": {
+                      "type": "string",
+                      "enum": ["framework", "plugin"],
+                      "description": "合并执行位置：plugin=插件侧合批（该群 agent 忙时到达的消息攒成一批，turn 结束后一次性发出，可跨发言人合并）；framework=交回框架 followup 队列的 collect 模式（默认 plugin）"
+                    },
+                    "maxBatchSize": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "description": "单批最多合并多少条群消息（默认 10）。超出时丢弃较早的消息，并在正文留一行丢弃说明"
+                    },
+                    "maxHoldMs": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "单批最长持有时长（毫秒，默认 300000=5 分钟）。turn 永久挂起时的兜底强制冲刷；0=只在 turn 结束时发"
                     }
                   }
                 },

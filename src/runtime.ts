@@ -31,10 +31,16 @@ function installExitHooksOnce(): void {
   // plugin-logger → runtime → inbound-debounce → dispatch → plugin-logger
   // （静态边会让 dispatch 图内的模块顶层求值撞上未初始化的 plugin-logger，
   // tsx/esbuild 下表现为 `__name is not a function`，见 CI 事故）。
+  // 群合批缓冲同理（features/group-merge.ts 依赖 dispatch）——一并冲刷，
+  // 否则退出时攒批的群消息会随进程消失。
   const flushDebounceBuffers = async (): Promise<void> => {
     try {
       const m = await import("./features/inbound-debounce.js");
       await m.flushAllC2CInboundDebouncers();
+    } catch {}
+    try {
+      const m = await import("./features/group-merge.js");
+      await m.flushAllGroupMergeQueues();
     } catch {}
   };
 

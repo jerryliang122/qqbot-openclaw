@@ -172,8 +172,13 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
   //     拦截后不再触发 typing / envelope；多问题 ask_user 答案消息红线放行
   bot.use(secretCapture({ accountId: account.accountId }));
 
-  // 10. 群聊消息排队已完全交给框架队列（dispatch 侧按 coalesce.enabled 传
-  //     queueModeOverride collect/followup），插件内不再做 busy-buffering。
+  // 10. 群聊消息合并在**插件侧**完成（features/group-merge.ts）：该群 agent
+  //     正在工作时到达的消息（含不同发言人）攒成一批，turn 结束后一次性
+  //     发给框架。框架的 collect 队列按 senderId 分组、遇首个不同键即断，
+  //     跨发言人合并不了，故插件侧自建。框架队列仅作兜底（dispatch 侧按
+  //     coalesce.enabled 传 queueModeOverride collect/followup）。
+  //     忙碌信号由插件自建（features/group-session-busy.ts：dispatch 的
+  //     promise 覆盖整个 turn）。中间件链本身不做 busy-buffering。
 
   // 11. C2C 输入状态指示器（配额感知：优先占被动回复配额，耗尽后与回复
   //     消息一样降级为主动发送；续期间隔默认 20s 且不低于 20s，
