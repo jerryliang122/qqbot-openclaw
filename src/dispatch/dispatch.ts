@@ -17,7 +17,7 @@ import { buildEnvelope } from './envelope-builder.js';
 import { assembleBody, type AssembledBody } from './body-assembler.js';
 import { sendText, getGateway, resolveQuotaAccountId } from '../outbound/outbound-service.js';
 import { sendMedia } from '../outbound/media-send.js';
-import { deliverReply, type DeliverPayload, type DeliverInfo, type DeliverContext } from '../outbound/deliver-pipeline.js';
+import { deliverReply, isSystemNoticePayload, type DeliverPayload, type DeliverInfo, type DeliverContext } from '../outbound/deliver-pipeline.js';
 import { buildCtxPayload } from './ctx-builder.js';
 
 import { DeliverDebouncer } from '../outbound/debounce.js';
@@ -28,7 +28,7 @@ import {
   resolveQQBotStreamMode,
   resolveDisableBlockStreaming,
 } from '../outbound/streaming-controller.js';
-import { shouldDeliverBlockText, BLOCK_QUOTA_RESERVE } from '../outbound/block-quota.js';
+import { shouldDeliverBlockText, BLOCK_QUOTA_RESERVE, BlockNotDeliveredError } from '../outbound/block-quota.js';
 import { ProgressCardPublisher } from '../outbound/progress-card-publisher.js';
 import { getPassiveReplyQuotaRemaining } from '../features/quota-manager.js';
 import { getAdapters, type RuntimeAdapters } from '../adapter/resolve.js';
@@ -550,6 +550,13 @@ export async function dispatchToOpenClaw(
   let outboundSendOk = 0;
   let outboundSendFail = 0;
   const trackOutbound = <T extends { error?: string }>(result: T, via: string): T => {
+    // 被动配额守卫**刻意丢弃**的中间块不是「发送失败」——它既没送达（不计 ok）
+    // 也不是错误（不计 fail）。否则块被丢 + final 真失败时会误发失败兜底文案
+    // （用户其实已经看过部分内容）。
+    if (result.error === 'passive-quota-exhausted') {
+      dlog?.debug(`outbound dropped by passive quota via ${via}`);
+      return result;
+    }
     if (result.error) {
       outboundSendFail++;
       dlog?.error(`outbound send failed via ${via}: ${String(result.error)}`);
@@ -577,17 +584,31 @@ export async function dispatchToOpenClaw(
     const text = payload.text?.trim() ?? '';
     if (!text) return;
     const remaining = getPassiveReplyQuotaRemaining({
-      accountId: account.accountId,
+      // 与 sendText 预留配额同一账号键（含单账号回退），否则回退场景下
+      // 探测与记账错位（探测乐观、实际耗尽），中间块会吃掉最终回复的被动槽
+      accountId: resolveQuotaAccountId(account.accountId),
       msgId: envelope.messageId,
       scope: targetScope === 'group' ? 'group' : 'c2c',
     });
     if (!shouldDeliverBlockText(remaining)) {
+      // 抛错而不是静默返回：框架默认把未 settlement 的块记为「已送达」，
+      // 一旦静默丢弃，它会把携带全文的 final 一并丢弃 → 正文永久丢失。
+      // 抛错让框架记为 failed-deliver，final 就会补发全文兜底。
       dlog?.warn(
-        `[block] dropped by passive quota remaining=${remaining} reserve=${BLOCK_QUOTA_RESERVE} scope=${targetScope}`,
+        `[block] not delivered by passive quota remaining=${remaining} reserve=${BLOCK_QUOTA_RESERVE} scope=${targetScope}`,
       );
-      return;
+      throw new BlockNotDeliveredError(
+        `passive quota exhausted (remaining=${remaining}, reserve=${BLOCK_QUOTA_RESERVE})`,
+      );
     }
-    await deliverReply({ text }, info, deliverCtx, { passiveOnly: true });
+    // 直接走 ctx.sendText（块是纯文本，deliverReply 的文本路径与此等价）——
+    // 需要拿到发送结果：**发送时才发现没槽位**（探测→发送之间的 TOCTOU）
+    // 同样必须报「未送达」，否则框架记为已送达 → final 被丢 → 正文丢失。
+    const result = await deliverCtx.sendText(deliverCtx.qualifiedTarget, text, { passiveOnly: true });
+    if (result.error) {
+      dlog?.warn(`[block] send failed: ${result.error}`);
+      throw new BlockNotDeliveredError(`send failed: ${result.error}`);
+    }
   };
 
   /**
@@ -679,24 +700,33 @@ export async function dispatchToOpenClaw(
         }
       }
 
-      // ── 1. block: 框架块流式的块投递（仅 partial 态会触发）──
-      // 三态都显式声明了框架块流式参与度（off/stream = disableBlockStreaming:true），
-      // 因此 kind:'block' **只在 partial 态**出现——这里就是 partial 态
-      // 「中间消息」的落地点。
-      // - 块文本：走与 final 相同的投递路径（含被动配额守卫）
-      // - 块媒体：立即转发
-      // 处理完必须 return：块文本已由 deliverBlockText 发出（或被配额守卫丢弃），
-      // 继续往下走会在默认路径被**再发一次**。
+      // ── 1. block: 渐进中间块 / 框架系统通知的投递 ──
+      // partial 态的**渐进中间块**（框架 block streaming 产出）：走配额守卫，
+      // 额度不足就丢弃（final 仍携带完整内容，且绝不降级主动烧每日预算）。
+      //
+      // 其余 kind:'block' 是**框架系统通知**（上下文压缩 / 准入 / 推理轨迹等，
+      // openclaw dist agent-runner 的 deliverProgress(…, "block")）——它们与
+      // disableBlockStreaming 无关，**任何模式都可能出现**，且必须保证送达
+      // （配额不足可降级主动），不能被配额守卫静默吞掉。
       if (kind === 'block') {
         if (payload.audioAsVoice) {
           await deliverReply(payload, info, deliverCtx);
           return;
         }
         await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
-        if (text) {
-          await deliverBlockText(payload, info);
+        if (!text) return;
+        if (payload.presentation !== undefined || payload.interactive !== undefined) {
+          // 已知限制：deliver 层不渲染 presentation（渲染由框架在投递前经通道
+          // 渲染器完成）。块里若带未渲染的按钮载荷，插件无从呈现——记 WARN 留痕。
+          dlog?.warn('[block] block payload carries presentation/interactive — not rendered by the deliver layer');
         }
-        return;
+        if (frameworkBlockStreaming && !isSystemNoticePayload(payload)) {
+          await deliverBlockText(payload, info);
+          // 已投递（或被守卫丢弃），不能再落默认路径——否则块文本发两遍
+          return;
+        }
+        // 系统通知 / off 态 / stream 态：继续往下走默认路径
+        //（stream 态由流式控制器决定是否已流出——与本次改动前语义一致）
       }
 
       // ── 2. 流式路径：流式已启动且未降级 -> 跳过静态发送 ──
@@ -774,6 +804,12 @@ export async function dispatchToOpenClaw(
       await deliverReply(filteredPayload, info, deliverCtx);
       if (text) deliveredTexts.add(text);
     } catch (err) {
+      // 中间块未送达：必须让框架知道（否则它记为「已送达」并把携带全文的
+      // final 一并丢弃 → 正文永久丢失）。框架的块回复管线会 catch 住这个错误
+      // 并继续，turn 不受影响。
+      if (err instanceof BlockNotDeliveredError) {
+        throw err;
+      }
       deliverErrorCount++;
       dlog?.error(`deliver error: ${err instanceof Error ? err.message : String(err)}`);
     }

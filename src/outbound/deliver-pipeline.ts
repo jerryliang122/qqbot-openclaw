@@ -32,6 +32,49 @@ export interface DeliverPayload {
    * 这类文本从未进入流式通道（模型死在半路），流式去重早退对它不适用。
    */
   isError?: boolean;
+  /**
+   * 框架的**系统/通知类** payload 标记。
+   *
+   * 这类 payload 不是「渐进中间消息」，而是框架自己产生的通知
+   * （上下文压缩 / 准入 / 推理轨迹 / 兜底 / 状态），**必须保证送达**——
+   * 不能被 partial 态的被动配额守卫静默丢弃（丢了用户就看不到压缩提示了）。
+   *
+   * 标记集合与框架自己的 `hasUnmergedReplySemantics` 分组保持一致
+   * （openclaw dist `chat-reply-media-*.mjs`）。
+   */
+  isReasoning?: boolean;
+  isReasoningSnapshot?: boolean;
+  isCompactionNotice?: boolean;
+  isFallbackNotice?: boolean;
+  isStatusNotice?: boolean;
+  btw?: unknown;
+  /**
+   * 框架的按钮/交互呈现载荷。
+   *
+   * 框架在投递前会经通道渲染器（`adaptMessagePresentationForChannel`）把
+   * presentation 渲染成 text+media；`deliverReply` 这一层不处理 presentation。
+   * 若某个**块**载荷带着未渲染的 presentation，插件无从渲染——记 WARN 留痕
+   * （已知限制，见 AGENTS.md「块内 presentation 未渲染」）。
+   */
+  presentation?: unknown;
+  interactive?: unknown;
+}
+
+/**
+ * 是否是框架的系统/通知类 payload（推理轨迹、上下文压缩、准入、兜底、状态通知）。
+ *
+ * 这类 payload 即使以 `kind:'block'` 到达也不是「渐进中间消息」，
+ * 必须走普通投递路径（配额不足可降级主动），不能被配额守卫丢弃。
+ */
+export function isSystemNoticePayload(payload: DeliverPayload): boolean {
+  return Boolean(
+    payload.isReasoning === true ||
+    payload.isReasoningSnapshot === true ||
+    payload.isCompactionNotice === true ||
+    payload.isFallbackNotice === true ||
+    payload.isStatusNotice === true ||
+    payload.btw !== undefined,
+  );
 }
 
 export interface DeliverInfo {

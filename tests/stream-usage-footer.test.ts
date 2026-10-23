@@ -41,7 +41,7 @@ async function test(name: string, fn: () => Promise<void> | void) {
 
 const { StreamingController } = await import('../src/outbound/streaming-controller.ts');
 const { dispatchToOpenClaw } = await import('../src/dispatch/dispatch.ts');
-const { registerGateway } = await import('../src/outbound/outbound-service.ts');
+const { registerGateway, unregisterGateway } = await import('../src/outbound/outbound-service.ts');
 const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
 const {
   registerMsgIdWindow,
@@ -333,6 +333,12 @@ async function runDispatch(opts: {
   requestSignal?: AbortSignal;
   /** 固定入站 msg_id（默认随机）——配额相关用例需要预先占用同一锚点的额度 */
   msgId?: string;
+  /**
+   * 网关注册在哪个账号键下（默认与配置账号同为 'test-account'）。
+   * 指定别的键可复现**单账号回退**场景：配置账号没网、只有一个别的账号在跑，
+   * 此时配额记账键 = 回退到的账号键（见 resolveGatewayForSend）。
+   */
+  gatewayAccountId?: string;
   /** gateway.sendText 失败策略：true = 每次都抛错 */
   failSendText?: boolean;
   /** 流式 update 失败策略：'definitive' = 平台明确拒绝；'ambiguous' = 网络层结果不明 */
@@ -382,6 +388,12 @@ async function runDispatch(opts: {
   } as any;
 
   const gw = installFakeGateway({ failSendText: opts.failSendText, failSecondUpdate: opts.failSecondUpdate });
+  if (opts.gatewayAccountId) {
+    // 复现**单账号回退**场景：配置账号没网、只有另一个账号在跑。
+    // 配额记账键 = 回退到的账号键（resolveGatewayForSend），探测必须同键。
+    unregisterGateway('test-account');
+    registerGateway(opts.gatewayAccountId, gw);
+  }
   await dispatchToOpenClaw(ctx, msg, account, runtime);
   return gw;
 }
@@ -765,7 +777,7 @@ await test('partial: 块文本不重复发（kind:block 分支收口，不落默
   );
 });
 
-await test('partial: 被动配额耗尽 → 块被丢弃（不发送、不降级主动）', async () => {
+await test('partial: 被动配额耗尽 → 块向框架报「未送达」（抛错），且绝不发消息', async () => {
   const msgId = 'msg-quota-exhausted';
   // 预占该 msg_id 的全部被动配额（c2c 4 条），让块发送时只剩 final 的槽位
   registerMsgIdWindow({ accountId: 'test-account', msgId, scope: 'c2c' });
@@ -776,13 +788,74 @@ await test('partial: 被动配额耗尽 → 块被丢弃（不发送、不降级
     streaming: { mode: 'partial', sendMode: 'static' },
     msgId,
     simulate: async (c) => {
-      await c.dispatcherOptions?.deliver?.({ text: '块一' }, { kind: 'block' });
+      // 插件必须**抛错**告诉框架「这块没送达」——静默返回会被框架记为
+      // 「已送达」，进而把携带全文的 final 一并丢弃（正文永久丢失）。
+      await assert.rejects(
+        () => c.dispatcherOptions?.deliver?.({ text: '块一' }, { kind: 'block' }) as Promise<void>,
+        (err: any) => err?.name === 'BlockNotDeliveredError',
+        '配额耗尽时块必须抛 BlockNotDeliveredError（向框架报未送达）',
+      );
     },
   });
   assert.strictEqual(
     gw.sentTexts.filter((t) => t === '块一').length,
     0,
-    `配额耗尽时块应被丢弃（绝不降级主动发送），实际: ${JSON.stringify(gw.sentTexts)}`,
+    `配额耗尽时块绝不能发出（更不能降级主动），实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+  clearQuotaCache();
+});
+
+await test('partial: 配额探测用回退后的账号键（单账号回退场景）', async () => {
+  const msgId = 'msg-quota-fallback-key';
+  // 网关在 'gw-account'，配置账号 'test-account' 没网 → 单账号回退。
+  // 配额记账发生在 'gw-account' 名下 → 探测必须同键，否则探测乐观、
+  // 块会吃掉 final 的被动预留槽。
+  registerMsgIdWindow({ accountId: 'gw-account', msgId, scope: 'c2c' });
+  for (let i = 0; i < 3; i++) {
+    checkAndConsumePassiveReplyQuota({ accountId: 'gw-account', msgId, scope: 'c2c' });
+  }
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    msgId,
+    gatewayAccountId: 'gw-account',
+    simulate: async (c) => {
+      // 'gw-account' 名下只剩 1 条（= final 的槽位）→ 守卫应判定不可投递
+      await assert.rejects(
+        () => c.dispatcherOptions?.deliver?.({ text: '块一' }, { kind: 'block' }) as Promise<void>,
+        (err: any) => err?.name === 'BlockNotDeliveredError',
+        '探测必须用回退后的账号键（否则探测乐观、块会发出去吃掉 final 的槽）',
+      );
+    },
+  });
+  assert.strictEqual(
+    gw.sentTexts.filter((t) => t === '块一').length,
+    0,
+    `回退场景下块不应发出，实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+  clearQuotaCache();
+});
+
+await test('partial: 系统通知（isCompactionNotice）不受配额守卫丢弃', async () => {
+  const msgId = 'msg-quota-system-notice';
+  registerMsgIdWindow({ accountId: 'test-account', msgId, scope: 'c2c' });
+  for (let i = 0; i < 4; i++) {
+    checkAndConsumePassiveReplyQuota({ accountId: 'test-account', msgId, scope: 'c2c' });
+  }
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    msgId,
+    simulate: async (c) => {
+      // 框架的上下文压缩 / 准入通知以 kind:'block' 投递（与 disableBlockStreaming
+      // 无关、任何模式都可能出现），必须保证送达，不能被配额守卫吞掉。
+      await c.dispatcherOptions?.deliver?.(
+        { text: '上下文已压缩', isCompactionNotice: true },
+        { kind: 'block' },
+      );
+    },
+  });
+  assert.ok(
+    gw.sentTexts.includes('上下文已压缩'),
+    `系统通知必须送达（可降级主动），实际: ${JSON.stringify(gw.sentTexts)}`,
   );
   clearQuotaCache();
 });
