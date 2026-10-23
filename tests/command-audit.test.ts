@@ -73,15 +73,18 @@ const byName = (name: string): SlashCommand | undefined =>
 
 console.log('\n=== command-audit（withAudit 包装）===');
 
-test('全部 11 个内置命令注册且名称不变', () => {
+test('全部 10 个内置命令注册且名称不变', () => {
   const expected = [
-    'bot-help', 'bot-ping', 'bot-version', 'bot-me', 'bot-logs', 'bot-streaming',
+    'bot-help', 'bot-ping', 'bot-version', 'bot-me', 'bot-logs',
     'bot-clear-storage', 'bot-approve', 'bot-group-always', 'bot-group-info', 'bot-pairing',
   ];
   for (const name of expected) {
     assert.ok(byName(name), `命令 ${name} 应已注册`);
   }
   assert.equal(commands.length, expected.length);
+  // /bot-streaming 已移除：流式配置改由 Control UI 直接维护
+  // （channels.qqbot.streaming.mode / sendMode，manifest schema 已声明）
+  assert.equal(byName('bot-streaming'), undefined);
 });
 
 test('handler 返回值透传 + [cmd] INFO 含命令/sender/scope/raw', async () => {
@@ -104,21 +107,21 @@ test('raw 截断到 80 字符', async () => {
 });
 
 test('authorized 通过：无 WARN、verdict 透传', () => {
-  const botStreaming = byName('bot-streaming')!;
-  assert.ok(botStreaming.authorized, 'bot-streaming 应带 authorized');
+  const botApprove = byName('bot-approve')!;
+  assert.ok(botApprove.authorized, 'bot-approve 应带 authorized');
   const { ctx, captured } = makeCtx({ policy: { c2cMode: 'open', allowFrom: [] } });
-  const verdict = botStreaming.authorized!(ctx);
+  const verdict = botApprove.authorized!(ctx);
   assert.equal(verdict, true);
   assert.equal(captured.warn.length, 0);
 });
 
 test('authorized 拒绝：[cmd] unauthorized WARN、拒绝原因透传', () => {
-  const botStreaming = byName('bot-streaming')!;
+  const botApprove = byName('bot-approve')!;
   const { ctx, captured } = makeCtx({ policy: { c2cMode: 'allowlist', allowFrom: ['OTHER_USER'] } });
-  const verdict = botStreaming.authorized!(ctx);
+  const verdict = botApprove.authorized!(ctx);
   assert.equal(verdict, '⚠️ 无权限执行此命令');
   assert.equal(captured.warn.length, 1);
-  assert.match(captured.warn[0], /\[cmd\] unauthorized bot-streaming sender=USER_OPENID_1/);
+  assert.match(captured.warn[0], /\[cmd\] unauthorized bot-approve sender=USER_OPENID_1/);
 });
 
 test('ctx.log 仅有 debug 方法（SDK 可选方法形态）时不抛错', async () => {
