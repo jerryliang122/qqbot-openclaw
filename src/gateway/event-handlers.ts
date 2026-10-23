@@ -30,6 +30,7 @@ import {
 import { recordKnownUser } from '../features/proactive.js';
 import { cacheMsgId } from '../features/msgid-cache.js';
 import { enqueueC2CInboundMessage } from '../features/inbound-debounce.js';
+import { enqueueGroupInboundMessage } from '../features/group-merge.js';
 import { recordGroupEvent, getGroupModeFacts } from '../features/group-mode-store.js';
 import { recordPushAuthorizeEvent } from '../features/push-authorization-store.js';
 import { getAdapters } from '../adapter/resolve.js';
@@ -93,13 +94,14 @@ export async function handleMessage(
     // 确认卡的指令按钮代发（或用户手打）的 "1: 3\n2: 1" 是真实用户消息，
     // 必须原样放行走框架原生 keyed 文本认领；任何拦截都会破坏认领链路。
 
-    // ── C2C 入站防抖合并 ──
+    // ── 入站防抖/合批 ──
     // 私聊：同一发送者在防抖窗口内的连续消息合并为一次 dispatch（文件 +
     // 伴随文字 → 单个 turn，修复"后到文字把文件 turn 打断"的结构缺陷）。
+    // 群聊：插件侧合批——该群 agent 正在工作时到达的消息（含**不同发言人**）
+    // 攒成一批，turn 结束后一次性发给框架。框架的 collect 队列做不到跨
+    // 发言人合并（分组键含 senderId 且遇首个不同键即断），故插件侧自建。
+    // 两种情况未接管（关闭 / 非目标 scope / 旁路已直发）时走原直发路径。
     // 上方的 per-message 记账（被动锚点登记 / recordKnownUser）不受影响。
-    // 防抖未接管（关闭 / 非 c2c / 控制命令旁路已直发）时走原直发路径。
-    // 群聊：恒直发——合并由框架 followup 队列承担，且群有 mention 门控
-    // 语义，插件侧合并会破坏唤醒判定。
     const dispatchNow = () =>
       runWithRequestContext(
         {
@@ -115,7 +117,8 @@ export async function handleMessage(
       const handled = await enqueueC2CInboundMessage(ctx, msg, account, runtime, hlog);
       if (!handled) await dispatchNow();
     } else {
-      await dispatchNow();
+      const handled = await enqueueGroupInboundMessage(ctx, msg, account, runtime, hlog);
+      if (!handled) await dispatchNow();
     }
   } catch (err) {
     hlog.error(`dispatch error: ${err}`);

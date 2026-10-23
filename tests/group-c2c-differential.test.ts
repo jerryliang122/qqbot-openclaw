@@ -2,9 +2,10 @@
  * 群聊/私聊差异化处理测试
  *
  * 验证：
- * 1. 群消息排队/合并完全交给框架（collect / followup），插件不再有内建 coalescer
- * 2. 私聊消息使用 exclusive admission，用户可以"插嘴"
- * 3. sessionKey 根据群聊/私聊生成不同格式
+ * 1. 群消息合并配置解析（enabled / strategy / maxBatchSize / maxHoldMs）
+ * 2. 插件侧群合批存在且 strategy 双档可切换（plugin / framework）
+ * 3. 私聊消息使用 exclusive admission，用户可以"插嘴"
+ * 4. sessionKey 根据群聊/私聊生成不同格式
  *
  * 运行方式: npx tsx tests/group-c2c-differential.test.ts
  */
@@ -54,6 +55,9 @@ async function main(): Promise<void> {
     // 默认配置
     const defaultConfig = resolveGroupCoalesceConfig(cfg, 'GROUP_456', 'default');
     assert.equal(defaultConfig.enabled, true);
+    assert.equal(defaultConfig.strategy, 'plugin');
+    assert.equal(defaultConfig.maxBatchSize, 10);
+    assert.equal(defaultConfig.maxHoldMs, 300_000);
 
     // 群级配置覆盖
     const groupConfig = resolveGroupCoalesceConfig(cfg, 'GROUP_123', 'default');
@@ -64,15 +68,36 @@ async function main(): Promise<void> {
     assert.equal(resolveGroupCoalesceEnabled(cfg, 'GROUP_123', 'default'), false);
   });
 
-  // 测试 1b: 插件内建 coalescer 已删除（排队完全交给框架）
-  await test('插件内建 coalescer 已删除', async () => {
-    let importFailed = false;
+  // 测试 1b: 插件侧群合批存在（2026-10-23 起，群合并在插件侧完成）
+  await test('插件侧群合批模块存在且 strategy 双档可切换', async () => {
+    // 旧的 message-coalescer 仍不存在（职责已迁移到 features/group-merge.ts）
+    let legacyImportFailed = false;
     try {
       await import('../src/features/message-coalescer.js');
     } catch {
-      importFailed = true;
+      legacyImportFailed = true;
     }
-    assert.ok(importFailed, 'message-coalescer 模块应已不存在');
+    assert.ok(legacyImportFailed, 'message-coalescer 模块应已不存在');
+
+    const mod = await import('../src/features/group-merge.js');
+    assert.equal(typeof mod.enqueueGroupInboundMessage, 'function', '群合批入口应存在');
+    assert.equal(typeof mod.flushGroupMergeQueue, 'function', '群合批冲刷入口应存在');
+
+    const { resolveGroupConfigFromAccount } = await import('../src/config.js');
+    const account = {
+      accountId: 'default',
+      config: { groupCoalesce: { strategy: 'framework' } },
+    } as any;
+    assert.equal(
+      resolveGroupConfigFromAccount(account, 'GROUP_1').coalesce.strategy,
+      'framework',
+      'strategy=framework 应交回框架队列',
+    );
+    assert.equal(
+      resolveGroupConfigFromAccount({ accountId: 'default', config: {} } as any, 'GROUP_1').coalesce.strategy,
+      'plugin',
+      '默认 strategy 应为 plugin（插件侧合批）',
+    );
   });
 
   // 测试 2: 验证 sessionKey 生成逻辑

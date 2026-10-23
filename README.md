@@ -37,7 +37,7 @@ Scan to join the QQ group chat
 
 | Feature | Description |
 |---------|-------------|
-| 🔄 **Group Queueing** | Group messages dispatch immediately; queueing/merging is delegated to the OpenClaw framework followup queue (collect mode) — active turns are never interrupted, bursts merge into one batch |
+| 🔄 **Group Queueing** | Group messages dispatch immediately when the group is idle; while the agent is busy they are batched (across senders) and sent as one turn when it ends — active turns are never interrupted |
 | 👁️ **Room Events** (opt-in) | In groups with full-message push mode, the bot can read every message like a normal member; un-@'d traffic arrives as passive room events (read-only — the AI speaks only via the proactive `message` tool) |
 | 🔔 **Three Wake Modes** | @mention, name patterns (`mentionPatterns`, e.g. "沈处"), and quote-of-bot-message all trigger normal replies |
 | 📤 **Passive-First Outbound** | Every send prefers passive reply (msg_id) to conserve the 1000/day proactive budget; quota-aware fallback never hard-fails |
@@ -698,7 +698,10 @@ Control how group messages are queued and merged when they arrive in quick succe
   "channels": {
     "qqbot": {
       "groupCoalesce": {
-        "enabled": true
+        "enabled": true,
+        "strategy": "plugin",
+        "maxBatchSize": 10,
+        "maxHoldMs": 300000
       },
       "accounts": {
         "default": {
@@ -718,16 +721,29 @@ Control how group messages are queued and merged when they arrive in quick succe
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | `boolean` | `true` | `true` → framework `collect` mode (queue + merge batches); `false` → `followup` mode (queue without merging — preserves the "disable merging" intent while never interrupting active turns). Queueing/merging is fully delegated to the OpenClaw followup queue |
+| `enabled` | `boolean` | `true` | `true` → merge per `strategy`; `false` → `followup` mode (queue without merging — preserves the "disable merging" intent while never interrupting active turns) |
+| `strategy` | `"plugin"` \| `"framework"` | `"plugin"` | Where merging happens. `plugin` → the plugin batches messages that arrive while the group agent is busy and sends them as **one** turn when the turn ends (merges **across senders**). `framework` → delegate to the OpenClaw followup queue's `collect` mode (merges only consecutive messages from the **same** sender) |
+| `maxBatchSize` | `integer` | `10` | Max messages per plugin-side batch. Older messages are dropped when exceeded, and the merged body carries a `[已丢弃 N 条…]` note so the model isn't silently missing content |
+| `maxHoldMs` | `integer` | `300000` | Max time a batch is held (ms). Safety valve for the "flush only when the turn ends" rule — a hung turn would otherwise keep the batch in memory until restart. `0` = never force-flush |
 
 **Priority chain**: `groups.{groupId}.coalesce` > `groupCoalesce` (account-level) > defaults
 
-**When enabled** (framework `collect`):
+**When `strategy: "plugin"` (default)**:
+
+- Messages that arrive **while the group agent is busy** are batched and sent as one turn when the turn ends
+- Batches may mix **different senders** — each message keeps its own `[sender (openid)]` attribution, and the merged body carries a **single** history block
+- An idle group dispatches immediately (no added latency)
+- Bypass (never batched, dispatched immediately): control commands (`stop`/`esc`/`abort`/`exit`), slash commands, multi-question `ask_user` keyed answers, and voice turns
+- If the batch contains any message that explicitly addresses the bot (@ / quote / name pattern), the whole batch is treated as a user request; otherwise it stays a passive room event
+
+**When `strategy: "framework"`**:
 
 - Messages during an active turn queue up and drain as one merged batch
 - 500ms debounce absorbs rapid-fire bursts even on an idle group
 - Queue overflow is summarized (never hard-dropped like the old buffer-full behavior)
 - The AI sees combined context with per-sender attribution, single reply per batch
+
+> The framework's `collect` mode groups by sender (its grouping key includes the sender id) and stops at the first differing key — so messages from different group members are **never** merged there. That is why the plugin-side strategy exists.
 
 ---
 
@@ -885,7 +901,7 @@ The plugin processes messages through a carefully ordered middleware chain:
 **Key points**:
 
 - Inbound guard and history buffer run **before** mention gate → junk is dropped early, all real messages are cached
-- Group messages dispatch immediately; the OpenClaw followup queue handles queueing/merging (`coalesce.enabled` selects `collect` vs `followup`)
+- Group messages dispatch immediately when the group is **idle**; while the agent is **busy** they are batched by the plugin (`coalesce.strategy: "plugin"`, default) and sent as one turn when the turn ends. `coalesce.strategy: "framework"` falls back to the OpenClaw followup queue's `collect` mode (same-sender only)
 - Typing indicator only runs for **C2C** messages
 
 ---

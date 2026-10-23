@@ -111,6 +111,11 @@ const DEFAULT_GROUP_HISTORY_LIMIT = 20;
 /** 群消息合并默认配置 */
 const DEFAULT_GROUP_COALESCE_CONFIG: Required<GroupCoalesceConfig> = {
   enabled: true,
+  // 默认走插件侧合批：框架的 collect 队列按 senderId 分组，同群不同
+  // 发言人的消息永远合并不了（详见 features/group-merge.ts 头注释）。
+  strategy: 'plugin',
+  maxBatchSize: 10,
+  maxHoldMs: 300_000,
 };
 
 const DEFAULT_GROUP_CONFIG: Omit<Required<GroupConfig>, "prompt" | "coalesce" | "historyMode" | "unmentionedInbound" | "roomEventRequireMessageTool" | "tools"> & { coalesce: Required<GroupCoalesceConfig>; historyMode: 'clear' | 'rolling'; unmentionedInbound: 'user_request' | 'room_event' } = {
@@ -229,8 +234,13 @@ export function resolveGroupConfigFromAccount(account: ResolvedQQBotAccount, gro
   const accountDefaultRequireMention = account.config?.defaultRequireMention ?? DEFAULT_GROUP_CONFIG.requireMention;
   const accountDefaultCoalesce = account.config?.groupCoalesce ?? DEFAULT_GROUP_COALESCE_CONFIG;
 
+  // 合并配置解析优先级：群级 → 通配群（"*"）→ 账号级 → 默认
+  // （与 requireMention 等字段同款回落链）
   const coalesce = {
     enabled: specificCfg.coalesce?.enabled ?? wildcardCfg.coalesce?.enabled ?? accountDefaultCoalesce.enabled ?? DEFAULT_GROUP_COALESCE_CONFIG.enabled,
+    strategy: specificCfg.coalesce?.strategy ?? wildcardCfg.coalesce?.strategy ?? accountDefaultCoalesce.strategy ?? DEFAULT_GROUP_COALESCE_CONFIG.strategy,
+    maxBatchSize: specificCfg.coalesce?.maxBatchSize ?? wildcardCfg.coalesce?.maxBatchSize ?? accountDefaultCoalesce.maxBatchSize ?? DEFAULT_GROUP_COALESCE_CONFIG.maxBatchSize,
+    maxHoldMs: specificCfg.coalesce?.maxHoldMs ?? wildcardCfg.coalesce?.maxHoldMs ?? accountDefaultCoalesce.maxHoldMs ?? DEFAULT_GROUP_COALESCE_CONFIG.maxHoldMs,
   };
 
   // 群级显式值（不含默认值）：入站策略回落链据此判断"用户是否显式配过"
