@@ -1,0 +1,7 @@
+{
+  "mode": "text",
+  "text": "第一段正文：本地环境验证。\n第二段正文：流式三态。\n第三段正文：收尾。",
+  "chunkSize": 12,
+  "delayMs": 250,
+  "includeFooter": true
+}

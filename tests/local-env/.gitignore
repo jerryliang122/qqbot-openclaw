@@ -1,0 +1,2 @@
+# 运行时产物（假 QQ 平台的请求记录）——每次跑场景会重写
+mock-qq-record.jsonl
