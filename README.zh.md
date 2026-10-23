@@ -13,7 +13,7 @@
 > 运行要求：OpenClaw `>= 2026.10.5`；npm 包名 [`@jerryliang122/openclaw-qqbot`](https://www.npmjs.com/package/@jerryliang122/openclaw-qqbot)。
 > 与旧版本的差异及升级指南见 [CHANGELOG](CHANGELOG.md)。上游仓库：[tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot)。
 
-### 🚀 当前版本： `v2.6.0`
+### 🚀 当前版本： `v3.1.0`
 
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![QQ Bot](https://img.shields.io/badge/QQ_Bot-API_v2-red)](https://bot.q.qq.com/wiki/)
@@ -35,7 +35,7 @@
 
 | 功能 | 说明 |
 |------|------|
-| 🔄 **群消息排队** | 群消息即时进入框架，排队/合并交给 OpenClaw 框架队列（collect 模式）——正在处理的任务绝不被打断，突发消息合并成一批 |
+| 🔄 **群消息排队** | 群空闲时即时进入框架；agent 忙时到达的群消息（含不同发言人）在插件侧攒成一批，turn 结束后一次性发出——正在处理的任务绝不被打断 |
 | 👁️ **房间事件（可选）** | 全量模式群里，bot 像普通群成员一样读到每条消息；未 @ 的消息作为被动房间事件（只读，AI 想发言走主动 `message` 工具） |
 | 🔔 **三种唤醒方式** | @提及、称呼唤醒（`mentionPatterns`，如「沈处」）、引用 bot 消息，均触发正常回复 |
 | 📤 **被动优先出站** | 所有发送优先走被动回复（msg_id）以节省每天约 1000 条主动消息预算；配额感知降级，绝不硬失败 |
@@ -547,7 +547,66 @@ openclaw message send --channel "qqbot" \
 | `unmentionedInbound` | `"user_request" \| "room_event"` | `"user_request"` | `room_event`：像普通群成员一样读到所有消息，未 @ 的作为被动房间事件（详见下文；需群主开启全量推送模式）。也可在 `agents.entries.<id>.groupChat.unmentionedInbound`（按 agent）或 `messages.groupChat.unmentionedInbound`（全局）声明 |
 | `roomEventRequireMessageTool` | `boolean` | `true` | room_event 下是否强制要求 `message` 工具可用。`true`（默认）：工具确定不可用时该群**自动降级为 `user_request`**（恢复正常回复权）并打一条 WARN；`false`：不降级，保持严格静默语义（由用户自行保证工具面） |
 | `tools` | `object` | — | 群级工具白名单（`allow` / `alsoAllow` / `deny`），显式声明时原样透传给框架，优先级高于 `toolPolicy`。⚠️ room_event 群若在此排除 `message`，该群将失去唯一发声通道（插件会自动降级并告警） |
-| `coalesce` | `object` | `{enabled: true}` | 群消息排队配置，完全交给框架队列（`enabled=true`→collect 合并批处理；`false`→followup 排队不合并） |
+| `coalesce` | `object` | `{enabled: true, strategy: "plugin", maxBatchSize: 10, maxHoldMs: 300000}` | 群消息排队与合批配置（详见下文「群消息排队与合批」）。`enabled=false`→排队但不合并（followup） |
+
+#### 群消息排队与合批（插件侧）
+
+群消息的排队与合并由**插件自己**完成：当某个群的 agent 正在工作时，到达的消息会攒进一个批次，**turn 结束后一次性**作为一个 turn 发给框架。
+
+> **为什么不用框架的 collect 队列**：框架 followup 队列的 collect 模式按 `senderId` 分组，且分组时遇到第一个 key 不同的消息就断开 ⇒ **同一群里不同发言人发的消息永远合并不了**。而「群里几个人同时问、bot 忙完一次性回」恰恰是群聊最常见的诉求。插件侧合批按**群**为键，因此可以跨发言人合并。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | `boolean` | `true` | `false` → 只排队不合并（followup），不打断正在处理的 turn |
+| `strategy` | `"plugin"` \| `"framework"` | `"plugin"` | `plugin`=插件侧合批（可跨发言人）；`framework`=交回框架 collect 队列（仅同发言人的连续消息可合并） |
+| `maxBatchSize` | `integer` | `10` | 单批最多合并多少条群消息。超出时丢弃**较早**的消息，并在合并正文里留一行丢弃说明（模型不会静默缺内容） |
+| `maxHoldMs` | `integer` | `300000` | 单批最长持有时长（毫秒）。兜底用：turn 永久挂起时批次会滞留内存且随进程重启丢失。`0`=永不强制冲刷 |
+
+回落链与其他群配置项一致：群级 `coalesce` > 账号级 `groupCoalesce` > 默认值。
+
+**行为示例**：
+
+```
+成员A：「问题1」→ 群空闲 → 立即进入框架，开始处理
+成员B：「问题2」→ agent 忙 → 进批次
+成员C：「问题3」→ agent 忙 → 进批次
+
+「问题1」处理完成 → [问题2, 问题3] 一次性发出 → AI 看到合并后的上下文，只回一次
+```
+
+**合并后的 Web UI 形态**：
+
+```
+Carol                          ← 气泡标签 = 载体（批次内最后一条）的发送者
+[消息 1/3]
+[Alice (U_ALICE)] 问题1 (@you)
+
+[消息 2/3]
+[Bob (U_BOB)] 问题2
+
+[消息 3/3]
+[Carol (U_CAROL)] 问题3
+```
+
+- 一个批次在 Web UI 上是**一个**用户气泡（不是每条一个）：正文按 `[消息 i/N]` 分节，每节带该条自己的 `[sender (openid)]` 归属。
+- 气泡上方的**发送者标签是载体（最后一条）的发送者**——各发言人的区分靠正文里的逐条归属。标签刻意不改成「3 条消息」这类合成值：同一个字段也会进模型的 `Conversation info.sender`，合成标签会让模型误判作者。
+- 批次挂起期间这些消息**还没进框架**，所以 Web UI 不会逐条回显（QQ 群里成员自己的消息照常可见）。
+- room_event 群的批次同理，其 transcript 行也不再带 `#ROBOT1.0_…` 前缀（消息 id 与正文在平台层是分开的，此前是框架把两者合并进了同一行）。
+
+**已知限制**：当 turn 被框架**排队**（defer 到活动 turn 之后）时，插件的 dispatch promise 在「仅入队」时就 resolve，busy 信号会提前归零 ⇒ 那一小段窗口内到达的群消息不会被合批。消息仍全部送达、顺序不变，只是没被合成一轮。
+
+**建议同时调大框架队列上限**：OpenClaw followup 队列默认 `messages.queue.cap: 20`，溢出时会丢弃最老的一条并在 transcript 里显示 `[Queue overflow] Dropped N messages due to cap.`。插件侧合批会显著减少进入该队列的条目数，但繁忙群仍建议调大：
+
+```json
+{
+  "messages": {
+    "queue": {
+      "cap": 60,
+      "drop": "summarize"
+    }
+  }
+}
+```
 
 #### 房间事件模式（全量模式群，可选）
 
