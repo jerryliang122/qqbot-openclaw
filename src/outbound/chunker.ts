@@ -342,10 +342,11 @@ export function splitOversizedChunk(chunk: string, limit: number): string[] {
  * 保证每个块都不超限
  *
  * 只处理**严格超限**（`length > limit`）的块。长度恰好等于 limit 的块原样放行——
- * 框架 chunker 在无空白长串上就是切出恰好等于 limit 的块，其切点只受
- * `avoidTrailingHighSurrogateBreak`（代理对级）保护，切点落在 ZWJ 序列或组合符号
- * 中间时仍会切碎字形。这条残留边界需要「在切点处重锚定」才能根治，
- * 成本另议（见 AGENTS.md「分块路径的已知残留」），此处不做处理。
+ * 框架 chunker 在无空白长串上就是切出恰好等于 limit 的块。
+ *
+ * 框架 10.5 的切点保护已升级到**字形簇级**（`chunkMarkdownText` 在 5 处调用
+ * `findGraphemeChunkEnd`），ZWJ 序列 / 组合符号被切碎的残留已不复现；
+ * 「切点处重锚定」的需求随之上游修复而消失。
  */
 export function enforceChunkLimit(chunks: string[], limit: number): string[] {
   if (limit <= 0) return chunks;
@@ -366,7 +367,7 @@ export function enforceChunkLimit(chunks: string[], limit: number): string[] {
  *
  * 两条路径都过一遍 `enforceChunkLimit`——**超限块**（长中文句 / 超长表格行 /
  * 超长单行围栏）在这里按字形簇安全切开；长度恰好等于 limit 的块由框架自身的
- * 切点保护负责（代理对级，字形簇级残留见 `enforceChunkLimit` 注释）。
+ * 切点保护负责（字形簇级，见 `enforceChunkLimit` 注释）。
  */
 export function chunkQQBotMarkdown(text: string, limit: number): string[] {
   const rt = tryGetQQBotRuntime();
