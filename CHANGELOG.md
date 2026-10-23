@@ -8,6 +8,38 @@
 
 ---
 
+## [Unreleased]
+
+### 变更（行为）
+
+- **流式三态重构：partial 态改走 openclaw 框架的块流式（block streaming），群聊同步支持（2026-10-23）**。三态语义与**配置文件格式均不变**（用户**无需修改任何配置**）：
+
+  | 态 | 配置 | 框架块流式 | 中间消息产出方 | 适用目标 |
+  |---|---|---|---|---|
+  | off | `streaming.mode: "off"` | 显式关 | 无 | 私聊 + 群 |
+  | partial | `streaming.mode: "partial"` + `sendMode: "static"` | **显式开** | **框架块流式** | **私聊 + 群** |
+  | stream | `streaming.mode: "partial"` + `sendMode: "stream"`（含 sendMode 缺省） | 显式关 | 插件自研原生流式 | 仅 C2C |
+
+  - **三态显式声明框架块流式参与度**（`replyOptions.disableBlockStreaming`）：off → `true`、partial → **`false`**、stream → `true`。此前 off 与 stream 两态都**没设**该标志——用户在别的通道开了全局 `agents.defaults.blockStreamingDefault: "on"` 就会连带影响 QQ：**stream 态双投**（框架块回复 + 插件原生流式发两遍）、**off 态「只发 final」语义失效**（本该只发最终回复却收到中间消息）。现三态互斥且不依赖用户全局配置。
+  - **partial 态的中间消息改由框架产出**（`deliverPreparedBlockReply` → 通道 `deliver(kind:'block')`），插件侧只做「投递 + 被动回复配额守卫」。此前 partial 态是插件自研分段 flush（段级：一个 assistant 消息一条），现为**块级**（按框架 chunker 的断点偏好切块），中间消息更细粒度、更贴近「渐进可读」。
+  - **partial 态的 coalescer 延迟已消除**：当年自研的直接原因是框架 coalescer 默认 `minChars=800 / idleMs=1000` 的 buffer 延迟（PR#1「消除 QQBot static 模式中途文本延迟」）。openclaw 10.5 开放了插件级覆盖点 `ChannelPlugin.streaming.blockStreamingCoalesceDefaults`，插件声明 `{ minChars: 1, idleMs: 0 }` → **块即时 flush，用户零配置**（用户仍可用 `channels.qqbot.streaming.block.coalesce` 覆盖，优先级更高）。
+  - **群聊 partial 与私聊对称**（此前 `shouldUseStreaming()` 直接把群挡掉，群只有 final）。群无 QQ 原生流式 API，群里 partial = **普通多条消息**，与私聊同一条代码路径（仅 scope 与配额上限不同）。
+  - **新增被动回复配额守卫**（partial 态中间块专用）：QQ 对**每条用户消息**的被动回复条数有限（c2c 4 条 / 群 5 条），且配额耗尽后会**降级为主动发送**（不带 msg_id）烧每日主动预算。中间块发送前用 `getPassiveReplyQuotaRemaining()` 纯探测，剩余 ≤1（为 final 预留槽位）→ **丢弃该中间块**（final 仍携带完整内容送达，用户不缺内容），并用 `passiveOnly` 兜住「探测 → 发送」之间的 TOCTOU 竞态，**绝不落主动通道**。中间块被丢弃时用户看到的是「跳跃式渐进」，属可接受代价。
+  - **stream 态保持自研**：`StreamingController` 及其 issue #44 / #67 修复**一行未改**（含三态差量对账、整段补发、`[stream-final]` 兜底）。注意其内部的 static 分支现已不可达（控制器只在 stream 态创建），属待清理死代码，本次刻意不动以降低改动面。**关键推论不变：stream 态「final 与已投递内容是否对账」仍无框架兜底，账本在插件手里**——任何新增流式行为仍必须在 `StreamingController` 边界补测试。
+  - **配置兼容性**：旧配置语义**完全不变**——`mode: "partial"` 且未写 `sendMode` → 仍为 stream 态（sendMode 缺省值即 `"stream"`）；`mode: "partial"` + `sendMode: "static"` → 现为 partial 态（**行为变化**：中间消息由段级自研改为块级框架产出，且群聊从此生效）；`mode: "off"` → 不变，仅不再受用户全局 `blockStreamingDefault` 影响（即更严格地兑现「只发 final」）。
+
+- **移除 `/bot-streaming` 斜杠命令**。流式配置改由 Control UI 直接维护（`channels.qqbot.streaming.mode` / `sendMode`，manifest schema 已在 `channelConfigs.qqbot.schema` 声明）。旧命令写 `streaming = { mode }` 会**抹掉 `sendMode`**，是配置语义漂移的来源之一。命令数 11 → 10。
+
+### 修复
+
+- **`kind: "block"` 分支收口，避免块文本被发两遍**。partial 态下框架产的块经 `deliver(kind:'block')` 到达插件，原分支只转发媒体、文本落空（"文本留给流式"是 stream 态的旧约定）。现 partial 态下块文本走与 final 相同的投递路径，**且处理完必须 return**——否则块文本会在默认路径被再发一次。
+
+### 文档
+
+- **更正「框架 chunker 不字形簇安全」的过时断言**。`src/outbound/grapheme.ts` 与 `src/outbound/chunker.ts` 的注释、以及 AGENTS.md 的「分块路径的已知残留」条目此前按 openclaw 9.1 描述「框架按换行/空白断点切块、中文长句在硬上限处硬截断 → ZWJ 序列被切碎」。**openclaw 10.5 的 `chunkMarkdownText` 已在 5 处调用 `findGraphemeChunkEnd`**（切点吸附到字形簇边界），该残留**不复现**。本地 GFM 表格 fallback 仍然保留——它承担的是**表格表头补回**（官方 `chunkMarkdownText` 无任何 table 处理代码）。
+
+---
+
 ## [3.0.1] - 2026-10-22
 
 ### 修复

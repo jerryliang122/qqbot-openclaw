@@ -77,6 +77,22 @@ export function createQQBotPluginBase(params: QQBotPluginBaseParams = {}) {
       // （见 src/features/command-panel.ts 顶部说明）。
     },
     setupWizard: setupWizard as any,
+    /**
+     * 框架块流式（partial 态）的 coalesce 默认值。
+     *
+     * 框架默认 `minChars=800 / idleMs=1000`（openclaw dist
+     * `block-streaming-*.mjs` 的 DEFAULT_BLOCK_STREAM_MIN / COALESCE_IDLE_MS）
+     * 会把中间消息 buffer 住，造成肉眼可见的延迟——这正是 PR#1 当年
+     * 「显式关掉 SDK block streaming、自研分段」的原因。
+     *
+     * 10.5 开放了插件级覆盖点（`ChannelPlugin.streaming.blockStreamingCoalesceDefaults`，
+     * 被 `resolveBlockStreamingCoalescing` 读取），声明 `{ minChars: 1, idleMs: 0 }`
+     * 即可让块即时 flush，**用户零配置**。用户仍可用
+     * `channels.qqbot.streaming.block.coalesce` 覆盖（优先级高于本默认值）。
+     */
+    streaming: {
+      blockStreamingCoalesceDefaults: { minChars: 1, idleMs: 0 },
+    },
     reload: {
       configPrefixes: ['channels.qqbot'],
     },

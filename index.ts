@@ -65,6 +65,10 @@ export {
 export {
   StreamingController,
   shouldUseStreaming,
+  shouldUseNativeStream,
+  usesFrameworkBlockStreaming,
+  resolveQQBotStreamMode,
+  resolveDisableBlockStreaming,
 } from './src/outbound/streaming-controller.js';
 export * from './src/types.js';
 export * from './src/config.js';

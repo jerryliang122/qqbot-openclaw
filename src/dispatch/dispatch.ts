@@ -21,7 +21,14 @@ import { deliverReply, type DeliverPayload, type DeliverInfo, type DeliverContex
 import { buildCtxPayload } from './ctx-builder.js';
 
 import { DeliverDebouncer } from '../outbound/debounce.js';
-import { StreamingController, shouldUseStreaming } from '../outbound/streaming-controller.js';
+import {
+  StreamingController,
+  shouldUseNativeStream,
+  usesFrameworkBlockStreaming,
+  resolveQQBotStreamMode,
+  resolveDisableBlockStreaming,
+} from '../outbound/streaming-controller.js';
+import { shouldDeliverBlockText, BLOCK_QUOTA_RESERVE } from '../outbound/block-quota.js';
 import { ProgressCardPublisher } from '../outbound/progress-card-publisher.js';
 import { getPassiveReplyQuotaRemaining } from '../features/quota-manager.js';
 import { getAdapters, type RuntimeAdapters } from '../adapter/resolve.js';
@@ -485,7 +492,14 @@ export async function dispatchToOpenClaw(
     chatScope: envelope.chatScope === 'group' ? 'group' : 'direct',
     cfg,
     debouncer: debouncer?.enabled ? debouncer : undefined,
-    sendText: (to, text) => sendText({ to, text, accountId: account.accountId, replyToId: envelope.messageId, account })
+    sendText: (to, text, opts) => sendText({
+      to,
+      text,
+      accountId: account.accountId,
+      replyToId: envelope.messageId,
+      account,
+      ...(opts?.passiveOnly ? { passiveOnly: true } : {}),
+    })
       .then((result) => trackOutbound(result, 'deliverCtx.sendText')),
     sendMedia: (to, source, opts) => sendMedia({
       to,
@@ -506,17 +520,22 @@ export async function dispatchToOpenClaw(
     agentId: route.agentId ?? 'default',
   };
 
-  const streamingEnabled = shouldUseStreaming(
-    account,
-    envelope.chatScope === 'group' ? 'group' : 'c2c',
-  );
+  const targetScope = envelope.chatScope === 'group' ? 'group' : 'c2c';
+  const streamMode = resolveQQBotStreamMode(account);
+  // stream 态：插件自研原生流式控制器（QQ stream_messages，仅 C2C）。
+  // partial 态：中间消息由**框架 block streaming** 产出，插件不建控制器——
+  // 只负责投递块文本 + 被动回复配额守卫（私聊与群聊都适用）。
+  const nativeStreamEnabled = shouldUseNativeStream(account, targetScope);
+  const frameworkBlockStreaming = usesFrameworkBlockStreaming(account, targetScope);
 
-  const streamingController = streamingEnabled
+  const streamingController = nativeStreamEnabled
     ? createStreamingController(envelope, account, log?.child('streaming'))
     : null;
 
   if (streamingController) {
     dlog?.debug(`streaming enabled for ${envelope.senderId}`);
+  } else if (frameworkBlockStreaming) {
+    dlog?.debug(`framework block streaming enabled for ${envelope.senderId} scope=${targetScope}`);
   }
 
   const deliveredMediaUrls = new Set<string>();
@@ -538,6 +557,37 @@ export async function dispatchToOpenClaw(
       outboundSendOk++;
     }
     return result;
+  };
+
+  /**
+   * partial 态的**块文本**投递（框架 block streaming 产出的中间消息）。
+   *
+   * 被动回复配额守卫：QQ 平台对**每条用户消息**的被动回复条数有限
+   * （c2c 4 条 / 群 5 条），且配额耗尽后会**降级为主动发送**（不带 msg_id），
+   * 烧掉每日主动预算。这里为最终回复保留 1 条槽位，额度不足时直接丢弃该
+   * 中间块——最终回复仍会携带完整内容送达，用户不会缺内容。
+   *
+   * `passiveOnly: true` 兜住「探测 → 发送」之间的 TOCTOU 竞态：即使额度
+   * 在探测后被抢占，也绝不落到主动通道。
+   */
+  const deliverBlockText = async (
+    payload: DeliverPayload,
+    info: DeliverInfo | undefined,
+  ): Promise<void> => {
+    const text = payload.text?.trim() ?? '';
+    if (!text) return;
+    const remaining = getPassiveReplyQuotaRemaining({
+      accountId: account.accountId,
+      msgId: envelope.messageId,
+      scope: targetScope === 'group' ? 'group' : 'c2c',
+    });
+    if (!shouldDeliverBlockText(remaining)) {
+      dlog?.warn(
+        `[block] dropped by passive quota remaining=${remaining} reserve=${BLOCK_QUOTA_RESERVE} scope=${targetScope}`,
+      );
+      return;
+    }
+    await deliverReply({ text }, info, deliverCtx, { passiveOnly: true });
   };
 
   /**
@@ -629,15 +679,24 @@ export async function dispatchToOpenClaw(
         }
       }
 
-      // ── 1. block: 媒体/语音立即发送，文本留给流式 ──
-      // 注：static 模式已显式 disableBlockStreaming:true，kind:'block' 不会再触发；
-      // 此分支保留以兼容 stream 模式与未来变化。
+      // ── 1. block: 框架块流式的块投递（仅 partial 态会触发）──
+      // 三态都显式声明了框架块流式参与度（off/stream = disableBlockStreaming:true），
+      // 因此 kind:'block' **只在 partial 态**出现——这里就是 partial 态
+      // 「中间消息」的落地点。
+      // - 块文本：走与 final 相同的投递路径（含被动配额守卫）
+      // - 块媒体：立即转发
+      // 处理完必须 return：块文本已由 deliverBlockText 发出（或被配额守卫丢弃），
+      // 继续往下走会在默认路径被**再发一次**。
       if (kind === 'block') {
         if (payload.audioAsVoice) {
           await deliverReply(payload, info, deliverCtx);
-        } else {
-          await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
+          return;
         }
+        await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
+        if (text) {
+          await deliverBlockText(payload, info);
+        }
+        return;
       }
 
       // ── 2. 流式路径：流式已启动且未降级 -> 跳过静态发送 ──
@@ -857,20 +916,13 @@ export async function dispatchToOpenClaw(
                 ...(turnVisibleReplies === 'message_tool'
                   ? { sourceReplyDeliveryMode: 'message_tool_only' as const }
                   : {}),
-                ...(streamingController?.isStaticSendMode
-                  ? {
-                      // 对齐 telegram 模式一：显式关掉 SDK block streaming，绕开 coalescer
-                      // （minChars=800/idleMs=1000 的 buffer 会造成文本延迟）。
-                      // 文本由 onPartialReply 累积，边界由 onToolStart 自己监听 flush。
-                      disableBlockStreaming: true,
-                      // 让 onToolStart 在 verbose 关闭时也能触发
-                      // （默认受 requiresToolSummaryVisibility 门控，verbose off 时不触发）
-                      allowToolLifecycleWhenProgressHidden: true,
-                      // 工具【开始执行前】触发：把已累积的上一段文本立即发出
-                      // （不等工具执行完，对齐 telegram prepareAnswerLaneForToolProgress）
-                      onToolStart: async () => { await streamingController.flushSegment(); },
-                    }
-                  : {}),
+                // 三态显式声明「框架块流式」的参与度，不依赖用户全局
+                // agents.defaults.blockStreamingDefault（否则用户在别的通道开了
+                // blockStreamingDefault，QQ 会被连带影响）：
+                // - off     → true  只有最终回复，无中间消息
+                // - partial → false 框架产块（partial 态），插件只投递 + 守配额
+                // - stream  → true  插件自研原生流式，必须与框架块流式互斥（防双投）
+                disableBlockStreaming: resolveDisableBlockStreaming(streamMode),
                 ...(streamingController
                   ? {
                       onPartialReply: async (p: { text?: string }) => {
@@ -878,12 +930,9 @@ export async function dispatchToOpenClaw(
                       },
                       // 兜底：block 信号未覆盖的边界（如部分 provider 不发 text_end）
                       // 仍由 onAssistantMessageStart 触发分段。
-                      // static 模式 = 固化上一段；stream 模式 = 封口上一段
-                      // （整段保留、拼进同一条消息），两种模式都不再靠长度
-                      // 启发式猜边界（issue #67）。
-                      onAssistantMessageStart: streamingController.isStaticSendMode
-                        ? async () => { await streamingController.flushSegment(); }
-                        : async () => { await streamingController.beginSegment(); },
+                      // stream 态 = 封口上一段（整段保留、拼进同一条消息），
+                      // 不再靠长度启发式猜边界（issue #67）。
+                      onAssistantMessageStart: async () => { await streamingController.beginSegment(); },
                     }
                   : {}),
                 ...(progressPublisher

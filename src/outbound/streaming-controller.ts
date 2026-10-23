@@ -695,11 +695,90 @@ function normalizedPrefixEnd(finalText: string, tail: string): number {
 
 import type { ResolvedQQBotAccount } from '../types.js';
 
-export function shouldUseStreaming(
+/**
+ * QQBot 流式三态。
+ *
+ * - `off`     → 只发最终回复（无中间消息）
+ * - `partial` → 中间消息 + 最终回复；中间消息由 **openclaw 框架的 block streaming**
+ *               产出（`replyOptions.disableBlockStreaming: false`），插件只负责
+ *               投递与被动回复配额守卫。私聊与群聊都适用。
+ * - `stream`  → QQ 原生流式（`stream_messages`），插件自研控制器，**仅 C2C**。
+ *
+ * 配置面沿用两键 `streaming: { mode, sendMode }`（用户无需改配置）：
+ *   - `mode: 'off'`                                → off
+ *   - `mode: 'partial'` + `sendMode: 'static'`     → partial
+ *   - `mode: 'partial'` + `sendMode: 'stream'`     → stream（sendMode 缺省值）
+ */
+export type QQBotStreamMode = 'off' | 'partial' | 'stream';
+
+/**
+ * 归一化流式模式（单一事实源）。
+ *
+ * `sendMode` 缺省为 `'stream'`（与 dispatch 侧的历史默认一致），
+ * 所以 `mode: 'partial'` 且未写 `sendMode` → stream 态（原生流式），
+ * 存量配置行为不变。
+ */
+export function resolveQQBotStreamMode(account: ResolvedQQBotAccount): QQBotStreamMode {
+  const streaming = account.config?.streaming;
+  if (!streaming || streaming.mode === 'off') return 'off';
+  return streaming.sendMode === 'static' ? 'partial' : 'stream';
+}
+
+/**
+ * 三态对「框架块流式」的参与度（`replyOptions.disableBlockStreaming`）。
+ *
+ * - off     → `true`（显式关）：只有最终回复，无中间消息
+ * - partial → `false`（显式开）：框架产块，插件只投递 + 守配额
+ * - stream  → `true`（显式关）：插件自研原生流式，**必须与框架块流式互斥**（否则双投）
+ *
+ * 显式声明的意义：**不依赖用户全局 `agents.defaults.blockStreamingDefault`**——
+ * 否则用户在别的通道开了全局块流式，QQ 会被连带影响（off 态「只发 final」
+ * 的语义失效、stream 态双投）。
+ */
+export function resolveDisableBlockStreaming(mode: QQBotStreamMode): boolean {
+  return mode !== 'partial';
+}
+
+/**
+ * 是否启用插件自研原生流式（QQ `stream_messages`）。
+ *
+ * 仅 C2C——QQ 开放平台只对私聊开放流式 API，`openStream` 对非 c2c 直接 throw。
+ */
+export function shouldUseNativeStream(
   account: ResolvedQQBotAccount,
   targetScope: 'c2c' | 'group' | 'channel',
 ): boolean {
   if (targetScope !== 'c2c') return false;
-  const streaming = account.config?.streaming;
-  return !!streaming && streaming.mode !== 'off';
+  return resolveQQBotStreamMode(account) === 'stream';
+}
+
+/**
+ * 是否启用框架块流式（partial 态）。
+ *
+ * partial 态的中间消息由框架的 block streaming 产出，插件侧只做
+ * 「投递 + 被动回复配额守卫」。群里没有原生流式 API，块回复就是普通多条消息，
+ * 因此群聊与私聊走同一条代码路径。
+ */
+export function usesFrameworkBlockStreaming(
+  account: ResolvedQQBotAccount,
+  targetScope: 'c2c' | 'group' | 'channel',
+): boolean {
+  if (targetScope === 'channel') return false;
+  return resolveQQBotStreamMode(account) === 'partial';
+}
+
+/**
+ * 是否启用任何形式的中间消息投递（partial 框架块流式 或 stream 原生流式）。
+ *
+ * 供「本轮是否会产生中间消息」这类判断使用；**不代表**插件会自建流式控制器
+ * ——控制器只在 stream 态创建（见 `shouldUseNativeStream`）。
+ */
+export function shouldUseStreaming(
+  account: ResolvedQQBotAccount,
+  targetScope: 'c2c' | 'group' | 'channel',
+): boolean {
+  return (
+    shouldUseNativeStream(account, targetScope) ||
+    usesFrameworkBlockStreaming(account, targetScope)
+  );
 }

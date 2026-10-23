@@ -8,7 +8,14 @@
  */
 
 import assert from "node:assert";
-import { StreamingController, shouldUseStreaming } from "../src/outbound/streaming-controller.js";
+import {
+  StreamingController,
+  shouldUseStreaming,
+  shouldUseNativeStream,
+  usesFrameworkBlockStreaming,
+  resolveQQBotStreamMode,
+  resolveDisableBlockStreaming,
+} from "../src/outbound/streaming-controller.js";
 
 // ============ fake gateway / session ============
 
@@ -280,15 +287,78 @@ await test("static：sendStatic 抛错 → failed", async () => {
   assert.strictEqual(ctrl.currentPhase, "failed");
 });
 
-console.log("\n=== 3. shouldUseStreaming ===");
+console.log("\n=== 3. 流式三态判定 ===");
 
-await test("shouldUseStreaming 配置矩阵", async () => {
+await test("resolveQQBotStreamMode 归一化矩阵", async () => {
+  const acct = (streaming: unknown) => ({ config: { streaming } }) as any;
+  assert.strictEqual(resolveQQBotStreamMode(acct(undefined)), "off", "未配置 → off");
+  assert.strictEqual(resolveQQBotStreamMode(acct({ mode: "off" })), "off");
+  // sendMode 缺省 = 'stream'（历史默认），存量配置行为不变
+  assert.strictEqual(resolveQQBotStreamMode(acct({ mode: "partial" })), "stream", "sendMode 缺省 → stream");
+  assert.strictEqual(resolveQQBotStreamMode(acct({ mode: "partial", sendMode: "stream" })), "stream");
+  assert.strictEqual(resolveQQBotStreamMode(acct({ mode: "partial", sendMode: "static" })), "partial");
+});
+
+await test("shouldUseNativeStream 仅 C2C（QQ 流式 API 平台限制）", async () => {
+  const acct = (streaming: unknown) => ({ config: { streaming } }) as any;
+  assert.strictEqual(shouldUseNativeStream(acct({ mode: "partial" }), "c2c"), true);
+  assert.strictEqual(shouldUseNativeStream(acct({ mode: "partial", sendMode: "stream" }), "c2c"), true);
+  assert.strictEqual(
+    shouldUseNativeStream(acct({ mode: "partial", sendMode: "static" }), "c2c"),
+    false,
+    "partial 态不走原生流式",
+  );
+  assert.strictEqual(shouldUseNativeStream(acct({ mode: "partial" }), "group"), false, "原生流式仅 C2C");
+  assert.strictEqual(shouldUseNativeStream(acct({ mode: "off" }), "c2c"), false);
+  assert.strictEqual(shouldUseNativeStream(acct(undefined), "c2c"), false);
+});
+
+await test("usesFrameworkBlockStreaming 私聊+群，channel 不支持", async () => {
+  const acct = (streaming: unknown) => ({ config: { streaming } }) as any;
+  assert.strictEqual(
+    usesFrameworkBlockStreaming(acct({ mode: "partial", sendMode: "static" }), "c2c"),
+    true,
+  );
+  assert.strictEqual(
+    usesFrameworkBlockStreaming(acct({ mode: "partial", sendMode: "static" }), "group"),
+    true,
+    "群聊支持 partial（群无原生流式，块回复=普通多条消息）",
+  );
+  assert.strictEqual(
+    usesFrameworkBlockStreaming(acct({ mode: "partial", sendMode: "static" }), "channel"),
+    false,
+  );
+  assert.strictEqual(
+    usesFrameworkBlockStreaming(acct({ mode: "partial" }), "c2c"),
+    false,
+    "stream 态不走框架块流式",
+  );
+  assert.strictEqual(usesFrameworkBlockStreaming(acct({ mode: "off" }), "c2c"), false);
+  assert.strictEqual(usesFrameworkBlockStreaming(acct(undefined), "c2c"), false);
+});
+
+await test("resolveDisableBlockStreaming 三态显式声明框架参与度", async () => {
+  assert.strictEqual(resolveDisableBlockStreaming("off"), true, "off：只有 final");
+  assert.strictEqual(resolveDisableBlockStreaming("partial"), false, "partial：必须显式开框架块流式");
+  assert.strictEqual(resolveDisableBlockStreaming("stream"), true, "stream：必须显式关，防双投");
+});
+
+await test("shouldUseStreaming = 原生流式 或 框架块流式", async () => {
   const acct = (streaming: unknown) => ({ config: { streaming } }) as any;
   assert.strictEqual(shouldUseStreaming(acct({ mode: "partial" }), "c2c"), true);
   assert.strictEqual(shouldUseStreaming(acct({ mode: "partial", sendMode: "static" }), "c2c"), true);
   assert.strictEqual(shouldUseStreaming(acct({ mode: "off" }), "c2c"), false);
   assert.strictEqual(shouldUseStreaming(acct(undefined), "c2c"), false);
-  assert.strictEqual(shouldUseStreaming(acct({ mode: "partial" }), "group"), false, "群聊不支持流式");
+  assert.strictEqual(
+    shouldUseStreaming(acct({ mode: "partial" }), "group"),
+    false,
+    "stream 态不支持群",
+  );
+  assert.strictEqual(
+    shouldUseStreaming(acct({ mode: "partial", sendMode: "static" }), "group"),
+    true,
+    "partial 态支持群",
+  );
 });
 
 // ============ 结果 ============

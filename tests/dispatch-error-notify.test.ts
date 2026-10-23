@@ -189,52 +189,57 @@ async function runDispatchWithPayloads(opts: {
 
 group('issue #8: 流式已启动后 agent run 失败通知不被吞');
 
-await test('static 模式：首分片已送达，isError final payload 必须静态发出', async () => {
+await test('stream 模式：首分片已送达，isError final payload 必须静态发出', async () => {
   _resetAdaptersCache();
-  const { sentTexts } = installFakeGateway();
+  const { sentTexts, streamUpdates } = installFakeGateway({ streamMode: true });
   const errorText = '⚠️ Agent run failed (model: minimax/MiniMax-M3).';
 
   await runDispatchWithPayloads({
-    account: makeAccount({ mode: 'partial', sendMode: 'static' }),
+    account: makeAccount({ mode: 'partial', sendMode: 'stream' }),
     firstPartial: '这是已送达用户的首段回答（1062 字符）。',
-    flushFirstChunk: true,
     payloads: [{ payload: { text: errorText, isError: true }, info: { kind: 'final' } }],
   });
 
   assert.ok(
+    streamUpdates.length > 0,
+    '首分片应已通过流式会话送达用户',
+  );
+  assert.ok(
     sentTexts.some((s) => s.text === errorText),
     `失败通知必须经 sendText 发出，实际发送: ${JSON.stringify(sentTexts.map((s) => s.text))}`,
   );
-  assert.equal(sentTexts.length, 2, '应恰好两条：首分片（static flush）+ 失败通知');
+  assert.equal(
+    sentTexts.length,
+    1,
+    `应恰好一条（首分片走流式会话、不经 sendText）：失败通知，实际: ${JSON.stringify(sentTexts.map((s) => s.text))}`,
+  );
 });
 
-await test('static 模式：非 error final payload 的流式去重早退保持不变', async () => {
+await test('stream 模式：非 error final payload 的流式去重早退保持不变', async () => {
   _resetAdaptersCache();
-  const { sentTexts } = installFakeGateway();
+  const { sentTexts, streamUpdates } = installFakeGateway({ streamMode: true });
   const firstChunk = '这是已送达用户的首段回答。';
   // fixture 修正（issue #44 修复后）：本用例要守的是「非 error final 仍走流式去重
   // 早退」，final 文本必须是**已流出内容**才能真正走到去重分支。原 fixture 用的是
   // 一段与流式内容毫不相干的文本（注释却写「与流式内容一致」），实际断言的其实是
   // 「final 与流内无关时不得发送」——那正是 issue #44 认定的静默丢失行为。现按用例
-  // 本意改为已流出段落的精确复现（末段还有 footer 增量时由 absorb 并入缓冲）。
+  // 本意改为已流出段落的精确复现（末段还有 footer 增量时由 absorb 并入流内）。
   const finalText = firstChunk;
 
   await runDispatchWithPayloads({
-    account: makeAccount({ mode: 'partial', sendMode: 'static' }),
+    account: makeAccount({ mode: 'partial', sendMode: 'stream' }),
     firstPartial: firstChunk,
-    flushFirstChunk: true,
     payloads: [{ payload: { text: finalText }, info: { kind: 'final' } }],
   });
 
   assert.equal(
     sentTexts.length,
-    1,
-    `final 与已流出内容一致时应只有一条消息（去重早退），实际: ${JSON.stringify(sentTexts.map((s) => s.text))}`,
+    0,
+    `final 与已流出内容一致时应走流式去重早退（不额外发消息），实际: ${JSON.stringify(sentTexts.map((s) => s.text))}`,
   );
-  assert.equal(
-    sentTexts[0]?.text,
-    firstChunk,
-    '唯一一条应是工具开始时 flush 的首段',
+  assert.ok(
+    streamUpdates.includes(firstChunk),
+    `唯一可见内容应是流式会话里的首段，实际: ${JSON.stringify(streamUpdates)}`,
   );
 });
 

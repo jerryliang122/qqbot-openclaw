@@ -43,6 +43,11 @@ const { StreamingController } = await import('../src/outbound/streaming-controll
 const { dispatchToOpenClaw } = await import('../src/dispatch/dispatch.ts');
 const { registerGateway } = await import('../src/outbound/outbound-service.ts');
 const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
+const {
+  registerMsgIdWindow,
+  checkAndConsumePassiveReplyQuota,
+  clearQuotaCache,
+} = await import('../src/features/quota-manager.ts');
 
 const FOOTER = 'Usage: 66k in / 9.8k out · cache 894k cached / 0 new';
 
@@ -326,6 +331,8 @@ async function runDispatch(opts: {
   simulate: (captured: CapturedDispatch) => Promise<void>;
   /** 自定义请求级 signal（模拟用户取消 / SDK 超时中止） */
   requestSignal?: AbortSignal;
+  /** 固定入站 msg_id（默认随机）——配额相关用例需要预先占用同一锚点的额度 */
+  msgId?: string;
   /** gateway.sendText 失败策略：true = 每次都抛错 */
   failSendText?: boolean;
   /** 流式 update 失败策略：'definitive' = 平台明确拒绝；'ambiguous' = 网络层结果不明 */
@@ -334,7 +341,7 @@ async function runDispatch(opts: {
   _resetAdaptersCache();
   const msg = {
     kind: 'c2c',
-    messageId: `msg-${Math.random().toString(36).slice(2, 10)}`,
+    messageId: opts.msgId ?? `msg-${Math.random().toString(36).slice(2, 10)}`,
     content: 'hello',
     senderId: 'USER_123',
     senderName: 'Tester',
@@ -462,9 +469,9 @@ await test('stream 模式: tool payload 封口当前段后到达的 final → �
   );
 });
 
-await test('static 模式: footer 并入最后一段，整段一条消息发出', async () => {
+await test('partial 模式: footer 随 final 整条发出（不经插件差量补发）', async () => {
   const gw = await runDispatch({
-    streaming: { mode: 'stream', sendMode: 'static' },
+    streaming: { mode: 'partial', sendMode: 'static' },
     simulate: async (c) => {
       await c.replyOptions?.onPartialReply?.({ text: '这是回答' });
       await c.replyOptions?.onPartialReply?.({ text: '这是回答全文' });
@@ -481,9 +488,9 @@ await test('static 模式: footer 并入最后一段，整段一条消息发出'
   );
 });
 
-await test('static 模式: 正文发送失败 → 不补发 footer（避免只见 footer 不见正文）', async () => {
+await test('partial 模式: 正文发送失败 → 不额外补发 footer（插件侧无补发机制）', async () => {
   const gw = await runDispatch({
-    streaming: { mode: 'stream', sendMode: 'static' },
+    streaming: { mode: 'partial', sendMode: 'static' },
     failSendText: true,
     simulate: async (c) => {
       await c.replyOptions?.onPartialReply?.({ text: '这是回答全文' });
@@ -493,11 +500,14 @@ await test('static 模式: 正文发送失败 → 不补发 footer（避免只�
       );
     },
   });
-  assert.strictEqual(gw.sentTexts.length, 1, '只应有合并正文+footer这一次失败尝试');
   assert.strictEqual(
     gw.sentTexts[0],
     `这是回答全文\n${FOOTER}`,
-    '失败的是合并后的整段发送（absorb 已并入 footer）',
+    '失败的是整条 final 发送',
+  );
+  assert.ok(
+    gw.sentTexts[1]?.includes('Something went wrong'),
+    `正文未送达时应发失败兜底文案（对齐非流式路径），实际: ${JSON.stringify(gw.sentTexts)}`,
   );
   assert.ok(
     !gw.sentTexts.slice(1).some((t) => t.includes('Usage:')),
@@ -699,77 +709,98 @@ await test('shouldSuppressFinalTailFallback 判定矩阵：仅「正文确定未
   assert.strictEqual(done.shouldSuppressFinalTailFallback, false, 'done 不抑制');
 });
 
-// ============ Part 3: issue #44 —— static 模式 final 正文静默丢失 ============
+// ============ Part 3: partial 态（框架块流式）—— final 正文与中间块 ============
 
-group('Part 3: issue #44 static 模式 final 正文补发（端到端）');
+group('Part 3: partial 态（框架块流式）中间块与 final');
 
-await test('static: 多段 flush 后末段无 partial → final 正文整段补发（issue #44 复现）', async () => {
+await test('partial: final 正文整条送达（不经插件差量补发）', async () => {
   const gw = await runDispatch({
     streaming: { mode: 'partial', sendMode: 'static' },
     simulate: async (c) => {
-      // 5 段工具前置文本，每段在工具开始前 flush（dispatch 的 onToolStart 路径）
-      for (const seg of ['segA', 'segB', 'segC', 'segD', 'segE']) {
-        await c.replyOptions?.onPartialReply?.({ text: seg });
-        await c.replyOptions?.onToolStart?.();
-      }
-      // 最终 600+ 字正文：框架没有送来任何 partial，只有 final payload 文本
+      // partial 态插件不注册 onPartialReply / onToolStart（无自研控制器）：
+      // 中间消息由框架块流式产出，final 直接走默认投递路径整条发出。
       await c.dispatcherOptions?.deliver?.({ text: FINAL_BODY }, { kind: 'final' });
     },
   });
-  assert.strictEqual(gw.sentTexts.length, 6, `5 段碎片 + 1 条最终正文，实际 ${gw.sentTexts.length} 条`);
+  assert.strictEqual(gw.sentTexts.length, 1, `final 应整条发出，实际 ${gw.sentTexts.length} 条`);
   assert.strictEqual(
-    gw.sentTexts[5],
+    gw.sentTexts[0],
     FINAL_BODY,
-    `最终正文应作为最后一条完整送达，实际长度 ${gw.sentTexts[5]?.length}`,
+    `最终正文应完整送达，实际长度 ${gw.sentTexts[0]?.length}`,
   );
-  assert.ok(gw.sentTexts[5]!.length >= 600, '最终正文应完整无截断');
+  assert.ok(gw.sentTexts[0]!.length >= 600, '最终正文应完整无截断');
 });
 
-await test('static: 末段正常有 partial → 不产生额外消息（回归保护）', async () => {
+await test('partial: 块文本（kind:block）作为中间消息发出，final 再整条发', async () => {
   const gw = await runDispatch({
     streaming: { mode: 'partial', sendMode: 'static' },
     simulate: async (c) => {
-      await c.replyOptions?.onPartialReply?.({ text: 'segA' });
-      await c.replyOptions?.onToolStart?.();
-      await c.replyOptions?.onPartialReply?.({ text: '最终正文' });
-      await c.dispatcherOptions?.deliver?.({ text: `最终正文\n${FOOTER}` }, { kind: 'final' });
-    },
-  });
-  assert.strictEqual(gw.sentTexts.length, 2, `A 段 + 末段（含 footer）两条，不应有第三条，实际: ${JSON.stringify(gw.sentTexts.map((t) => t.length))}`);
-  assert.strictEqual(gw.sentTexts[1], `最终正文\n${FOOTER}`, 'footer 应并入末段');
-});
-
-await test('static: 补发后 dispatch 末尾差量兜底不重复补发（回归保护）', async () => {
-  const gw = await runDispatch({
-    streaming: { mode: 'partial', sendMode: 'static' },
-    simulate: async (c) => {
-      await c.replyOptions?.onPartialReply?.({ text: 'segA' });
-      await c.replyOptions?.onToolStart?.();
-      await c.dispatcherOptions?.deliver?.({ text: FINAL_BODY }, { kind: 'final' });
+      await c.dispatcherOptions?.deliver?.({ text: '块一' }, { kind: 'block' });
+      await c.dispatcherOptions?.deliver?.(
+        { text: `最终正文\n${FOOTER}` },
+        { kind: 'final' },
+      );
     },
   });
   assert.strictEqual(
-    gw.sentTexts.filter((t) => t === FINAL_BODY).length,
+    gw.sentTexts.length,
+    2,
+    `块 + final 两条，不应有第三条，实际: ${JSON.stringify(gw.sentTexts.map((t) => t.length))}`,
+  );
+  assert.strictEqual(gw.sentTexts[0], '块一', '块文本应作为中间消息发出');
+  assert.strictEqual(gw.sentTexts[1], `最终正文\n${FOOTER}`, 'final 应整条发出并带 footer');
+});
+
+await test('partial: 块文本不重复发（kind:block 分支收口，不落默认路径）', async () => {
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async (c) => {
+      await c.dispatcherOptions?.deliver?.({ text: '块一' }, { kind: 'block' });
+    },
+  });
+  assert.strictEqual(
+    gw.sentTexts.filter((t) => t === '块一').length,
     1,
-    `final 正文必须且只能出现一次（[stream-final] 兜底不得重复），实际: ${JSON.stringify(gw.sentTexts.map((t) => t.length))}`,
+    `块文本必须且只能出现一次，实际: ${JSON.stringify(gw.sentTexts)}`,
   );
 });
 
-await test('static: 请求级 signal 中止的 turn 不补发 final', async () => {
+await test('partial: 被动配额耗尽 → 块被丢弃（不发送、不降级主动）', async () => {
+  const msgId = 'msg-quota-exhausted';
+  // 预占该 msg_id 的全部被动配额（c2c 4 条），让块发送时只剩 final 的槽位
+  registerMsgIdWindow({ accountId: 'test-account', msgId, scope: 'c2c' });
+  for (let i = 0; i < 4; i++) {
+    checkAndConsumePassiveReplyQuota({ accountId: 'test-account', msgId, scope: 'c2c' });
+  }
+  const gw = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    msgId,
+    simulate: async (c) => {
+      await c.dispatcherOptions?.deliver?.({ text: '块一' }, { kind: 'block' });
+    },
+  });
+  assert.strictEqual(
+    gw.sentTexts.filter((t) => t === '块一').length,
+    0,
+    `配额耗尽时块应被丢弃（绝不降级主动发送），实际: ${JSON.stringify(gw.sentTexts)}`,
+  );
+  clearQuotaCache();
+});
+
+await test('partial: 请求级 signal 中止 → 插件不自行补发（只有框架投递的那一条）', async () => {
   const requestAbort = new AbortController();
   const gw = await runDispatch({
     streaming: { mode: 'partial', sendMode: 'static' },
     requestSignal: requestAbort.signal,
     simulate: async (c) => {
-      await c.replyOptions?.onPartialReply?.({ text: 'segA' });
-      await c.replyOptions?.onToolStart?.();
       requestAbort.abort();
       await c.dispatcherOptions?.deliver?.({ text: FINAL_BODY }, { kind: 'final' });
     },
   });
-  assert.ok(
-    !gw.sentTexts.includes(FINAL_BODY),
-    `已取消的 turn 不得补发 final 正文，实际: ${JSON.stringify(gw.sentTexts.map((t) => t.length))}`,
+  assert.strictEqual(
+    gw.sentTexts.length,
+    1,
+    `插件侧不应额外补发，只应有框架投递的那一条，实际: ${JSON.stringify(gw.sentTexts.map((t) => t.length))}`,
   );
 });
 

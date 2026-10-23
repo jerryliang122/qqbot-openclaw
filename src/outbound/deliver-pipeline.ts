@@ -45,7 +45,7 @@ export interface DeliverContext {
   /** 会话类型（用于判断语音是否可用） */
   chatScope?: 'direct' | 'group';
   /** 发送文本 */
-  sendText: (to: string, text: string) => Promise<SendResult>;
+  sendText: (to: string, text: string, opts?: { passiveOnly?: boolean }) => Promise<SendResult>;
   /** 发送媒体 */
   sendMedia: (to: string, source: string, opts?: { text?: string; mediaKind?: MediaKind }) => Promise<SendResult>;
   /** TTS 文字转语音（返回本地音频路径，失败返回 null） */
@@ -91,11 +91,17 @@ function resolveAttachmentPaths(payload: DeliverPayload): string[] {
  * 1. 语音意图 → TTS
  * 2. 媒体发送 → mediaUrl / mediaUrls
  * 3. 纯文本回复 → debounce 合并
+ *
+ * `opts.passiveOnly`：只走被动回复——配额不可用时直接返回 error
+ * （不调网关、不降级主动、不烧每日主动预算）。用于 partial 态的
+ * **中间块**：中间块只是渐进展示，额度不足时宁可丢弃，也不能把
+ * 每日主动预算烧在进度展示上。
  */
 export async function deliverReply(
   payload: DeliverPayload,
   _info: DeliverInfo | undefined,
   ctx: DeliverContext,
+  opts?: { passiveOnly?: boolean },
 ): Promise<void> {
   const text = payload.text?.trim() ?? '';
   const mediaUrls = resolveMediaUrls(payload);
@@ -130,10 +136,12 @@ export async function deliverReply(
   // ── Layer 3: 纯文本回复 ──
   if (!text) return;
 
-  if (ctx.debouncer) {
+  // passiveOnly 的消息（partial 态的中间块）不做 debounce 合并——
+  // 合并会引入额外延迟，且合并后的发送无法保证仍落在被动配额内。
+  if (ctx.debouncer && !opts?.passiveOnly) {
     await ctx.debouncer.enqueue(ctx.qualifiedTarget, text);
   } else {
-    const result = await ctx.sendText(ctx.qualifiedTarget, text);
+    const result = await ctx.sendText(ctx.qualifiedTarget, text, opts);
     if (result.error) {
       ctx.log?.error(`[text] sendText failed: ${result.error}`);
     }
