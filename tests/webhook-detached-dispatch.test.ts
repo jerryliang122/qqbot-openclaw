@@ -528,6 +528,42 @@ await test('delegate 挂死：超时兜底 500、settle 照常有界、根不无
   }
 });
 
+await test('持有上限是总预算：delegate 消耗的预算从 settle 扣除，不被两段串行翻倍', async () => {
+  resetWebhookDispatchTrackerForTest();
+  const logger = fakeLogger();
+  const guards = fakeGuards();
+  const stuckDispatch = deferred();
+
+  // 预算 400ms：delegate「正常」耗时 300ms（未超时），登记的派发挂死 →
+  // settle 只剩 ~100ms 预算。若两段各计 400ms，回调要到 ~700ms 才 settle。
+  const prevHold = process.env.QQBOT_WEBHOOK_DISPATCH_HOLD_MS;
+  process.env.QQBOT_WEBHOOK_DISPATCH_HOLD_MS = '400';
+  try {
+    await dispatchOp0WithDetachedWork({
+      eventType: 'C2C_MESSAGE_CREATE',
+      log: logger.log,
+      guards,
+      onDelegateError: () => {},
+      delegate: async () => {
+        trackWebhookDispatch('acct-a', stuckDispatch.promise);
+        await sleep(300);
+      },
+    });
+    // startedAt ≈ delegate 起点（fake guards 只隔一个 microtask）：
+    // 总预算 400ms → 回调应在 ≈400ms settle（300 delegate + ~100 settle 剩余）；
+    // 若两段各计全额（bug 形态）则 ≈700ms。窗口 [340, 600] 把两者分开。
+    const startedAt = Date.now();
+    await keepAlive(guards.runs[0].catch(() => {}));
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed < 600, `持有总时长应受单一 deadline 约束（实际 ${elapsed}ms，翻倍形态 ≈700ms）`);
+    assert.ok(elapsed >= 340, `持有应真实等待了预算（实际 ${elapsed}ms，零等待说明没等登记）`);
+  } finally {
+    if (prevHold === undefined) delete process.env.QQBOT_WEBHOOK_DISPATCH_HOLD_MS;
+    else process.env.QQBOT_WEBHOOK_DISPATCH_HOLD_MS = prevHold;
+    stuckDispatch.release();
+  }
+});
+
 await test('生产路径：默认 loader 加载真实 guards，withDetachedWebhookWork 持有到工作完成（评审意见 7）', async () => {
   resetWebhookDispatchTrackerForTest();
   const logger = fakeLogger();
