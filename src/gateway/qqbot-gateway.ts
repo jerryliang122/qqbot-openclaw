@@ -33,6 +33,7 @@ import { checkAndConsumePassiveReplyQuota, invalidateMsgIdQuota } from '../featu
 import { recordProactiveSend } from '../features/proactive-budget.js';
 import { selectMsgIdForPassiveReply, evictMsgId, peekMsgIdReceivedAt } from '../features/msgid-cache.js';
 import { notifyOutboundMessageSent } from '../features/typing-refresh.js';
+import { installWebhookDispatchTracking, makeTrackedListener } from '../features/webhook-dispatch-tracker.js';
 
 export interface GatewayCallbacks {
   onReady?: () => void;
@@ -131,6 +132,11 @@ export class QQBotGateway {
     // 包装 sendText/sendMedia，回复后自动写入 ref-index store
     this.wrapBotSendForRefIndex();
 
+    // webhook 模式：包裹入站派发入口，为 detached 准入根提供在途登记
+    // （issue #74 —— transport=webhook 下入站派发 100% 被 GatewayDrainingError 拒；
+    //   登记点与语义见 src/features/webhook-dispatch-tracker.ts）
+    if (isWebhook) installWebhookDispatchTracking(this.bot, account.accountId, this.log);
+
     // concurrencyGuard 已移除，消息不再在此处合并
     // 所有消息都直接走完中间件链，由 bot.on('message') 处理转发
     // 并发控制由 OpenClaw 框架的 session lane 机制处理
@@ -164,13 +170,15 @@ export class QQBotGateway {
       }
     });
 
-    this.bot.on('interaction', (_ctx, event: InteractionEvent) => {
-      handleInteraction(event, this.account, this.runtime, this.log, (id, code, data) =>
-        this.bot.acknowledgeInteraction(id, code, data),
-      ).catch((err) => {
+    this.bot.on('interaction', makeTrackedListener(
+      this.account.accountId,
+      (_ctx: unknown, event: InteractionEvent) =>
+        handleInteraction(event, this.account, this.runtime, this.log, (id, code, data) =>
+          this.bot.acknowledgeInteraction(id, code, data)),
+      (err) => {
         this.log.error(`Interaction error: ${err}`);
-      });
-    });
+      },
+    ));
 
     // 平台原始事件观测：一切未被 SDK 映射为 message/interaction 的推送
     // （入群申请、好友变动、reaction、media_upload_finish、未来新增类型）
