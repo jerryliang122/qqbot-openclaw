@@ -313,6 +313,27 @@ await test('text-grapheme 的 findGraphemeChunkEnd 仍是运行时值', () => {
   );
 });
 
+/**
+ * 同上（属性访问对扫描器不可见）：src/adapter/webhook.ts 是动态
+ * `import('openclaw/plugin-sdk/webhook-request-guards')` 后取
+ * `mod.runDetachedWebhookWork` —— webhook 模式 detached 准入根的承重件
+ * （issue #74），缺了它 op:0 派发会被 GatewayDrainingError 全量拒绝。
+ */
+await test('webhook-request-guards 的 runDetachedWebhookWork 仍是运行时值', () => {
+  const probe = probeRuntime('openclaw/plugin-sdk/webhook-request-guards', ['runDetachedWebhookWork']);
+  assert.equal(
+    probe.error,
+    undefined,
+    `openclaw@${openclawPkg.version} 无法 require webhook-request-guards: ${probe.error}`,
+  );
+  assert.equal(
+    probe.missing.length,
+    0,
+    `openclaw@${openclawPkg.version} 的 webhook-request-guards 缺少运行时值: ${probe.missing.join(', ')}。` +
+      `\n    该原语是 webhook 模式 detached 派发准入的承重件（src/adapter/webhook.ts，issue #74）。`,
+  );
+});
+
 await test('具名子句的值/类型分类正确（inline type 标记不得记为值导出）', () => {
   const cases: Array<{ clause: string; expected: Array<[string, boolean]> }> = [
     // 纯值
