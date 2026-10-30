@@ -217,11 +217,13 @@ function resolveTargetHandler(path: string, accountId: string): WebhookRequestHa
 // ── op:0 的 detached 派发（issue #74：transport=webhook 入站 100% 被拒） ──
 
 /**
- * webhook 派发的 detached 准入根持有上限（ms）。
+ * webhook 派发的 detached 准入根持有上限（ms）——**总预算**：delegate race
+ * 与登记表 settle 共享同一 deadline，不是两段各计一份。
  *
  * detached 根需要覆盖到框架 enqueue；入站链 settle 的最长正常路径是群合批
  * （maxHoldMs 默认 300s 兜底 + 批次 dispatch），360s 留出余量。超限即放弃
- * 持有——未入队的工作将以无根身份继续（群合批冲刷另有 detached 包裹兜底）。
+ * 持有——未入队的工作将以无根身份继续（群合批的批次派发另有 detached
+ * 包裹兜底，见 src/features/group-merge.ts 的 onFlush completion）。
  */
 const WEBHOOK_DISPATCH_HOLD_MS_DEFAULT = 360_000;
 
@@ -288,6 +290,11 @@ export async function dispatchOp0WithDetachedWork(params: {
       const scope = beginWebhookDispatchScope();
       let delegatePromise: Promise<void>;
       let delegateError: unknown = null;
+      // 持有上限是**总预算**：delegate race 与 settle 共享同一 deadline，
+      // 两段各计上限串行跑满会让 detached 根挂到 2 倍时长（restart drain
+      // 也要跟着等 2 倍）
+      const holdBudgetMs = resolveWebhookDispatchHoldMs();
+      const holdDeadline = Date.now() + holdBudgetMs;
       try {
         // 同步调用：SDK 的派发（及登记）发生在这个调用的同步级联里
         delegatePromise = params.delegate();
@@ -300,21 +307,30 @@ export async function dispatchOp0WithDetachedWork(params: {
       }
       // 委托本身也要有界：SDK handler 正常毫秒级返回，但若它挂死，回调会
       // 永远到不了 settle、detached 根无限持有且响应永不写出
-      const raced = await Promise.race([
-        delegatePromise.then(
-          () => 'done' as const,
-          (err) => {
-            // 响应兜底要即时写（不等 settle）——委托失败时平台还在等回包
-            params.onDelegateError();
-            delegateError = err;
-            return 'error' as const;
-          },
-        ),
-        new Promise<'timeout'>((resolve) => {
-          const t = setTimeout(() => resolve('timeout'), resolveWebhookDispatchHoldMs());
-          t.unref?.();
-        }),
-      ]);
+      let delegateTimer: NodeJS.Timeout | undefined;
+      let raced: 'done' | 'error' | 'timeout';
+      try {
+        raced = await Promise.race([
+          delegatePromise.then(
+            () => 'done' as const,
+            (err) => {
+              // 响应兜底要即时写（不等 settle）——委托失败时平台还在等回包
+              params.onDelegateError();
+              delegateError = err;
+              return 'error' as const;
+            },
+          ),
+          new Promise<'timeout'>((resolve) => {
+            // Promise.race 不取消落败方——delegate 先赢时必须 clearTimeout，
+            // 否则每个 op:0 请求遗留一个挂满持有上限的定时器（对齐 tracker
+            // 的 settle 路径）
+            delegateTimer = setTimeout(() => resolve('timeout'), holdBudgetMs);
+            delegateTimer.unref?.();
+          }),
+        ]);
+      } finally {
+        clearTimeout(delegateTimer);
+      }
       if (raced === 'timeout') {
         params.onDelegateError();
         params.log.error('[webhook] dispatch delegation timed out — writing fallback response, detached hold continues to settle');
@@ -323,7 +339,9 @@ export async function dispatchOp0WithDetachedWork(params: {
       // ERR_WRITE_AFTER_END——挂上 catch 防未处理拒绝
       void delegatePromise.catch(() => {});
 
-      const settled = await settleWebhookDispatchScope(scope, resolveWebhookDispatchHoldMs());
+      // settle 只花预算的剩余量（settle 的 timeoutMs=0 是「不限时」语义，
+      // 故下限钳到 1ms——预算耗尽即立刻到点，绝不无限等）
+      const settled = await settleWebhookDispatchScope(scope, Math.max(1, holdDeadline - Date.now()));
       if (
         settled.awaited === 0
         && DISPATCH_PRODUCING_EVENT_TYPES.has(params.eventType)
@@ -405,12 +423,21 @@ async function handleSimple(req: any, res: any, path: string, log: PluginLogger)
     // detached 派发。**不能**顺序试 handler：第一个 await 之后 scope 已收口，
     // 后续账号的派发登记不进 scope、detached 根随 ACK 释放——同路径第 2+ 个
     // 账号的消息会被当 drain 拒掉（多账号同路径仅降级路径受影响）。
+    // 多 target 同签名（两账号配同一 secret）按 ingress 同款语义拒 401
+    // （resolveSingleWebhookTarget 的 ambiguous 分支），两条路径不分叉。
     const entries = sharedTargets.get(path) ?? [];
     const timestamp = String(getHeader(req, 'x-signature-timestamp') ?? '');
     const signature = String(getHeader(req, 'x-signature-ed25519') ?? '');
-    const matched = entries.find(
-      (t) => verifyWebhookSignature({ body: rawBody, timestamp, signature, botSecret: t.clientSecret }),
-    );
+    let matched: (typeof entries)[number] | undefined;
+    for (const t of entries) {
+      if (verifyWebhookSignature({ body: rawBody, timestamp, signature, botSecret: t.clientSecret })) {
+        if (matched) {
+          log.warn?.(`[webhook] simple ${req.method ?? '?'} ${path} -> 401 (ambiguous signature: ${entries.length} targets)`);
+          res.statusCode = 401; res.end(JSON.stringify({ error: 'invalid signature' })); return;
+        }
+        matched = t;
+      }
+    }
     if (!matched) {
       log.warn?.(`[webhook] simple ${req.method ?? '?'} ${path} -> 401 (no target matched signature)`);
       res.statusCode = 401; res.end(JSON.stringify({ error: 'invalid signature' })); return;
