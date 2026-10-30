@@ -10,23 +10,30 @@
  *     判 `current.released === true` → GatewayDrainingError。
  *  2. 修法：op:0 委托放进 openclaw/plugin-sdk/webhook-request-guards 的
  *     runDetachedWebhookWork 回调（detached 根在回调挂起期间保持引用），
- *     回调内等「本次请求派生的在途派发」全部落地（tracker 登记）。
+ *     回调内等「本次委托派生的在途派发」全部落地（tracker scope 登记）。
  *  3. **只包 runDetachedWebhookWork 不等登记表是不够的**：SDK 的后台
  *     promise 不在回调的 AsyncWorkScope 里，回调随 ACK settle 后 detached
  *     根照样释放——「money test」同时锁这两件事。
  *
- * 覆盖：
- *  A. tracker 纯语义：marker 排除旧条目 / 账号隔离 / 超时 / settle 出表；
+ * 覆盖（含 Sourcery 评审 8 条意见的回归面）：
+ *  A. tracker scope 语义：同步级联圈定 / end() 后他人登记不混入（并发
+ *     请求各自持根）/ 超时截断 / 秒完成计入 / 容量上限（settled 与卡死
+ *     unsettled 均 FIFO 有界——评审意见 3、4）；
  *  B. installWebhookDispatchTracking：surface 缺失 WARN；真实 QQBot 实例
  *     （构造无网络副作用）包裹后派发被同步登记、随链 settle；
- *  C. makeTrackedListener：同步登记、完成/出错均出表、错误回传 onError；
- *  D. dispatchOp0WithDetachedWork（注入 fake guards）：委托在 detached 回调
- *     内执行；回调等登记表归零才 settle；guards 缺失直连；tripwire WARN；
+ *  C. createInteractionDispatchListener（网关真实接线，评审意见 8）：
+ *     type-13 观测型互动事件经真实 handleInteraction 驱动——同步登记、
+ *     settle 出表、错误走 onError；
+ *  D. dispatchOp0WithDetachedWork：detached 回调内委托 + 等 scope 归零；
+ *     委托失败兜底写 500（评审意见 2）；tripwire；guards 缺失直连；
+ *     **默认 loader + 真实 runDetachedWebhookWork 的生产路径**（评审意见 7）；
  *  E. 真实 SDK WebhookTransport + 合法 Ed25519 签名的 op:0：ACK 即时、
  *     包裹后的 handleInboundMessage 同步登记、ACK 落地先于派发链完成；
  *  F. money test（子进程加载真实 openclaw dist 的准入状态机）：
  *     fire-and-forget 链在根释放后 enqueue 判 closed=true（复现 bug）；
- *     runDetachedWebhookWork + 回调内 await 工作期间判 closed=false（修法）。
+ *     runDetachedWebhookWork + 回调内 await 工作期间判 closed=false（修法）；
+ *  G. withDetachedWebhookWork（group-merge 冲刷的包裹原语，评审意见 1）：
+ *     包裹 / 直跑降级 / 真实默认 loader。
  *
  * 运行方式: npx tsx tests/webhook-detached-dispatch.test.ts
  */
@@ -34,17 +41,24 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { QQBot } from '@tencent-connect/qqbot-nodejs';
+import { QQBot, type InteractionEvent } from '@tencent-connect/qqbot-nodejs';
 import { WebhookTransport, ed25519Sign } from '@tencent-connect/qqbot-nodejs/protocol';
 import {
+  beginWebhookDispatchScope,
   installWebhookDispatchTracking,
   makeTrackedListener,
-  markWebhookDispatches,
   resetWebhookDispatchTrackerForTest,
-  settleWebhookDispatchesSince,
+  settleWebhookDispatchScope,
   trackWebhookDispatch,
+  webhookDispatchTrackerStatsForTest,
 } from '../src/features/webhook-dispatch-tracker.js';
-import { dispatchOp0WithDetachedWork } from '../src/adapter/webhook.js';
+import {
+  loadDetachedWebhookGuards,
+  withDetachedWebhookWork,
+} from '../src/features/detached-webhook-work.js';
+import { dispatchOp0WithDetachedWork, writeErrorResponse } from '../src/adapter/webhook.js';
+import { createInteractionDispatchListener } from '../src/gateway/qqbot-gateway.js';
+import type { PluginLogger } from '../src/utils/plugin-logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
@@ -85,66 +99,94 @@ function group(title: string) {
 /** 收集 warn/error 的假 logger */
 function fakeLogger() {
   const lines: string[] = [];
-  return {
-    lines,
-    log: {
-      info: () => {},
-      debug: () => {},
-      warn: (m: string) => { lines.push(`WARN: ${m}`); },
-      error: (m: string) => { lines.push(`ERROR: ${m}`); },
-    } as any,
+  const log: PluginLogger = {
+    info: () => {}, debug: () => {},
+    warn: (m: string) => { lines.push(`WARN: ${m}`); },
+    error: (m: string) => { lines.push(`ERROR: ${m}`); },
+    child: () => log,
   };
+  return { lines, log };
 }
 
-group('A. tracker 纯语义');
+/** 手动释放闸 */
+function deferred(): { promise: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const promise = new Promise<void>((r) => { release = r; });
+  return { promise, release };
+}
 
-await test('marker 之后的条目才被等待（旧条目/他账条目不搭车）', async () => {
+group('A. tracker scope 语义');
+
+await test('scope 只圈定同步级联里的登记；end() 后他人的登记不混入（并发隔离）', async () => {
   resetWebhookDispatchTrackerForTest();
-  // marker 之前的旧条目（不应被等待）
-  let releaseOld!: () => void;
-  trackWebhookDispatch('acct-a', new Promise<void>((r) => { releaseOld = r; }));
-  // 他账号条目
-  let releaseB!: () => void;
-  trackWebhookDispatch('acct-b', new Promise<void>((r) => { releaseB = r; }));
+  // scope 外的旧条目（他请求）——不得被等
+  const old = deferred();
+  trackWebhookDispatch('acct-a', old.promise);
 
-  const marker = markWebhookDispatches();
-  let releaseNew!: () => void;
-  trackWebhookDispatch('acct-a', new Promise<void>((r) => { releaseNew = r; }));
+  const scope = beginWebhookDispatchScope();
+  const mine = deferred();
+  trackWebhookDispatch('acct-a', mine.promise); // 同步级联内的登记
+  scope.end();
 
-  const settle = settleWebhookDispatchesSince('acct-a', marker, 5_000);
-  releaseOld();
-  releaseB();
+  // end() 之后他人（并发请求）的登记——不得被等
+  const concurrent = deferred();
+  trackWebhookDispatch('acct-a', concurrent.promise);
+
+  const settle = settleWebhookDispatchScope(scope, 5_000);
+  old.release();
+  concurrent.release();
   await sleep(30);
-  // 旧条目与他账号条目都 settle 了，新条目还挂着 → settle 不得返回
   let returned = false;
   void settle.then(() => { returned = true; });
   await sleep(30);
-  assert.equal(returned, false, '新条目未 settle 前 settleSince 不应返回');
-  releaseNew();
+  assert.equal(returned, false, 'scope 内条目未 settle 前不得返回');
+  mine.release();
   const result = await keepAlive(settle);
-  assert.equal(result.awaited, 1);
+  assert.equal(result.awaited, 1, '只等 scope 圈定的 1 条');
   assert.equal(result.timedOut, false);
 });
 
 await test('超时截断：timedOut=true 且不中断被等的工作', async () => {
   resetWebhookDispatchTrackerForTest();
-  const marker = markWebhookDispatches();
-  let release!: () => void;
-  const work = new Promise<void>((r) => { release = r; });
-  trackWebhookDispatch('acct-a', work);
+  const scope = beginWebhookDispatchScope();
+  const work = deferred();
+  trackWebhookDispatch('acct-a', work.promise);
+  scope.end();
 
-  const result = await keepAlive(settleWebhookDispatchesSince('acct-a', marker, 50));
+  const result = await keepAlive(settleWebhookDispatchScope(scope, 50));
   assert.equal(result.timedOut, true);
   assert.equal(result.awaited, 1);
-  release(); // 工作自身照常完成
+  work.release();
   await sleep(10);
 });
 
-await test('无新条目：awaited=0 立即返回', async () => {
+await test('秒完成的派发也计入（awaited≥1）；空 scope 立即返回 awaited=0', async () => {
   resetWebhookDispatchTrackerForTest();
-  const marker = markWebhookDispatches();
-  const result = await settleWebhookDispatchesSince('acct-a', marker, 5_000);
-  assert.deepEqual(result, { awaited: 0, timedOut: false });
+  const scope = beginWebhookDispatchScope();
+  trackWebhookDispatch('acct-a', Promise.resolve());
+  scope.end();
+  const r1 = await settleWebhookDispatchScope(scope, 1_000);
+  assert.deepEqual(r1, { awaited: 1, timedOut: false });
+
+  const empty = beginWebhookDispatchScope();
+  empty.end();
+  const r2 = await settleWebhookDispatchScope(empty, 1_000);
+  assert.deepEqual(r2, { awaited: 0, timedOut: false });
+});
+
+await test('容量上限：settled 与永不 settle 的条目均 FIFO 有界', async () => {
+  resetWebhookDispatchTrackerForTest();
+  // 70 条已完成 → settled 上限 64
+  for (let i = 0; i < 70; i++) trackWebhookDispatch('acct-a', Promise.resolve());
+  await sleep(10);
+  let stats = webhookDispatchTrackerStatsForTest()['acct-a'];
+  assert.ok(stats.settled <= 64, `settled 条目应有界（实际 ${stats.settled}）`);
+
+  // 70 条永不 settle → unsettled 上限 64（卡死条目不许多到无界）
+  resetWebhookDispatchTrackerForTest();
+  for (let i = 0; i < 70; i++) trackWebhookDispatch('acct-a', new Promise<void>(() => {}));
+  stats = webhookDispatchTrackerStatsForTest()['acct-a'];
+  assert.ok(stats.unsettled <= 64, `未 settle 条目应有界（实际 ${stats.unsettled}）`);
 });
 
 group('B. installWebhookDispatchTracking（真实 QQBot 实例，构造无网络）');
@@ -156,12 +198,11 @@ function newTestBot(): QQBot {
 await test('包裹后：handleInboundMessage 派发被登记且随链 settle', async () => {
   resetWebhookDispatchTrackerForTest();
   const bot: any = newTestBot();
-  let releaseListener!: () => void;
-  const listenerDone = new Promise<void>((r) => { releaseListener = r; });
-  bot.on('message', () => listenerDone);
+  const listenerDone = deferred();
+  bot.on('message', () => listenerDone.promise);
   installWebhookDispatchTracking(bot, 'acct-a', fakeLogger().log);
 
-  const marker = markWebhookDispatches();
+  const scope = beginWebhookDispatchScope();
   const c2cRaw = {
     id: 'msg-1', timestamp: Date.now(),
     author: { user_openid: 'openid-user' },
@@ -169,10 +210,11 @@ await test('包裹后：handleInboundMessage 派发被登记且随链 settle', a
   };
   const dispatched = bot.handleInboundMessage(c2cRaw);
   // 同步级联断言：登记必须发生在派发链的第一个 await 之前——
-  // settleSince 的快照逻辑在同一 tick 同步执行，若包裹只异步登记会漏拍
-  const settleProbe = settleWebhookDispatchesSince('acct-a', marker, 5_000);
+  // settle 的快照逻辑在同一 tick 同步执行，若包裹只异步登记会漏拍
+  const settleProbe = settleWebhookDispatchScope(scope, 5_000);
+  scope.end();
   await sleep(10);
-  releaseListener();
+  listenerDone.release();
   await dispatched;
   const result = await keepAlive(settleProbe);
   assert.equal(result.awaited, 1, '派发链挂起期间登记表应有 1 条在途条目');
@@ -183,9 +225,12 @@ await test('无 reply target 的消息：早退路径也登记并立即 settle',
   resetWebhookDispatchTrackerForTest();
   const bot: any = newTestBot();
   installWebhookDispatchTracking(bot, 'acct-a', fakeLogger().log);
-  const marker = markWebhookDispatches();
-  await bot.handleInboundMessage({ id: 'x', content: 'no-target' });
-  const result = await settleWebhookDispatchesSince('acct-a', marker, 1_000);
+  const scope = beginWebhookDispatchScope();
+  const p = bot.handleInboundMessage({ id: 'x', content: 'no-target' });
+  const settleProbe = settleWebhookDispatchScope(scope, 1_000);
+  scope.end();
+  await p;
+  const result = await keepAlive(settleProbe);
   assert.equal(result.awaited, 1);
   assert.equal(result.timedOut, false);
 });
@@ -197,36 +242,63 @@ await test('surface 缺失：WARN 且不炸', () => {
   assert.ok(logger.lines.some((l) => l.includes('handleInboundMessage surface missing')));
 });
 
-group('C. makeTrackedListener');
+group('C. createInteractionDispatchListener（网关真实接线）');
 
-await test('同步登记；完成出表；错误走 onError 且同样出表', async () => {
+/** type=13（消息反馈）走 handlePlatformInteraction 纯观测分支：不 ack、不进框架 */
+function observationInteractionEvent(): InteractionEvent {
+  return {
+    id: 'itx-1',
+    type: 13,
+    data: { type: 3001 },
+    group_openid: 'group-1',
+  } as unknown as InteractionEvent;
+}
+
+await test('真实 listener：同步登记、settle 出表、错误走 onError', async () => {
   resetWebhookDispatchTrackerForTest();
-  const errors: unknown[] = [];
-  const listener = makeTrackedListener('acct-a', async (x: number) => {
-    await sleep(20);
-    if (x === 0) throw new Error('boom');
-    return x;
-  }, (err) => { errors.push(err); });
+  const logger = fakeLogger();
+  const ackCalls: unknown[][] = [];
+  const listener = createInteractionDispatchListener({
+    account: { accountId: 'acct-a', appId: 'a', clientSecret: 's' } as any,
+    runtime: {} as any,
+    log: logger.log,
+    acknowledgeInteraction: async (id, code, data) => { ackCalls.push([id, code, data]); },
+  });
 
-  const marker = markWebhookDispatches();
-  listener(1);
-  listener(0);
-  // 同步登记：两条在途
-  const settleAll = keepAlive(settleWebhookDispatchesSince('acct-a', marker, 5_000));
-  const result = await settleAll;
-  assert.equal(result.awaited, 2);
+  const scope = beginWebhookDispatchScope();
+  listener({}, observationInteractionEvent());
+  // bot.emit 同步调 listener → 登记必须已发生（同一 tick 快照）
+  const settleProbe = settleWebhookDispatchScope(scope, 5_000);
+  scope.end();
+  const result = await keepAlive(settleProbe);
+  assert.equal(result.awaited, 1, 'listener 调用即应同步登记 1 条在途派发');
   assert.equal(result.timedOut, false);
-  assert.equal(errors.length, 1);
-  assert.ok(errors[0] instanceof Error && errors[0].message === 'boom');
+  assert.equal(ackCalls.length, 0, 'type-13 观测型事件不得 ack');
+
+  // 错误路径：handleInteraction 拒绝 → onError 记日志、条目照常出表。
+  // （handleConfigQuery 等分支内部吞错，故用 data getter 在入口第一行炸）
+  const failing = createInteractionDispatchListener({
+    account: { accountId: 'acct-a', appId: 'a', clientSecret: 's' } as any,
+    runtime: {} as any,
+    log: logger.log,
+    acknowledgeInteraction: async () => {},
+  });
+  const badEvent = {
+    id: 'itx-2',
+    type: 12,
+    get data(): never { throw new Error('bad interaction payload'); },
+  } as unknown as InteractionEvent;
+  const scope2 = beginWebhookDispatchScope();
+  failing({}, badEvent);
+  const settleProbe2 = settleWebhookDispatchScope(scope2, 5_000);
+  scope2.end();
+  const result2 = await keepAlive(settleProbe2);
+  assert.equal(result2.awaited, 1);
+  assert.ok(logger.lines.some((l) => l.includes('Interaction error')), '错误应走 onError 记日志');
 });
 
-group('D. dispatchOp0WithDetachedWork（注入 fake guards）');
+group('D. dispatchOp0WithDetachedWork');
 
-/**
- * fake guards：模拟真实原语「预留根后一个 microtask 再执行回调」，
- * 并把回调 promise 暴露给测试（真实代码里它被 void —— detached 根的
- * 持有时长就体现在这个 promise 上）。
- */
 function fakeGuards() {
   const runs: Array<Promise<unknown>> = [];
   return {
@@ -242,26 +314,24 @@ function fakeGuards() {
   };
 }
 
-await test('detached 回调内委托 + 等登记归零；ACK 先于派发完成', async () => {
+await test('detached 回调内委托 + 等 scope 归零；ACK 先于派发完成', async () => {
   resetWebhookDispatchTrackerForTest();
   const guards = fakeGuards();
   const logger = fakeLogger();
 
   let ackWritten = false;
-  let releaseDispatch!: () => void;
-  const dispatchWork = new Promise<void>((r) => { releaseDispatch = r; });
+  const dispatchWork = deferred();
 
   await dispatchOp0WithDetachedWork({
-    expectAccountId: 'acct-a',
     eventType: 'GROUP_AT_MESSAGE_CREATE',
     log: logger.log,
     guards,
+    onDelegateError: () => {},
     delegate: async () => {
       // 模拟 SDK：同步启动 fire-and-forget 派发链（= 包裹后的 handleInboundMessage 被同步调用）
-      trackWebhookDispatch('acct-a', dispatchWork);
+      trackWebhookDispatch('acct-a', dispatchWork.promise);
       await sleep(1); // ACK 写出
       ackWritten = true;
-      return 'acct-a';
     },
   });
 
@@ -273,25 +343,78 @@ await test('detached 回调内委托 + 等登记归零；ACK 先于派发完成'
   let done = false;
   void detachedRun.then(() => { done = true; }).catch(() => { done = true; });
   await sleep(50);
-  assert.equal(done, false, '登记表未归零前 detached 回调不得 settle（detached 根需继续持有）');
-  releaseDispatch();
+  assert.equal(done, false, 'scope 未归零前 detached 回调不得 settle（detached 根需继续持有）');
+  dispatchWork.release();
   await detachedRun;
   assert.equal(logger.lines.length, 0, '正常路径无 WARN');
 });
 
-await test('秒完成的派发也计入（awaited≥1，tripwire 不误报）', async () => {
+await test('委托异步失败：兜底 500 立即写出（不等 settle）、记 ERROR', async () => {
+  resetWebhookDispatchTrackerForTest();
+  const guards = fakeGuards();
+  const logger = fakeLogger();
+  const stuck = deferred(); // 已启动的派发挂着，验证 500 不等 settle
+  let errors = 0;
+
+  await dispatchOp0WithDetachedWork({
+    eventType: 'C2C_MESSAGE_CREATE',
+    log: logger.log,
+    guards,
+    onDelegateError: () => { errors++; },
+    delegate: async () => {
+      trackWebhookDispatch('acct-a', stuck.promise);
+      await sleep(1);
+      throw new Error('delegate boom');
+    },
+  });
+  await sleep(30);
+  assert.equal(errors, 1, '委托失败应立即兜底（未等 settle）');
+  stuck.release();
+  await guards.runs[0].catch(() => {}); // 回调尾部 rethrow delegateError → run promise 拒绝（预期）
+  assert.ok(logger.lines.some((l) => l.includes('detached dispatch failed')), '应记 ERROR 日志');
+});
+
+await test('委托同步抛错：同样兜底 500', async () => {
+  resetWebhookDispatchTrackerForTest();
+  const guards = fakeGuards();
+  const logger = fakeLogger();
+  let errors = 0;
+  await dispatchOp0WithDetachedWork({
+    eventType: 'C2C_MESSAGE_CREATE',
+    log: logger.log,
+    guards,
+    onDelegateError: () => { errors++; },
+    delegate: () => { throw new Error('sync boom'); },
+  });
+  await guards.runs[0].catch(() => {}); // 同步抛错 → run promise 拒绝（预期）
+  assert.equal(errors, 1);
+  assert.ok(logger.lines.some((l) => l.includes('detached dispatch failed')), '应记 ERROR 日志');
+});
+
+await test('writeErrorResponse：仅在响应未写出时兜底', () => {
+  const written: any = { headersSent: true, writableEnded: true, statusCode: 200, setHeader: () => {}, end: () => { throw new Error('不得重复写'); } };
+  writeErrorResponse(written); // 已写出 → no-op
+
+  const fresh: any = {
+    headersSent: false, writableEnded: false, statusCode: 0,
+    setHeader: () => {}, end: (b: string) => { fresh.body = b; },
+  };
+  writeErrorResponse(fresh);
+  assert.equal(fresh.statusCode, 500);
+  assert.ok(String(fresh.body).includes('internal error'));
+});
+
+await test('秒完成的派发也计入（tripwire 不误报）', async () => {
   resetWebhookDispatchTrackerForTest();
   const guards = fakeGuards();
   const logger = fakeLogger();
   await dispatchOp0WithDetachedWork({
-    expectAccountId: 'acct-a',
     eventType: 'C2C_MESSAGE_CREATE',
     log: logger.log,
     guards,
+    onDelegateError: () => {},
     delegate: async () => {
-      // 派发链在 settleSince 快照前就完成（如被 guard 拦截的消息）
       trackWebhookDispatch('acct-a', Promise.resolve());
-      return 'acct-a';
     },
   });
   await guards.runs[0];
@@ -303,11 +426,11 @@ await test('tripwire：应派生派发的事件零登记 → WARN；非派发事
   const logger = fakeLogger();
   const guardsWarn = fakeGuards();
   await dispatchOp0WithDetachedWork({
-    expectAccountId: 'acct-a',
     eventType: 'GROUP_AT_MESSAGE_CREATE',
     log: logger.log,
     guards: guardsWarn,
-    delegate: async () => 'acct-a',
+    onDelegateError: () => {},
+    delegate: async () => {},
   });
   await guardsWarn.runs[0];
   assert.ok(logger.lines.some((l) => l.includes('no tracked dispatch observed')), '应打出 tripwire WARN');
@@ -315,32 +438,58 @@ await test('tripwire：应派生派发的事件零登记 → WARN；非派发事
   logger.lines.length = 0;
   const guardsQuiet = fakeGuards();
   await dispatchOp0WithDetachedWork({
-    expectAccountId: 'acct-a',
     eventType: 'GROUP_ADD_ROBOT',
     log: logger.log,
     guards: guardsQuiet,
-    delegate: async () => 'acct-a',
+    onDelegateError: () => {},
+    delegate: async () => {},
   });
   await guardsQuiet.runs[0];
   assert.equal(logger.lines.filter((l) => l.includes('no tracked dispatch observed')).length, 0, '非派生事件不应 WARN');
 });
 
-await test('guards 缺失：直连委托（修复前行为），不进 detached 回调', async () => {
+await test('guards 缺失：直连委托（修复前行为），委托失败照常兜底', async () => {
   resetWebhookDispatchTrackerForTest();
   const logger = fakeLogger();
   let delegated = false;
+  let errors = 0;
   await dispatchOp0WithDetachedWork({
-    expectAccountId: 'acct-a',
     eventType: 'C2C_MESSAGE_CREATE',
     log: logger.log,
     guards: null,
+    onDelegateError: () => { errors++; },
     delegate: async () => {
       delegated = true;
-      return 'acct-a';
+      throw new Error('boom');
     },
   });
   assert.ok(delegated);
-  assert.equal(logger.lines.length, 0);
+  assert.equal(errors, 1, '直连路径委托失败也要兜底 500');
+  assert.ok(logger.lines.some((l) => l.includes('dispatch delegation failed')));
+});
+
+await test('生产路径：默认 loader 加载真实 guards，withDetachedWebhookWork 持有到工作完成（评审意见 7）', async () => {
+  resetWebhookDispatchTrackerForTest();
+  const logger = fakeLogger();
+  // ① 默认 loader 能在已安装 openclaw（≥2026.10.5 基线）上加载真实原语
+  const guards = await loadDetachedWebhookGuards(logger.log);
+  assert.ok(guards, '应能加载 webhook-request-guards（基线 2026.10.5 起）');
+  assert.equal(typeof guards!.runDetachedWebhookWork, 'function');
+
+  // ② 默认路径（不注入 guards）+ 真实原语：回调 await 的工作未完成时不得返回
+  //    —— dispatchOp0WithDetachedWork 的返回 promise 是即发的（void detached），
+  //    持有语义在这里直接对 withDetachedWebhookWork 断言（同一默认 loader）
+  const work = deferred();
+  const run = withDetachedWebhookWork(async () => {
+    await work.promise;
+  }, logger.log);
+  await sleep(50);
+  let done = false;
+  void run.then(() => { done = true; });
+  await sleep(50);
+  assert.equal(done, false, '真实 detached 原语必须在回调工作完成前保持挂起（生产路径）');
+  work.release();
+  await run;
 });
 
 group('E. 真实 SDK WebhookTransport（合法 Ed25519 签名 op:0）');
@@ -365,9 +514,8 @@ function signedOp0Request(payload: object) {
 await test('ACK 即时返回；包裹后的派发同步登记；ACK 先于派发链完成', async () => {
   resetWebhookDispatchTrackerForTest();
   const bot: any = newTestBot();
-  let releaseListener!: () => void;
-  const listenerDone = new Promise<void>((r) => { releaseListener = r; });
-  bot.on('message', () => listenerDone);
+  const listenerDone = deferred();
+  bot.on('message', () => listenerDone.promise);
   installWebhookDispatchTracking(bot, ACCOUNT, fakeLogger().log);
 
   const transport = new WebhookTransport(
@@ -382,25 +530,25 @@ await test('ACK 即时返回；包裹后的派发同步登记；ACK 先于派发
     } as any,
   );
 
-  const marker = markWebhookDispatches();
+  const scope = beginWebhookDispatchScope();
   const req = signedOp0Request({
     op: 0,
     t: 'C2C_MESSAGE_CREATE',
     d: { id: 'm1', timestamp: Date.now(), author: { user_openid: 'u1' }, content: 'hi' },
   });
   const resp = await transport.handleRequest(req);
+  // handleRequest 返回即 ACK——派发链此时已同步启动并登记（同一 tick 快照）
+  const settleProbe = settleWebhookDispatchScope(scope, 5_000);
+  scope.end();
 
-  // ACK：op:12
   assert.equal(resp.status, 200);
   assert.deepEqual(JSON.parse(String(resp.body)), { op: 12, d: 0 });
 
-  // 派发链已被同步启动并登记（ACK 已返回而链仍未完成）
-  const settleProbe = settleWebhookDispatchesSince(ACCOUNT, marker, 5_000);
   let settledEarly = false;
   void settleProbe.then((r) => { if (r.awaited > 0 && !r.timedOut) settledEarly = true; });
   await sleep(20);
   assert.equal(settledEarly, false, 'listener 挂起期间登记表不应归零');
-  releaseListener();
+  listenerDone.release();
   const result = await keepAlive(settleProbe);
   assert.equal(result.awaited, 1);
   assert.equal(result.timedOut, false);
@@ -467,7 +615,7 @@ await test('fire-and-forget 链在根释放后判 closed=true（复现 #74）', 
 });
 
 await test('runDetachedWebhookWork 回调内 await 工作期间判 closed=false（修法）', async () => {
-  const result = runSub<{ found: boolean; duringWork: boolean; guards: boolean }>(`
+  const result = runSub<{ found: boolean; duringWork: boolean | null; guards: boolean }>(`
     import fs from 'node:fs';
     import path from 'node:path';
     import { pathToFileURL } from 'node:url';
@@ -489,14 +637,14 @@ await test('runDetachedWebhookWork 回调内 await 工作期间判 closed=false�
     }
     const guards = await import('openclaw/plugin-sdk/webhook-request-guards').then((m) => m, () => null);
     if (!admission || !guards?.runDetachedWebhookWork) {
-      console.log(JSON.stringify({ found: false, guards: !!guards?.runDetachedWebhookWork }));
+      console.log(JSON.stringify({ found: false, guards: !!guards?.runDetachedWebhookWork, duringWork: null }));
       process.exit(0);
     }
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const out = { found: true, duringWork: null, guards: true };
     await admission.withRoot(async () => {
       await guards.runDetachedWebhookWork(async () => {
-        // 模拟「委托 + 等登记表归零」：工作挂起期间 detached 根必须保住准入
+        // 模拟「委托 + 等 scope 归零」：工作挂起期间 detached 根必须保住准入
         await sleep(60);
         out.duringWork = admission.isClosed();
       });
@@ -506,6 +654,31 @@ await test('runDetachedWebhookWork 回调内 await 工作期间判 closed=false�
   assert.ok(result.found, '未能在 openclaw dist 中定位准入状态机模块');
   assert.ok(result.guards, 'openclaw/plugin-sdk/webhook-request-guards 应可加载（基线 2026.10.5 起）');
   assert.equal(result.duringWork, false, 'detached 回调内 await 工作期间准入必须开放（修法依据）');
+});
+
+group('G. withDetachedWebhookWork（群合批冲刷的包裹原语，评审意见 1）');
+
+await test('包裹：run 在 guards 回调内执行并 await 完成', async () => {
+  const logger = fakeLogger();
+  const guards = fakeGuards();
+  let ran = false;
+  await withDetachedWebhookWork(async () => { ran = true; }, logger.log, guards);
+  assert.ok(ran);
+  assert.equal(guards.runs.length, 1);
+});
+
+await test('guards 为 null：直跑降级', async () => {
+  const logger = fakeLogger();
+  let ran = false;
+  await withDetachedWebhookWork(async () => { ran = true; }, logger.log, null);
+  assert.ok(ran);
+});
+
+await test('默认 loader（真实模块）：正常包裹', async () => {
+  const logger = fakeLogger();
+  let ran = false;
+  await withDetachedWebhookWork(async () => { ran = true; }, logger.log);
+  assert.ok(ran);
 });
 
 // ── 汇总 ──

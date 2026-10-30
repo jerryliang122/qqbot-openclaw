@@ -40,6 +40,30 @@ export interface GatewayCallbacks {
   onError?: (error: Error) => void;
 }
 
+/**
+ * interaction 入站监听器（导出供回归测试驱动真实接线，tests/webhook-detached-dispatch.test.ts）。
+ *
+ * 经 makeTrackedListener 包装：interaction 派发同样登记在途（issue #74）——
+ * SDK 的 onInteraction 回调对 bot.emit 是 fire-and-forget，派发 promise 不被
+ * HTTP 请求持有；bot.emit 同步调用 listener，登记因此落在 webhook 委托的
+ * 同步级联里。websocket 模式下无人消费登记表，仅多一次零成本记号。
+ */
+export function createInteractionDispatchListener(params: {
+  account: ResolvedQQBotAccount;
+  runtime: PluginRuntime;
+  log: PluginLogger;
+  acknowledgeInteraction: (id: string, code?: number, data?: Record<string, unknown>) => Promise<void>;
+}): (ctx: unknown, event: InteractionEvent) => void {
+  return makeTrackedListener(
+    params.account.accountId,
+    (_ctx: unknown, event: InteractionEvent) =>
+      handleInteraction(event, params.account, params.runtime, params.log, params.acknowledgeInteraction),
+    (err) => {
+      params.log.error(`Interaction error: ${err}`);
+    },
+  );
+}
+
 export interface SendOptions {
   msgId?: string;
   /** 显式锚点链透传的被动回复序号（quotaReserved 链已在上游发号） */
@@ -170,15 +194,12 @@ export class QQBotGateway {
       }
     });
 
-    this.bot.on('interaction', makeTrackedListener(
-      this.account.accountId,
-      (_ctx: unknown, event: InteractionEvent) =>
-        handleInteraction(event, this.account, this.runtime, this.log, (id, code, data) =>
-          this.bot.acknowledgeInteraction(id, code, data)),
-      (err) => {
-        this.log.error(`Interaction error: ${err}`);
-      },
-    ));
+    this.bot.on('interaction', createInteractionDispatchListener({
+      account: this.account,
+      runtime: this.runtime,
+      log: this.log,
+      acknowledgeInteraction: (id, code, data) => this.bot.acknowledgeInteraction(id, code, data),
+    }));
 
     // 平台原始事件观测：一切未被 SDK 映射为 message/interaction 的推送
     // （入群申请、好友变动、reaction、media_upload_finish、未来新增类型）

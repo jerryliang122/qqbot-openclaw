@@ -18,116 +18,160 @@
  *      每条消息派发在这里同步进入（SDK 的 handleDispatch → onMessage →
  *      handleInboundMessage 在 handler 调用的同步级联里）；
  *   2. interaction listener 在 bot.emit 同步调用 listener 的时刻登记；
- *   3. webhook 侧在委托前后取 marker / settleSince，等「本次请求派生的工作」
- *      全部落地后才放行 detached 回调 —— detached 根因此覆盖到框架 enqueue。
+ *   3. webhook 侧用 **scope** 圈定「本次委托的同步级联里登记的条目」、
+ *      等它们全部落地后才放行 detached 回调 —— detached 根因此覆盖到
+ *      框架 enqueue。
+ *
+ * scope 相关性（而非按 marker/账号过滤）：并发 webhook 请求各自持各自的
+ * detached 根；`beginWebhookDispatchScope()` 后**同步**调用委托——JS 单线程
+ * 下委托的同步级联里发生的登记恰好属于本请求，同步段一结束立刻 `end()`
+ * （await 期间他人登记不得混入）。
  *
  * 语义边界：
- * - marker 是全局单调 id，settle 只等**该账号** id > marker 的条目——并发
- *   webhook 请求各自持各自的 detached 根，互不搭车；
  * - 超时不中断被等的工作（它有自己的生命周期：c2c 防抖窗口、群合批的
  *   maxHoldMs 兜底等），只是不再为它撑住 detached 根——届时未入队的工作
- *   将以无根身份运行（与群合批定时器冲刷的既有形态一致）；
- * - 条目 settle 后留作计数凭证（防秒完成派发被快照漏拍），每账号超
- *   上限 FIFO 淘汰已 settle 条目，稳态内存有界。
+ *   将以无根身份运行（群合批冲刷另有 detached 包裹兜底，见
+ *   src/features/detached-webhook-work.ts）；
+ * - 条目 settle 后留作计数凭证（防秒完成派发被快照漏拍、tripwire 误报），
+ *   每账号已 settle 条目 FIFO 淘汰；
+ * - 永不 settle 的卡死条目由**未 settle 条目上限**兜底（同 FIFO 淘汰最旧），
+ *   防内存无界增长。
  */
 
 interface TrackedWebhookDispatch {
   id: number;
   settled: boolean;
   promise: Promise<unknown>;
+  /** 登记时活跃的 webhook 委托 scope（无则为 null：非 webhook 路径登记） */
+  scope: WebhookDispatchScopeInternal | null;
 }
 
-/**
- * 已 settle 条目的每账号保留上限（FIFO 淘汰最旧）。
- *
- * settle 后**不立即出表**：settleSince 要数「marker 之后登记过的工作」——
- * 秒完成的派发（如被 guard 拦截的消息）同样属于本请求的工作，立即出表
- * 会让快照漏拍、tripwire 误报。等待只针对未 settle 条目，已 settle 的
- * 只作计数凭证，用本上限约束稳态内存。
- */
-const MAX_SETTLED_ENTRIES_PER_ACCOUNT = 64;
+interface WebhookDispatchScopeInternal {
+  entries: TrackedWebhookDispatch[];
+  ended: boolean;
+}
 
-/** 全局单调 id —— 跨账号不重号，marker 无需按账号区分 */
+export interface WebhookDispatchScope {
+  /** 本 scope 圈定的登记条数（含已秒完成的） */
+  readonly count: number;
+  /** 同步段结束必须立刻调用（await 期间他人的登记不得混入） */
+  end(): void;
+  /** @internal 圈定的条目，settleWebhookDispatchScope 消费 */
+  readonly entries: readonly TrackedWebhookDispatch[];
+}
+
+/** 已 settle 条目的每账号保留上限（FIFO 淘汰最旧） */
+const MAX_SETTLED_ENTRIES_PER_ACCOUNT = 64;
+/** 未 settle（卡死）条目的每账号保留上限（FIFO 淘汰最旧——settle 时照常标记） */
+const MAX_UNSETTLED_ENTRIES_PER_ACCOUNT = 64;
+
+/** 全局单调 id——排障日志用 */
 let nextDispatchId = 1;
 const byAccount = new Map<string, Set<TrackedWebhookDispatch>>();
 
-export interface WebhookDispatchMarker {
-  readonly lastId: number;
+/** 当前活跃的委托 scope（同步级联窗口内非 null） */
+let currentDispatchScope: WebhookDispatchScopeInternal | null = null;
+
+/**
+ * 开一个委托 scope：此后**同步**执行委托调用，其同步级联里的登记
+ * （包裹后的 handleInboundMessage / interaction listener）都圈进本 scope；
+ * 同步段结束必须立刻 `end()`。
+ */
+export function beginWebhookDispatchScope(): WebhookDispatchScope {
+  const scope: WebhookDispatchScopeInternal = { entries: [], ended: false };
+  currentDispatchScope = scope;
+  return {
+    get count() {
+      return scope.entries.length;
+    },
+    get entries() {
+      return scope.entries;
+    },
+    end: () => {
+      if (scope.ended) return;
+      scope.ended = true;
+      if (currentDispatchScope === scope) currentDispatchScope = null;
+    },
+  };
 }
 
-function markSettled(accountId: string, entries: Set<TrackedWebhookDispatch>, entry: TrackedWebhookDispatch): void {
-  entry.settled = true;
-  let settledCount = 0;
-  for (const e of entries) if (e.settled) settledCount++;
-  if (settledCount <= MAX_SETTLED_ENTRIES_PER_ACCOUNT) return;
+function pruneEntries(accountId: string, entries: Set<TrackedWebhookDispatch>, settledOnly: boolean, cap: number): void {
+  let count = 0;
+  for (const e of entries) if (e.settled === settledOnly) count++;
+  if (count <= cap) return;
   for (const e of entries) {
-    if (settledCount <= MAX_SETTLED_ENTRIES_PER_ACCOUNT) break;
-    if (e.settled) {
+    if (count <= cap) break;
+    if (e.settled === settledOnly) {
       entries.delete(e);
-      settledCount--;
+      count--;
     }
   }
   if (entries.size === 0) byAccount.delete(accountId);
 }
 
-/** 登记一条在途派发（settle 后留作计数凭证，超上限 FIFO 淘汰） */
+/** 登记一条在途派发（settle 后留作计数凭证；超上限 FIFO 淘汰） */
 export function trackWebhookDispatch(accountId: string, promise: Promise<unknown>): void {
-  const entry: TrackedWebhookDispatch = { id: nextDispatchId++, settled: false, promise };
+  const entry: TrackedWebhookDispatch = { id: nextDispatchId++, settled: false, promise, scope: currentDispatchScope };
   let entries = byAccount.get(accountId);
   if (!entries) {
     entries = new Set();
     byAccount.set(accountId, entries);
   }
   entries.add(entry);
-  const registered = entries;
-  void Promise.resolve(promise).then(
-    () => markSettled(accountId, registered, entry),
-    () => markSettled(accountId, registered, entry),
-  );
-}
+  if (currentDispatchScope && !currentDispatchScope.ended) currentDispatchScope.entries.push(entry);
 
-/** 取当前登记水位（在委托 SDK handler **之前**取，委托中同步登记的条目必然 > 该水位） */
-export function markWebhookDispatches(): WebhookDispatchMarker {
-  return { lastId: nextDispatchId - 1 };
+  void Promise.resolve(promise).then(
+    () => {
+      entry.settled = true;
+      pruneEntries(accountId, entries!, true, MAX_SETTLED_ENTRIES_PER_ACCOUNT);
+    },
+    () => {
+      entry.settled = true;
+      pruneEntries(accountId, entries!, true, MAX_SETTLED_ENTRIES_PER_ACCOUNT);
+    },
+  );
+  // 卡死条目兜底：永不 settle 的登记不许多到无界（淘汰后 settle 照常标记，无副作用）
+  pruneEntries(accountId, entries, false, MAX_UNSETTLED_ENTRIES_PER_ACCOUNT);
 }
 
 export interface SettleWebhookDispatchesResult {
-  /** 本次实际等待的条目数（0 = 委托没有派生任何被跟踪工作） */
+  /** scope 实际圈定的条目数（0 = 委托没有派生任何被跟踪工作） */
   awaited: number;
   /** true = 等待被超时截断（仍有条目未落地） */
   timedOut: boolean;
 }
 
 /**
- * 等「marker 之后登记到该账号」的全部在途派发落地（或超时）。
- *
- * `awaited` 数**登记过**的条目（含已秒完成的——它们也是本请求的工作），
- * 实际只等待其中未 settle 的。只快照调用时刻的集合：等待期间新登记的
- * 条目属于其他请求的 detached 根，不在这里搭车。
+ * 等 scope 圈定的全部派发落地（或超时）。只等**未 settle** 的条目；
+ * `awaited` 数全部圈定条目（含已秒完成的）。
  */
-export async function settleWebhookDispatchesSince(
-  accountId: string,
-  marker: WebhookDispatchMarker,
+export async function settleWebhookDispatchScope(
+  scope: WebhookDispatchScope,
   timeoutMs: number,
 ): Promise<SettleWebhookDispatchesResult> {
-  const registered = [...(byAccount.get(accountId) ?? [])].filter((e) => e.id > marker.lastId);
-  if (registered.length === 0) return { awaited: 0, timedOut: false };
-
-  const unsettled = registered.filter((e) => !e.settled);
-  if (unsettled.length === 0) return { awaited: registered.length, timedOut: false };
+  const entries = scope.entries;
+  if (entries.length === 0) return { awaited: 0, timedOut: false };
+  const unsettled = entries.filter((e) => !e.settled);
+  if (unsettled.length === 0) return { awaited: entries.length, timedOut: false };
 
   const work = Promise.allSettled(unsettled.map((e) => e.promise));
   if (timeoutMs > 0) {
-    const timer = new Promise<'timeout'>((resolve) => {
-      const t = setTimeout(() => resolve('timeout'), timeoutMs);
-      // 生产上不让持有上限的定时器拖住进程退出；测试环境用 keepAlive 保活
-      t.unref?.();
-    });
-    const raced = await Promise.race([work.then(() => 'done' as const), timer]);
-    return { awaited: registered.length, timedOut: raced === 'timeout' };
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const timeout = new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), timeoutMs);
+        // 生产上不让持有上限的定时器拖住进程退出；测试环境用 keepAlive 保活。
+        // race 结束即 clearTimeout（finally），不留悬挂定时器。
+        timer.unref?.();
+      });
+      const raced = await Promise.race([work.then(() => 'done' as const), timeout]);
+      return { awaited: entries.length, timedOut: raced === 'timeout' };
+    } finally {
+      clearTimeout(timer);
+    }
   }
   await work;
-  return { awaited: registered.length, timedOut: false };
+  return { awaited: entries.length, timedOut: false };
 }
 
 /**
@@ -153,11 +197,6 @@ export function makeTrackedListener<A extends unknown[]>(
       })
       .finally(() => releaseTracked());
   };
-}
-
-/** 测试辅助：清空全部登记 */
-export function resetWebhookDispatchTrackerForTest(): void {
-  byAccount.clear();
 }
 
 /**
@@ -189,4 +228,22 @@ export function installWebhookDispatchTracking(
     trackWebhookDispatch(accountId, dispatch);
     return dispatch;
   };
+}
+
+/** 测试辅助：清空全部登记 */
+export function resetWebhookDispatchTrackerForTest(): void {
+  byAccount.clear();
+  currentDispatchScope = null;
+}
+
+/** 测试辅助：每账号登记表规模（settled / unsettled）——容量上限断言用 */
+export function webhookDispatchTrackerStatsForTest(): Record<string, { settled: number; unsettled: number }> {
+  const out: Record<string, { settled: number; unsettled: number }> = {};
+  for (const [accountId, entries] of byAccount) {
+    let settled = 0;
+    let unsettled = 0;
+    for (const e of entries) e.settled ? settled++ : unsettled++;
+    out[accountId] = { settled, unsettled };
+  }
+  return out;
 }
