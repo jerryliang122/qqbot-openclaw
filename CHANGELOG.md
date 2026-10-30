@@ -8,6 +8,25 @@
 
 ---
 
+## [3.1.1] - 2026-10-30
+
+### 修复
+
+- **`transport: "webhook"` 下入站事件 100% 被拒：`GatewayDrainingError`（core 并未 drain）——issue #74**。现场：平台回调地址验证（op:13）通过、签名校验通过、事件正常到达，但派发到 agent 那一步被网关拒绝，用户只收到失败兜底文案；同账号切回 `websocket` 完全正常。自 v3.1.0 起任何版本配 webhook 模式均不可用（issue 报告环境：3.1.0 + openclaw 2026.10.7 + SDK 1.0.5）。
+  - **根因（经已安装 openclaw dist 的准入状态机实证）**：SDK `WebhookTransport.handleRequest` 对 op:0 是「先 ACK、后台 fire-and-forget 派发」（防平台重投超时），插件拿不到那条派发 promise；而 openclaw 对每个 HTTP 请求持一次 root-work 准入（route-auth `runWithGatewayHttpWorkAdmission`），插件路由 handler settle 即释放——后台派发链经 AsyncLocalStorage **继承的是这个已释放的请求根** → 框架 enqueue 处 `isGatewaySubordinateWorkAdmissionClosed()` 判 `current.released === true` → `GatewayDrainingError`（报错文案是四分支兜底句 "temporarily unavailable"；websocket 的准入挂在常驻连接上故无恙；无根上下文反而放行——判定只对「有根且已释放」关闸）。
+  - **修法：op:0 委托放进 `openclaw/plugin-sdk/webhook-request-guards` 的 `runDetachedWebhookWork` 回调（2026.10.5 基线即有），回调内等「本次委托派生的在途派发」全部落地**。在途登记（新增 `src/features/webhook-dispatch-tracker.ts`）：消息路径 = webhook 模式包裹 bot 实例的 `handleInboundMessage`（SDK 派发发生在委托的同步级联里，包裹即同步登记）；interaction 路径 = 网关 interaction listener 同步登记。相关性用 **scope** 圈定（同步级联里的登记恰好属于本请求，并发请求各自持根互不搭车）。ACK 仍即时返回，平台重投超时不受影响。
+  - **只包 `runDetachedWebhookWork` 不够**（issue 建议的「选项 1」形态，实测确认）：detached 根只在回调挂起期间保持引用，SDK 的 fire-and-forget promise 不在回调的 AsyncWorkScope 里（scope 的 pending 集合只收显式注册的 promise）——不等登记表的话根随 ACK 释放、bug 原样复现。
+  - **群合批的批次派发同样包 detached 根**（`src/features/group-merge.ts` 的 onFlush completion——定时器 / busy 归零 / 退出冲刷的唯一咽喉）：busy 归零回调运行在上一轮 dispatch 的延续上下文里，继承的根在 turn 结束时多半已释放，webhook 模式下批次 enqueue 会被拒（尤其 `maxHoldMs` 配大于持有上限时请求根先到期）。
+  - **失败兜底与有界持有**：委托失败（同步抛错 / 异步 reject / 超时）与 `runDetachedWebhookWork` 自身拒绝（全局 drain）都兜底写 500（幂等，防请求悬挂到平台超时）；降级路径（webhook-ingress 不可用时的 `handleSimple`）改为先自行验签再委托（顺序试 handler 会让同路径第 2+ 账号的派发落在 scope 外）。持有上限默认 **360s 且是总预算**（delegate race 与登记表 settle 共享同一 deadline；`QQBOT_WEBHOOK_DISPATCH_HOLD_MS` 可覆盖），两段的 race timer 均在 finally 清理。
+  - **守卫**：新增 `tests/webhook-detached-dispatch.test.ts`（25 例）——含用真实 openclaw dist 准入状态机的 money test（fire-and-forget 链在根释放后判 closed=true 复现病灶、detached 回调内 await 工作期间判 closed=false 锁修法）、真实 SDK WebhookTransport + 合法 Ed25519 签名端到端、网关 interaction 接线、总预算时序；`tests/sdk-surface.test.ts` 补 `runDetachedWebhookWork` 名级运行时断言。经 Sourcery 三轮评审（8 + 7 + 3 条意见全部处置）。
+
+### 已知限制
+
+- **持有上限是有界权衡**：超过 360s 才到 enqueue 的**直发**入站链会在上限处失去准入、退回修复前行为（用户收到可见的失败兜底文案，非静默丢失）。群合批这条唯一合法长路径的批次派发有自己的 detached 根，不受此限。
+- **SDK webhook 模式丢弃 `raw` 事件**：`dispatchEvent` 返回 `action:"raw"` 的事件（入群申请、好友变动等）在 SDK 的 handleDispatch switch 中无处理分支，`bot.on('rawEvent')` 在 webhook 下收不到——SDK 既有局限，与本修复无关。
+
+---
+
 ## [3.1.0] - 2026-10-23
 
 ### 变更
