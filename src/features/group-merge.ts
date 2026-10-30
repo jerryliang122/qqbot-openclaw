@@ -55,6 +55,12 @@ import { resolveGroupConfigFromAccount } from '../config.js';
 import { findPendingMultiQuestionByConversation } from './question-helpers.js';
 import { isGroupBusy, onGroupIdle } from './group-session-busy.js';
 import { withDetachedWebhookWork } from './detached-webhook-work.js';
+
+/** dlog 缺席时 onFlush 冲刷包裹用的静默 logger（guards 不可用的 WARN 才会用到） */
+const SILENT_GROUP_MERGE_LOG: PluginLogger = {
+  info: () => {}, debug: () => {}, warn: () => {}, error: () => {},
+  child: () => SILENT_GROUP_MERGE_LOG,
+};
 import { detectEventMention } from '../utils/mention.js';
 import { resolveWakeDecision } from './room-event.js';
 import { mergeProcessedAttachments } from './inbound-debounce.js';
@@ -350,29 +356,40 @@ function getOrCreateDebouncer(item: GroupMergeItem): Debouncer {
         markAdmitted();
       };
 
-      const completion = (async () => {
-        try {
-          if (kept.length === 1 && dropped === 0) {
-            await dispatchItem(kept[0]!, { onTurnSubmitted: admit });
-            return;
+      const completion = withDetachedWebhookWork(
+        async () => {
+          try {
+            if (kept.length === 1 && dropped === 0) {
+              await dispatchItem(kept[0]!, { onTurnSubmitted: admit });
+              return;
+            }
+            const carrier = kept[kept.length - 1]!;
+            dlog?.info(
+              `[group-merge] merged ${kept.length} group messages group=${groupOpenidOf(carrier)} anchorMsgId=${carrier.msg.messageId}`,
+            );
+            // 批内任一条"在叫 bot" ⇒ 整批按 user_request 投递。
+            // ⚠️ 置位必须在**装配之后**：装配器按各成员自己的 mention 状态渲染
+            // `(@you)`，先置位会把载体（最后一条）虚标成"叫了 bot"（实际叫 bot
+            // 的是批内更早的成员）——对模型是归因误导。装配后再置位，载体
+            // 的正文已定，置位只影响 dispatch 侧的入站分类。
+            const anyWoken = kept.some((i) => isExplicitlyWoken(i));
+            const ctx = buildMergedCarrier(kept, dropped, droppedNote);
+            if (anyWoken) forceUserRequestOnCarrier(carrier);
+            await dispatchItem({ ...carrier, ctx }, { onTurnSubmitted: admit });
+          } finally {
+            admit();
           }
-          const carrier = kept[kept.length - 1]!;
-          dlog?.info(
-            `[group-merge] merged ${kept.length} group messages group=${groupOpenidOf(carrier)} anchorMsgId=${carrier.msg.messageId}`,
-          );
-          // 批内任一条"在叫 bot" ⇒ 整批按 user_request 投递。
-          // ⚠️ 置位必须在**装配之后**：装配器按各成员自己的 mention 状态渲染
-          // `(@you)`，先置位会把载体（最后一条）虚标成"叫了 bot"（实际叫 bot
-          // 的是批内更早的成员）——对模型是归因误导。装配后再置位，载体
-          // 的正文已定，置位只影响 dispatch 侧的入站分类。
-          const anyWoken = kept.some((i) => isExplicitlyWoken(i));
-          const ctx = buildMergedCarrier(kept, dropped, droppedNote);
-          if (anyWoken) forceUserRequestOnCarrier(carrier);
-          await dispatchItem({ ...carrier, ctx }, { onTurnSubmitted: admit });
-        } finally {
-          admit();
-        }
-      })();
+        },
+        // **包在 onFlush 的 completion 这一层**（而非 flushGroupMergeQueue）：
+        // 这是全部冲刷路径的唯一咽喉——maxWait 兜底定时器直接调 onFlush、
+        // busy 归零的显式 flushKey、退出冲刷都经过这里。冲刷运行在「上一轮
+        // dispatch 的延续 / 定时器」上下文里，继承的准入根可能已释放
+        // （webhook 模式下批次 enqueue 会被当 drain 拒掉，issue #74）——
+        // withDetachedWebhookWork 在继承根缺失/已释放时给批次一个全新
+        // 独立根；websocket 模式继承根本就常活，行为等价。真处 drain 时
+        // 新根被拒 = 与不包时的 enqueue 拒绝同结果，无退化。
+        dlog ?? SILENT_GROUP_MERGE_LOG,
+      );
 
       const tracked = completion.catch(() => {});
       activeCompletions.add(tracked);
@@ -418,7 +435,7 @@ function ensureGroupIdleSubscription(
   const entry = debouncers.get(accountId);
   if (!entry || entry.unsubscribes.has(key)) return;
   const unsubscribe = onGroupIdle(accountId, groupOpenid, () => {
-    void flushGroupMergeQueue(accountId, groupOpenid, log).catch((err) => {
+    void flushGroupMergeQueue(accountId, groupOpenid).catch((err) => {
       log?.child('group-merge')?.error(
         `[group-merge] flush on idle failed: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -467,28 +484,13 @@ export async function enqueueGroupInboundMessage(
  * 显式冲刷某群的合批缓冲（turn 结束 → busy 归零 → 调用）。
  *
  * flushKey 走框架的 flushBuffer，**绕过** shouldHoldFlush —— 这正是
- * "攒到 turn 结束一次性发"的放行口。
- *
- * **包 detached 准入根（issue #74）**：busy 归零回调运行在上一轮 dispatch
- * 的延续上下文里，继承的准入根在 turn 结束时多半已释放——webhook 模式下
- * 批次 enqueue 会被当成 drain 拒掉（用户丢消息）。`withDetachedWebhookWork`
- * 在「继承根缺失/已释放」时给冲刷一个全新独立根（websocket 模式下继承根
- * 本就常活，行为等价）。退出路径（flushAllGroupMergeQueues）刻意不包——
- * shutdown 期间新根会被全局 drain 拒绝，不如沿用既有上下文。
+ * "攒到 turn 结束一次性发"的放行口。批次派发本身的 detached 准入包裹
+ * 在 onFlush 的 completion 里（见 getOrCreateDebouncer），这里无需重复包。
  */
-export async function flushGroupMergeQueue(accountId: string, groupOpenid: string, log?: PluginLogger): Promise<void> {
+export async function flushGroupMergeQueue(accountId: string, groupOpenid: string): Promise<void> {
   const entry = debouncers.get(accountId);
   if (!entry) return;
-  // guards 不可用的 WARN 需要一个 logger；调用方没带就用静默壳（该 WARN 只在
-  // openclaw 子路径缺失这一持久异常下打一次，onIdle 调用方已带日志路径）
-  const silentLog: PluginLogger = {
-    info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, child: () => silentLog,
-  };
-  const flushLog: PluginLogger = log?.child('group-merge') ?? silentLog;
-  await withDetachedWebhookWork(
-    () => entry.debouncer.flushKey(`qqbot:${accountId}:group:${groupOpenid}`),
-    flushLog,
-  );
+  await entry.debouncer.flushKey(`qqbot:${accountId}:group:${groupOpenid}`);
 }
 
 /**

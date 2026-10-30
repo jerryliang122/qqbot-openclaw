@@ -298,13 +298,30 @@ export async function dispatchOp0WithDetachedWork(params: {
         // 同步段一结束立刻收口 scope——await 期间他人的登记不得混入
         scope.end();
       }
-      try {
-        await delegatePromise;
-      } catch (err) {
-        // 响应兜底要即时写（不等 settle）——委托失败时平台还在等回包
+      // 委托本身也要有界：SDK handler 正常毫秒级返回，但若它挂死，回调会
+      // 永远到不了 settle、detached 根无限持有且响应永不写出
+      const raced = await Promise.race([
+        delegatePromise.then(
+          () => 'done' as const,
+          (err) => {
+            // 响应兜底要即时写（不等 settle）——委托失败时平台还在等回包
+            params.onDelegateError();
+            delegateError = err;
+            return 'error' as const;
+          },
+        ),
+        new Promise<'timeout'>((resolve) => {
+          const t = setTimeout(() => resolve('timeout'), resolveWebhookDispatchHoldMs());
+          t.unref?.();
+        }),
+      ]);
+      if (raced === 'timeout') {
         params.onDelegateError();
-        delegateError = err;
+        params.log.error('[webhook] dispatch delegation timed out — writing fallback response, detached hold continues to settle');
       }
+      // 委托迟到 settle（超时后）时 res 已被兜底写过、其 res.end 会抛
+      // ERR_WRITE_AFTER_END——挂上 catch 防未处理拒绝
+      void delegatePromise.catch(() => {});
 
       const settled = await settleWebhookDispatchScope(scope, resolveWebhookDispatchHoldMs());
       if (
@@ -322,6 +339,10 @@ export async function dispatchOp0WithDetachedWork(params: {
       if (delegateError) throw delegateError;
     })
     .catch((err) => {
+      // runDetachedWebhookWork 自身拒绝（如全局 drain 下新根被拒——回调
+      // 未执行、无 ACK）也要兜底写响应，否则请求悬挂到平台超时；
+      // writeErrorResponse 有 headersSent 防重复写，回调已写 ACK 时为 no-op
+      params.onDelegateError();
       params.log.error(
         `[webhook] detached dispatch failed: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -380,25 +401,24 @@ async function handleSimple(req: any, res: any, path: string, log: PluginLogger)
       return;
     }
 
-    // op:0（及其他 op）逐 target 试签名；成功者同样走 detached 派发
+    // op:0（及其他 op）→ 自行逐 target 验签（镜像 ingress 路径），命中者进
+    // detached 派发。**不能**顺序试 handler：第一个 await 之后 scope 已收口，
+    // 后续账号的派发登记不进 scope、detached 根随 ACK 释放——同路径第 2+ 个
+    // 账号的消息会被当 drain 拒掉（多账号同路径仅降级路径受影响）。
     const entries = sharedTargets.get(path) ?? [];
+    const timestamp = String(getHeader(req, 'x-signature-timestamp') ?? '');
+    const signature = String(getHeader(req, 'x-signature-ed25519') ?? '');
+    const matched = entries.find(
+      (t) => verifyWebhookSignature({ body: rawBody, timestamp, signature, botSecret: t.clientSecret }),
+    );
+    if (!matched) {
+      log.warn?.(`[webhook] simple ${req.method ?? '?'} ${path} -> 401 (no target matched signature)`);
+      res.statusCode = 401; res.end(JSON.stringify({ error: 'invalid signature' })); return;
+    }
     await dispatchOp0WithDetachedWork({
       eventType: typeof payload?.t === 'string' ? payload.t : '',
       log,
-      delegate: async () => {
-        for (const entry of entries) {
-          const resp = await entry.handler({ body: rawBody, headers: mapHeaders(req) });
-          if (resp.status < 400) {
-            log.debug?.(`[webhook] simple ${req.method ?? '?'} ${path} -> ${resp.status} (account=${entry.accountId})`);
-            res.statusCode = resp.status;
-            if (resp.headers) for (const [k, v] of Object.entries(resp.headers)) res.setHeader(k, v as string);
-            res.end(resp.body);
-            return;
-          }
-        }
-        log.warn?.(`[webhook] simple ${req.method ?? '?'} ${path} -> 401 (no target matched signature)`);
-        res.statusCode = 401; res.end(JSON.stringify({ error: 'invalid signature' }));
-      },
+      delegate: () => delegateToHandler(matched.handler, req, res, rawBody),
       onDelegateError: () => writeErrorResponse(res),
     });
   } catch (err) {
