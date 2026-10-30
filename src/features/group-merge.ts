@@ -54,6 +54,7 @@ import { dispatchToOpenClaw } from '../dispatch/index.js';
 import { resolveGroupConfigFromAccount } from '../config.js';
 import { findPendingMultiQuestionByConversation } from './question-helpers.js';
 import { isGroupBusy, onGroupIdle } from './group-session-busy.js';
+import { withDetachedWebhookWork } from './detached-webhook-work.js';
 import { detectEventMention } from '../utils/mention.js';
 import { resolveWakeDecision } from './room-event.js';
 import { mergeProcessedAttachments } from './inbound-debounce.js';
@@ -417,7 +418,7 @@ function ensureGroupIdleSubscription(
   const entry = debouncers.get(accountId);
   if (!entry || entry.unsubscribes.has(key)) return;
   const unsubscribe = onGroupIdle(accountId, groupOpenid, () => {
-    void flushGroupMergeQueue(accountId, groupOpenid).catch((err) => {
+    void flushGroupMergeQueue(accountId, groupOpenid, log).catch((err) => {
       log?.child('group-merge')?.error(
         `[group-merge] flush on idle failed: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -467,11 +468,27 @@ export async function enqueueGroupInboundMessage(
  *
  * flushKey 走框架的 flushBuffer，**绕过** shouldHoldFlush —— 这正是
  * "攒到 turn 结束一次性发"的放行口。
+ *
+ * **包 detached 准入根（issue #74）**：busy 归零回调运行在上一轮 dispatch
+ * 的延续上下文里，继承的准入根在 turn 结束时多半已释放——webhook 模式下
+ * 批次 enqueue 会被当成 drain 拒掉（用户丢消息）。`withDetachedWebhookWork`
+ * 在「继承根缺失/已释放」时给冲刷一个全新独立根（websocket 模式下继承根
+ * 本就常活，行为等价）。退出路径（flushAllGroupMergeQueues）刻意不包——
+ * shutdown 期间新根会被全局 drain 拒绝，不如沿用既有上下文。
  */
-export async function flushGroupMergeQueue(accountId: string, groupOpenid: string): Promise<void> {
+export async function flushGroupMergeQueue(accountId: string, groupOpenid: string, log?: PluginLogger): Promise<void> {
   const entry = debouncers.get(accountId);
   if (!entry) return;
-  await entry.debouncer.flushKey(`qqbot:${accountId}:group:${groupOpenid}`);
+  // guards 不可用的 WARN 需要一个 logger；调用方没带就用静默壳（该 WARN 只在
+  // openclaw 子路径缺失这一持久异常下打一次，onIdle 调用方已带日志路径）
+  const silentLog: PluginLogger = {
+    info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, child: () => silentLog,
+  };
+  const flushLog: PluginLogger = log?.child('group-merge') ?? silentLog;
+  await withDetachedWebhookWork(
+    () => entry.debouncer.flushKey(`qqbot:${accountId}:group:${groupOpenid}`),
+    flushLog,
+  );
 }
 
 /**

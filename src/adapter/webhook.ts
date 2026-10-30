@@ -11,10 +11,13 @@ import type { ResolvedQQBotAccount } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
 import type { WebhookServerAdapter, WebhookRequestHandler } from '@tencent-connect/qqbot-nodejs';
 import { verifyWebhookSignature, GatewayEvent } from '@tencent-connect/qqbot-nodejs/protocol';
-import type { runDetachedWebhookWork } from 'openclaw/plugin-sdk/webhook-request-guards';
 import {
-  markWebhookDispatches,
-  settleWebhookDispatchesSince,
+  loadDetachedWebhookGuards,
+  type RunDetachedWebhookWork,
+} from '../features/detached-webhook-work.js';
+import {
+  beginWebhookDispatchScope,
+  settleWebhookDispatchScope,
 } from '../features/webhook-dispatch-tracker.js';
 
 // ── 模块级共享状态 ──
@@ -189,13 +192,10 @@ function createSharedHandler(path: string, log: PluginLogger) {
           // ingress 管线对 handle 返回后不写默认响应，in-flight 槽按
           // request close 释放，均不受 ACK 晚几个 microtask 影响。
           await dispatchOp0WithDetachedWork({
-            expectAccountId: matched.accountId,
             eventType: typeof payload?.t === 'string' ? payload.t : '',
             log,
-            delegate: async () => {
-              await delegateToHandler(h, req, res, rawBody);
-              return matched.accountId;
-            },
+            delegate: () => delegateToHandler(h, req, res, rawBody),
+            onDelegateError: () => writeErrorResponse(res),
           });
         },
       });
@@ -221,7 +221,7 @@ function resolveTargetHandler(path: string, accountId: string): WebhookRequestHa
  *
  * detached 根需要覆盖到框架 enqueue；入站链 settle 的最长正常路径是群合批
  * （maxHoldMs 默认 300s 兜底 + 批次 dispatch），360s 留出余量。超限即放弃
- * 持有——未入队的工作将以无根身份继续（与群合批定时器冲刷同形态）。
+ * 持有——未入队的工作将以无根身份继续（群合批冲刷另有 detached 包裹兜底）。
  */
 const WEBHOOK_DISPATCH_HOLD_MS_DEFAULT = 360_000;
 
@@ -240,83 +240,86 @@ const DISPATCH_PRODUCING_EVENT_TYPES = new Set<string>([
   GatewayEvent.INTERACTION_CREATE,
 ]);
 
-type RunDetachedWebhookWork = typeof runDetachedWebhookWork;
-
-let detachedGuards: { runDetachedWebhookWork: RunDetachedWebhookWork } | null | undefined;
-
-/**
- * 加载 openclaw/plugin-sdk/webhook-request-guards（缓存；失败一次性 WARN）。
- *
- * 基线 2026.10.5 起该子路径即存在；缺失视为运行时异常，降级为直接委托
- * （= 修复前行为：ACK 正常、派发被 GatewayDrainingError 拒）。
- */
-async function loadDetachedGuards(log: PluginLogger): Promise<{ runDetachedWebhookWork: RunDetachedWebhookWork } | null> {
-  if (detachedGuards !== undefined) return detachedGuards;
-  const mod = await import('openclaw/plugin-sdk/webhook-request-guards').catch((err) => {
-    log.warn?.(
-      `[webhook] webhook-request-guards unavailable (${err instanceof Error ? err.message : String(err)}) `
-      + '— falling back to direct delegation; detached dispatch will be refused by admission (issue #74)',
-    );
-    return null;
-  });
-  detachedGuards = mod?.runDetachedWebhookWork ? (mod as { runDetachedWebhookWork: RunDetachedWebhookWork }) : null;
-  return detachedGuards;
-}
-
 /**
  * op:0 委托入口：SDK handler 会立刻 ACK 并把派发 fire-and-forget 到后台，
  * 那条派发链继承的请求根在响应结束后即释放 → 框架 enqueue 被当成 drain 拒掉。
  *
  * 这里把委托放进 `runDetachedWebhookWork` 的回调（detached 根在回调挂起期间
- * 保持引用），回调内再等「本次请求派生的在途派发」全部落地
+ * 保持引用），回调内再等「本次委托派生的在途派发」全部落地
  * （QQBotGateway 对 handleInboundMessage / interaction listener 的在途登记，
  * 见 src/features/webhook-dispatch-tracker.ts）——ACK 仍由 SDK handler 即时
  * 返回，平台侧重投超时不受影响。
+ *
+ * 相关性用 **scope** 圈定：`beginWebhookDispatchScope()` 后同步调用委托，
+ * 委托同步级联里的登记恰好属于本请求（JS 单线程）；同步段结束立刻 `end()`，
+ * 并发请求的登记不混入、本根不为无关工作多等一毫秒。
  *
  * 注意：**不能**只把 delegateToHandler 包进 runDetachedWebhookWork 就完事——
  * SDK 的后台派发 promise 不在回调的 AsyncWorkScope 里，回调随 ACK settle 后
  * detached 根照样释放（work scope 的 pending 集合只收显式注册的 promise）。
  */
 export async function dispatchOp0WithDetachedWork(params: {
-  /** 签名匹配路径已知账号；handleSimple 降级路径传 null、由 delegate 回报 */
-  expectAccountId: string | null;
   eventType: string;
   log: PluginLogger;
-  /** 执行 SDK handler 委托（写 ACK 到 res）；返回实际派发账号，null=无可用 target */
-  delegate: () => Promise<string | null>;
-  /** 测试注入；缺省用 loadDetachedGuards（真实 openclaw 子路径） */
+  /** 执行 SDK handler 委托（写 ACK/错误响应到 res） */
+  delegate: () => Promise<void>;
+  /** 委托失败且响应未写出时兜底写 500（防请求悬挂到平台超时） */
+  onDelegateError: () => void;
+  /** 测试注入；缺省用 loadDetachedWebhookGuards（真实 openclaw 子路径） */
   guards?: { runDetachedWebhookWork: RunDetachedWebhookWork } | null;
 }): Promise<void> {
-  const guards = params.guards !== undefined ? params.guards : await loadDetachedGuards(params.log);
+  const guards = params.guards !== undefined
+    ? params.guards
+    : await loadDetachedWebhookGuards(params.log);
   if (!guards) {
-    await params.delegate();
+    try {
+      await params.delegate();
+    } catch (err) {
+      params.onDelegateError();
+      params.log.error(
+        `[webhook] dispatch delegation failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     return;
   }
 
-  const marker = markWebhookDispatches();
   void guards
     .runDetachedWebhookWork(async () => {
-      let dispatchedAccount: string | null = null;
+      const scope = beginWebhookDispatchScope();
+      let delegatePromise: Promise<void>;
+      let delegateError: unknown = null;
       try {
-        dispatchedAccount = await params.delegate();
+        // 同步调用：SDK 的派发（及登记）发生在这个调用的同步级联里
+        delegatePromise = params.delegate();
+      } catch (err) {
+        params.onDelegateError();
+        throw err;
       } finally {
-        const accountId = dispatchedAccount ?? params.expectAccountId;
-        const settled = accountId
-          ? await settleWebhookDispatchesSince(accountId, marker, resolveWebhookDispatchHoldMs())
-          : { awaited: 0, timedOut: false };
-        if (
-          settled.awaited === 0
-          && DISPATCH_PRODUCING_EVENT_TYPES.has(params.eventType)
-        ) {
-          // tripwire：本应派生派发的事件没有观测到任何在途登记——
-          // 多半是 SDK 停止经 bot 实例派发（surface 漂移），detached 根已不再
-          // 覆盖派发，issue #74 的症状会复现。这条 WARN 是唯一的信号。
-          params.log.warn?.(
-            `[webhook] op:0 ${params.eventType} delegated but no tracked dispatch observed `
-            + '— SDK dispatch surface drift? (issue #74)',
-          );
-        }
+        // 同步段一结束立刻收口 scope——await 期间他人的登记不得混入
+        scope.end();
       }
+      try {
+        await delegatePromise;
+      } catch (err) {
+        // 响应兜底要即时写（不等 settle）——委托失败时平台还在等回包
+        params.onDelegateError();
+        delegateError = err;
+      }
+
+      const settled = await settleWebhookDispatchScope(scope, resolveWebhookDispatchHoldMs());
+      if (
+        settled.awaited === 0
+        && DISPATCH_PRODUCING_EVENT_TYPES.has(params.eventType)
+      ) {
+        // tripwire：本应派生派发的事件没有观测到任何在途登记——
+        // 多半是 SDK 停止经 bot 实例派发（surface 漂移），detached 根已不再
+        // 覆盖派发，issue #74 的症状会复现。这条 WARN 是唯一的信号。
+        params.log.warn?.(
+          `[webhook] op:0 ${params.eventType} delegated but no tracked dispatch observed `
+          + '— SDK dispatch surface drift? (issue #74)',
+        );
+      }
+      if (delegateError) throw delegateError;
     })
     .catch((err) => {
       params.log.error(
@@ -336,6 +339,14 @@ async function delegateToHandler(handler: WebhookRequestHandler, req: any, res: 
     for (const [k, v] of Object.entries(resp.headers)) res.setHeader(k, v as string);
   }
   res.end(resp.body);
+}
+
+/** 委托失败且响应未写出时的兜底 500——否则请求悬挂到平台超时（响应写出权在 detached 回调手里） */
+export function writeErrorResponse(res: any): void {
+  if (res.headersSent || res.writableEnded) return;
+  res.statusCode = 500;
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify({ error: 'internal error' }));
 }
 
 async function handleSimple(req: any, res: any, path: string, log: PluginLogger) {
@@ -372,7 +383,6 @@ async function handleSimple(req: any, res: any, path: string, log: PluginLogger)
     // op:0（及其他 op）逐 target 试签名；成功者同样走 detached 派发
     const entries = sharedTargets.get(path) ?? [];
     await dispatchOp0WithDetachedWork({
-      expectAccountId: null,
       eventType: typeof payload?.t === 'string' ? payload.t : '',
       log,
       delegate: async () => {
@@ -383,13 +393,13 @@ async function handleSimple(req: any, res: any, path: string, log: PluginLogger)
             res.statusCode = resp.status;
             if (resp.headers) for (const [k, v] of Object.entries(resp.headers)) res.setHeader(k, v as string);
             res.end(resp.body);
-            return entry.accountId;
+            return;
           }
         }
         log.warn?.(`[webhook] simple ${req.method ?? '?'} ${path} -> 401 (no target matched signature)`);
         res.statusCode = 401; res.end(JSON.stringify({ error: 'invalid signature' }));
-        return null;
       },
+      onDelegateError: () => writeErrorResponse(res),
     });
   } catch (err) {
     log.error(`Webhook simple handler error: ${(err as Error).message}`);
