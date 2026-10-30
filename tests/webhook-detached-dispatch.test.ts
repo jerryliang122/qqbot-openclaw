@@ -133,17 +133,15 @@ await test('scope 只圈定同步级联里的登记；end() 后他人的登记�
   trackWebhookDispatch('acct-a', concurrent.promise);
 
   const settle = settleWebhookDispatchScope(scope, 5_000);
-  old.release();
-  concurrent.release();
-  await sleep(30);
-  let returned = false;
-  void settle.then(() => { returned = true; });
-  await sleep(30);
-  assert.equal(returned, false, 'scope 内条目未 settle 前不得返回');
+  // 圈内的先放行：若实现错误地等账号级全局工作（old/concurrent 仍挂起），
+  // settle 不会返回——outsiders 必须保持 pending 直到断言完成
   mine.release();
   const result = await keepAlive(settle);
   assert.equal(result.awaited, 1, '只等 scope 圈定的 1 条');
   assert.equal(result.timedOut, false);
+  old.release();
+  concurrent.release();
+  await sleep(10);
 });
 
 await test('超时截断：timedOut=true 且不中断被等的工作', async () => {
@@ -378,16 +376,18 @@ await test('委托同步抛错：同样兜底 500', async () => {
   resetWebhookDispatchTrackerForTest();
   const guards = fakeGuards();
   const logger = fakeLogger();
+  // 镜像 writeErrorResponse 的幂等语义：内层 catch 与外层 catch 都可能调
+  let written = false;
   let errors = 0;
   await dispatchOp0WithDetachedWork({
     eventType: 'C2C_MESSAGE_CREATE',
     log: logger.log,
     guards,
-    onDelegateError: () => { errors++; },
+    onDelegateError: () => { if (!written) { written = true; errors++; } },
     delegate: () => { throw new Error('sync boom'); },
   });
   await guards.runs[0].catch(() => {}); // 同步抛错 → run promise 拒绝（预期）
-  assert.equal(errors, 1);
+  assert.equal(errors, 1, '兜底响应恰好写出一次（幂等）');
   assert.ok(logger.lines.some((l) => l.includes('detached dispatch failed')), '应记 ERROR 日志');
 });
 
@@ -466,6 +466,66 @@ await test('guards 缺失：直连委托（修复前行为），委托失败照�
   assert.ok(delegated);
   assert.equal(errors, 1, '直连路径委托失败也要兜底 500');
   assert.ok(logger.lines.some((l) => l.includes('dispatch delegation failed')));
+});
+
+await test('runDetachedWebhookWork 自身拒绝（回调未执行、无 ACK）：外层 catch 兜底 500（评审二轮意见 2）', async () => {
+  resetWebhookDispatchTrackerForTest();
+  const logger = fakeLogger();
+  const rejectingGuards = {
+    // 模拟全局 drain：新根被拒、回调根本不执行
+    runDetachedWebhookWork: async (_run: () => Promise<unknown>) => {
+      throw new Error('GatewayDrainingError');
+    },
+  };
+  let delegated = false;
+  let errors = 0;
+  await dispatchOp0WithDetachedWork({
+    eventType: 'C2C_MESSAGE_CREATE',
+    log: logger.log,
+    guards: rejectingGuards as any,
+    onDelegateError: () => { errors++; },
+    delegate: async () => { delegated = true; },
+  });
+  await sleep(20);
+  assert.equal(delegated, false, '回调不应执行');
+  assert.equal(errors, 1, '外层 catch 必须兜底写响应（否则请求悬挂）');
+  assert.ok(logger.lines.some((l) => l.includes('detached dispatch failed')));
+});
+
+await test('delegate 挂死：超时兜底 500、settle 照常有界、根不无限持有（评审二轮意见 3）', async () => {
+  resetWebhookDispatchTrackerForTest();
+  const logger = fakeLogger();
+  const guards = fakeGuards();
+  const stuckDelegate = deferred();
+  const stuckDispatch = deferred();
+  let errors = 0;
+
+  // 持有上限经 env 覆盖成 80ms（生产 360s；resolveWebhookDispatchHoldMs 调用时读取）
+  const prevHold = process.env.QQBOT_WEBHOOK_DISPATCH_HOLD_MS;
+  process.env.QQBOT_WEBHOOK_DISPATCH_HOLD_MS = '80';
+  try {
+    await dispatchOp0WithDetachedWork({
+      eventType: 'C2C_MESSAGE_CREATE',
+      log: logger.log,
+      guards,
+      onDelegateError: () => { errors++; },
+      delegate: () => {
+        // 同步登记已发生的派发（挂在 scope 里），delegate 本身永不返回
+        trackWebhookDispatch('acct-a', stuckDispatch.promise);
+        return stuckDelegate.promise;
+      },
+    });
+    await sleep(200);
+    assert.equal(errors, 1, 'delegate 超时必须兜底写 500');
+    assert.ok(logger.lines.some((l) => l.includes('timed out')), '应记超时 ERROR');
+    // settle 也受同一上限约束 → detached 回调有界 settle（不无限持有根）
+    await keepAlive(guards.runs[0].catch(() => {}));
+  } finally {
+    if (prevHold === undefined) delete process.env.QQBOT_WEBHOOK_DISPATCH_HOLD_MS;
+    else process.env.QQBOT_WEBHOOK_DISPATCH_HOLD_MS = prevHold;
+    stuckDelegate.release();
+    stuckDispatch.release();
+  }
 });
 
 await test('生产路径：默认 loader 加载真实 guards，withDetachedWebhookWork 持有到工作完成（评审意见 7）', async () => {
