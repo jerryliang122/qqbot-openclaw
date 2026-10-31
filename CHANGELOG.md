@@ -8,6 +8,14 @@
 
 ---
 
+## [Unreleased]
+
+### 修复
+
+- **语音平台转写在提交文本里逐字重复（room transcript 可见两份相同转写）**。现场：room_event 群里一条语音消息的 ambient transcript 形如 `- Voice: <wav URL>` / `- ASR: <平台转写全文>` 之后又跟一行 `[昵称 (openid)] [Voice message] <同一份平台转写全文>`——同一字符串被印两遍。根因：body 是「Layer 4 元数据块 + Layer 1/3 用户消息」两层拼接（`src/dispatch/body-assembler.ts` 的 `buildDynamicCtx` + `buildUserContent`），框架 STT 未配置时语音走平台转写分支（`text = asr_refer_text`），而 `- ASR:` 元数据行的渲染条件恰好是 `source === 'asr'`——**只在正文已是同一份文本时才渲染**，恒为纯重复（2026-10-04「严格信框架」重构收窄该行后的残留，旧测试把冗余锁成了预期）。修复：**删除 `- ASR:` 渲染**，且 `- Voice:` 元数据行只列**非平台转写来源**的 `localPath`/`remoteUrl`——纯平台转写（正文已承载全文、无本地文件、URL 对 agent 无取用价值）时语音元数据整体静默，room 行收敛为干净的 `[昵称 (openid)] [Voice message] <全文>`；stt 路径的本地 wav 引用、fallback 无文本时的 URL 内容指针照旧保留。行为锁定翻转：`tests/body-assembler.test.ts` / `tests/voice-transcript.test.ts`。
+
+---
+
 ## [3.1.1] - 2026-10-30
 
 ### 修复

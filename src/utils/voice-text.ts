@@ -13,7 +13,7 @@ export type TranscriptSource = 'stt' | 'asr' | 'fallback';
  * 设计原则：行存自洽 — 单条语音的转录文本、来源、媒体引用全部聚合在
  * 一个对象中，避免与 `ProcessedAttachments` 上的多个平行数组按下标对齐。
  * 渲染层（如 `buildDynamicCtx`）通过 `transcripts.map(...)` 投影出
- * `paths` / `urls` / `asrTexts` 列表。
+ * `paths` / `urls` 列表（仅非平台转写来源）。
  */
 export interface VoiceTranscript {
   /** 转录文本（STT/ASR/fallback 三选一的最终结果） */
