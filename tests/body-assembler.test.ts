@@ -102,8 +102,8 @@ interface DynCtxCase {
 
 const dynCtxCases: DynCtxCase[] = [
   {
-    // 严格信框架（2026-10-04）：stt transcript 不再携带 asrReferText，
-    // - ASR 行只在平台转写即来源（source==='asr'）时渲染
+    // 严格信框架（2026-10-04）：stt transcript 不再携带 asrReferText；
+    // - ASR 行已删除（平台转写来源下与正文逐字重复），语音元数据只保留 - Voice
     name: 'STT 成功（严格信框架）：- Voice 用 localPath，无 - ASR 行',
     processed: makeProcessed({
       transcripts: [
@@ -121,7 +121,9 @@ const dynCtxCases: DynCtxCase[] = [
     expectedNotContains: ['- ASR'],
   },
   {
-    name: 'STT 未配置仅有 ASR：- Voice 仅 remoteUrl，- ASR 等于 text',
+    // 平台转写来源：正文（[Voice message] 全文）已完整承载内容、无本地文件，
+    // URL 对 agent 无取用价值——语音元数据整体静默，不再与正文重复
+    name: '平台转写（source asr）：语音元数据整体静默，正文承载全文',
     processed: makeProcessed({
       transcripts: [
         {
@@ -131,11 +133,27 @@ const dynCtxCases: DynCtxCase[] = [
           asrReferText: '语音里的话',
         },
       ],
+      // 与真实链路一致：voiceText 由 formatVoiceText(transcripts) 生成
+      voiceText: '[Voice message] 语音里的话',
     }),
-    expectedContains: [
-      '- Voice: https://x/b.silk',
-      '- ASR: 语音里的话',
-    ],
+    expectedContains: ['[Voice message] 语音里的话'],
+    expectedNotContains: ['- Voice', '- ASR'],
+  },
+  {
+    name: '平台转写与 STT 混合：- Voice 只列非 asr 来源的引用',
+    processed: makeProcessed({
+      transcripts: [
+        {
+          text: '平台转的那句',
+          source: 'asr',
+          remoteUrl: 'https://x/b.silk',
+          asrReferText: '平台转的那句',
+        },
+        { text: 'stt 的那句', source: 'stt', localPath: '/tmp/a.wav', remoteUrl: 'https://x/a.silk' },
+      ],
+    }),
+    expectedContains: ['- Voice: /tmp/a.wav, https://x/a.silk'],
+    expectedNotContains: ['- ASR', 'https://x/b.silk'],
   },
   {
     name: '多条语音：paths/urls 跨条聚合 + 去重',

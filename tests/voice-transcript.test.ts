@@ -13,7 +13,7 @@
  *
  * - isFrameworkSttConfigured / hasLegacySttConfig 判定
  * - processAttachments 集成链路：平台转写直接采用 / 遗留键不影响 / 下载失败占位
- * - body-assembler 的 - ASR: 行渲染
+ * - body-assembler 的语音元数据行渲染（平台转写来源整体静默，正文承载全文）
  *
  * 运行方式:  npx tsx tests/voice-transcript.test.ts
  */
@@ -229,9 +229,9 @@ await test('框架 STT 已配置 + 下载失败（非 https 被跳过）→ 严�
   assert.equal(t.remoteUrl, 'http://qqbot.ugcimg.cn/uservoice/demo.silk');
 });
 
-// ── body-assembler：- ASR: 行渲染 ─────────────────────────
+// ── body-assembler：语音元数据行渲染 ───────────────────────
 
-console.log('\n=== body-assembler - ASR: 行 ===');
+console.log('\n=== body-assembler 语音元数据行 ===');
 
 function buildAgentBody(transcripts: VoiceTranscript[]): string {
   const ctx = {
@@ -268,11 +268,13 @@ await test('自有 STT 成功（不携带 asrReferText）→ 无 - ASR: 行（�
   assert.ok(!body.includes('- ASR:'), `不应包含 - ASR: 行，实际: ${body}`);
 });
 
-await test('平台转写直接采用（source asr）→ - ASR: 行携带平台文本', () => {
+await test('平台转写直接采用（source asr）→ 无 - ASR:/- Voice: 行，正文承载全文（不重复）', () => {
   const body = buildAgentBody([
     { text: '平台转写文本', source: 'asr', asrReferText: '平台转写文本', remoteUrl: 'https://x/v.wav' },
   ]);
-  assert.ok(body.includes('- ASR: 平台转写文本'));
+  assert.ok(body.includes('[Voice message] 平台转写文本'), `正文应含转写全文，实际: ${body}`);
+  assert.ok(!body.includes('- ASR:'), `不应包含 - ASR: 行，实际: ${body}`);
+  assert.ok(!body.includes('- Voice:'), `不应包含 - Voice: 行（平台转写无取用价值），实际: ${body}`);
 });
 
 await test('STT 失败占位（fallback、无 asrReferText）→ 占位文本且无 - ASR: 行', () => {

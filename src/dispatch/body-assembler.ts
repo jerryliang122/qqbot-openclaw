@@ -276,7 +276,7 @@ function buildUserMessage(input: {
  * （coalesce.enabled → dispatch 侧 queueModeOverride collect/followup）。
  */
 
-/** Layer 4：- Images / - Voice / - ASR 元数据块 + msg_elements 引用上下文 */
+/** Layer 4：- Images / - Voice 元数据块 + msg_elements 引用上下文 */
 function buildDynamicCtx(
   processed: ProcessedAttachments | undefined,
   msg: QQBotInboundMessage,
@@ -289,26 +289,17 @@ function buildDynamicCtx(
     lines.push(`- Images: ${processed.imageUrls.join(', ')}`);
   }
 
-  // Voice：从 transcripts 行存投影出 paths + urls，去重后拼接
-  const transcripts = processed?.transcripts ?? [];
+  // Voice：从非平台转写（source!=='asr'）transcript 投影出 paths + urls，去重后拼接。
+  // 平台转写的正文（[Voice message] <全文>）已完整承载内容、无本地文件，
+  // URL 对 agent 无取用价值——再渲染元数据只会与正文逐字重复（token 冗余）。
+  // stt 路径的本地 wav、fallback 无文本时的 URL 内容指针照旧保留。
+  const transcripts = (processed?.transcripts ?? []).filter((t) => t.source !== 'asr');
   const voiceRefs = unique([
     ...transcripts.map((t) => t.localPath).filter(isNonEmpty),
     ...transcripts.map((t) => t.remoteUrl).filter(isNonEmpty),
   ]);
   if (voiceRefs.length > 0) {
     lines.push(`- Voice: ${voiceRefs.join(', ')}`);
-  }
-
-  // ASR：仅平台转写来源（source==='asr'）——严格信框架后 stt/fallback
-  // transcript 不再携带 asrReferText
-  const asrTexts = unique(
-    transcripts
-      .filter((t) => t.source === 'asr')
-      .map((t) => t.text)
-      .filter(isNonEmpty),
-  );
-  if (asrTexts.length > 0) {
-    lines.push(`- ASR: ${asrTexts.join(' | ')}`);
   }
 
   // msg_elements 上下文（引用内容本身来自 msg_elements[0] 时跳过该元素避免重复，
