@@ -29,8 +29,9 @@
  * - 斜杠命令（'/' 开头）：合并会破坏 buildCtxPayload 的命令标记；
  * - 多问题 ask_user 的 keyed 答案文本（"1: 3\n2: 1"）：合并会改写答案
  *   文本，框架 keyed 认领失败 → 挂起的 ask_user 永远等不到答案；
- * - 含语音的 turn：与框架 requiresIndividualCollectDrain 的
- *   currentInboundAudio 约束对齐（语音转写结果需要独立成轮）。
+ * - stt / fallback 来源语音（真实音频语义：本地文件 / 待理解媒体）。
+ *   平台转写语音（source:'asr'）= 纯文本，**参与合批**——见
+ *   needsStandaloneVoiceTurn。
  *
  * 容量：默认最多 10 条。超出时**丢弃较早的消息**（保留最新 10 条），
  * 并在合并正文里留一行丢弃说明——避免模型静默缺内容（与框架
@@ -131,11 +132,21 @@ function isExplicitlyWoken(item: GroupMergeItem): boolean {
   return wake.wasMentioned;
 }
 
-/** 该条是否含语音（框架侧同款约束：语音 turn 强制单独成轮） */
-function hasAudio(item: GroupMergeItem): boolean {
+/**
+ * 该条语音是否需要独立成轮：仅 stt / fallback 来源——stt 有真实本地音频
+ * （时长、框架媒体理解在跑），fallback 是占位文本且媒体 fact `transcribed:false`
+ * （框架可能自行尝试音频理解）。**平台转写（全部 transcript source==='asr'）
+ * 已是纯文本**（正文含全文、媒体 fact 为 transcribed:true 的惰性引用——框架
+ * 不产 prompt 媒体注记、不二次转写），按普通文本参与合批。
+ *
+ * 框架 `requiresIndividualCollectDrain` 的 `currentInboundAudio` 约束作用于
+ * 框架队列**多个 pending item 之间**的 collect 合批；插件把一批消息合成一条
+ * turn 只会减少队列 item 数，不触发该路径——按来源收窄旁路不与框架冲突。
+ */
+function needsStandaloneVoiceTurn(item: GroupMergeItem): boolean {
   const processed = item.ctx.state.processedAttachments as ProcessedAttachments | undefined;
   if (!processed) return false;
-  return !!processed.voiceText || processed.transcripts.length > 0;
+  return processed.transcripts.some((t) => t.source !== 'asr');
 }
 
 /**
@@ -163,8 +174,10 @@ function isBypassItem(item: GroupMergeItem): boolean {
     return true;
   }
 
-  // 含语音：语音转写结果需要独立成轮（对齐框架 requiresIndividualCollectDrain）
-  if (hasAudio(item)) return true;
+  // stt/fallback 来源语音：真实音频语义，独立成轮；平台转写语音=纯文本可合批
+  // （2026-11-01 修复：任何语音都旁路会在忙时拆散批次——语音单独成 turn、
+  // 且 SDK 对旁路项先冲刷 pending buffer 再单独发，把已攒的文本批也拆了）
+  if (needsStandaloneVoiceTurn(item)) return true;
 
   return false;
 }

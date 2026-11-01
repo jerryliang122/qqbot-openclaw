@@ -16,7 +16,8 @@
  * `activeRunQueueAction === "enqueue-followup"` 分支：`enqueueFollowupRun` +
  * `scheduleFollowupDrain` 后直接 return，turn 的实际执行由 drain 调度器
  * **脱离该 promise 链**）⇒ 此时 `await inboundRun` 在**仅入队**时就 resolve，
- * 计数提前归零。影响面：旁路项（控制命令 / 斜杠命令 / keyed 答案 / 语音）
+ * 计数提前归零。影响面：旁路项（控制命令 / 斜杠命令 / keyed 答案 /
+ * stt·fallback 来源语音——平台转写语音可合批，见 group-merge）
  * 在忙时直发却被框架排队时，其 dispatch promise 提前 resolve → busy 提前
  * 归零 → 那一小段窗口内到达的群消息**不会**被插件合批（退化为框架队列的
  * 逐条排队）。

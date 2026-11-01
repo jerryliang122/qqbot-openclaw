@@ -14,8 +14,9 @@
  *      **一次** dispatch，正文含 3 段、各段 sender 标签正确；
  *    - 单份历史：批内 2 条均带历史 → 历史块只出现一次；
  *    - 容量与丢弃：12 条 → 保留最新 10 条 + 丢弃说明；
- *    - 旁路不合并：斜杠命令 / 控制命令（stop）立即直发，且 pending
- *      buffer 先冲刷（保序）；
+ *    - 旁路不合并：斜杠命令 / 控制命令（stop）/ stt·fallback 来源语音
+ *      立即直发，且 pending buffer 先冲刷（保序）；平台转写语音
+ *      （source:'asr'）= 纯文本，**参与合批**；
  *    - 跨群隔离：两个群的批次互不干扰；
  *    - 前缀归位：room_event turn 的 transcript 体（AmbientTranscriptBody）
  *      **不含** `#<messageId>` 前缀，且 AmbientTranscriptMessageId 仍是
@@ -81,6 +82,7 @@ const {
   resetGroupBusyStateForTests,
 } = await import('../src/features/group-session-busy.ts');
 const { assembleMergedGroupBody } = await import('../src/dispatch/body-assembler.ts');
+const { formatVoiceText } = await import('../src/utils/voice-text.ts');
 const { resolveGroupConfigFromAccount } = await import('../src/config.ts');
 const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
 const { registerGateway } = await import('../src/outbound/outbound-service.ts');
@@ -160,7 +162,8 @@ function makeGroupMsgAndCtx(overrides: {
   mentioned?: boolean;
   timestamp?: string;
   history?: Array<{ senderId: string; senderName?: string; content: string }>;
-  voiceText?: string;
+  /** 语音 transcript 注入（与真实链路一致：voiceText 由 formatVoiceText 生成） */
+  transcripts?: Array<{ text: string; source: 'stt' | 'asr' | 'fallback'; duration?: number; localPath?: string; remoteUrl?: string }>;
 } = {}) {
   msgSeq += 1;
   const senderId = overrides.senderId ?? 'USER_A';
@@ -181,13 +184,13 @@ function makeGroupMsgAndCtx(overrides: {
     state: {
       mention: { wasMentioned: overrides.mentioned === true, implicit: false },
       ...(overrides.history ? { history: overrides.history } : {}),
-      ...(overrides.voiceText
+      ...(overrides.transcripts
         ? {
             processedAttachments: {
-              voiceText: overrides.voiceText,
+              voiceText: formatVoiceText(overrides.transcripts),
               imageUrls: [],
               otherInfo: '',
-              transcripts: [],
+              transcripts: overrides.transcripts,
               localMediaPaths: [],
               localMediaTypes: [],
               remoteMediaUrls: [],
@@ -464,6 +467,161 @@ await test('斜杠命令旁路：立即直发，pending buffer 先冲刷（保�
   assert.ok(flushIdx >= 0, 'pending buffer 未被冲刷');
   assert.ok(slashIdx >= 0, '斜杠命令未 dispatch');
   assert.ok(flushIdx < slashIdx, 'buffer 应先于旁路项发出（保序）');
+
+  release();
+  await keepAlive(pa);
+});
+
+// ── 语音合批（按转写来源旁路，2026-11-01 起）──
+
+group('语音合批：平台转写（asr）参与合批，stt/fallback 仍旁路');
+
+await test('平台转写语音（source asr）busy 期间参与合批——不再拆散批次', async () => {
+  let release!: () => void;
+  const hang = new Promise<void>((r) => { release = r; });
+  const scenario = setupScenario({ hang });
+
+  const a = makeGroupMsgAndCtx({ content: '问题一', senderId: 'U_ALICE', senderName: 'Alice', mentioned: true });
+  const pa = fire(scenario, a);
+  await sleep(30);
+  assert.equal(scenario.captured.length, 1, 'A 应已 dispatch');
+
+  // 语音（平台转写）+ 两条文本：busy 期间全部进缓冲（语音不再旁路拆批）
+  const voice = makeGroupMsgAndCtx({
+    senderId: 'U_BOB',
+    senderName: 'Bob',
+    transcripts: [{ text: '语音里说的话', source: 'asr', remoteUrl: 'https://x/v.wav' }],
+  });
+  const t3 = makeGroupMsgAndCtx({ content: '问题三', senderId: 'U_CAROL', senderName: 'Carol' });
+  const t4 = makeGroupMsgAndCtx({ content: '问题四', senderId: 'U_DAVE', senderName: 'Dave' });
+  await fire(scenario, voice);
+  await fire(scenario, t3);
+  await fire(scenario, t4);
+  await sleep(30);
+  assert.equal(scenario.captured.length, 1, 'busy 期间不应有新 dispatch（平台转写语音不旁路）');
+
+  release();
+  await keepAlive(pa);
+  await keepAlive(sleep(120));
+
+  assert.equal(scenario.captured.length, 2, `expected 2 dispatches (A + 合并批), got ${scenario.captured.length}`);
+  const merged = scenario.captured[1]!;
+  assert.ok(merged.ingest.textForAgent.includes('[消息 1/3]'), '缺分节头 1');
+  assert.ok(merged.ingest.textForAgent.includes('[消息 3/3]'), '缺分节头 3');
+  assert.ok(
+    merged.ingest.textForAgent.includes('[Bob (U_BOB)] [Voice message] 语音里说的话'),
+    '语音成员应在自己的分节内渲染转写全文',
+  );
+  assert.ok(merged.ingest.textForAgent.includes('[Carol (U_CAROL)] 问题三'), '缺 Carol 归属');
+  assert.ok(merged.ingest.textForAgent.includes('[Dave (U_DAVE)] 问题四'), '缺 Dave 归属');
+});
+
+await test('平台转写语音作为批内最新成员（carrier）：合批正常，锚点取语音 msgId', async () => {
+  let release!: () => void;
+  const hang = new Promise<void>((r) => { release = r; });
+  const scenario = setupScenario({ hang });
+
+  const a = makeGroupMsgAndCtx({ content: '问题一', senderId: 'U_ALICE', senderName: 'Alice', mentioned: true });
+  const pa = fire(scenario, a);
+  await sleep(30);
+
+  const t = makeGroupMsgAndCtx({ content: '问题二', senderId: 'U_CAROL', senderName: 'Carol' });
+  const voice = makeGroupMsgAndCtx({
+    senderId: 'U_BOB',
+    senderName: 'Bob',
+    transcripts: [{ text: '结尾的语音', source: 'asr' }],
+  });
+  await fire(scenario, t);
+  await fire(scenario, voice);
+
+  release();
+  await keepAlive(pa);
+  await keepAlive(sleep(120));
+
+  assert.equal(scenario.captured.length, 2, `expected 2 dispatches, got ${scenario.captured.length}`);
+  const merged = scenario.captured[1]!;
+  assert.ok(merged.ingest.textForAgent.includes('[消息 2/2]'), '缺分节头 2');
+  assert.ok(merged.ingest.textForAgent.includes('[Bob (U_BOB)] [Voice message] 结尾的语音'), '语音成员渲染缺失');
+  assert.equal(merged.params.raw.messageId, voice.msg.messageId, '载体应为批内最新（语音消息），锚点取其 msgId');
+});
+
+await test('stt 来源语音仍旁路：立即直发，pending buffer 先冲刷（保序）', async () => {
+  let release!: () => void;
+  const hang = new Promise<void>((r) => { release = r; });
+  const scenario = setupScenario({ hang });
+
+  const a = makeGroupMsgAndCtx({ content: '问题一', senderId: 'A', mentioned: true });
+  const pa = fire(scenario, a);
+  await sleep(30);
+
+  await fire(scenario, makeGroupMsgAndCtx({ content: '问题二', senderId: 'B' }));
+  await sleep(20);
+
+  const voice = makeGroupMsgAndCtx({
+    senderId: 'C',
+    transcripts: [{ text: 'stt 转写结果', source: 'stt', localPath: '/tmp/v.wav', duration: 12 }],
+  });
+  await keepAlive(fire(scenario, voice));
+
+  const bodies = scenario.captured.map((c) => c.ingest.textForAgent);
+  const flushIdx = bodies.findIndex((b) => b.includes('问题二'));
+  const voiceIdx = bodies.findIndex((b) => b.includes('[Voice message (12s)] stt 转写结果'));
+  assert.ok(flushIdx >= 0, 'pending buffer 未被冲刷');
+  assert.ok(voiceIdx >= 0, 'stt 语音未单独 dispatch');
+  assert.ok(flushIdx < voiceIdx, 'buffer 应先于旁路项发出（保序）');
+  assert.ok(!bodies[voiceIdx]!.includes('[消息 '), '旁路项不应带分节头（未被合批）');
+
+  release();
+  await keepAlive(pa);
+});
+
+await test('fallback 来源语音（无转写占位）仍旁路', async () => {
+  let release!: () => void;
+  const hang = new Promise<void>((r) => { release = r; });
+  const scenario = setupScenario({ hang });
+
+  const a = makeGroupMsgAndCtx({ content: '问题一', senderId: 'A', mentioned: true });
+  const pa = fire(scenario, a);
+  await sleep(30);
+  assert.equal(scenario.captured.length, 1);
+
+  const voice = makeGroupMsgAndCtx({
+    senderId: 'B',
+    transcripts: [{ text: '[Voice message - transcription unavailable]', source: 'fallback', remoteUrl: 'https://x/v.silk' }],
+  });
+  await keepAlive(fire(scenario, voice));
+  await sleep(30);
+
+  assert.equal(scenario.captured.length, 2, 'fallback 语音应立即单独 dispatch（不进缓冲）');
+  const body = scenario.captured[1]!.ingest.textForAgent;
+  assert.ok(body.includes('[Voice message - transcription unavailable]'), '占位文本缺失');
+  assert.ok(!body.includes('[消息 '), '旁路项不应带分节头');
+
+  release();
+  await keepAlive(pa);
+});
+
+await test('混合来源语音（asr + stt）仍旁路——任一真实音频语义即独立成轮', async () => {
+  let release!: () => void;
+  const hang = new Promise<void>((r) => { release = r; });
+  const scenario = setupScenario({ hang });
+
+  const a = makeGroupMsgAndCtx({ content: '问题一', senderId: 'A', mentioned: true });
+  const pa = fire(scenario, a);
+  await sleep(30);
+  assert.equal(scenario.captured.length, 1);
+
+  const voice = makeGroupMsgAndCtx({
+    senderId: 'B',
+    transcripts: [
+      { text: '平台转的那句', source: 'asr', remoteUrl: 'https://x/v1.wav' },
+      { text: 'stt 的那句', source: 'stt', localPath: '/tmp/v2.wav' },
+    ],
+  });
+  await keepAlive(fire(scenario, voice));
+  await sleep(30);
+
+  assert.equal(scenario.captured.length, 2, '混合来源语音应立即单独 dispatch（不进缓冲）');
 
   release();
   await keepAlive(pa);
