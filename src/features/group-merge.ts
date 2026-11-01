@@ -291,7 +291,18 @@ function trimToCapacity(
   maxBatchSize: number,
   maxBodyChars: number,
 ): { kept: GroupMergeItem[]; dropped: number } {
-  const sizeOf = (i: GroupMergeItem) => (i.msg.content ?? '').length;
+  // 正文体量 = 原文 + userContent 层的附加文本：语音转写全文（voiceText）与
+  // 其他附件描述（otherInfo）都随 buildUserContent 进合并正文，必须计入
+  // 上限——ASR 语音参与合批后（2026-11-01）转写可达数百上千字，漏计会让
+  // 批次超过 maxBodyChars 上限。（- Images 等 dynamicCtx 元数据行沿现状不计。）
+  const sizeOf = (i: GroupMergeItem) => {
+    const processed = i.ctx.state.processedAttachments as ProcessedAttachments | undefined;
+    return (
+      (i.msg.content ?? '').length +
+      (processed?.voiceText?.length ?? 0) +
+      (processed?.otherInfo?.length ?? 0)
+    );
+  };
   const keptReversed: GroupMergeItem[] = [];
   let total = 0;
   for (let i = items.length - 1; i >= 0; i -= 1) {

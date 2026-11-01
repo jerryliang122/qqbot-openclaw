@@ -556,6 +556,9 @@ await test('stt 来源语音仍旁路：立即直发，pending buffer 先冲刷�
 
   await fire(scenario, makeGroupMsgAndCtx({ content: '问题二', senderId: 'B' }));
   await sleep(20);
+  // 前提锁定：busy 且普通消息被缓冲（若合批路径退化成全直发，此处先红）
+  assert.equal(isGroupBusy('test-account', 'GROUP_X'), true, '前提：群应处于 busy');
+  assert.equal(scenario.captured.length, 1, '前提：busy 期间普通消息应被缓冲、未 dispatch');
 
   const voice = makeGroupMsgAndCtx({
     senderId: 'C',
@@ -584,6 +587,8 @@ await test('fallback 来源语音（无转写占位）仍旁路', async () => {
   const pa = fire(scenario, a);
   await sleep(30);
   assert.equal(scenario.captured.length, 1);
+  // 前提锁定：语音直发只能因旁路，而非群空闲
+  assert.equal(isGroupBusy('test-account', 'GROUP_X'), true, '前提：群应处于 busy（旁路而非空闲直发）');
 
   const voice = makeGroupMsgAndCtx({
     senderId: 'B',
@@ -610,6 +615,8 @@ await test('混合来源语音（asr + stt）仍旁路——任一真实音频�
   const pa = fire(scenario, a);
   await sleep(30);
   assert.equal(scenario.captured.length, 1);
+  // 前提锁定：语音直发只能因旁路，而非群空闲
+  assert.equal(isGroupBusy('test-account', 'GROUP_X'), true, '前提：群应处于 busy（旁路而非空闲直发）');
 
   const voice = makeGroupMsgAndCtx({
     senderId: 'B',
@@ -810,6 +817,35 @@ await test('正文字符上限：超限时保留最新消息并留丢弃说明',
   assert.ok(body.includes('[已丢弃'), '超限应留丢弃说明');
   assert.ok(body.includes('Z'), '应保留最新一条');
   assert.ok(!body.includes('X'), '最早一条应被丢弃');
+});
+
+await test('正文字符上限计入语音转写全文（ASR 语音参与合批后不超限）', async () => {
+  let release!: () => void;
+  const hang = new Promise<void>((r) => { release = r; });
+  const scenario = setupScenario({ hang });
+
+  const a = makeGroupMsgAndCtx({ content: '起手', senderId: 'UA', mentioned: true });
+  const pa = fire(scenario, a);
+  await sleep(30);
+
+  // 旧语音（平台转写 7900 字）+ 新文本 200 字：转写全文计入 8000 上限后，
+  // 旧语音应被整体丢弃；漏计（只数 msg.content，转写贡献 0）则两条全保留、批次超限
+  await fire(scenario, makeGroupMsgAndCtx({
+    senderId: 'UV',
+    transcripts: [{ text: `V${'音'.repeat(7900)}`, source: 'asr' }],
+  }));
+  await fire(scenario, makeGroupMsgAndCtx({ content: `T${'文'.repeat(200)}`, senderId: 'UT' }));
+  await sleep(20);
+
+  release();
+  await keepAlive(pa);
+  await keepAlive(sleep(150));
+
+  assert.equal(scenario.captured.length, 2, `expected 2 dispatches, got ${scenario.captured.length}`);
+  const body = scenario.captured[1]!.ingest.textForAgent;
+  assert.ok(body.includes('[已丢弃'), '超限应留丢弃说明');
+  assert.ok(body.includes('T'), '应保留最新一条（文本）');
+  assert.ok(!body.includes('V'), '超限的长转写语音应被丢弃（转写全文计入上限）');
 });
 
 await test('批内有人叫 bot 时，载体未被虚标 (@you)', async () => {
