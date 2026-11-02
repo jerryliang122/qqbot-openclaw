@@ -768,6 +768,64 @@ await test('N9: mediaUrls 内重复 URL 只发一次', async () => {
   assert.strictEqual(sentMedia.filter((u) => u === URL).length, 1, '重复 URL 只发一次');
 });
 
+
+group('Part 6: 发版前复审批次（R1–R3）回归用例');
+
+await test('R1: ask_user 前置 flush 失败 + 续跑只有 final → 答案正文送达', async () => {
+  const { sentTexts, botCardTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    failFirstTextSend: true, // 前置 flush 的 sendStatic 抛错
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '前置说明' });
+  await captured.dispatcherOptions?.deliver?.(ASK_USER_PAYLOAD('要继续吗？'), { kind: 'final' });
+  assert.deepStrictEqual(botCardTexts, ['要继续吗？'], '问题卡片照发');
+  // 续跑：只投 final，没有 partial（此前这条路径下答案永久丢失）
+  await captured.dispatcherOptions?.deliver?.({ text: '答案正文' }, { kind: 'final' });
+  assert.ok(
+    sentTexts.includes('答案正文'),
+    `答案正文必须送达（修复前：只发出过期的「前置说明」，答案=${JSON.stringify(sentTexts)}）`,
+  );
+  assert.ok(
+    !sentTexts.includes('前置说明'),
+    '未送达的前置文本不该在收尾时被当成答案再发一遍',
+  );
+});
+
+await test('R2: 已取消的 turn → dispatch 收尾不发取消前的缓冲文本', async () => {
+  const ac = new AbortController();
+  const { sentTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    ctxSignal: ac.signal,
+    simulate: async (c) => {
+      await c.replyOptions?.onPartialReply?.({ text: '取消前的文本' });
+      ac.abort(); // dispatch 尚未收尾时取消
+    },
+  });
+  assert.ok(
+    !sentTexts.includes('取消前的文本'),
+    `取消后不得发送取消前累积的内容（发送=${JSON.stringify(sentTexts)}）`,
+  );
+});
+
+await test('R3: 已取消的 turn → block 语音路径不再额外投递一次', async () => {
+  const ac = new AbortController();
+  ac.abort();
+  const { sentTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    ctxSignal: ac.signal,
+    simulate: async () => {},
+  });
+  await captured.dispatcherOptions?.deliver?.({ text: '语音内容', audioAsVoice: true }, { kind: 'block' });
+  // 默认路径的文本投递是既有语义（评审3 已锁定）；此处锁定的是「block 语音
+  // 路径不再绕过取消检查额外发一次」
+  assert.strictEqual(
+    sentTexts.filter((t) => t === '语音内容').length,
+    1,
+    `block 路径不应绕过取消检查重复投递（发送=${JSON.stringify(sentTexts)}）`,
+  );
+});
+
 // ============ 结果 ============
 
 console.log(`\n========================================`);

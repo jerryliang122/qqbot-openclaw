@@ -584,6 +584,9 @@ export async function dispatchToOpenClaw(
   // 收尾后按前缀差量补发未流出部分（见 dispatch 末尾 [stream-final] 段）
   let pendingStreamFinalText: string | undefined;
   let deliverErrorCount = 0;
+  // 流式收尾时因 turn 被取消而主动 abort（PR #81 复审 R2）：此状态下用户
+  // 主动放弃了本轮，不应再发「失败兜底」消息（那是对一次被取消的回复的噪声）
+  let streamingCancelled = false;
   // 出站发送成功/失败计数：deliver-pipeline 对 sendText {error} 只记日志不抛错，
   // 这里在 dispatch 拥有的发送闭包边界上统计，作为"用户是否收到可见回复"的判据。
   let outboundSendOk = 0;
@@ -652,11 +655,25 @@ export async function dispatchToOpenClaw(
             } else {
               await streamingController?.closeSegment('ask_user', { signal: combinedAbortSignal });
             }
+            // 前置文本发送失败 → 缓冲处于「未送达残留」状态。此时**不能**标记
+            // 「内容已外部投递」：那会关掉终稿的 rescue 补发路径，作答后的
+            // 答案正文将永久丢失（PR #81 复审 R1）。
+            const preambleFailed = streamingController?.hasStaleBuffer === true;
+            if (preambleFailed) {
+              dlog?.warn('[question] ask_user preamble not delivered — keeping final rescue path open');
+            }
+            // 卡片发送前二次复查取消信号：flush/close 是 await 期间可能已被取消
+            // （PR #81 复审 R1：取消后仍发卡片）
+            if (combinedAbortSignal.aborted) {
+              dlog?.info('[question] skipped: turn cancelled before card');
+              return;
+            }
             try {
               await bot.sendTextWithKeyboard(replyTarget, text, keyboard as never);
               outboundSendOk++;
               // 标记流式控制器：内容已通过外部通道投递，finalize 不走 fallback
-              streamingController?.markDeliveredExternally();
+              // （前置文本没能送达时不标记——否则终稿救不回来）
+              if (!preambleFailed) streamingController?.markDeliveredExternally();
               dlog?.debug(`[question] sent ask_user with keyboard questionId=${questionId} options=${optionValues.length}`);
               return;
             } catch (err) {
@@ -695,6 +712,16 @@ export async function dispatchToOpenClaw(
             } else {
               await streamingController?.closeSegment('ask_user', { signal: combinedAbortSignal });
             }
+            // 前置文本未送达 → 不标记「内容已外部投递」（保住终稿 rescue 路径）
+            const preambleFailed = streamingController?.hasStaleBuffer === true;
+            if (preambleFailed) {
+              dlog?.warn('[question] ask_user preamble not delivered (multi) — keeping final rescue path open');
+            }
+            // 卡片发送前二次复查取消信号（await 期间可能已取消）
+            if (combinedAbortSignal.aborted) {
+              dlog?.info('[question] skipped: turn cancelled before cards (multi)');
+              return;
+            }
             try {
               for (const [index, question] of questions.entries()) {
                 const cardText = formatMultiQuestionCard(question, index, questions.length);
@@ -703,7 +730,7 @@ export async function dispatchToOpenClaw(
                 outboundSendOk++;
               }
               // 标记流式控制器：内容已通过外部通道投递，finalize 不走 fallback
-              streamingController?.markDeliveredExternally();
+              if (!preambleFailed) streamingController?.markDeliveredExternally();
               dlog?.debug(`[question] sent multi-question ask_user questionId=${questionId} questions=${questions.length}`);
               return;
             } catch (err) {
@@ -722,10 +749,14 @@ export async function dispatchToOpenClaw(
       // 此分支保留以兼容 stream 模式与未来变化。
       if (kind === 'block') {
         if (payload.audioAsVoice) {
-          await deliverReply(payload, info, deliverCtx);
+          // 已取消的 turn 不发语音（TTS 合成 + 投递都是耗时操作，取消后仍发
+          // 等于把用户已经放弃的回复推过去——PR #81 复审 R1）
+          if (!combinedAbortSignal.aborted) {
+            await deliverReply(payload, info, deliverCtx);
+          }
         } else if (!combinedAbortSignal.aborted) {
           // 已取消的 turn 不发附件（PR #81 评审 N3：取消后仍收到媒体）
-          outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
+          outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog, combinedAbortSignal);
         }
       }
 
@@ -815,7 +846,7 @@ export async function dispatchToOpenClaw(
         // 不标记（forwardMediaUrls 内处理）并计入失败统计（评审 M1）。
         if ((kind === 'final' || kind === 'tool') && !combinedAbortSignal.aborted) {
           // 已取消的 turn 不发附件（PR #81 评审 N3：取消后仍收到媒体）
-          outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
+          outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog, combinedAbortSignal);
         }
         if (payload.isError === true) {
           dlog?.info(`run-failure notice bypasses streaming dedup (kind=${kind ?? 'none'} textLen=${text.length})`);
@@ -844,7 +875,7 @@ export async function dispatchToOpenClaw(
       // ── 4. tool 媒体：立即转发（static 流式路径已在上方 flush 文本）──
       if (kind === 'tool') {
         if (!combinedAbortSignal.aborted) {
-          outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
+          outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog, combinedAbortSignal);
         }
         return;
       }
@@ -1111,8 +1142,22 @@ export async function dispatchToOpenClaw(
   // Progress card：dispatch 收尾，停止发布（无定时器，纯状态关闭）
   progressPublisher?.dispose();
 
-  if (streamingController && !streamingController.isTerminal) {
-    await streamingController.finalize();
+  // 流式收尾：**取消感知的 finalize**（PR #81 复审 R2）
+  // 已取消 / 被插嘴取代的 turn 不发取消前累积的内容（static 模式的 finalize
+  // 会把缓冲整段发出）——改为 abort：只收尾流式会话（DONE 帧，防草稿气泡
+  // 永久悬挂），缓冲内容丢弃并留 WARN。
+  //
+  // 依据：combinedAbortSignal 在**正常完成的 c2c turn 收尾时不会中止**
+  // ——同一处的 [stream-final] 尾巴兜底同样以 `!combinedAbortSignal.aborted`
+  // 为前提，/usage footer 能正常送达即证明这一点（该信号只在取消 / 被取代
+  // 时置位）。
+  if (streamingController) {
+    if (combinedAbortSignal.aborted) {
+      streamingCancelled = true;
+      await streamingController.abort('cancelled');
+    } else if (!streamingController.isTerminal) {
+      await streamingController.finalize();
+    }
   }
 
   // ── 流式 final 差量补发（/usage tokens|full footer 等）──
@@ -1153,6 +1198,7 @@ export async function dispatchToOpenClaw(
   if (
     (hadDispatchError() || deliverErrorCount > 0 || outboundSendFail > 0)
     && !turnAbort.signal.aborted
+    && !streamingCancelled
     && inboundEventKind !== 'room_event'
   ) {
     const streamedVisible = !!streamingController
@@ -1257,11 +1303,18 @@ async function forwardMediaUrls(
   ctx: DeliverContext,
   delivered: Set<string>,
   log?: PluginLogger,
+  signal?: AbortSignal,
 ): Promise<number> {
   const urls = resolveMediaUrls(payload);
   const newUrls = urls.filter((u) => !delivered.has(u));
   let failures = 0;
   for (const url of newUrls) {
+    // 逐条复查取消信号：媒体转发是逐个 await 的长过程，取消后不应继续发
+    // （PR #81 复审 R1：取消后仍收到媒体）
+    if (signal?.aborted) {
+      log?.info('media forward skipped: turn cancelled');
+      break;
+    }
     try {
       const result = await sendMedia({
         to: ctx.qualifiedTarget,

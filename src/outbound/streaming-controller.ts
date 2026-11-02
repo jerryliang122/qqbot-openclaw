@@ -122,6 +122,17 @@ export class StreamingController {
   private _deliveredExternally = false;
 
   /**
+   * static 模式：当前缓冲处于「已尝试发送但**未送达**」状态（发送失败后的残留）。
+   *
+   * 这条状态必须与「缓冲非空」区分开：`canRescueUndeliveredFinal` 用
+   * `!lastAcceptedFull` 当「本段从未流出」的代理，而**失败的 flush 会留下一个
+   * 非空但从未送达的缓冲**——两者语义相反，会让 rescue 判定误判为「本段已
+   * 流出」而拒绝补发终稿（PR #81 复审 R1：ask_user 前置文本发送失败后，续跑
+   * 只有 final 时答案正文永久丢失）。
+   */
+  private staleBuffer = false;
+
+  /**
    * 标记：final payload 与已承接内容无关、且当前无待发缓冲时，已整段补发
    * （issue #44 恢复路径）。仅用于把终态原因与静默的 finalize:fallback 区分开。
    */
@@ -169,6 +180,14 @@ export class StreamingController {
 
   /** 是否处于 park 待命态（finalize 时从未承接内容，未终态化，issue #80） */
   get parked(): boolean { return this._parked; }
+
+  /**
+   * static 模式：当前缓冲是否处于「发送失败后的未送达残留」状态。
+   * 上层据此判断「ask_user 前置文本是否没能发出去」——前置发送失败时不能
+   * 标记「内容已外部投递」，否则终稿的 rescue 补发路径会被关闭
+   * （PR #81 复审 R1）。
+   */
+  get hasStaleBuffer(): boolean { return this.staleBuffer; }
 
   get isTerminal(): boolean {
     return this.phase === 'done' || this.phase === 'failed';
@@ -259,6 +278,9 @@ export class StreamingController {
    * - static 模式：四条同时成立才动手——普通消息通道可用 / **当前缓冲为空**
    *   （= 本段一条 partial 都没流出来，缓冲有内容说明本段已流出、final 与其
    *   无关属模型重写）/ 至少已发出一段 / 未走外部投递通道（issue #44）。
+   *   **例外：缓冲处于 stale 状态**（= 发送失败后的未送达残留，见 staleBuffer）
+   *   ——此时「缓冲非空」不代表「本段已流出」，终稿必须补发，否则用户永远
+   *   收不到答案（PR #81 复审 R1）。
    * - stream 模式：**当前段从未推送到平台**（= 终稿是这一段的唯一文本，
    *   用户还没看到任何这段内容）→ 必须整段补发，绝不静默丢弃
    *   （issue #67 的「内容丢失」面）。当前段已推送时 final 与其无关 =
@@ -268,7 +290,7 @@ export class StreamingController {
     if (!this.deps.sendStatic) return false;
     if (this._deliveredExternally) return false;
     if (this.sentChunkCount === 0) return false;
-    if (this.isStaticMode) return !this.lastAcceptedFull;
+    if (this.isStaticMode) return !this.lastAcceptedFull || this.staleBuffer;
     return !this.currentSegmentPushed;
   }
 
@@ -408,6 +430,9 @@ export class StreamingController {
           if (!tolerant) {
             this.transition('failed', 'flush_send_error');
           } else {
+            // 缓冲标记为「未送达残留」：它非空但从未送达，不能再被当作
+            // 「本段已流出」而挡掉终稿的 rescue 补发（PR #81 复审 R1）
+            this.staleBuffer = true;
             this.deps.log?.warn(
               `flushSegment tolerated send failure (buffer kept for retry) chars=${this.lastAcceptedFull.length}`,
             );
@@ -416,6 +441,7 @@ export class StreamingController {
         }
         // 重置缓冲，开始新一段累积（保持 streaming 态，不进终态）
         this.lastAcceptedFull = '';
+        this.staleBuffer = false;
       }
     }).catch((err) => {
       this.deps.log?.error(`flushSegment error: ${err instanceof Error ? err.message : String(err)}`);
@@ -427,6 +453,13 @@ export class StreamingController {
   async abort(reason?: string): Promise<void> {
     if (this.isTerminal) return;
     this.deps.log?.warn(`aborting stream reason=${reason ?? 'manual'} sent=${this.sentChunkCount}`);
+    // static 模式：缓冲不会发出（已取消的 turn 不发过时内容）——留痕，
+    // 否则「取消前累积的内容被丢弃」在日志里完全不可见（PR #81 复审 R2）
+    if (this.isStaticMode && this.lastAcceptedFull) {
+      this.deps.log?.warn(
+        `abort dropped static buffer: reason=${reason ?? 'manual'} chars=${this.lastAcceptedFull.length}`,
+      );
+    }
     if (this.session) {
       try { await this.session.complete(); } catch (e) {
         this.deps.log?.error(`abort complete failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -516,6 +549,16 @@ export class StreamingController {
           this.transition('failed', 'final_rescue_send_error');
           return;
         }
+        // 缓冲若是「未送达残留」（ask_user 前置文本发送失败留下的），此刻已被
+        // 终稿取代——放弃它，否则收尾时会把过期文本当成答案再发一遍
+        // （PR #81 复审 R1）
+        if (this.staleBuffer && this.lastAcceptedFull) {
+          this.deps.log?.warn(
+            `stale buffer abandoned after final rescue: chars=${this.lastAcceptedFull.length} (never delivered)`,
+          );
+          this.lastAcceptedFull = '';
+        }
+        this.staleBuffer = false;
         this.lastDeliveredSegmentText = finalText;
         this.sentChunkCount++;
         this._finalRescued = true;
@@ -576,6 +619,8 @@ export class StreamingController {
       this.deps.log?.info(`static new segment: lastAccepted=${this.lastAcceptedFull.length}→chunk=${text.length}`);
       this.lastAcceptedFull = text;
       this.lastDeliveredSegmentText = text;
+      // 新内容覆盖了旧缓冲 → 旧残留不再是「未送达残留」
+      this.staleBuffer = false;
       this.sentChunkCount++;
       return;
     }
@@ -686,6 +731,8 @@ export class StreamingController {
       }
       this.lastAcceptedFull = text;
       this.lastDeliveredSegmentText = text;
+      // 新内容覆盖旧缓冲 → 不再是「未送达残留」
+      this.staleBuffer = false;
       this.sentChunkCount++;
       return;
     }
@@ -733,8 +780,11 @@ export class StreamingController {
           // 非空」语义收敛为「未发送内容」，flushSegment 的终态丢弃 WARN 不误报
           // （issue #80）
           this.lastAcceptedFull = '';
+          this.staleBuffer = false;
         } catch (err) {
           this.deps.log?.error(`static send failed: ${err instanceof Error ? err.message : String(err)}`);
+          // 缓冲未送达 → 标记 stale（它非空但从未送达）
+          this.staleBuffer = true;
           this.transition('failed', 'static_send_error');
         }
       }
