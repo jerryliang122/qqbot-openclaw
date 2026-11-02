@@ -8,7 +8,12 @@
  * 修复后（三件套）：
  *   1. 无内容 finalize 不终态化（park 保持 idle 待命），后续内容正常承接；
  *   2. dispatch 已收尾时 deliver(kind='final') 补位 finalize，收尾最后一段缓冲；
- *   3. 终态丢弃内容的入口（handleChunk/flushSegment/absorbFinalText）打 WARN 附字符数。
+ *   3. 终态丢弃内容的入口（handleChunk/flushSegment/doCloseSegment/absorbFinalText）
+ *      打 WARN 附字符数。
+ *
+ * 另含 Sourcery 评审驱动的补丁用例（PR #81 评审意见 1-5/7/8）：
+ * 补位收尾发送失败回退默认路径、纯空白 partial 不算内容、已中止 turn 不承接
+ * 迟到内容、流式早退前转发媒体、stream parked 尾巴直接补发、终态封口告警。
  *
  * 运行方式: npx tsx tests/streaming-parked-finalize.test.ts
  */
@@ -283,21 +288,33 @@ function makeFakeRuntime(opts: { onInboundRun?: (params: any) => Promise<any> } 
   } as any;
 }
 
-function installFakeGateway() {
+function installFakeGateway(opts: { failFirstTextSend?: boolean } = {}) {
   const sentTexts: string[] = [];
+  const sentMedia: string[] = [];
+  let textSendCount = 0;
   const gw = {
     sendText: async (_target: any, text: string) => {
+      textSendCount++;
+      // outbound-service.sendText 只把 gateway 的【抛错】当失败（返回值一律视为
+      // 成功，error 由其 catch formatError 产生）——模拟失败必须 throw
+      if (opts.failFirstTextSend && textSendCount === 1) {
+        throw new Error('boom (failFirstTextSend)');
+      }
       sentTexts.push(text);
       return { id: `out-${sentTexts.length}` };
     },
-    sendMedia: async () => ({ id: 'media-out' }),
+    sendMedia: async (...args: any[]) => {
+      const url = args.find((a) => typeof a === 'string' && a.startsWith('http'));
+      sentMedia.push(url ?? `arg:${args.length}`);
+      return { id: 'media-out' };
+    },
     openStream: () => ({
       update: async () => {},
       complete: async () => ({ id: 'stream-done', timestamp: Date.now() }),
     }),
   } as any;
   registerGateway('test-account', gw);
-  return { sentTexts };
+  return { sentTexts, sentMedia };
 }
 
 /**
@@ -308,7 +325,9 @@ function installFakeGateway() {
 async function runDispatch(opts: {
   streaming: false | { mode: string; sendMode?: 'static' };
   simulate: (captured: CapturedDispatch) => Promise<void>;
-}): Promise<{ sentTexts: string[]; captured: CapturedDispatch }> {
+  ctxSignal?: AbortSignal;
+  failFirstTextSend?: boolean;
+}): Promise<{ sentTexts: string[]; sentMedia: string[]; captured: CapturedDispatch }> {
   _resetAdaptersCache();
   const msg = {
     kind: 'c2c',
@@ -320,7 +339,11 @@ async function runDispatch(opts: {
     replyTarget: { scope: 'c2c', targetId: 'USER_123' },
     timestamp: Date.now(),
   } as any;
-  const ctx = { state: {}, message: { content: 'hello' } } as any;
+  const ctx = {
+    state: {},
+    message: { content: 'hello' },
+    ...(opts.ctxSignal ? { signal: opts.ctxSignal } : {}),
+  } as any;
   let captured: CapturedDispatch = {};
 
   const runtime = makeFakeRuntime({
@@ -347,9 +370,9 @@ async function runDispatch(opts: {
     },
   } as any;
 
-  const { sentTexts } = installFakeGateway();
+  const { sentTexts, sentMedia } = installFakeGateway({ failFirstTextSend: opts.failFirstTextSend });
   await dispatchToOpenClaw(ctx, msg, account, runtime);
-  return { sentTexts, captured };
+  return { sentTexts, sentMedia, captured };
 }
 
 group('Part 2: dispatch 层（端到端）');
@@ -377,12 +400,115 @@ await test('issue #80 复现：提前收尾后长跑投递 → 前置消息与�
   );
 });
 
-await test('提前收尾但无后续内容（空 turn）→ park 无害：无异常、无多余发送', async () => {
-  const { sentTexts } = await runDispatch({
+await test('空 turn park 无害 + 迟到内容仍被承接（park 未终态化的直接证据，评审意见 8）', async () => {
+  const { sentTexts, captured } = await runDispatch({
     streaming: { mode: 'partial', sendMode: 'static' },
     simulate: async () => {},
   });
   assert.deepStrictEqual(sentTexts, [], '空 turn 不应有任何发送');
+
+  // 仅断言「无发送」无法区分 park 与旧的终态化（旧行为同样静默）——直接
+  // 验证 park 的行为面：迟到 partial 应被承接并在边界 flush 发出。
+  await captured.replyOptions?.onPartialReply?.({ text: '迟到段落' });
+  await captured.replyOptions?.onToolStart?.();
+  assert.deepStrictEqual(sentTexts, ['迟到段落'], 'park（非终态）应承接迟到内容并发出');
+});
+
+group('Part 3: Sourcery 评审驱动用例（PR #81）');
+
+await test('评审1: parked 补位收尾发送失败 → final 落回默认路径送达', async () => {
+  const { sentTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    failFirstTextSend: true, // 第一次 sendText（补位 finalize 的 sendStatic）失败
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '终稿正文' });
+  await captured.dispatcherOptions?.deliver?.({ text: '终稿正文' }, { kind: 'final' });
+  assert.ok(
+    sentTexts.includes('终稿正文'),
+    '补位 finalize 发送失败（failed）后，final 应经默认路径整段补发而非被早退 return 吞掉',
+  );
+});
+
+await test('评审2: 纯空白 partial 不算内容 → final 走默认路径送达', async () => {
+  const { sentTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '   \n  ' });
+  await captured.dispatcherOptions?.deliver?.({ text: '终稿' }, { kind: 'final' });
+  assert.deepStrictEqual(
+    sentTexts,
+    ['终稿'],
+    '空白 partial 不置 hasStarted/不计数，final 经默认路径整段送达（不吞稿、不发空白）',
+  );
+});
+
+await test('controller: 纯空白 partial 不置 hasStarted、不进缓冲', async () => {
+  const ctrl = makeController({ sendMode: 'static' });
+  await ctrl.onPartialReply('   ');
+  assert.strictEqual(ctrl.hasStarted, false, '空白 partial 不算流式启动');
+  await ctrl.finalize();
+  assert.strictEqual(ctrl.parked, true, '仍按无内容 park');
+  assert.strictEqual(staticSendCalls.length, 0, '不发送空白');
+});
+
+await test('评审3: 已中止 turn 的迟到 partial/final 不再发出任何内容', async () => {
+  const abortCtl = new AbortController();
+  abortCtl.abort();
+  const { sentTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    ctxSignal: abortCtl.signal,
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '迟到内容' });
+  await captured.replyOptions?.onToolStart?.();
+  await captured.dispatcherOptions?.deliver?.({ text: '终稿' }, { kind: 'final' });
+  // 迟到 partial 被信号守卫拦下（评审关注点：park 不复活已取消 turn 的输出）；
+  // final 文本经默认路径送达是既有语义（默认路径不按 signal 门控），不在本修复面
+  assert.ok(!sentTexts.includes('迟到内容'), '已取消 turn 的迟到 partial 不得承接/发出');
+  assert.deepStrictEqual(sentTexts, ['终稿'], 'final 走默认路径（既有行为，非信号门控面）');
+});
+
+await test('评审4: parked 流式早退前转发 final 携带的媒体', async () => {
+  const { sentTexts, sentMedia, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '见附图' });
+  await captured.dispatcherOptions?.deliver?.(
+    { text: '见附图', mediaUrls: ['https://example.com/img.png'] },
+    { kind: 'final' },
+  );
+  assert.ok(sentTexts.includes('见附图'), '终稿正文经补位 finalize 送达');
+  assert.ok(
+    sentMedia.some((m) => m.includes('img.png')),
+    'final 携带的媒体应在流式早退 return 前转发（默认路径此时不可达）',
+  );
+});
+
+await test('评审5: stream parked + 段已封口 → final 尾巴直接补发', async () => {
+  const { sentTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial' }, // stream 模式（默认）
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '段A' });
+  await captured.dispatcherOptions?.deliver?.({ text: '段A' }, { kind: 'tool' }); // closeSegment 封口，会话关闭
+  await captured.dispatcherOptions?.deliver?.({ text: '段A\nUsage: 66k in / 9.8k out' }, { kind: 'final' });
+  assert.ok(
+    sentTexts.some((t) => t.includes('Usage:')),
+    '段已封口无会话时 absorb 接不住 extension，usage footer 尾巴应在 park 场景直接补发（dispatch 末尾兜底已跑过）',
+  );
+});
+
+await test('controller: stream 终态后 closeSegment 丢弃段文本 → WARN（评审意见 7）', async () => {
+  const ctrl = makeController({ sendMode: 'stream' });
+  await ctrl.onPartialReply('段A');
+  await ctrl.abort('test'); // failed 终态（session 已 complete，currentSegmentText 残留）
+  logs.length = 0;
+  await ctrl.closeSegment('late');
+  assert.strictEqual(warnCount('segment close dropped'), 1, '终态封口丢弃段文本应告警（issue #80 四入口可观测）');
+  assert.ok(logs.some((l) => l.includes('chars=2')), 'WARN 应附丢弃字符数');
 });
 
 await test('回归锚点：dispatch 存活期间的正常 static 多段流行为不变', async () => {

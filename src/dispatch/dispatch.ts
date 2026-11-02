@@ -588,6 +588,15 @@ export async function dispatchToOpenClaw(
               scope: envelope.chatScope === 'group' ? 'group' as const : 'c2c' as const,
               targetId: peerId,
             };
+            // ask_user 前先固化已累积的流式内容（评审意见 6）：stream 模式封口
+            // 当前段（等待用户作答期间草稿气泡不该悬挂）；static 模式 flush 缓冲
+            // （问题卡片之前的前置文本先落地）。两者均不终态化——作答后 run
+            // 续跑，新一段照常另起。
+            if (streamingController?.isStaticSendMode) {
+              await streamingController.flushSegment();
+            } else {
+              await streamingController?.closeSegment('ask_user');
+            }
             try {
               await bot.sendTextWithKeyboard(replyTarget, text, keyboard as never);
               outboundSendOk++;
@@ -619,6 +628,12 @@ export async function dispatchToOpenClaw(
             const replyTarget = { scope, targetId: peerId };
             // 先登记再发送，避免用户先点按钮时查无此单
             registerPendingMultiQuestion(account.accountId, questionId, scope, peerId, questions);
+            // ask_user 前先固化已累积的流式内容（同单问题分支，评审意见 6）
+            if (streamingController?.isStaticSendMode) {
+              await streamingController.flushSegment();
+            } else {
+              await streamingController?.closeSegment('ask_user');
+            }
             try {
               for (const [index, question] of questions.entries()) {
                 const cardText = formatMultiQuestionCard(question, index, questions.length);
@@ -687,8 +702,19 @@ export async function dispatchToOpenClaw(
           // 提前 resolve，controller 被 park 而非终态化），不会再有「dispatch 末尾
           // 的 finalize」——final 是这个 delivery context 的最后一个事件，上方
           // absorb 已把终稿并入缓冲，此处补位收尾把最后一段发出。
-          if (kind === 'final' && streamingController.parked) {
+          // 已取消的 turn 不补位（评审意见 3）：取消的回复不应再发出内容。
+          if (kind === 'final' && streamingController.parked && !combinedAbortSignal.aborted) {
             await streamingController.finalize();
+            // 补位收尾发送失败（sendStatic 抛错 → failed）：终稿未送达，且
+            // dispatch 已 return、末尾差量/失败兜底都不会再跑——落回默认路径
+            // 整段补发（评审意见 1；isError 本就自然走默认路径，不在此重复）
+            if (streamingController.currentPhase === 'failed' && text && payload.isError !== true) {
+              dlog?.warn(`parked finalize send failed — delivering final via default path chars=${text.length}`);
+              const rescuePayload = filterDeliveredMedia(payload, deliveredMediaUrls);
+              await deliverReply(rescuePayload, info, deliverCtx);
+              deliveredTexts.add(text);
+              return;
+            }
           }
           // 其余情况 static 模式不 finalize（finalize 会进入终态并造成后续丢失）
         } else if (kind === 'tool') {
@@ -702,6 +728,28 @@ export async function dispatchToOpenClaw(
           // stream 模式：**仅**在终稿时收尾整轮。段边界由框架
           // onAssistantMessageStart（+ 工具调用）驱动。
           await streamingController.finalize();
+          // park 场景（issue #80）：dispatch 已 return，末尾 [stream-final] 差量
+          // 兜底不会再跑——final 的未流出尾巴（usage footer 等）在此直接补发。
+          // 覆盖「上一段已封口、无活动会话，absorb 接不住 extension」的残余
+          // 路径（评审意见 5）；非 park 时 dispatch 末尾兜底仍兜得住（absorb
+          // 已把尾巴推入会话时 remainder 为空串，不会重复发送）。
+          if (
+            streamingController.parked && text
+            && !combinedAbortSignal.aborted
+            && !streamingController.shouldSuppressFinalTailFallback
+          ) {
+            const tailRemainder = streamingController.computeUnsentRemainder(text).trim();
+            if (tailRemainder) {
+              dlog?.info(`[stream-final] parked late tail chars=${tailRemainder.length}`);
+              await deliverCtx.sendText(qualifiedTarget, tailRemainder);
+            }
+          }
+        }
+        // 流式早退前转发 final/tool 携带的媒体（评审意见 4）：早退 return 后
+        // 默认路径（含媒体发送）不可达，不在此转发即丢失。block 媒体已在上方
+        // kind==='block' 分支转发；deliveredMediaUrls 去重防双重发送。
+        if (kind === 'final' || kind === 'tool') {
+          await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
         }
         if (payload.isError === true) {
           dlog?.info(`run-failure notice bypasses streaming dedup (kind=${kind ?? 'none'} textLen=${text.length})`);
@@ -902,23 +950,33 @@ export async function dispatchToOpenClaw(
                       // （默认受 requiresToolSummaryVisibility 门控，verbose off 时不触发）
                       allowToolLifecycleWhenProgressHidden: true,
                       // 工具【开始执行前】触发：把已累积的上一段文本立即发出
-                      // （不等工具执行完，对齐 telegram prepareAnswerLaneForToolProgress）
-                      onToolStart: async () => { await streamingController.flushSegment(); },
+                      // （不等工具执行完，对齐 telegram prepareAnswerLaneForToolProgress）。
+                      // 已取消的 turn（评审意见 3）：中止信号已置位时不再承接/发送。
+                      onToolStart: async () => {
+                        if (combinedAbortSignal.aborted) return;
+                        await streamingController.flushSegment();
+                      },
                     }
                   : {}),
                 ...(streamingController
                   ? {
                       onPartialReply: async (p: { text?: string }) => {
-                        if (p.text) await streamingController.onPartialReply(p.text);
+                        if (p.text && !combinedAbortSignal.aborted) await streamingController.onPartialReply(p.text);
                       },
                       // 兜底：block 信号未覆盖的边界（如部分 provider 不发 text_end）
                       // 仍由 onAssistantMessageStart 触发分段。
                       // static 模式 = 固化上一段；stream 模式 = 封口上一段
                       // （整段保留、拼进同一条消息），两种模式都不再靠长度
-                      // 启发式猜边界（issue #67）。
+                      // 启发式猜边界（issue #67）。已取消的 turn 同样不承接（评审意见 3）。
                       onAssistantMessageStart: streamingController.isStaticSendMode
-                        ? async () => { await streamingController.flushSegment(); }
-                        : async () => { await streamingController.beginSegment(); },
+                        ? async () => {
+                            if (combinedAbortSignal.aborted) return;
+                            await streamingController.flushSegment();
+                          }
+                        : async () => {
+                            if (combinedAbortSignal.aborted) return;
+                            await streamingController.beginSegment();
+                          },
                     }
                   : {}),
                 ...(progressPublisher

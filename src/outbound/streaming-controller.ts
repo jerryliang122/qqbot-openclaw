@@ -275,6 +275,10 @@ export class StreamingController {
   // ── 入口 ──
 
   onPartialReply(text: string): Promise<void> {
+    // 纯空白 partial 不算内容（评审意见 2）：不置 hasStarted（final 仍走默认
+    // 投递路径送达）、不进缓冲计数——否则 final 与已承接内容匹配不上、rescue
+    // 又被 sentChunkCount>0 拒绝，终稿会被吞掉（只发出那条空白）。
+    if (!text || !text.trim()) return Promise.resolve();
     this._hasStarted = true; // 同步置位：不等异步发送，final 就能感知流式已启动
     this.chain = this.chain.then(() => this.handleChunk(text)).catch((err) => {
       this.deps.log?.error(`onPartialReply error: ${err instanceof Error ? err.message : String(err)}`);
@@ -320,7 +324,17 @@ export class StreamingController {
    * → 自锁（handleChunk → closeSegment → 等待排在 handleChunk 之后的自己）。
    */
   private async doCloseSegment(reason: string): Promise<void> {
-    if (this.isTerminal || this.isStaticMode) return;
+    if (this.isTerminal) {
+      // stream 模式终态 + 段文本残留 = 封口动作丢弃已承接内容（issue #80 要求
+      // 四个入口全部可观测；static 模式 doCloseSegment 本就 no-op，无内容可丢）
+      if (!this.isStaticMode && this.currentSegmentText) {
+        this.deps.log?.warn(
+          `segment close dropped: terminal phase=${this.phase} chars=${this.currentSegmentText.length} (issue #80)`,
+        );
+      }
+      return;
+    }
+    if (this.isStaticMode) return;
     if (!this.currentSegmentText) return;
     this.deps.log?.info(`segment sealed chars=${this.currentSegmentText.length} reason=${reason}`);
     await this.completeSession(`segment_boundary:${reason}`);
