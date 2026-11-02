@@ -8,6 +8,30 @@
 
 ---
 
+## [3.1.3] - 2026-11-02
+
+### 修复
+
+- **流式 turn 提前收尾被终态化 → follow-up 注入的长跑产出全程静默丢失（issue #80）**。现场：框架 follow-up 注入（框架日志 `steering rejected; applying follow-up policy reason=reply-owner-ended`）场景下，dispatch 的 `inboundRun` promise 在**仅入队**时即 resolve → dispatch 提前收尾 → 收尾的 `finalize()` 打到 idle 无内容的 controller → 落入终态。此后长跑 run 持续通过 dispatch 注册的 `replyOptions` 投递 partial / flush / final，全部被 `isTerminal` 守卫在 `handleChunk` / `flushSegment` / `absorbFinalText` **静默吞掉——零日志、零网络请求**；最终回复之所以能到达，是 `_hasStarted` 同步置位 + `shouldFallbackToStatic=true` 让 final 绕过流式早退走默认投递路径。修法（三件套，均在插件侧）：① **park 代替终态化**——`handleFinalize()` 的「从未承接任何内容」分支不再进终态，标记 `_parked` 保持 idle 待命 + WARN 日志；「段落已全部 flush」的正常收尾区分出 reason `finalize:flushed`（不再与「从未有内容」共用误导性的 `finalize:fallback`），static 与 stream 两模式均覆盖。② **parked 补位收尾**——dispatch 的 deliver 回调中 `kind === 'final' && parked` 时补一次 `finalize()`：dispatch 已 return，不会再有「dispatch 末尾的 finalize」，final 是该 delivery context 的最后一个事件，此处收尾把最后一段缓冲发出。③ **可观测性**——四个丢弃入口（`handleChunk` / `flushSegment` / `doCloseSegment` / `absorbFinalText`）因终态丢弃内容时打 WARN 并附丢弃字符数，根除「零日志无从排查」。框架未向通道插件暴露「run 是否存活」的查询 API，插件侧能做到的对齐就是「无内容不终结」；reply-owner 交接时两侧生命周期的同步需框架暴露 drain 完成信号，超出插件能力范围。回归测试 `tests/streaming-parked-finalize.test.ts`。
+- **park 场景的 9 条复审缺陷（内容丢失 / 重复内容 / 取消语义 / 媒体完整性）**。上一条修复自身开出新的口子，经真实 `dispatchToOpenClaw` 逐条实测后收口（每条都有对应回归用例）：
+  - **ask_user 前置文本 flush 失败 → 答案正文消失**（高危）：static 模式下 `flushSegment()` 发送失败会把 controller 转终态 `failed`，ask_user 卡片照发，但作答后的 partial/final 全被 `isTerminal` 守卫丢弃——用户看到问题卡片却看不到答案。修法：ask_user 路径的 flush 走 **tolerant**（发送失败**不**终态化，缓冲保留，后续 flush/finalize 有一次重试机会），controller 保持可承接。
+  - **parked 尾巴 sendText 失败被当成功 → footer 静默丢失**：`sendText` 失败返回 `{error}` 而不抛错，原实现不检查就当成功；parked 场景 dispatch 已收尾、末尾兜底不会再跑，footer 就此丢失。修法：检查 `{error}`，失败重试一次，仍失败记 ERROR。
+  - **isError final 造成内容重复**：parked stream 收到 `isError` final 时先补尾巴、随后整段发，用户看到两份内容。修法：`isError` payload 不补尾巴（与 `absorbFinalText` 的既有处理一致）。
+  - **两个重叠 final 导致 footer 发两遍**：两个投递在任一排队的 `finalize()` 执行前各自读到 `parked`，段已封口时 `absorbFinalText` 无法在没有 session 的情况下推进差量基准 → 两个回调算出同一份 remainder 并各发一次。修法：**认领制**（发送前先登记，同一 remainder 只发一次）。
+  - **已取消的 turn 仍发排队内容 / ask_user 卡片 / 媒体**：取消信号此前只传给了 `absorbFinalText`，`onPartialReply` / `flushSegment` / `closeSegment` 入队工作时不再复查（dispatch 侧守卫只覆盖调用时刻，入队后仍可能中止＝TOCTOU 窗口）。修法：三个入口全部接收 `signal` 并在**实际执行时**复查；ask_user 分支与三处媒体转发加 `aborted` 门控。
+  - **流式早退路径丢弃 `attachments`**：媒体集合只读 `mediaUrl` / `mediaUrls`，仅带 `attachments` 的 payload 永远收不到媒体。修法：与默认路径共用 `deliver-pipeline` 的 `resolveMediaUrls`（`mediaUrls` → `mediaUrl` → `attachments[].url/path`，列表内去重），`filterDeliveredMedia` 同步过滤 attachments。
+  - **流式路径媒体发送失败无用户可见提示**：流式早退绕过了 `deliverReply` 的「⚠️ 媒体发送失败」通知，附件静默丢失、用户毫无察觉。修法：与默认路径同口径发送失败提示。
+  - **重复 URL 重复发送**：同一 payload 的 `mediaUrls` 内重复 URL 未去重，收件人收到同一附件的多份副本。修法：`resolveMediaUrls` 列表内去重。
+  - **ask_user 顺序断言缺失**：两条用例分开断言 `sentTexts` 与 `botCardTexts`，只能证明「两件事都发生过」，证明不了「谁先谁后」。修法：改用共享事件序列断言顺序。
+
+- **发版前复审再抓 3 条（终稿救援被前置残留挡住 / 取消后仍发过时内容 / 语音路径绕过取消检查）**：v3.1.3 合并前的复审又抓到 3 条，逐条实测成立后一并修掉。① **ask_user 前置文本发送失败后，续跑「只有终稿、没有 partial」时答案永久丢失**——根因是 `canRescueUndeliveredFinal` 用「缓冲非空」当「本段已流出」的代理，而**失败的 flush 留下的缓冲非空却从未送达**（语义正好相反），终稿因此被判为「无关重写」而不补发，用户最终只收到那条过期的前置文本。修复：控制器新增 `staleBuffer`（未送达残留）状态；rescue 判定在 stale 时放行；补发成功后放弃该残留（否则收尾时会把过期文本当答案再发一遍）；且 ask_user 前置发送失败时**不**标记「内容已外部投递」——那会关掉终稿的 rescue 路径。② **已取消的 turn 在 dispatch 收尾时仍把取消前累积的文本发出去**——收尾的 `finalize()` 无条件执行，static 模式会把缓冲整段发出；修复：收尾感知取消信号，改走 `abort()`（只收尾流式会话的 DONE 帧、防草稿气泡永久悬挂，缓冲丢弃并留 WARN），且该状态下不再发送「失败兜底」消息（对一次被用户放弃的回复发兜底属噪声）。依据：正常完成的 c2c turn 收尾时 `combinedAbortSignal` 不会中止——同一处的 `[stream-final]` 尾巴兜底以 `!combinedAbortSignal.aborted` 为前提，/usage footer 能正常送达即证明该信号只在取消 / 被取代时置位。③ **block 语音路径绕过取消检查**——`audioAsVoice` 分支直接走 `deliverReply`，取消后仍会合成并投递语音；修复：与 ask_user 卡片、媒体转发一致地在发送前复查取消信号（媒体转发改为逐条 URL 复查）。
+
+### 已知限制
+
+- **媒体 source 的 SSRF 防护实测可被绕过——本次决定暂不加固（结论与触发器已记入 `AGENTS.md`）**：`resolveMediaPath` 只按「小写 `http(s)://` 前缀」决定是否走 `validateRemoteUrl`，而平台侧 URL 解析器会把 `HTTP://`（大写）、`http:/`（单斜杠）、前导空格等变体**归一化成同一个 `http://` 绝对 URL**——实测这三种拼写均可绕过内网地址拦截并原样交给平台。**决定暂不加固**：触发前提是 agent 侧输出被污染（提示注入 / 被投毒的外部工具 / MCP），那一步成立后 agent 已具备更强能力（跑工具、读文件），SSRF 的边际收益低；「明确拒绝非 http(s) scheme」还会打断可能存在的既有工作流。本地文件读取**不受影响**（`file://` / 绝对路径 / `~` / `./` / `C:\` 全走 realpath + 根目录白名单），且 SDK 不本地 fetch（`body.url` 交给平台抓取，无响应回传通道）。**但这是「假防护」而非「无防护」**：一旦插件出现「先下载再上传」的媒体路径（按平台软限制预检大小、算 `file_size`、取时长/缩略图），这些变体立刻变成插件主机侧完整可利用的 SSRF + 响应回传。触发器（① 出现本地下载媒体路径 ② source 可信度假设改为「不可信」③ 出现提示注入可触达外部内容的部署形态）与届时做法（`new URL()` 解析式判定 + 校验与消费共用同一份解析结果）记入 `AGENTS.md`。
+
+---
+
 ## [3.1.2] - 2026-11-01
 
 ### 修复
