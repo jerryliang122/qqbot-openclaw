@@ -531,6 +531,21 @@ export async function dispatchToOpenClaw(
     dlog?.debug(`streaming enabled for ${envelope.senderId}`);
   }
 
+  /**
+   * 流式 final 尾巴差量补发（usage footer 等，PR #81 评审 L3 抽取）。
+   * 两处消费——park 场景 deliver 回调内 / dispatch 末尾兜底——共用同一实现，
+   * 防止两份四条件逻辑各自演化分叉。调用方负责各自的门控条件
+   * （!aborted / !shouldSuppressFinalTailFallback 等）。返回是否实际发送。
+   */
+  const sendFinalTailRemainder = async (finalText: string, via: string): Promise<boolean> => {
+    if (!streamingController) return false;
+    const remainder = streamingController.computeUnsentRemainder(finalText).trim();
+    if (!remainder) return false;
+    dlog?.info(`[stream-final] ${via} chars=${remainder.length}`);
+    await deliverCtx.sendText(qualifiedTarget, remainder);
+    return true;
+  };
+
   const deliveredMediaUrls = new Set<string>();
   const deliveredTexts = new Set<string>();
   // 流式 turn 的 final payload 文本暂存：框架把 usage footer（/usage tokens|full）
@@ -663,7 +678,7 @@ export async function dispatchToOpenClaw(
         if (payload.audioAsVoice) {
           await deliverReply(payload, info, deliverCtx);
         } else {
-          await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
+          outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
         }
       }
 
@@ -727,6 +742,9 @@ export async function dispatchToOpenClaw(
         } else if (kind === 'final') {
           // stream 模式：**仅**在终稿时收尾整轮。段边界由框架
           // onAssistantMessageStart（+ 工具调用）驱动。
+          // 快照 park 状态：finalize 的终态转移会清掉 _parked（评审 L1），
+          // 下方补发门控须用进入分支前的值
+          const wasParked = streamingController.parked;
           await streamingController.finalize();
           // park 场景（issue #80）：dispatch 已 return，末尾 [stream-final] 差量
           // 兜底不会再跑——final 的未流出尾巴（usage footer 等）在此直接补发。
@@ -734,29 +752,30 @@ export async function dispatchToOpenClaw(
           // 路径（评审意见 5）；非 park 时 dispatch 末尾兜底仍兜得住（absorb
           // 已把尾巴推入会话时 remainder 为空串，不会重复发送）。
           if (
-            streamingController.parked && text
+            wasParked && text
             && !combinedAbortSignal.aborted
             && !streamingController.shouldSuppressFinalTailFallback
           ) {
-            const tailRemainder = streamingController.computeUnsentRemainder(text).trim();
-            if (tailRemainder) {
-              dlog?.info(`[stream-final] parked late tail chars=${tailRemainder.length}`);
-              await deliverCtx.sendText(qualifiedTarget, tailRemainder);
-            }
+            await sendFinalTailRemainder(text, 'parked late tail');
           }
         }
         // 流式早退前转发 final/tool 携带的媒体（评审意见 4）：早退 return 后
         // 默认路径（含媒体发送）不可达，不在此转发即丢失。block 媒体已在上方
-        // kind==='block' 分支转发；deliveredMediaUrls 去重防双重发送。
+        // kind==='block' 分支转发；deliveredMediaUrls 去重防双重发送，失败
+        // 不标记（forwardMediaUrls 内处理）并计入失败统计（评审 M1）。
         if (kind === 'final' || kind === 'tool') {
-          await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
+          outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
         }
         if (payload.isError === true) {
           dlog?.info(`run-failure notice bypasses streaming dedup (kind=${kind ?? 'none'} textLen=${text.length})`);
         } else if (!streamingController.shouldFallbackToStatic) {
           // final 文本暂存：absorbFinalText 未能并入（终态 / stream 无会话 /
           // static 缓冲已 flush 后重算仍有增量等）的残余场景，由 dispatch
-          // 末尾 [stream-final] 段按前缀差量兜底单独补发
+          // 末尾 [stream-final] 段按前缀差量兜底单独补发。
+          // ⚠️ parked 场景（dispatch 已 return）此暂存无人消费——消费者在
+          // dispatch 尾部、早已跑完；尾巴已由上方 parked 分支就地补发。这里
+          // 是为非 parked 路径维持既有契约，读起来别误当「已被覆盖」
+          // （PR #81 评审 L2）
           if (kind === 'final' && text) {
             pendingStreamFinalText = text;
           }
@@ -773,7 +792,7 @@ export async function dispatchToOpenClaw(
 
       // ── 4. tool 媒体：立即转发（static 流式路径已在上方 flush 文本）──
       if (kind === 'tool') {
-        await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
+        outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
         return;
       }
 
@@ -1055,11 +1074,8 @@ export async function dispatchToOpenClaw(
     && !combinedAbortSignal.aborted
     && !streamingController.shouldSuppressFinalTailFallback
   ) {
-    const remainder = streamingController.computeUnsentRemainder(pendingStreamFinalText).trim();
-    if (remainder) {
-      dlog?.info(`[stream-final] appending unsent final tail chars=${remainder.length}`);
-      await deliverCtx.sendText(qualifiedTarget, remainder);
-    } else {
+    const tailSent = await sendFinalTailRemainder(pendingStreamFinalText, 'appending unsent final tail');
+    if (!tailSent) {
       dlog?.debug?.(`[stream-final] final text fully covered by streamed content (chars=${pendingStreamFinalText.length})`);
     }
   }
@@ -1166,20 +1182,21 @@ function createStreamingController(
 
 // ── 辅助函数 ──
 
-/** 提取 payload 中的媒体 URL 并逐个发送（去重） */
+/** 提取 payload 中的媒体 URL 并逐个发送（去重），返回发送失败数 */
 async function forwardMediaUrls(
   payload: DeliverPayload,
   ctx: DeliverContext,
   delivered: Set<string>,
   log?: PluginLogger,
-): Promise<void> {
+): Promise<number> {
   const urls: string[] = [];
   if (payload.mediaUrls?.length) urls.push(...payload.mediaUrls);
   if (payload.mediaUrl && !urls.includes(payload.mediaUrl)) urls.push(payload.mediaUrl);
   const newUrls = urls.filter((u) => !delivered.has(u));
+  let failures = 0;
   for (const url of newUrls) {
     try {
-      await sendMedia({
+      const result = await sendMedia({
         to: ctx.qualifiedTarget,
         source: url,
         text: '',
@@ -1188,11 +1205,22 @@ async function forwardMediaUrls(
         log: ctx.log,
         agentId: ctx.agentId,
       });
+      if (result.error) {
+        // 发送失败【不】标记已投递：sendMedia 失败时返回 {error} 而非抛错
+        // （media-send 各失败路径均不 throw），无条件 add 会让
+        // filterDeliveredMedia 把该 URL 从默认路径剥掉——重试与 deliverReply
+        // 的「媒体发送失败」提示双双失效，媒体静默丢失（PR #81 评审 M1）
+        failures++;
+        log?.error(`media forward failed: ${result.error}`);
+        continue;
+      }
       delivered.add(url);
     } catch (err) {
+      failures++;
       log?.error(`media forward failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  return failures;
 }
 
 /** 过滤已发送的媒体 URL */

@@ -426,9 +426,18 @@ export class StreamingController {
     const signal = opts?.signal;
     this.chain = this.chain.then(async () => {
       if (this.isTerminal) {
-        this.deps.log?.warn(
-          `final absorb skipped: terminal phase=${this.phase} chars=${finalText.length} (issue #80)`,
-        );
+        // 框架会幂等重投同一 final（既有测试佐证）——identical 重投是良性
+        // no-op，降为 INFO；只有「与已承接内容无关的终稿被吞」才 WARN
+        // （PR #81 评审 N2）
+        if (this.matchFinalText(finalText).kind === 'identical') {
+          this.deps.log?.info(
+            `final absorb skipped: terminal (identical re-delivery) chars=${finalText.length}`,
+          );
+        } else {
+          this.deps.log?.warn(
+            `final absorb skipped: terminal phase=${this.phase} chars=${finalText.length} (issue #80)`,
+          );
+        }
         return;
       }
       if (signal?.aborted) return;
@@ -714,6 +723,10 @@ export class StreamingController {
     if (this.phase === next) return;
     this.deps.log?.info(`phase: ${this.phase} → ${next} (${reason})`);
     this.phase = next;
+    // 离开 park：终态化即 park 使命结束（PR #81 评审 L1）——补位 finalize
+    // 完成后的重复 final 不再重入补位分支（终态空转无谓，且「当前处于 park」
+    // 的语义已不成立）
+    if (next === 'done' || next === 'failed') this._parked = false;
   }
 }
 

@@ -288,10 +288,13 @@ function makeFakeRuntime(opts: { onInboundRun?: (params: any) => Promise<any> } 
   } as any;
 }
 
-function installFakeGateway(opts: { failFirstTextSend?: boolean } = {}) {
+function installFakeGateway(opts: { failFirstTextSend?: boolean; failFirstMediaSend?: boolean } = {}) {
   const sentTexts: string[] = [];
   const sentMedia: string[] = [];
+  const botCardTexts: string[] = [];
+  const streamSessions: Array<{ updates: string[]; completes: number }> = [];
   let textSendCount = 0;
+  let mediaSendCount = 0;
   const gw = {
     sendText: async (_target: any, text: string) => {
       textSendCount++;
@@ -304,17 +307,36 @@ function installFakeGateway(opts: { failFirstTextSend?: boolean } = {}) {
       return { id: `out-${sentTexts.length}` };
     },
     sendMedia: async (...args: any[]) => {
+      mediaSendCount++;
+      // 同 sendText：media-send 失败路径返回 {error} 不抛错，模拟失败须 throw
+      if (opts.failFirstMediaSend && mediaSendCount === 1) {
+        throw new Error('boom (failFirstMediaSend)');
+      }
       const url = args.find((a) => typeof a === 'string' && a.startsWith('http'));
       sentMedia.push(url ?? `arg:${args.length}`);
       return { id: 'media-out' };
     },
-    openStream: () => ({
-      update: async () => {},
-      complete: async () => ({ id: 'stream-done', timestamp: Date.now() }),
-    }),
+    openStream: () => {
+      const session = { updates: [] as string[], completes: 0 };
+      streamSessions.push(session);
+      return {
+        update: async (text: string) => { session.updates.push(text); },
+        complete: async () => {
+          session.completes++;
+          return { id: 'stream-done', timestamp: Date.now() };
+        },
+      };
+    },
+    // tryGetBotForAccount 走 getGateway(accountId).bot——ask_user 卡片经此发出
+    bot: {
+      sendTextWithKeyboard: async (_target: any, text: string) => {
+        botCardTexts.push(text);
+        return { id: `card-${botCardTexts.length}` };
+      },
+    },
   } as any;
   registerGateway('test-account', gw);
-  return { sentTexts, sentMedia };
+  return { sentTexts, sentMedia, botCardTexts, streamSessions };
 }
 
 /**
@@ -327,7 +349,14 @@ async function runDispatch(opts: {
   simulate: (captured: CapturedDispatch) => Promise<void>;
   ctxSignal?: AbortSignal;
   failFirstTextSend?: boolean;
-}): Promise<{ sentTexts: string[]; sentMedia: string[]; captured: CapturedDispatch }> {
+  failFirstMediaSend?: boolean;
+}): Promise<{
+  sentTexts: string[];
+  sentMedia: string[];
+  botCardTexts: string[];
+  streamSessions: Array<{ updates: string[]; completes: number }>;
+  captured: CapturedDispatch;
+  }> {
   _resetAdaptersCache();
   const msg = {
     kind: 'c2c',
@@ -370,9 +399,12 @@ async function runDispatch(opts: {
     },
   } as any;
 
-  const { sentTexts, sentMedia } = installFakeGateway({ failFirstTextSend: opts.failFirstTextSend });
+  const { sentTexts, sentMedia, botCardTexts, streamSessions } = installFakeGateway({
+    failFirstTextSend: opts.failFirstTextSend,
+    failFirstMediaSend: opts.failFirstMediaSend,
+  });
   await dispatchToOpenClaw(ctx, msg, account, runtime);
-  return { sentTexts, sentMedia, captured };
+  return { sentTexts, sentMedia, botCardTexts, streamSessions, captured };
 }
 
 group('Part 2: dispatch 层（端到端）');
@@ -522,6 +554,54 @@ await test('回归锚点：dispatch 存活期间的正常 static 多段流行为
     },
   });
   assert.deepStrictEqual(sentTexts, ['段A', '段B'], '正常流：段A 工具边界即时发，段B 兜底 finalize 发');
+});
+
+group('Part 4: 主人评审（M1/M2）');
+
+await test('M1: 媒体转发失败不标记已投递 → 后续投递重试送达', async () => {
+  const URL = 'https://example.com/m1-img.png';
+  const { sentTexts, sentMedia, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    failFirstMediaSend: true, // 第一次媒体发送失败（media-send 失败返回 {error} 不抛错）
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '见附图' });
+  await captured.dispatcherOptions?.deliver?.({ text: '见附图', mediaUrls: [URL] }, { kind: 'tool' }); // flush 文本 + 媒体首发失败
+  await captured.dispatcherOptions?.deliver?.({ text: '终稿', mediaUrls: [URL] }, { kind: 'final' }); // 媒体应重试成功
+  assert.ok(sentTexts.includes('见附图'), '前置文本 flush 送达');
+  assert.ok(
+    sentMedia.some((m) => m.includes('m1-img.png')),
+    '首发失败的媒体不得标记已投递（否则被 filterDeliveredMedia 从默认路径剥掉，重试与失败提示双失效）',
+  );
+});
+
+const ASK_USER_PAYLOAD = (text: string) => ({
+  text,
+  channelData: { askUser: { questionId: `ask_${'a'.repeat(32)}`, optionValues: ['继续', '取消'] } },
+});
+
+await test('M2: static ask_user 前置文本在问题卡片之前送达', async () => {
+  const { sentTexts, botCardTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '前置说明' });
+  await captured.dispatcherOptions?.deliver?.(ASK_USER_PAYLOAD('要继续吗？'), { kind: 'final' });
+  assert.deepStrictEqual(sentTexts, ['前置说明'], '前置文本应在卡片前 flush 送达（不悬挂到作答后）');
+  assert.deepStrictEqual(botCardTexts, ['要继续吗？'], '问题卡片经 bot.sendTextWithKeyboard 送达');
+});
+
+await test('M2: stream ask_user 前封口当前段（DONE 帧）再发卡片', async () => {
+  const { botCardTexts, streamSessions, captured } = await runDispatch({
+    streaming: { mode: 'partial' }, // stream 模式（默认）
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '前置说明' });
+  await captured.dispatcherOptions?.deliver?.(ASK_USER_PAYLOAD('要继续吗？'), { kind: 'final' });
+  assert.strictEqual(streamSessions.length, 1, '应已开流式会话承接前置文本');
+  assert.deepStrictEqual(streamSessions[0]!.updates, ['前置说明']);
+  assert.strictEqual(streamSessions[0]!.completes, 1, 'ask_user 前应收尾会话（DONE 帧）——草稿气泡不悬挂');
+  assert.deepStrictEqual(botCardTexts, ['要继续吗？'], '问题卡片随后送达');
 });
 
 // ============ 结果 ============
