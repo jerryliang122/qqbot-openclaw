@@ -293,6 +293,12 @@ function installFakeGateway(opts: { failFirstTextSend?: boolean; failFirstMediaS
   const sentMedia: string[] = [];
   const botCardTexts: string[] = [];
   const streamSessions: Array<{ updates: string[]; completes: number }> = [];
+  /**
+   * 共享事件序列（文本发送 / 卡片发送 / 流式 update / 流式封口）。
+   * 顺序断言必须落在同一个序列上——分开断言 sentTexts 与 botCardTexts 只能
+   * 证明「两件事都发生过」，证明不了「谁先谁后」（PR #81 评审 N9）。
+   */
+  const events: string[] = [];
   let textSendCount = 0;
   let mediaSendCount = 0;
   const gw = {
@@ -304,6 +310,7 @@ function installFakeGateway(opts: { failFirstTextSend?: boolean; failFirstMediaS
         throw new Error('boom (failFirstTextSend)');
       }
       sentTexts.push(text);
+      events.push(`text:${text}`);
       return { id: `out-${sentTexts.length}` };
     },
     sendMedia: async (...args: any[]) => {
@@ -314,15 +321,20 @@ function installFakeGateway(opts: { failFirstTextSend?: boolean; failFirstMediaS
       }
       const url = args.find((a) => typeof a === 'string' && a.startsWith('http'));
       sentMedia.push(url ?? `arg:${args.length}`);
+      events.push(`media:${url ?? ''}`);
       return { id: 'media-out' };
     },
     openStream: () => {
       const session = { updates: [] as string[], completes: 0 };
       streamSessions.push(session);
       return {
-        update: async (text: string) => { session.updates.push(text); },
+        update: async (text: string) => {
+          session.updates.push(text);
+          events.push('stream:update');
+        },
         complete: async () => {
           session.completes++;
+          events.push('stream:complete');
           return { id: 'stream-done', timestamp: Date.now() };
         },
       };
@@ -331,12 +343,13 @@ function installFakeGateway(opts: { failFirstTextSend?: boolean; failFirstMediaS
     bot: {
       sendTextWithKeyboard: async (_target: any, text: string) => {
         botCardTexts.push(text);
+        events.push(`card:${text}`);
         return { id: `card-${botCardTexts.length}` };
       },
     },
   } as any;
   registerGateway('test-account', gw);
-  return { sentTexts, sentMedia, botCardTexts, streamSessions };
+  return { sentTexts, sentMedia, botCardTexts, streamSessions, events };
 }
 
 /**
@@ -355,6 +368,7 @@ async function runDispatch(opts: {
   sentMedia: string[];
   botCardTexts: string[];
   streamSessions: Array<{ updates: string[]; completes: number }>;
+  events: string[];
   captured: CapturedDispatch;
   }> {
   _resetAdaptersCache();
@@ -399,12 +413,12 @@ async function runDispatch(opts: {
     },
   } as any;
 
-  const { sentTexts, sentMedia, botCardTexts, streamSessions } = installFakeGateway({
+  const { sentTexts, sentMedia, botCardTexts, streamSessions, events } = installFakeGateway({
     failFirstTextSend: opts.failFirstTextSend,
     failFirstMediaSend: opts.failFirstMediaSend,
   });
   await dispatchToOpenClaw(ctx, msg, account, runtime);
-  return { sentTexts, sentMedia, botCardTexts, streamSessions, captured };
+  return { sentTexts, sentMedia, botCardTexts, streamSessions, events, captured };
 }
 
 group('Part 2: dispatch 层（端到端）');
@@ -581,7 +595,7 @@ const ASK_USER_PAYLOAD = (text: string) => ({
 });
 
 await test('M2: static ask_user 前置文本在问题卡片之前送达', async () => {
-  const { sentTexts, botCardTexts, captured } = await runDispatch({
+  const { sentTexts, botCardTexts, events, captured } = await runDispatch({
     streaming: { mode: 'partial', sendMode: 'static' },
     simulate: async () => {},
   });
@@ -589,10 +603,16 @@ await test('M2: static ask_user 前置文本在问题卡片之前送达', async 
   await captured.dispatcherOptions?.deliver?.(ASK_USER_PAYLOAD('要继续吗？'), { kind: 'final' });
   assert.deepStrictEqual(sentTexts, ['前置说明'], '前置文本应在卡片前 flush 送达（不悬挂到作答后）');
   assert.deepStrictEqual(botCardTexts, ['要继续吗？'], '问题卡片经 bot.sendTextWithKeyboard 送达');
+  // 顺序断言必须落在同一事件序列上：分开断言只能证明「都发生过」，
+  // 证明不了「文本在卡片之前」（PR #81 评审 N9）
+  const textIdx = events.indexOf('text:前置说明');
+  const cardIdx = events.indexOf('card:要继续吗？');
+  assert.ok(textIdx !== -1 && cardIdx !== -1, `前置文本与卡片都应发出（events=${JSON.stringify(events)}）`);
+  assert.ok(textIdx < cardIdx, `前置文本必须早于卡片（events=${JSON.stringify(events)}）`);
 });
 
 await test('M2: stream ask_user 前封口当前段（DONE 帧）再发卡片', async () => {
-  const { botCardTexts, streamSessions, captured } = await runDispatch({
+  const { botCardTexts, streamSessions, events, captured } = await runDispatch({
     streaming: { mode: 'partial' }, // stream 模式（默认）
     simulate: async () => {},
   });
@@ -602,6 +622,150 @@ await test('M2: stream ask_user 前封口当前段（DONE 帧）再发卡片', a
   assert.deepStrictEqual(streamSessions[0]!.updates, ['前置说明']);
   assert.strictEqual(streamSessions[0]!.completes, 1, 'ask_user 前应收尾会话（DONE 帧）——草稿气泡不悬挂');
   assert.deepStrictEqual(botCardTexts, ['要继续吗？'], '问题卡片随后送达');
+  // 顺序断言落在同一事件序列：封口（DONE 帧）必须早于卡片
+  const completeIdx = events.indexOf('stream:complete');
+  const cardIdx = events.indexOf('card:要继续吗？');
+  assert.ok(completeIdx !== -1 && cardIdx !== -1, `封口与卡片都应发生（events=${JSON.stringify(events)}）`);
+  assert.ok(completeIdx < cardIdx, `段封口必须早于卡片（events=${JSON.stringify(events)}）`);
+});
+
+
+group('Part 5: Sourcery 复审批次（07:31）回归用例');
+
+await test('N1: ask_user 前置文本 flush 失败 → 答案正文仍送达', async () => {
+  const { sentTexts, botCardTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    failFirstTextSend: true, // 前置 flush 的 sendStatic 抛错（发送失败）
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '前置说明' });
+  await captured.dispatcherOptions?.deliver?.(ASK_USER_PAYLOAD('要继续吗？'), { kind: 'final' });
+  assert.deepStrictEqual(botCardTexts, ['要继续吗？'], '前置文本发送失败不应挡住问题卡片');
+
+  // 用户作答后 run 续跑：答案正文必须送达
+  await captured.replyOptions?.onPartialReply?.({ text: '答案正文' });
+  await captured.dispatcherOptions?.deliver?.({ text: '答案正文' }, { kind: 'final' });
+  assert.ok(
+    sentTexts.includes('答案正文'),
+    '答案正文必须送达（修复前：flush 失败 → controller 终态化 → 答案被 isTerminal 守卫丢弃）',
+  );
+});
+
+await test('N2: parked 尾巴发送失败 → 重试后送达（不静默丢 footer）', async () => {
+  const { sentTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial' }, // stream 模式：尾巴走 dispatch 的 sendFinalTailRemainder
+    failFirstTextSend: true,
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '正文' });
+  await captured.replyOptions?.onAssistantMessageStart?.(); // 封口当前段（无活动 session）
+  await captured.dispatcherOptions?.deliver?.({ text: '正文\nUsage: 1 in / 2 out' }, { kind: 'final' });
+  assert.ok(
+    sentTexts.some((t) => t.includes('Usage')),
+    '尾巴发送失败应重试并送达（修复前：{error} 被当成功 → footer 静默丢失）',
+  );
+});
+
+await test('N3: parked stream 的 isError final 不产生重复内容', async () => {
+  const { sentTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial' },
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '正文ABC' });
+  await captured.dispatcherOptions?.deliver?.({ text: '正文ABC发生错误', isError: true }, { kind: 'final' });
+  assert.deepStrictEqual(
+    sentTexts,
+    ['正文ABC发生错误'],
+    'isError final 整段发一次即可（修复前：先补尾巴再发整段 → ["发生错误","正文ABC发生错误"]）',
+  );
+});
+
+await test('N4: 两个重叠 final → footer 只发一次', async () => {
+  const { sentTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial' },
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '正文' });
+  await captured.replyOptions?.onAssistantMessageStart?.(); // 封口段（absorb 接不住 extension）
+  await Promise.all([
+    captured.dispatcherOptions?.deliver?.({ text: '正文\nUsage: 1 in / 2 out' }, { kind: 'final' }),
+    captured.dispatcherOptions?.deliver?.({ text: '正文\nUsage: 1 in / 2 out' }, { kind: 'final' }),
+  ]);
+  assert.strictEqual(
+    sentTexts.filter((t) => t.includes('Usage')).length,
+    1,
+    'footer 只发一次（修复前：两个重叠 final 各自算 remainder → 发两遍）',
+  );
+});
+
+await test('N5: 流式早退路径转发 attachments', async () => {
+  const ATT = 'https://example.com/att-only.png';
+  const { sentMedia, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '前置' }); // 让 hasStarted=true 走流式早退路径
+  await captured.dispatcherOptions?.deliver?.(
+    { text: '前置', attachments: [{ url: ATT }] } as any,
+    { kind: 'final' },
+  );
+  assert.ok(sentMedia.includes(ATT), 'attachments 应在流式早退路径转发（修复前：被丢弃）');
+});
+
+await test('N6: 流式路径媒体发送失败 → 用户可见提示', async () => {
+  const URL = 'https://example.com/fail.png';
+  const { sentTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    failFirstMediaSend: true,
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '见附图' });
+  await captured.dispatcherOptions?.deliver?.({ text: '见附图', mediaUrls: [URL] }, { kind: 'final' });
+  assert.ok(
+    sentTexts.some((t) => t.includes('媒体发送失败')),
+    '媒体失败应通知用户（修复前：流式路径只记日志，附件静默丢失）',
+  );
+});
+
+await test('N7: 已取消的 turn 不发排队内容与 ask_user 卡片', async () => {
+  const ac = new AbortController();
+  const { sentTexts, botCardTexts, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    ctxSignal: ac.signal,
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: '取消前的文本' });
+  ac.abort(); // turn 被取消（用户插嘴）
+  await captured.dispatcherOptions?.deliver?.(ASK_USER_PAYLOAD('要继续吗？'), { kind: 'final' });
+  assert.deepStrictEqual(botCardTexts, [], '取消后不发问题卡片');
+  assert.ok(!sentTexts.includes('取消前的文本'), '取消后不发取消前累积的文本');
+});
+
+await test('N8: 已取消的 turn 不转发媒体', async () => {
+  const ac = new AbortController();
+  const URL = 'https://example.com/cancelled.png';
+  const { sentMedia, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    ctxSignal: ac.signal,
+    simulate: async () => {},
+  });
+  // 先让流式启动（hasStarted=true），取消发生在流式启动之后 —— 评审场景：
+  // deliverHandler 跳过终稿吸收，但仍会调 forwardMediaUrls 把附件发出去
+  await captured.replyOptions?.onPartialReply?.({ text: 'x' });
+  ac.abort();
+  await captured.dispatcherOptions?.deliver?.({ text: 'x', mediaUrls: [URL] }, { kind: 'final' });
+  assert.deepStrictEqual(sentMedia, [], '取消后不发附件');
+});
+
+await test('N9: mediaUrls 内重复 URL 只发一次', async () => {
+  const URL = 'https://example.com/dup.png';
+  const { sentMedia, captured } = await runDispatch({
+    streaming: { mode: 'partial', sendMode: 'static' },
+    simulate: async () => {},
+  });
+  await captured.replyOptions?.onPartialReply?.({ text: 'x' });
+  await captured.dispatcherOptions?.deliver?.({ text: 'x', mediaUrls: [URL, URL] }, { kind: 'final' });
+  assert.strictEqual(sentMedia.filter((u) => u === URL).length, 1, '重复 URL 只发一次');
 });
 
 // ============ 结果 ============

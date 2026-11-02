@@ -17,7 +17,7 @@ import { buildEnvelope } from './envelope-builder.js';
 import { assembleBody, type AssembledBody } from './body-assembler.js';
 import { sendText, getGateway, resolveQuotaAccountId } from '../outbound/outbound-service.js';
 import { sendMedia } from '../outbound/media-send.js';
-import { deliverReply, type DeliverPayload, type DeliverInfo, type DeliverContext } from '../outbound/deliver-pipeline.js';
+import { deliverReply, resolveMediaUrls, formatMediaFailureNotice, type DeliverPayload, type DeliverInfo, type DeliverContext } from '../outbound/deliver-pipeline.js';
 import { buildCtxPayload } from './ctx-builder.js';
 
 import { DeliverDebouncer } from '../outbound/debounce.js';
@@ -532,18 +532,49 @@ export async function dispatchToOpenClaw(
   }
 
   /**
+   * 已认领的尾巴文本（同一 dispatch 生命周期内）。
+   *
+   * 两个重叠的 final 投递会在任一排队的 finalize() 执行前各自读到 parked；
+   * 最后一个 stream 段此前已封口时 absorbFinalText 无法在没有 session 的
+   * 情况下推进差量基准 → 两个回调算出**同一份** remainder 并各发一次
+   * （usage footer 发两遍，PR #81 评审 N8）。认领制：发送前先登记，同一
+   * remainder 只发一次。
+   */
+  const claimedFinalTails = new Set<string>();
+
+  /**
    * 流式 final 尾巴差量补发（usage footer 等，PR #81 评审 L3 抽取）。
    * 两处消费——park 场景 deliver 回调内 / dispatch 末尾兜底——共用同一实现，
    * 防止两份四条件逻辑各自演化分叉。调用方负责各自的门控条件
    * （!aborted / !shouldSuppressFinalTailFallback 等）。返回是否实际发送。
+   *
+   * sendText 失败返回 {error} 而**不抛错**：不检查就是把失败当成功——parked
+   * 场景 dispatch 已收尾，末尾兜底不会再跑，footer 就此静默丢失
+   * （PR #81 评审 N5）。失败重试一次，仍失败记 ERROR 并返回 false。
    */
   const sendFinalTailRemainder = async (finalText: string, via: string): Promise<boolean> => {
     if (!streamingController) return false;
     const remainder = streamingController.computeUnsentRemainder(finalText).trim();
     if (!remainder) return false;
+    if (claimedFinalTails.has(remainder)) {
+      dlog?.info(`[stream-final] ${via} skipped: tail already claimed chars=${remainder.length}`);
+      return false;
+    }
+    claimedFinalTails.add(remainder);
     dlog?.info(`[stream-final] ${via} chars=${remainder.length}`);
-    await deliverCtx.sendText(qualifiedTarget, remainder);
-    return true;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const result = await deliverCtx.sendText(qualifiedTarget, remainder);
+        if (!result.error) return true;
+        dlog?.warn(`[stream-final] ${via} send failed (attempt ${attempt}/2): ${String(result.error)}`);
+      } catch (err) {
+        dlog?.warn(
+          `[stream-final] ${via} send threw (attempt ${attempt}/2): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    dlog?.error(`[stream-final] ${via} tail dropped after retries chars=${remainder.length}`);
+    return false;
   };
 
   const deliveredMediaUrls = new Set<string>();
@@ -593,6 +624,12 @@ export async function dispatchToOpenClaw(
       // 单问题单选场景：用 inline keyboard 替代纯文本
       const payloadWithChannelData = payload as DeliverPayload & { channelData?: unknown };
       if (isAskUserPayload(payloadWithChannelData as any) && text) {
+        // 已取消的 turn 不发问题卡片，也不发送取消前累积的内容
+        // （PR #81 评审 N2：取消后仍发排队内容/卡片，用户看到过时输出）
+        if (combinedAbortSignal.aborted) {
+          dlog?.info('[question] skipped: turn cancelled');
+          return;
+        }
         const { questionId, optionValues } = (payloadWithChannelData as any).channelData.askUser;
         const questionRuntime = await getQuestionGatewayRuntime();
         {
@@ -607,10 +644,13 @@ export async function dispatchToOpenClaw(
             // 当前段（等待用户作答期间草稿气泡不该悬挂）；static 模式 flush 缓冲
             // （问题卡片之前的前置文本先落地）。两者均不终态化——作答后 run
             // 续跑，新一段照常另起。
+            // static 的 flush 走 tolerant：前置文本发送失败**不**终态化 controller
+            // ——终态化会让作答后的 partial/final 全被 isTerminal 守卫丢弃，
+            // 用户看到问题卡片却看不到答案（PR #81 评审 N1）。
             if (streamingController?.isStaticSendMode) {
-              await streamingController.flushSegment();
+              await streamingController.flushSegment({ signal: combinedAbortSignal, tolerant: true });
             } else {
-              await streamingController?.closeSegment('ask_user');
+              await streamingController?.closeSegment('ask_user', { signal: combinedAbortSignal });
             }
             try {
               await bot.sendTextWithKeyboard(replyTarget, text, keyboard as never);
@@ -634,6 +674,10 @@ export async function dispatchToOpenClaw(
       // 集齐后合成一条"用户文本回复"走入站通道，由框架的文本应答
       // 解析器 resolve 挂起的 ask_user ──
       if (isNonSingleAskUserPayload(payloadWithChannelData as any) && text) {
+        if (combinedAbortSignal.aborted) {
+          dlog?.info('[question] skipped: turn cancelled (multi)');
+          return;
+        }
         const { questionId } = (payloadWithChannelData as any).channelData.askUser;
         const questions = parseMultiQuestionPrompt(text);
         if (questions) {
@@ -644,10 +688,12 @@ export async function dispatchToOpenClaw(
             // 先登记再发送，避免用户先点按钮时查无此单
             registerPendingMultiQuestion(account.accountId, questionId, scope, peerId, questions);
             // ask_user 前先固化已累积的流式内容（同单问题分支，评审意见 6）
+            // static 的 flush 走 tolerant：前置文本发送失败不终态化 controller
+            // （PR #81 评审 N1）
             if (streamingController?.isStaticSendMode) {
-              await streamingController.flushSegment();
+              await streamingController.flushSegment({ signal: combinedAbortSignal, tolerant: true });
             } else {
-              await streamingController?.closeSegment('ask_user');
+              await streamingController?.closeSegment('ask_user', { signal: combinedAbortSignal });
             }
             try {
               for (const [index, question] of questions.entries()) {
@@ -677,7 +723,8 @@ export async function dispatchToOpenClaw(
       if (kind === 'block') {
         if (payload.audioAsVoice) {
           await deliverReply(payload, info, deliverCtx);
-        } else {
+        } else if (!combinedAbortSignal.aborted) {
+          // 已取消的 turn 不发附件（PR #81 评审 N3：取消后仍收到媒体）
           outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
         }
       }
@@ -711,7 +758,7 @@ export async function dispatchToOpenClaw(
           // 这里仅兜底：deliver(kind:'tool') 时再 flush 一次（controller 内部去重，
           // buffer 已空时 flushSegment 无副作用）。
           if (kind === 'tool') {
-            await streamingController.flushSegment();
+            await streamingController.flushSegment({ signal: combinedAbortSignal });
           }
           // park 补位（issue #80）：dispatch 已收尾（inboundRun 因 follow-up 注入
           // 提前 resolve，controller 被 park 而非终态化），不会再有「dispatch 末尾
@@ -738,7 +785,7 @@ export async function dispatchToOpenClaw(
           // 另起一条消息完整送达。旧实现在这里直接 finalize（进入终态），
           // 工具后的整段正文既不进缓冲又算不出差量 → 静默丢失
           // （issue #67 的丢内容面）。
-          await streamingController.closeSegment('tool_call');
+          await streamingController.closeSegment('tool_call', { signal: combinedAbortSignal });
         } else if (kind === 'final') {
           // stream 模式：**仅**在终稿时收尾整轮。段边界由框架
           // onAssistantMessageStart（+ 工具调用）驱动。
@@ -751,8 +798,11 @@ export async function dispatchToOpenClaw(
           // 覆盖「上一段已封口、无活动会话，absorb 接不住 extension」的残余
           // 路径（评审意见 5）；非 park 时 dispatch 末尾兜底仍兜得住（absorb
           // 已把尾巴推入会话时 remainder 为空串，不会重复发送）。
+          // isError payload 不补尾巴：它随后由默认路径整段发出（正文 + 错误
+          // 提示），先发尾巴再发整段 = 用户看到两份内容（PR #81 评审 N6）。
           if (
             wasParked && text
+            && payload.isError !== true
             && !combinedAbortSignal.aborted
             && !streamingController.shouldSuppressFinalTailFallback
           ) {
@@ -763,7 +813,8 @@ export async function dispatchToOpenClaw(
         // 默认路径（含媒体发送）不可达，不在此转发即丢失。block 媒体已在上方
         // kind==='block' 分支转发；deliveredMediaUrls 去重防双重发送，失败
         // 不标记（forwardMediaUrls 内处理）并计入失败统计（评审 M1）。
-        if (kind === 'final' || kind === 'tool') {
+        if ((kind === 'final' || kind === 'tool') && !combinedAbortSignal.aborted) {
+          // 已取消的 turn 不发附件（PR #81 评审 N3：取消后仍收到媒体）
           outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
         }
         if (payload.isError === true) {
@@ -792,7 +843,9 @@ export async function dispatchToOpenClaw(
 
       // ── 4. tool 媒体：立即转发（static 流式路径已在上方 flush 文本）──
       if (kind === 'tool') {
-        outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
+        if (!combinedAbortSignal.aborted) {
+          outboundSendFail += await forwardMediaUrls(payload, deliverCtx, deliveredMediaUrls, dlog);
+        }
         return;
       }
 
@@ -973,14 +1026,18 @@ export async function dispatchToOpenClaw(
                       // 已取消的 turn（评审意见 3）：中止信号已置位时不再承接/发送。
                       onToolStart: async () => {
                         if (combinedAbortSignal.aborted) return;
-                        await streamingController.flushSegment();
+                        await streamingController.flushSegment({ signal: combinedAbortSignal });
                       },
                     }
                   : {}),
                 ...(streamingController
                   ? {
                       onPartialReply: async (p: { text?: string }) => {
-                        if (p.text && !combinedAbortSignal.aborted) await streamingController.onPartialReply(p.text);
+                        if (p.text && !combinedAbortSignal.aborted) {
+                          // signal 传入：回调入队后、执行前仍可能中止（TOCTOU），
+                          // controller 内在实际执行时复查（PR #81 评审 N2）
+                          await streamingController.onPartialReply(p.text, { signal: combinedAbortSignal });
+                        }
                       },
                       // 兜底：block 信号未覆盖的边界（如部分 provider 不发 text_end）
                       // 仍由 onAssistantMessageStart 触发分段。
@@ -990,11 +1047,11 @@ export async function dispatchToOpenClaw(
                       onAssistantMessageStart: streamingController.isStaticSendMode
                         ? async () => {
                             if (combinedAbortSignal.aborted) return;
-                            await streamingController.flushSegment();
+                            await streamingController.flushSegment({ signal: combinedAbortSignal });
                           }
                         : async () => {
                             if (combinedAbortSignal.aborted) return;
-                            await streamingController.beginSegment();
+                            await streamingController.beginSegment({ signal: combinedAbortSignal });
                           },
                     }
                   : {}),
@@ -1076,7 +1133,9 @@ export async function dispatchToOpenClaw(
   ) {
     const tailSent = await sendFinalTailRemainder(pendingStreamFinalText, 'appending unsent final tail');
     if (!tailSent) {
-      dlog?.debug?.(`[stream-final] final text fully covered by streamed content (chars=${pendingStreamFinalText.length})`);
+      // 三种「没发」：无尾巴（已由流式承接）/ 已被其他投递认领 / 发送失败
+      // （失败路径内部已记 ERROR）——文案别把失败说成「已被覆盖」
+      dlog?.debug?.(`[stream-final] no unsent final tail to send (covered / claimed / failed) chars=${pendingStreamFinalText.length}`);
     }
   }
 
@@ -1182,16 +1241,24 @@ function createStreamingController(
 
 // ── 辅助函数 ──
 
-/** 提取 payload 中的媒体 URL 并逐个发送（去重），返回发送失败数 */
+/**
+ * 提取 payload 中的媒体 URL 并逐个发送（去重），返回发送失败数。
+ *
+ * 媒体集合口径与默认路径（deliver-pipeline 的 resolveMediaUrls）**完全一致**：
+ * mediaUrls → mediaUrl → attachments[].url/path，列表内去重——流式早退路径
+ * 与默认路径必须对同一 payload 解析出同一组媒体，否则会出现「一边发一边丢」
+ * 或「重复发送」（PR #81 评审 N4：attachments 被丢弃 / N7：重复 URL 重复发送）。
+ *
+ * 发送失败时给用户一条可见提示（与默认路径 sendMediaUrls 同口径，评审 N5）：
+ * 流式早退路径绕过了 deliverReply，失败若只记日志，附件静默丢失、用户毫无察觉。
+ */
 async function forwardMediaUrls(
   payload: DeliverPayload,
   ctx: DeliverContext,
   delivered: Set<string>,
   log?: PluginLogger,
 ): Promise<number> {
-  const urls: string[] = [];
-  if (payload.mediaUrls?.length) urls.push(...payload.mediaUrls);
-  if (payload.mediaUrl && !urls.includes(payload.mediaUrl)) urls.push(payload.mediaUrl);
+  const urls = resolveMediaUrls(payload);
   const newUrls = urls.filter((u) => !delivered.has(u));
   let failures = 0;
   for (const url of newUrls) {
@@ -1220,6 +1287,17 @@ async function forwardMediaUrls(
       log?.error(`media forward failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  if (failures > 0) {
+    const notice = formatMediaFailureNotice(failures, urls.length);
+    try {
+      const result = await ctx.sendText(ctx.qualifiedTarget, notice);
+      if (result.error) {
+        log?.error(`media failure notice send failed: ${result.error}`);
+      }
+    } catch (err) {
+      log?.error(`media failure notice failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   return failures;
 }
 
@@ -1229,9 +1307,20 @@ function filterDeliveredMedia(
   delivered: Set<string>,
 ): DeliverPayload {
   if (delivered.size === 0) return payload;
+  const attachments = (payload as any).attachments as Array<{ path?: string; url?: string }> | undefined;
   return {
     ...payload,
     mediaUrl: payload.mediaUrl && !delivered.has(payload.mediaUrl) ? payload.mediaUrl : undefined,
     mediaUrls: payload.mediaUrls?.filter((u) => !delivered.has(u)),
+    // attachments 同样可能被流式早退路径转发过（resolveMediaUrls 的第三档来源）
+    // ——不过滤会在补发路径重复发送同一附件（PR #81 评审 N4）
+    ...(attachments
+      ? {
+          attachments: attachments.filter((a) => {
+            const key = a?.url ?? a?.path;
+            return !(typeof key === 'string' && delivered.has(key));
+          }),
+        }
+      : {}),
   };
 }

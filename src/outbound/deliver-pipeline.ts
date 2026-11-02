@@ -63,9 +63,21 @@ export interface DeliverContext {
 }
 
 /**
- * 解析 ReplyPayload 中的媒体 URL 列表（优先 mediaUrls，fallback 单个 mediaUrl）
+ * 解析 ReplyPayload 中的媒体 URL 列表（优先 mediaUrls，fallback 单个 mediaUrl，
+ * 再 fallback attachments[].url/path）
+ *
+ * 列表内去重：同一 URL 出现多次只发一次（否则收件人收到同一附件的多份副本）。
+ * 流式早退路径（dispatch 的 forwardMediaUrls）与默认路径共用本函数——两条
+ * 路径对同一 payload 必须解析出同一组媒体，否则会出现「一边发一边丢」或
+ * 「重复发送」（PR #81 评审 N4/N7）。
  */
-function resolveMediaUrls(payload: DeliverPayload): string[] {
+export function resolveMediaUrls(payload: DeliverPayload): string[] {
+  const raw = resolveMediaUrlsRaw(payload);
+  // 保留首次出现顺序去重
+  return [...new Set(raw)];
+}
+
+function resolveMediaUrlsRaw(payload: DeliverPayload): string[] {
   if (payload.mediaUrls?.length) {
     return payload.mediaUrls.filter(Boolean);
   }
@@ -140,6 +152,15 @@ export async function deliverReply(
   }
 }
 
+/**
+ * 媒体发送失败的用户可见提示文案（流式早退路径与默认路径共用，避免两套口径）。
+ */
+export function formatMediaFailureNotice(failed: number, total: number): string {
+  return failed === total
+    ? `⚠️ 媒体发送失败（${failed} 个），请重试`
+    : `⚠️ ${failed}/${total} 个媒体发送失败`;
+}
+
 // ── 媒体批量发送 ──
 
 async function sendMediaUrls(ctx: DeliverContext, urls: string[]): Promise<void> {
@@ -163,9 +184,7 @@ async function sendMediaUrls(ctx: DeliverContext, urls: string[]): Promise<void>
   if (failedUrls.length > 0) {
     const count = failedUrls.length;
     const total = urls.length;
-    const failMsg = count === total
-      ? `⚠️ 媒体发送失败（${count} 个），请重试`
-      : `⚠️ ${count}/${total} 个媒体发送失败`;
+    const failMsg = formatMediaFailureNotice(count, total);
     const textResult = await ctx.sendText(ctx.qualifiedTarget, failMsg);
     if (textResult.error) {
       ctx.log?.error(`[media] failed to send failure notification: ${textResult.error}`);

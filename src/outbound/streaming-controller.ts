@@ -274,13 +274,22 @@ export class StreamingController {
 
   // ── 入口 ──
 
-  onPartialReply(text: string): Promise<void> {
+  onPartialReply(text: string, opts?: { signal?: AbortSignal }): Promise<void> {
     // 纯空白 partial 不算内容（评审意见 2）：不置 hasStarted（final 仍走默认
     // 投递路径送达）、不进缓冲计数——否则 final 与已承接内容匹配不上、rescue
     // 又被 sentChunkCount>0 拒绝，终稿会被吞掉（只发出那条空白）。
     if (!text || !text.trim()) return Promise.resolve();
+    const signal = opts?.signal;
     this._hasStarted = true; // 同步置位：不等异步发送，final 就能感知流式已启动
-    this.chain = this.chain.then(() => this.handleChunk(text)).catch((err) => {
+    this.chain = this.chain.then(() => {
+      // 信号复查：dispatch 侧守卫只覆盖调用时刻，回调入队后、执行前仍可能
+      // 中止（TOCTOU）——已取消的回复不得继续增长/发送（PR #81 评审 N2）
+      if (signal?.aborted) {
+        this.deps.log?.info(`partial skipped: turn cancelled chars=${text.length}`);
+        return;
+      }
+      return this.handleChunk(text);
+    }).catch((err) => {
       this.deps.log?.error(`onPartialReply error: ${err instanceof Error ? err.message : String(err)}`);
       this.transition('failed', 'chunk_error');
     });
@@ -296,8 +305,8 @@ export class StreamingController {
    *
    * 与 onPartialReply 共用同一条串行队列，避免与增量处理交叉。
    */
-  beginSegment(): Promise<void> {
-    return this.closeSegment('assistant_message_start');
+  beginSegment(opts?: { signal?: AbortSignal }): Promise<void> {
+    return this.closeSegment('assistant_message_start', opts);
   }
 
   /**
@@ -311,8 +320,9 @@ export class StreamingController {
    * 正文既不进缓冲又算不出差量 → **整段正文静默丢失**（issue #67 的丢内容面）。
    * 现在这里只封口「段」，整轮由 finalize() 收尾。
    */
-  closeSegment(reason: string): Promise<void> {
-    this.chain = this.chain.then(() => this.doCloseSegment(reason)).catch((err) => {
+  closeSegment(reason: string, opts?: { signal?: AbortSignal }): Promise<void> {
+    const signal = opts?.signal;
+    this.chain = this.chain.then(() => this.doCloseSegment(reason, signal)).catch((err) => {
       this.deps.log?.error(`closeSegment error: ${err instanceof Error ? err.message : String(err)}`);
     });
     return this.chain as Promise<void>;
@@ -322,8 +332,15 @@ export class StreamingController {
    * 封口当前段的实际动作——**必须在控制器串行队列内执行**。
    * 不可在此再入队（chain.then），否则队列内的调用方 await 自己排队的任务
    * → 自锁（handleChunk → closeSegment → 等待排在 handleChunk 之后的自己）。
+   *
+   * signal：合并中止信号，入队后执行前可能已中止——已取消的 turn 不再封口
+   * （否则会把取消前的内容发出去，用户看到过时输出，PR #81 评审 N2）。
    */
-  private async doCloseSegment(reason: string): Promise<void> {
+  private async doCloseSegment(reason: string, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      this.deps.log?.info(`segment close skipped: turn cancelled reason=${reason}`);
+      return;
+    }
     if (this.isTerminal) {
       // stream 模式终态 + 段文本残留 = 封口动作丢弃已承接内容（issue #80 要求
       // 四个入口全部可观测；static 模式 doCloseSegment 本就 no-op，无内容可丢）
@@ -357,8 +374,16 @@ export class StreamingController {
    * 对齐 telegram rotateLaneForNewMessage：固化旧段 + 开始新段。
    * 无累积内容时跳过（第一段开始时 lastAcceptedFull 为空）。
    */
-  flushSegment(): Promise<void> {
+  flushSegment(opts?: { signal?: AbortSignal; tolerant?: boolean }): Promise<void> {
+    const signal = opts?.signal;
+    const tolerant = opts?.tolerant === true;
     this.chain = this.chain.then(async () => {
+      // 信号复查：入队后、执行前 turn 可能已取消——已取消的回复不再发送
+      // （PR #81 评审 N2：取消后仍发排队内容，用户看到过时输出）
+      if (signal?.aborted) {
+        this.deps.log?.info(`flush skipped: turn cancelled bufferChars=${this.lastAcceptedFull.length}`);
+        return;
+      }
       if (this.isTerminal) {
         // 终态 + 缓冲非空 = 未发送内容被丢弃。正常 finalize 发送成功后缓冲已被
         // completeSession 清空，不会误报；此 WARN 只在真实丢失时出现（issue #80）
@@ -376,7 +401,17 @@ export class StreamingController {
           await this.deps.sendStatic(this.lastAcceptedFull);
         } catch (err) {
           this.deps.log?.error(`flushSegment send failed: ${err instanceof Error ? err.message : String(err)}`);
-          this.transition('failed', 'flush_send_error');
+          // tolerant（ask_user 前置文本）：发送失败**不**终态化——终态化会让
+          // 后续 partial / final 全被 isTerminal 守卫丢弃，用户看到问题卡片
+          // 却看不到答案（PR #81 评审 N1）。缓冲保留，后续 flush/finalize 有
+          // 一次重试机会。
+          if (!tolerant) {
+            this.transition('failed', 'flush_send_error');
+          } else {
+            this.deps.log?.warn(
+              `flushSegment tolerated send failure (buffer kept for retry) chars=${this.lastAcceptedFull.length}`,
+            );
+          }
           return;
         }
         // 重置缓冲，开始新一段累积（保持 streaming 态，不进终态）
@@ -384,7 +419,7 @@ export class StreamingController {
       }
     }).catch((err) => {
       this.deps.log?.error(`flushSegment error: ${err instanceof Error ? err.message : String(err)}`);
-      this.transition('failed', 'flush_error');
+      if (!tolerant) this.transition('failed', 'flush_error');
     });
     return this.chain as Promise<void>;
   }
