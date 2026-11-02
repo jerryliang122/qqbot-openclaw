@@ -148,7 +148,7 @@ await test("静态: finalize 时一次性发送累积的完整文本", async () 
   assert.strictEqual(ctrl.shouldFallbackToStatic, false, "不应触发降级");
 });
 
-await test("静态: 空文本不发送内容，0 分片触发降级", async () => {
+await test("静态: 空文本不发送内容，无内容 finalize → park（issue #80）", async () => {
   const ctrl = makeController({ sendMode: "static" });
 
   await ctrl.onPartialReply("");
@@ -158,7 +158,12 @@ await test("静态: 空文本不发送内容，0 分片触发降级", async () =
 
   assert.strictEqual(staticSendCalls.length, 0, "空文本不应发送");
   assert.strictEqual(ctrl.hasSentChunks, false, "空文本不应产生分片");
-  assert.strictEqual(ctrl.shouldFallbackToStatic, true, "0 分片应触发降级兜底");
+  // 修复（issue #80）：从未承接内容的 finalize 不再终态化/降级——旧 done 路径会把
+  // 之后 follow-up 注入长跑投递的 partial 全部静默吞掉；改为 park 保持 idle 待命
+  assert.strictEqual(ctrl.currentPhase, "idle", "应 park 保持 idle");
+  assert.strictEqual(ctrl.isTerminal, false, "非终态，后续内容可正常承接");
+  assert.strictEqual(ctrl.parked, true, "park 标记应置位");
+  assert.strictEqual(ctrl.shouldFallbackToStatic, false, "未终态化 → 不触发降级兜底");
 });
 
 await test("静态: markDeliveredExternally 阻止降级（ask_user 场景）", async () => {

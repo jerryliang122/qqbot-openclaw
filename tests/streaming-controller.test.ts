@@ -109,13 +109,17 @@ await test("基本流式：增长前缀 → 单会话连续 update，finalize �
   assert.strictEqual(sessions[0]!.completed, 1, "finalize 应 complete 会话");
 });
 
-await test("空文本被忽略，不启动会话", async () => {
+await test("空文本被忽略，不启动会话；无内容 finalize → park（issue #80）", async () => {
   const { ctrl, sessions } = createController();
   await ctrl.onPartialReply("");
   await ctrl.finalize();
   assert.strictEqual(sessions.length, 0, "不应有流式会话");
-  assert.strictEqual(ctrl.currentPhase, "done");
-  assert.ok(ctrl.shouldFallbackToStatic, "从未发片 → 降级标记");
+  // 修复（issue #80）：从未承接内容的 finalize 不再终态化（旧 done/fallback 会把
+  // 之后 follow-up 注入长跑投递的 partial 全部静默吞掉），改为 park 保持 idle
+  assert.strictEqual(ctrl.currentPhase, "idle", "无内容 finalize 应 park 保持 idle");
+  assert.strictEqual(ctrl.isTerminal, false, "非终态，后续内容可正常承接");
+  assert.strictEqual(ctrl.parked, true, "park 标记应置位");
+  assert.strictEqual(ctrl.shouldFallbackToStatic, false, "未终态化 → 不触发降级标记");
 });
 
 await test("markDeliveredExternally 阻止 finalize:fallback（ask_user 场景）", async () => {
@@ -123,11 +127,12 @@ await test("markDeliveredExternally 阻止 finalize:fallback（ask_user 场景�
   // 模型未流式输出任何文本，直接调用 ask_user 工具
   assert.strictEqual(ctrl.hasStarted, false, "尚未启动");
 
-  // 无外部投递时，finalize 应走 fallback
+  // 无外部投递且无内容 → park 待命而非终态化（issue #80：
+  // 旧 done/fallback 会吞掉后续 follow-up 注入长跑的投递）
   const { ctrl: ctrl2 } = createController();
   await ctrl2.finalize();
-  assert.strictEqual(ctrl2.currentPhase, "done");
-  assert.ok(ctrl2.shouldFallbackToStatic, "无外部投递 → 降级标记");
+  assert.strictEqual(ctrl2.currentPhase, "idle", "无内容 finalize 应 park 保持 idle");
+  assert.strictEqual(ctrl2.parked, true, "park 标记应置位");
 
   // 插件成功投递 ask_user 卡片后标记
   ctrl.markDeliveredExternally();

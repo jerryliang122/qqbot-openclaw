@@ -26,7 +26,8 @@
  * onPartialReply(text) 输入：当前段的文本，段内持续增长。
  * beginSegment()        输入：框架 onAssistantMessageStart——新段开始，封口上一段。
  * closeSegment()        输入：段边界（工具调用等）——封口当前段，不终止整轮。
- * finalize()            标记：框架通知回复结束，用已下发文本收尾。
+ * finalize()            标记：框架通知回复结束，用已下发文本收尾；**从未承接过
+ *                       任何内容时不终态化**，park 保持 idle 待命（issue #80）。
  */
 
 import type { ReplyTarget, StreamSession } from '@tencent-connect/qqbot-nodejs';
@@ -126,6 +127,17 @@ export class StreamingController {
    */
   private _finalRescued = false;
 
+  /**
+   * 标记：finalize 时从未承接过任何内容（issue #80）——不终态化，保持 idle 待命。
+   * 场景：框架 follow-up 注入（reply-owner-ended 交接）下 dispatch 的 inboundRun
+   * 在「仅入队」时即 resolve，dispatch 收尾的 finalize 打到 idle 无内容的
+   * controller；若此时终态化，之后长跑 run 持续投递的 partial/flush/final 全被
+   * isTerminal 守卫静默吞掉（零日志零网络请求）。park 后无 session、无定时器，
+   * 随 delivery context 被 GC，与终态化相比无泄漏差异；dispatch 侧据此在
+   * deliver(kind:'final') 时补位 finalize，收尾最后一段缓冲。
+   */
+  private _parked = false;
+
   /** 同步标志：收到第一个 onPartialReply 即置 true（不等 async 完成） */
   private _hasStarted = false;
 
@@ -154,6 +166,9 @@ export class StreamingController {
 
   /** 同步标志：流式已启动（不等异步完成），用于 final 去重 */
   get hasStarted(): boolean { return this._hasStarted; }
+
+  /** 是否处于 park 待命态（finalize 时从未承接内容，未终态化，issue #80） */
+  get parked(): boolean { return this._parked; }
 
   get isTerminal(): boolean {
     return this.phase === 'done' || this.phase === 'failed';
@@ -330,7 +345,17 @@ export class StreamingController {
    */
   flushSegment(): Promise<void> {
     this.chain = this.chain.then(async () => {
-      if (this.isTerminal || !this.isStaticMode) return;
+      if (this.isTerminal) {
+        // 终态 + 缓冲非空 = 未发送内容被丢弃。正常 finalize 发送成功后缓冲已被
+        // completeSession 清空，不会误报；此 WARN 只在真实丢失时出现（issue #80）
+        if (this.isStaticMode && this.lastAcceptedFull) {
+          this.deps.log?.warn(
+            `flushSegment dropped: terminal phase=${this.phase} bufferChars=${this.lastAcceptedFull.length} (issue #80)`,
+          );
+        }
+        return;
+      }
+      if (!this.isStaticMode) return;
       if (this.lastAcceptedFull && this.deps.sendStatic) {
         this.deps.log?.info(`flush segment chars=${this.lastAcceptedFull.length}`);
         try {
@@ -386,7 +411,12 @@ export class StreamingController {
   absorbFinalText(finalText: string, opts?: { signal?: AbortSignal }): Promise<void> {
     const signal = opts?.signal;
     this.chain = this.chain.then(async () => {
-      if (this.isTerminal) return;
+      if (this.isTerminal) {
+        this.deps.log?.warn(
+          `final absorb skipped: terminal phase=${this.phase} chars=${finalText.length} (issue #80)`,
+        );
+        return;
+      }
       if (signal?.aborted) return;
       const match = this.matchFinalText(finalText);
       if (match.kind === 'identical') return;
@@ -456,7 +486,17 @@ export class StreamingController {
   // ── 核心逻辑 ──
 
   private async handleChunk(text: string): Promise<void> {
-    if (this.isTerminal || !text) return;
+    if (this.isTerminal) {
+      // 终态后收到内容 = 本会被静默丢弃（issue #80「零日志」面）——打 WARN 留痕。
+      // 正常路径 finalize 后框架不应再投 partial；出现即为异常，值得逐条可见。
+      if (text) {
+        this.deps.log?.warn(
+          `chunk dropped: terminal phase=${this.phase} chars=${text.length} (issue #80)`,
+        );
+      }
+      return;
+    }
+    if (!text) return;
 
     if (this.isStaticMode) {
       // ── static 模式（语义不变）──
@@ -511,11 +551,12 @@ export class StreamingController {
     // 静态模式：用累积的完整文本一次性 sendStatic 收尾
     if (this.isStaticMode) {
       if (this.sentChunkCount > 0 && this.lastAcceptedFull && this.deps.sendStatic) {
+        const finalChars = this.lastAcceptedFull.length;
         await this.completeSession();
         // completeSession 内部 sendStatic 失败会先转 failed，此处不可回退为 done
         if (!this.isTerminal) {
           this.transition('done', 'finalize');
-          this.deps.log?.info(`static done chunks=${this.sentChunkCount} chars=${this.lastAcceptedFull.length}`);
+          this.deps.log?.info(`static done chunks=${this.sentChunkCount} chars=${finalChars}`);
         }
       } else if (this.sentChunkCount > 0 && this.lastAcceptedFull) {
         // 未提供 sendStatic → 降级标记，由上层兜底发送
@@ -527,8 +568,23 @@ export class StreamingController {
         // final 正文已由 absorbFinalText 整段补发（issue #44 恢复路径），
         // 缓冲空是补发后重置的正常状态——不是「什么都没发」的降级
         this.transition('done', 'finalize:rescued');
+      } else if (this.sentChunkCount > 0 || this.lastAcceptedFull || this.currentSegmentText) {
+        // 有过内容但此刻无可发缓冲（段落已全部 flush 发出）→ 正常终态；
+        // 与「从未有内容」区分 reason，排障不再混淆（issue #80）
+        this.transition('done', 'finalize:flushed');
       } else {
-        this.transition('done', 'finalize:fallback');
+        // 从未承接任何内容：dispatch 收尾早于 run 产出（follow-up 注入，issue #80）
+        // → 不终态化，park 待命，后续 partial/flush/final 正常工作。park 无
+        // session / 定时器资源，随 delivery context 被 GC，与终态化无泄漏差异。
+        // 附带改善：旧语义误标 done 会让 dispatch 末尾失败兜底把 streamedVisible
+        // 判为 true 而跳过兜底；park（idle）时该判断恢复正确。
+        if (!this._parked) {
+          this.deps.log?.warn(
+            'finalize while idle with no content — parking controller (not terminal); ' +
+            'content may still arrive via follow-up injection (issue #80)',
+          );
+        }
+        this._parked = true;
       }
       return;
     }
@@ -544,8 +600,19 @@ export class StreamingController {
     // 无会话 — 视有无下发决定终态
     if (this.sentChunkCount > 0 || this._deliveredExternally) {
       this.transition('done', this.sentChunkCount > 0 ? 'finalize:no_session' : 'finalize');
-    } else {
+    } else if (this.currentSegmentText) {
+      // 异常态：有段文本残留但无会话（如失败路径已关会话）——保守终态，不 park
       this.transition('done', 'finalize:fallback');
+    } else {
+      // 从未承接任何内容 → park（同 static 分支，issue #80）：后续 partial 正常
+      // 开流式会话；dispatch 侧 deliver(kind='final') 的既有 finalize 收尾
+      if (!this._parked) {
+        this.deps.log?.warn(
+          'finalize while idle with no content — parking controller (not terminal); ' +
+          'content may still arrive via follow-up injection (issue #80)',
+        );
+      }
+      this._parked = true;
     }
   }
 
@@ -604,6 +671,10 @@ export class StreamingController {
         this.deps.log?.info(`static send (sent=${this.sentChunkCount} chars=${this.lastAcceptedFull.length} reason=${reason ?? 'done'})`);
         try {
           await this.deps.sendStatic(this.lastAcceptedFull);
+          // 发送成功即清缓冲（对齐 flushSegment 的既有模式）：使「终态 + 缓冲
+          // 非空」语义收敛为「未发送内容」，flushSegment 的终态丢弃 WARN 不误报
+          // （issue #80）
+          this.lastAcceptedFull = '';
         } catch (err) {
           this.deps.log?.error(`static send failed: ${err instanceof Error ? err.message : String(err)}`);
           this.transition('failed', 'static_send_error');

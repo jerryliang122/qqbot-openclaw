@@ -683,7 +683,14 @@ export async function dispatchToOpenClaw(
           if (kind === 'tool') {
             await streamingController.flushSegment();
           }
-          // static 模式不 finalize（finalize 会进入终态并造成后续丢失）
+          // park 补位（issue #80）：dispatch 已收尾（inboundRun 因 follow-up 注入
+          // 提前 resolve，controller 被 park 而非终态化），不会再有「dispatch 末尾
+          // 的 finalize」——final 是这个 delivery context 的最后一个事件，上方
+          // absorb 已把终稿并入缓冲，此处补位收尾把最后一段发出。
+          if (kind === 'final' && streamingController.parked) {
+            await streamingController.finalize();
+          }
+          // 其余情况 static 模式不 finalize（finalize 会进入终态并造成后续丢失）
         } else if (kind === 'tool') {
           // stream 模式：工具调用 = **段边界**（工具执行前模型的文本已经说完）
           // → 封口当前段（收尾这条消息），**不终止整轮**：工具返回后的正文
