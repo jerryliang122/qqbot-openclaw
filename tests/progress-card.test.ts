@@ -6,7 +6,7 @@
  *    explanation 可选、超 maxLines 压缩为 N/M done 头）。
  * 2. 发布器：去重（无状态变化不重发）、防抖窗口、maxPerTurn 保险丝
  *    （反应式配额：无本地次数门，maxPerTurn 是唯一保险丝）、清卡
- *    （steps=[]）停止/恢复、passive-quota-exhausted 静默丢弃、
+ *    （steps=[]）停止/恢复、passive-quota-exhausted 停止本轮发布、
  *    stop/dispose/abort 关闭。
  * 3. 配置解析：resolveProgressCardConfig 默认值/覆盖/非法值钳制。
  * 4. outbound sendText passiveOnly：锚点判死返回 error 且不触达网关
@@ -235,15 +235,16 @@ await test('反应式配额：本地无次数门，maxPerTurn 内连续快照全
   assert.equal(h.sends.length, 4, '反应式：次数不再是本地门（旧口径第 4 条会被 reserve 保槽拦截）');
 });
 
-await test('passive-quota-exhausted：静默丢弃、无重试、不影响后续更新', async () => {
+await test('passive-quota-exhausted：锚点对本轮永久——首次即停止本轮发布（评审 #86-F4）', async () => {
   const h = makePublisher({ config: { minIntervalMs: 0 } });
   h.failNext();
   await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
   assert.equal(h.sends.length, 0, '被拒的卡片被丢弃');
   assert.equal(h.publisher.sentCards, 0);
-  // 未记为已发送 → 同状态重试可再发
+  // 反应式下该错误只剩锚点过期/判死一个来源，对本轮永久——同状态/新状态都不再发布
   await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
-  assert.equal(h.sends.length, 1, '同状态重试成功发送');
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_B });
+  assert.equal(h.sends.length, 0, '停止后不再逐快照重试');
 });
 
 await test('发送异常：丢弃该条卡片不抛错（结果未知，保守计数为已发送）', async () => {

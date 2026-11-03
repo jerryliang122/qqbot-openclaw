@@ -45,10 +45,23 @@ globalRegistry[GATEWAYS_REGISTRY_KEY] = gateways;
 // 环半初始化状态下崩溃），且日志失败绝不影响发送。
 let svcLog: ReturnType<typeof createPluginLogger> | undefined;
 
-function logFallbackInfo(msg: string): void {
+/**
+ * 惰性初始化的模块级 logger（循环依赖环上必须惰性，见上）。
+ * 供 reservePassiveReply 等无调用方 logger 的路径透传给 quota-manager
+ * （超限观测 INFO 等日志此前在主出站路径上是 no-op——评审 #86-F1）。
+ */
+function getOutboundLogger(): { debug?: (m: string) => void; info?: (m: string) => void } | undefined {
   try {
     svcLog ??= createPluginLogger({ prefix: '[outbound]' });
-    svcLog.info(msg);
+  } catch {
+    return undefined;
+  }
+  return svcLog;
+}
+
+function logFallbackInfo(msg: string): void {
+  try {
+    getOutboundLogger()?.info?.(msg);
   } catch {
     /* logging must never break sends */
   }
@@ -83,6 +96,9 @@ function reservePassiveReply(params: {
     ...(params.targetId
       ? { receivedAt: peekMsgIdReceivedAt(params.scope, params.targetId, params.replyToId) }
       : {}),
+    // 模块级 logger 兜底：dispatch 主回复/进度卡/static 收尾/失败兜底都走
+    // 本函数，透传后超限观测 INFO 才能在主路径真正落盘（评审 #86-F1）
+    log: getOutboundLogger(),
   });
   return {
     msgId: reservation.canReply ? params.replyToId : undefined,

@@ -154,11 +154,11 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 ### 出站与配额（[详情](docs/agents/outbound-and-quota.md)）
 
 - **出站锚点模型：显式锚点 or 主动（2026-11-03 移除池化选取）**——挂 msg_id 的被动消息在平台语义上是「对用户消息的回复」，锚点必须来自显式回复意图。网关 `resolveOutboundAnchor` 只透传显式 `opts.msgId`；**无显式锚点（message 工具不带 replyTo、remind/cron、框架直发）一律走主动发送**（烧每日预算）。**红线：禁止重新引入「从缓存挑 msg_id」的池化选取**——它会把回复引用挂到更早的错误消息上（历史演进 7a59a2c→bbed520→e3e2be7 为省预算引入，已按平台语义移除；代价：1000 条/天预算消耗、用户关「允许主动发送」时该类消息拒发）。
-- **反应式配额（2026-11-03）：本地不按「次数」阻断被动发送**——探针实测平台**不执行**文档口径的 c2c 4 次/群 5 次 per msg_id 上限（同 msg_id 25 次全送达；typing 也不占额度）。本地只强制两个真实硬约束：TTL 窗口预检（c2c 60min/群 5min，40034005 确定性）与 msg_seq 单调发号（40054005）；count 仅观测（超文档上限打一次 INFO）。平台真拒绝时由网关死锚点兜底转主动。**禁止把 count 上限改回 preemptive 阻断**——那会逼正文白烧每日 1000 条主动预算、让进度卡被静默跳过。
+- **反应式配额（2026-11-03）：本地不按「次数」阻断被动发送**——探针实测平台**不执行**文档口径的 c2c 4 次/群 5 次 per msg_id 上限（同 msg_id 25 次全送达；typing 也不占额度）。本地只强制两个真实硬约束：TTL 窗口预检（c2c 60min/群 5min，40034005 确定性）与 msg_seq 单调发号（40054005）；count 仅观测（超文档上限打一次 INFO，**仅 logger 在场才置位**——否则标志会被无 logger 的消耗烧死；主出站路径须透传 logger）；**观测计数只升不降**——判死时不得回截 count（证据保全）。平台真拒绝时由网关死锚点兜底转主动。**禁止把 count 上限改回 preemptive 阻断**——那会逼正文白烧每日 1000 条主动预算、让进度卡被静默跳过。
 - **锚点失效兜底**：被动发送被平台 **40034005**（过期）/ **40034128**（超限）确定性拒绝 → rollback + 驱逐 + 标记 dead → 同内容**转主动重发一次**。网络错（`httpStatus===0`，结果不明）**不重发**（有重复风险）。`passiveOnly` 发送（progress card）**不做主动重发**。
 - **QQ 语音投递口径以「体积」为准，不是「时长」**——平台文档里没有任何语音时长限制，「60 秒以内是语音条」是相关性错觉。格式只认 silk/mp3/wav/ogg 四种；超 20MB 软限制由 `resolveOutboundMediaKind` **显式**降级为文件投递。
 - **表情表态仅频道支持**（单聊/群聊 ❌），故 `capabilities.reactions: false` 是对的。
-- **Progress card 只走被动回复**（`passiveOnly`，绝不烧每日主动预算）——反应式配额下无本地次数门（`reserveQuota` 保槽配置已删除，残留会被 schema 拒收），唯一保险丝是 `maxPerTurn`；锚点无存活时 outbound 本地拦截丢弃。
+- **Progress card 只走被动回复**（`passiveOnly`，绝不烧每日主动预算）——反应式配额下无本地次数门（`reserveQuota` 保槽配置已删除，残留会被 schema 拒收），唯一保险丝是 `maxPerTurn`；锚点无存活时 outbound 本地拦截丢弃并**停止本轮卡片发布**（反应式下该错误对本轮永久，不逐快照重试）。
 
 ### 群聊与 room_event（[详情](docs/agents/group-and-room-event.md)）
 

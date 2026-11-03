@@ -156,14 +156,14 @@ async function main(): Promise<void> {
     clearQuotaCache();
   });
 
-  // 测试 5: rollbackPassiveReplyQuota 回滚机制
-  await test('rollbackPassiveReplyQuota 正确回滚配额', async () => {
-    const { checkAndConsumePassiveReplyQuota, rollbackPassiveReplyQuota, clearQuotaCache, getQuotaStats } = await import('../src/features/quota-manager.js');
+  // 测试 5: 消耗闭包的回滚机制（rollbackPassiveReplyQuota 已随反应式配额删除）
+  await test('消耗闭包 rollback 正确回滚观测计数', async () => {
+    const { checkAndConsumePassiveReplyQuota, clearQuotaCache, getQuotaStats } = await import('../src/features/quota-manager.js');
     
     clearQuotaCache();
     
-    // 消耗配额
-    await checkAndConsumePassiveReplyQuota({
+    // 消耗配额（拿到回滚闭包）
+    const reservation = await checkAndConsumePassiveReplyQuota({
       accountId: 'test',
       msgId: 'MSG_3',
       scope: 'c2c',
@@ -174,11 +174,7 @@ async function main(): Promise<void> {
     assert.equal(stats1.totalUsage, 1, '消耗后配额应该为 1');
     
     // 回滚
-    rollbackPassiveReplyQuota({
-      accountId: 'test',
-      msgId: 'MSG_3',
-      scope: 'c2c',
-    });
+    reservation.rollback();
     
     const stats2 = getQuotaStats('test', 'c2c');
     assert.equal(stats2.totalUsage, 0, '回滚后配额应该为 0');

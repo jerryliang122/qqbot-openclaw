@@ -15,8 +15,9 @@
  *   （平台实测不执行「c2c 4 条/group 5 条每 msg_id」，见
  *   features/quota-manager.ts 文件头），唯一本地保险丝是 maxPerTurn。
  * - 锚点无存活（无 msg_id / TTL 过期 / 判死）时 outbound 返回
- *   passive-quota-exhausted——本地拦截、确定未发出，同状态更新仍可
- *   重试；绝不烧每日主动预算。
+ *   passive-quota-exhausted——本地拦截、确定未发出；锚点过期/判死对
+ *   本轮是永久状态（卡片锚点固定为 turn 源消息），首次遇到即停止本轮
+ *   发布；绝不烧每日主动预算。
  * - 发送结果未知的失败（平台报错/网络异常——消息可能已落地）记录为
  *   「已发送」防重发。
  * - 卡片是锦上添花，正文优先：任何失败都不重试、不影响 turn。
@@ -242,8 +243,13 @@ export class ProgressCardPublisher {
       return;
     }
     if (result?.error === 'passive-quota-exhausted') {
-      // 本地拦截（探测→发送竞态）：确定未发出，同状态更新仍可重试
-      this.deps.log?.warn('[progress-card] send rejected: passive-quota-exhausted');
+      // 反应式模型下该错误只剩「锚点过期/判死」一个来源，而卡片锚点固定为
+      // turn 源消息——对本轮是**永久**状态。首次遇到即停止本轮发布，
+      // 不再逐快照重试刷 WARN（评审 #86-F4）。
+      this.deps.log?.warn(
+        '[progress-card] passive anchor unavailable (expired/dead); stopping card publishing for this turn',
+      );
+      this.stop('passive anchor unavailable');
       return;
     }
     if (result?.error) {

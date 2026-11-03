@@ -151,24 +151,6 @@ export function checkPassiveReplyQuota(params: QuotaCheckParams): boolean {
 }
 
 /**
- * 回滚被动回复配额（API 调用失败时使用）
- */
-export function rollbackPassiveReplyQuota(params: {
-  accountId: string;
-  msgId: string;
-  scope: 'c2c' | 'group';
-}): void {
-  const { accountId, msgId, scope } = params;
-  const key = `${accountId}:${scope}:${msgId}`;
-
-  const cached = quotaCache.get(key);
-  if (cached && !cached.dead && cached.count > 0) {
-    cached.count -= 1;
-    touchCacheEntry(key, cached);
-  }
-}
-
-/**
  * 原子操作：检查并消耗被动回复配额（含 msg_seq 发号）
  *
  * 反应式模型下「检查」只判 TTL 窗口与死锚点（不判次数）；count 仅观测
@@ -242,11 +224,14 @@ export function checkAndConsumePassiveReplyQuota(
   enforceCacheCapacity(now);
 
   // 超限观测（一次性）：count 超过文档口径上限不阻断（平台实测不执行，
-  // 见文件头），但打一条 INFO 留证——若平台未来收紧，这是定位一线证据
+  // 见文件头），但打一条 INFO 留证——若平台未来收紧，这是定位一线证据。
+  // 仅当 logger 真正在场（log.info 可调）才置位/打日志：主出站路径
+  // （outbound-service.reservePassiveReply）此前不传 logger，无条件置位
+  // 会让标志被「烧死」——之后即使带上 logger 也永不再打（评审 #86-F1）
   const limit = QUOTA_LIMITS[scope].count;
-  if (cached.count > limit && !cached.overLimitLogged) {
+  if (cached.count > limit && !cached.overLimitLogged && log?.info) {
     cached.overLimitLogged = true;
-    log?.info?.(
+    log.info(
       `[${accountId}] passive reply count ${cached.count} exceeded documented limit ${limit} (${scope}); ` +
         'platform probe 2026-11-02 showed the cap is not enforced — continuing passively',
     );
@@ -271,9 +256,8 @@ export function checkAndConsumePassiveReplyQuota(
  * 将某 msg_id 配额标记为死锚点（dead=true）——平台 40034005（msg_id 已
  * 过期）/40034128（回复次数超限）判死后调用：该锚点永不再被选取/允许
  * 消耗，rollback 也无法复活（防上游发送失败的补偿回滚把死锚点再次挂接、
- * 再吃一次平台确定性拒绝）。count 同步封顶到文档上限（观测口径对齐
- * 「耗尽」；反应式模型下 count 无阻断作用）。不删条目（保留 seq 与窗口
- * 现场便于排障）。
+ * 再吃一次平台确定性拒绝）。count 只升不降（Math.max 到文档上限——
+ * 保住判死前的真实消耗证据）。不删条目（保留 seq 与窗口现场便于排障）。
  */
 export function invalidateMsgIdQuota(params: {
   accountId: string;
@@ -285,7 +269,9 @@ export function invalidateMsgIdQuota(params: {
   const cached = quotaCache.get(key);
   if (!cached) return;
   cached.dead = true;
-  cached.count = QUOTA_LIMITS[scope].count;
+  // 观测计数只升不降：判死前的真实消耗次数（可能已超文档上限）是
+  // 「平台是否执行次数上限」的定位证据，不得回截抹掉（评审 #86-F2）
+  cached.count = Math.max(cached.count, QUOTA_LIMITS[scope].count);
   quotaCache.set(key, cached);
 }
 
