@@ -492,11 +492,6 @@
                 "type": "number",
                 "minimum": 0,
                 "description": "checklist 最多渲染行数（默认 8；超出时压缩为完成数 + 当前步 + 待办尾部）"
-              },
-              "reserveQuota": {
-                "type": "number",
-                "minimum": 0,
-                "description": "为最终回复保留的被动配额槽（默认 1）：剩余槽位 ≤ 此值则跳过发卡，保证正文优先"
               }
             }
           },
@@ -971,11 +966,6 @@
                       "type": "number",
                       "minimum": 0,
                       "description": "checklist 最多渲染行数（默认 8；超出时压缩为完成数 + 当前步 + 待办尾部）"
-                    },
-                    "reserveQuota": {
-                      "type": "number",
-                      "minimum": 0,
-                      "description": "为最终回复保留的被动配额槽（默认 1）：剩余槽位 ≤ 此值则跳过发卡，保证正文优先"
                     }
                   }
                 },

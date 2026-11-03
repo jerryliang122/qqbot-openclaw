@@ -4,12 +4,13 @@
  * 覆盖：
  * 1. 渲染：normalizePlanSteps 宽容归一 + renderProgressCardText（头部 ✅/▸/▢、
  *    explanation 可选、超 maxLines 压缩为 N/M done 头）。
- * 2. 发布器：去重（无状态变化不重发）、防抖窗口、maxPerTurn 保险丝、
- *    清卡（steps=[]）停止/恢复、配额探测（剩余 ≤ reserve 跳过）、
- *    passive-quota-exhausted 静默丢弃、stop/dispose/abort 关闭。
+ * 2. 发布器：去重（无状态变化不重发）、防抖窗口、maxPerTurn 保险丝
+ *    （反应式配额：无本地次数门，maxPerTurn 是唯一保险丝）、清卡
+ *    （steps=[]）停止/恢复、passive-quota-exhausted 停止本轮发布、
+ *    stop/dispose/abort 关闭。
  * 3. 配置解析：resolveProgressCardConfig 默认值/覆盖/非法值钳制。
- * 4. outbound sendText passiveOnly：配额耗尽返回 error 且不触达网关
- *    （不降级主动）；非 passiveOnly 维持原降级行为。
+ * 4. outbound sendText passiveOnly：锚点判死返回 error 且不触达网关
+ *    （不降级主动）；非 passiveOnly 判死后降级主动发送。
  * 5. dispatch 装配（真实 dispatchToOpenClaw）：c2c 默认启用挂 onPlanUpdate +
  *    suppressDefaultToolProgressMessages；群默认/scope 不匹配/enabled:false/
  *    room_event 不挂；端到端发送（被动挂 msgId）+ deliver final 停止发布。
@@ -49,6 +50,8 @@ const {
 const { resolveProgressCardConfig } = await import('../src/config.ts');
 const {
   checkAndConsumePassiveReplyQuota,
+  invalidateMsgIdQuota,
+  registerMsgIdWindow,
   clearQuotaCache,
 } = await import('../src/features/quota-manager.ts');
 const { dispatchToOpenClaw } = await import('../src/dispatch/dispatch.ts');
@@ -60,8 +63,6 @@ const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
 interface PublisherHarness {
   publisher: ProgressCardPublisher;
   sends: string[];
-  remaining: () => number;
-  setRemaining: (n: number) => void;
   failNext: () => void;
 }
 
@@ -70,7 +71,6 @@ function makePublisher(overrides: {
   signal?: AbortSignal;
 } = {}): PublisherHarness {
   const sends: string[] = [];
-  let remaining = 4;
   let failNext = false;
   const config = {
     enabled: true,
@@ -78,7 +78,6 @@ function makePublisher(overrides: {
     minIntervalMs: 1500,
     maxPerTurn: 3,
     maxLines: 8,
-    reserveQuota: 1,
     ...overrides.config,
   };
   const publisher = new ProgressCardPublisher({
@@ -91,15 +90,12 @@ function makePublisher(overrides: {
       sends.push(text);
       return {};
     },
-    quotaRemaining: () => remaining,
     signal: overrides.signal,
     log: undefined,
   });
   return {
     publisher,
     sends,
-    remaining: () => remaining,
-    setRemaining: (n: number) => { remaining = n; },
     failNext: () => { failNext = true; },
   };
 }
@@ -223,35 +219,38 @@ await test('清卡：steps=[] 不发消息；后续非空 update 恢复发布', 
   assert.equal(h.sends.length, 2, '清空后的新卡片恢复发布');
 });
 
-await test('配额：剩余额度 ≤ reserveQuota 跳过且不发送', async () => {
-  const h = makePublisher();
-  h.setRemaining(1); // reserve=1 → 1 ≤ 1 跳过
-  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
-  assert.equal(h.sends.length, 0);
-  h.setRemaining(0);
-  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_B });
-  assert.equal(h.sends.length, 0);
-  h.setRemaining(2);
-  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
-  assert.equal(h.sends.length, 1, '额度恢复后可发送');
+await test('反应式配额：本地无次数门，maxPerTurn 内连续快照全部发出', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0, maxPerTurn: 5 } });
+  const states = [
+    STEPS_A,
+    STEPS_B,
+    // 第 3 步完成（区别于 STEPS_B：step2 completed、step3 in_progress）
+    STEPS_A.map((s, i) => (i < 3 ? { ...s, status: 'completed' as const } : { ...s, status: 'in_progress' as const })),
+    // 全部完成
+    STEPS_A.map((s) => ({ ...s, status: 'completed' as const })),
+  ];
+  for (const steps of states) {
+    await h.publisher.onPlanUpdate({ phase: 'update', steps });
+  }
+  assert.equal(h.sends.length, 4, '反应式：次数不再是本地门（旧口径第 4 条会被 reserve 保槽拦截）');
 });
 
-await test('passive-quota-exhausted：静默丢弃、无重试、不影响后续更新', async () => {
+await test('passive-quota-exhausted：锚点对本轮永久——首次即停止本轮发布（评审 #86-F4）', async () => {
   const h = makePublisher({ config: { minIntervalMs: 0 } });
   h.failNext();
   await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
   assert.equal(h.sends.length, 0, '被拒的卡片被丢弃');
   assert.equal(h.publisher.sentCards, 0);
-  // 未记为已发送 → 同状态重试可再发
+  // 反应式下该错误只剩锚点过期/判死一个来源，对本轮永久——同状态/新状态都不再发布
   await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
-  assert.equal(h.sends.length, 1, '同状态重试成功发送');
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_B });
+  assert.equal(h.sends.length, 0, '停止后不再逐快照重试');
 });
 
 await test('发送异常：丢弃该条卡片不抛错（结果未知，保守计数为已发送）', async () => {
   const publisher = new ProgressCardPublisher({
-    config: { enabled: true, scope: 'c2c', minIntervalMs: 1500, maxPerTurn: 3, maxLines: 8, reserveQuota: 1 } as never,
+    config: { enabled: true, scope: 'c2c', minIntervalMs: 1500, maxPerTurn: 3, maxLines: 8 } as never,
     sendCard: async () => { throw new Error('QQ API unavailable'); },
-    quotaRemaining: () => 4,
   });
   await assert.doesNotReject(publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A }));
   assert.equal(publisher.sentCards, 1, '结果未知 → 计入保险丝（宁可少发不可刷屏）');
@@ -347,13 +346,12 @@ await test('通用发送错误防重发：同状态 update 不再重复（passiv
   const sends: string[] = [];
   let failAll = true;
   const publisher = new ProgressCardPublisher({
-    config: { enabled: true, scope: 'c2c', minIntervalMs: 0, maxPerTurn: 3, maxLines: 8, reserveQuota: 1 } as never,
+    config: { enabled: true, scope: 'c2c', minIntervalMs: 0, maxPerTurn: 3, maxLines: 8 } as never,
     sendCard: async (text: string) => {
       if (failAll) return { error: 'HTTP 500 upstream' }; // 结果未知（可能已落地）
       sends.push(text);
       return {};
     },
-    quotaRemaining: () => 4,
   });
   await publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
   await publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A }); // 同状态重复
@@ -368,14 +366,13 @@ await test('drain：等待 in-flight 发送落地（卡片先于答案完成）'
   let sendEntered: (() => void) | undefined;
   let releaseSend: (() => void) | undefined;
   const publisher = new ProgressCardPublisher({
-    config: { enabled: true, scope: 'c2c', minIntervalMs: 0, maxPerTurn: 3, maxLines: 8, reserveQuota: 1 } as never,
+    config: { enabled: true, scope: 'c2c', minIntervalMs: 0, maxPerTurn: 3, maxLines: 8 } as never,
     sendCard: async (text: string) => {
       sendEntered?.();
       await new Promise<void>((resolve) => { releaseSend = resolve; });
       sends.push(text);
       return {};
     },
-    quotaRemaining: () => 4,
   });
   const pending = publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
   // 等 sendCard 真正进入（已过 stop/abort/配额检查，正在 await 网络）
@@ -397,7 +394,7 @@ await test('drain：等待 in-flight 发送落地（卡片先于答案完成）'
 
 group('配置解析');
 
-await test('缺省默认值：enabled=true / scope=c2c / 1500ms / 3 / 8 / 1', () => {
+await test('缺省默认值：enabled=true / scope=c2c / 1500ms / 3 / 8', () => {
   const cfg = resolveProgressCardConfig({ config: {} } as never);
   assert.deepEqual(cfg, {
     enabled: true,
@@ -405,50 +402,61 @@ await test('缺省默认值：enabled=true / scope=c2c / 1500ms / 3 / 8 / 1', ()
     minIntervalMs: 1500,
     maxPerTurn: 3,
     maxLines: 8,
-    reserveQuota: 1,
   });
 });
 
 await test('账号级覆盖', () => {
   const cfg = resolveProgressCardConfig({
-    config: { progressCard: { enabled: false, scope: 'both', minIntervalMs: 300, maxPerTurn: 5, maxLines: 6, reserveQuota: 2 } },
+    config: { progressCard: { enabled: false, scope: 'both', minIntervalMs: 300, maxPerTurn: 5, maxLines: 6 } },
   } as never);
   assert.equal(cfg.enabled, false);
   assert.equal(cfg.scope, 'both');
   assert.equal(cfg.minIntervalMs, 300);
   assert.equal(cfg.maxPerTurn, 5);
   assert.equal(cfg.maxLines, 6);
-  assert.equal(cfg.reserveQuota, 2);
 });
 
 await test('非法数值钳制回默认（maxPerTurn 0.x 向下取整视为显式 0=禁发）', () => {
   const cfg = resolveProgressCardConfig({
-    config: { progressCard: { minIntervalMs: -5, maxPerTurn: 0.7, maxLines: 0, reserveQuota: 'x' as never } },
+    config: { progressCard: { minIntervalMs: -5, maxPerTurn: 0.7, maxLines: 0 } },
   } as never);
   assert.equal(cfg.minIntervalMs, 1500, '负数 → 默认');
   assert.equal(cfg.maxPerTurn, 0, '0.7 floor=0（显式禁发语义）');
   assert.equal(cfg.maxLines, 8, '0 → 默认 8');
-  assert.equal(cfg.reserveQuota, 1, '非数值 → 默认');
 });
 
 // ── 4. outbound sendText passiveOnly ──
 
 group('outbound passiveOnly');
 
-await test('resolveQuotaAccountId：与 sendText 记账同一账号（含单账号回退）', async () => {
-  const { resolveQuotaAccountId } = await import('../src/outbound/outbound-service.ts');
-  // 无网关：返回原 ID
-  assert.equal(resolveQuotaAccountId('pc-acct-none'), 'pc-acct-none');
-  // 单账号回退：请求不存在的账号 → 解析到唯一运行中账号（与 sendText 预留配额一致）
-  registerGateway('pc-acct-sole', {
-    sendText: async () => ({ id: 'x' }),
+await test('反应式：次数超文档上限 + passiveOnly → 仍正常发送（不因 count 拦截）', async () => {
+  clearQuotaCache();
+  const accountId = 'pc-over-limit';
+  const msgId = 'pc-msg-0';
+  const gwCalls: unknown[] = [];
+  registerGateway(accountId, {
+    sendText: async (...args: unknown[]) => {
+      gwCalls.push(args);
+      return { id: 'x' };
+    },
     sendMedia: async () => ({ id: 'm' }),
   } as never);
-  assert.equal(resolveQuotaAccountId('pc-acct-missing'), 'pc-acct-sole');
-  assert.equal(resolveQuotaAccountId('pc-acct-sole'), 'pc-acct-sole');
+  // 消耗 6 次（超文档上限 4）——反应式下全部放行，第 7 次发送照常被动
+  for (let i = 0; i < 6; i++) {
+    assert.equal(checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' }).canReply, true);
+  }
+  const result = await sendText({
+    to: 'qqbot:c2c:USER_X',
+    text: '卡片',
+    replyToId: msgId,
+    account: { accountId, config: {} } as never,
+    passiveOnly: true,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(gwCalls.length, 1, '网关被调用（被动发送）');
 });
 
-await test('配额耗尽 + passiveOnly → 返回 error 且不触达网关（不降级主动）', async () => {
+await test('锚点判死 + passiveOnly → 返回 error 且不触达网关（不降级主动）', async () => {
   clearQuotaCache();
   const accountId = 'pc-passive-only';
   const msgId = 'pc-msg-1';
@@ -460,10 +468,9 @@ await test('配额耗尽 + passiveOnly → 返回 error 且不触达网关（不
     },
     sendMedia: async () => ({ id: 'm' }),
   } as never);
-  // 耗尽 c2c 4 条被动配额
-  for (let i = 0; i < 4; i++) {
-    assert.equal(checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' }).canReply, true);
-  }
+  // 模拟平台 40034128/40034005 判死锚点
+  registerMsgIdWindow({ accountId, msgId, scope: 'c2c', receivedAt: Date.now() });
+  invalidateMsgIdQuota({ accountId, msgId, scope: 'c2c' });
   const result = await sendText({
     to: 'qqbot:c2c:USER_X',
     text: '卡片',
@@ -475,7 +482,7 @@ await test('配额耗尽 + passiveOnly → 返回 error 且不触达网关（不
   assert.equal(gwCalls.length, 0, '网关不应被调用');
 });
 
-await test('配额耗尽 + 非 passiveOnly → 维持原行为（降级主动发送）', async () => {
+await test('锚点判死 + 非 passiveOnly → 降级主动发送（不带 msgId）', async () => {
   clearQuotaCache();
   const accountId = 'pc-passive-fallback';
   const msgId = 'pc-msg-2';
@@ -487,9 +494,8 @@ await test('配额耗尽 + 非 passiveOnly → 维持原行为（降级主动发
     },
     sendMedia: async () => ({ id: 'm' }),
   } as never);
-  for (let i = 0; i < 4; i++) {
-    checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
-  }
+  registerMsgIdWindow({ accountId, msgId, scope: 'c2c', receivedAt: Date.now() });
+  invalidateMsgIdQuota({ accountId, msgId, scope: 'c2c' });
   const result = await sendText({
     to: 'qqbot:c2c:USER_X',
     text: '正文',

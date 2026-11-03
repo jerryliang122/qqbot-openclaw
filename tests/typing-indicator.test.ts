@@ -5,10 +5,11 @@
  * - 续期间隔钳制（QPS 约束：不低于 20s）
  * - ReplyLimiter.tryAcquire 的占用语义
  * - 中间件行为：C2C-only、首次立即发送、完成后清理定时器、
- *   被动配额耗尽后降级为主动发送（不带 msg_id）且续期不中断
+ *   锚点过期/判死后降级为主动发送（不带 msg_id）且续期不中断
  * - 出站消息后 5s 补发续期（QQ 客户端收到消息会终止输入状态显示），
  *   任务完成后不再补发；补发同样受 20s QPS 间距保护
- * - typing 与回复共享被动配额（tryAcquirePassiveSlot 记账）
+ * - 反应式配额：typing 不占回复额度（平台探针实测），仅锚点存活探测
+ *   （probePassiveAnchorAlive），续期次数不因「文档上限」失效
  *
  * 运行方式: npx tsx tests/typing-indicator.test.ts
  */
@@ -19,7 +20,14 @@ import {
   MIN_TYPING_INTERVAL_MS,
   POST_MESSAGE_REFRESH_DELAY_MS,
 } from '../src/middleware/typing.js';
-import { tryAcquirePassiveSlot } from '../src/outbound/outbound-service.js';
+import { probePassiveAnchorAlive } from '../src/outbound/outbound-service.js';
+import {
+  registerMsgIdWindow,
+  invalidateMsgIdQuota,
+  checkAndConsumePassiveReplyQuota,
+  clearQuotaCache,
+  __test_getQuotaCache,
+} from '../src/features/quota-manager.js';
 import { ReplyLimiter } from '../src/outbound/reply-limiter.js';
 import {
   subscribeOutboundMessage,
@@ -119,8 +127,8 @@ await test('不同 msgId 的配额互不影响', () => {
   assert.strictEqual(limiter.tryAcquire('m3b'), true, '新消息有独立配额');
 });
 
-await test('无 msgId 时不占被动配额（无法走被动通道）', () => {
-  assert.strictEqual(tryAcquirePassiveSlot('acct-x', undefined), false);
+await test('无 msgId 时无法走被动通道（探测返回 false）', () => {
+  assert.strictEqual(probePassiveAnchorAlive('acct-x', undefined), false);
 });
 
 group('中间件行为');
@@ -147,23 +155,24 @@ await test('C2C 消息立即发送一次（带 msg_id 被动发送），处理�
   assert.strictEqual(calls[0], 'cm1:60', '应带 msgId（被动）和 60s 窗口');
 });
 
-await test('被动配额耗尽后降级为主动发送（不带 msg_id）', async () => {
-  // 预耗尽该 msg_id 的被动配额（limit=4）
-  for (let i = 0; i < 4; i++) {
-    assert.strictEqual(tryAcquirePassiveSlot('acct-c2', 'cm2'), true);
-  }
+await test('锚点判死后降级为主动发送（不带 msg_id）', async () => {
+  // 反应式模型：次数不再阻断，判死锚点（平台 40034005/40034128）才降级
+  clearQuotaCache();
+  registerMsgIdWindow({ accountId: 'acct-c2', msgId: 'cm2', scope: 'c2c', receivedAt: Date.now() });
+  invalidateMsgIdQuota({ accountId: 'acct-c2', msgId: 'cm2', scope: 'c2c' });
+  assert.strictEqual(probePassiveAnchorAlive('acct-c2', 'cm2'), false);
   const calls: string[] = [];
   let nextCalled = false;
   const mw = c2cTypingIndicator({ accountId: 'acct-c2' });
   await mw(makeCtx('c2c', 'cm2', calls) as any, async () => {
     nextCalled = true;
   });
-  assert.strictEqual(calls.length, 1, '配额耗尽不应中断 typing');
+  assert.strictEqual(calls.length, 1, '锚点判死不应中断 typing');
   assert.strictEqual(calls[0], 'undefined:60', '应不带 msgId（主动）发送');
   assert.strictEqual(nextCalled, true, 'next 应被调用');
 });
 
-await test('续期定时器间隔为 20s，续期不因配额耗尽而中断', async () => {
+await test('续期定时器间隔为 20s，续期全程被动（次数不失效）', async () => {
   const calls: string[] = [];
   const origSetInterval = globalThis.setInterval;
   const origClearInterval = globalThis.clearInterval;
@@ -180,6 +189,7 @@ await test('续期定时器间隔为 20s，续期不因配额耗尽而中断', a
     clearedHandles.add(Number(h));
   }) as unknown as typeof globalThis.clearInterval;
   try {
+    clearQuotaCache();
     const mw = c2cTypingIndicator({ accountId: 'acct-c3', intervalMs: 1_000 }); // 应被钳制
     // next 挂起，模拟框架任务仍在进行（完成后 sendNow 不再生效）
     let releaseNext!: () => void;
@@ -190,14 +200,12 @@ await test('续期定时器间隔为 20s，续期不因配额耗尽而中断', a
     assert.strictEqual(captured!.ms, 20_000, '续期间隔应被钳制到 20000ms');
     assert.strictEqual(calls.length, 1, '初始发送一次');
 
-    // 连续触发 5 次续期回调：limit=4，前 3 次被动（带 msgId），之后降级主动（无 msgId）
+    // 连续触发 5 次续期回调：锚点存活 → 全程带 msgId（反应式：次数不失效）
     // cb 始终是同一个 sendNow 闭包，重置锚点不影响触发
     for (let i = 0; i < 5; i++) captured!.cb();
     assert.strictEqual(calls.length, 6, '续期不应中断');
     const passive = calls.filter((c) => c === 'cm3:60').length;
-    const proactive = calls.filter((c) => c === 'undefined:60').length;
-    assert.strictEqual(passive, 4, '被动配额 limit=4，应恰好 4 次带 msgId');
-    assert.strictEqual(proactive, 2, '配额耗尽后应降级主动发送');
+    assert.strictEqual(passive, 6, '锚点存活期间续期全程带 msgId（平台不执行次数上限）');
 
     releaseNext();
     await chainPromise;
@@ -212,16 +220,27 @@ await test('续期定时器间隔为 20s，续期不因配额耗尽而中断', a
   }
 });
 
-await test('typing 与回复共享配额：同一 limiter 记账', async () => {
+await test('typing 不消耗 count：发送后观测计数不含 typing', async () => {
+  clearQuotaCache();
   const calls: string[] = [];
   const mw = c2cTypingIndicator({ accountId: 'acct-c4' });
   await mw(makeCtx('c2c', 'cm4', calls) as any, async () => {});
   assert.strictEqual(calls.length, 1);
-  // typing 已占 1 条，再占 3 条后耗尽（limit=4），后续 typing/回复都走主动通道
-  for (let i = 0; i < 3; i++) {
-    assert.strictEqual(tryAcquirePassiveSlot('acct-c4', 'cm4'), true);
+  assert.strictEqual(calls[0], 'cm4:60', 'typing 带 msgId 发送');
+
+  // typing 未产生任何配额条目（不消耗、不发号）
+  assert.ok(!__test_getQuotaCache().has('acct-c4:c2c:cm4'), 'typing 不应创建配额条目');
+
+  // 之后正文回复消耗 6 次（超文档上限 4）全部放行，count 只含正文消耗
+  for (let i = 0; i < 6; i++) {
+    assert.strictEqual(
+      checkAndConsumePassiveReplyQuota({ accountId: 'acct-c4', msgId: 'cm4', scope: 'c2c' }).canReply,
+      true,
+    );
   }
-  assert.strictEqual(tryAcquirePassiveSlot('acct-c4', 'cm4'), false, '配额耗尽后应返回 false');
+  const entry = __test_getQuotaCache().get('acct-c4:c2c:cm4');
+  assert.ok(entry);
+  assert.strictEqual(entry!.count, 6, '观测计数应只含正文消耗（typing 不计入）');
 });
 
 group('出站消息信号（typing-refresh）');

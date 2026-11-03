@@ -32,7 +32,7 @@ export function isSecretInputCancelKeyword(text: string): boolean {
   return CANCEL_KEYWORDS.has(text.trim().toLowerCase());
 }
 
-/** 配额感知的直接回复：优先被动（msg_id），配额耗尽/发送失败降级主动 */
+/** 锚点感知的直接回复：被动优先（msg_id 存活时），锚点过期/判死或发送失败降级主动 */
 async function replyToUser(
   ctx: any,
   accountId: string,
@@ -44,6 +44,8 @@ async function replyToUser(
       accountId,
       msgId,
       scope: 'c2c',
+      // 透传 logger：超限观测 INFO 不因缺 logger 而丢失（评审 #86-F1）
+      log: ctx.log,
     });
     if (canReply) {
       try {

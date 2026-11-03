@@ -187,30 +187,35 @@ await test('B5: 零账号运行 → 错误保持原语义（无运行中列表�
   assert.strictEqual(result.error, 'Bot "default" not running');
 });
 
-await test('B6: 回退发送的被动配额记在实际发送账号下（Sourcery 复审：配额记账键）', async () => {
+await test('B6: 回退发送的被动锚点判定记在实际发送账号下（Sourcery 复审：配额记账键）', async () => {
   cleanupRegistry();
   clearQuotaCache();
+  const { registerMsgIdWindow, invalidateMsgIdQuota } = await import('../src/features/quota-manager.ts');
   const calls: { sendText?: Array<{ opts?: { msgId?: string } }> } = { sendText: [] };
   registerGateway('live', makeFakeGateway(calls as never));
-  // 同一 msg_id 连发 5 次：c2c 被动配额 4 次/msg。配额正确记在 'live' 下时，
-  // 前 4 次带 msgId（被动）、第 5 次耗尽降级主动（msgId undefined）；
-  // 若误记在请求键 "default" 下，'live' 的配额永不清耗，5 次全带 msgId。
-  for (let i = 0; i < 5; i++) {
-    const result = await sendText({
-      to: 'qqbot:c2c:user1',
-      text: `msg-${i}`,
-      replyToId: 'quota-key-1',
-      account: { accountId: 'default' } as never,
-    });
-    assert.strictEqual(result.error, undefined);
-  }
-  const msgIds = (calls.sendText ?? []).map((c) => c.opts?.msgId);
-  assert.strictEqual(
-    msgIds.filter(Boolean).length,
-    4,
-    `前 4 次应走被动通道: ${JSON.stringify(msgIds)}`,
-  );
-  assert.strictEqual(msgIds[4], undefined, '第 5 次应降级主动发送（无 msgId）');
+  // 反应式配额（2026-11-03）下次数不阻断，记账键改用「判死锚点」验证：
+  // 在实际发送账号 'live' 下判死该 msg_id 后，下一次发送应省略 msgId
+  // （降级主动）；若误记在请求键 "default" 下，'live' 的 dead 标记不可见，
+  // 发送仍会带 msgId。
+  registerMsgIdWindow({ accountId: 'live', msgId: 'quota-key-1', scope: 'c2c', receivedAt: Date.now() });
+  const first = await sendText({
+    to: 'qqbot:c2c:user1',
+    text: 'msg-0',
+    replyToId: 'quota-key-1',
+    account: { accountId: 'default' } as never,
+  });
+  assert.strictEqual(first.error, undefined);
+  assert.strictEqual(calls.sendText?.[0]?.opts?.msgId, 'quota-key-1', '判死前应走被动通道');
+
+  invalidateMsgIdQuota({ accountId: 'live', msgId: 'quota-key-1', scope: 'c2c' });
+  const second = await sendText({
+    to: 'qqbot:c2c:user1',
+    text: 'msg-1',
+    replyToId: 'quota-key-1',
+    account: { accountId: 'default' } as never,
+  });
+  assert.strictEqual(second.error, undefined);
+  assert.strictEqual(calls.sendText?.[1]?.opts?.msgId, undefined, '判死后应降级主动发送（无 msgId）——记账键必须是实际发送账号');
   cleanupRegistry();
   clearQuotaCache();
 });

@@ -2,7 +2,9 @@
  * 出站消息服务
  *
  * 负责将 AI 回复通过 QQBotGateway 发送到 QQ。
- * 超时保护由 QQBotGateway 内部统一处理，本层做 target 解析 + 被动回复限额管控。
+ * 超时保护由 QQBotGateway 内部统一处理，本层做 target 解析 + 被动锚点
+ * 存活管控（反应式配额：TTL/死锚点本地预检，次数不阻断——见
+ * features/quota-manager.ts 文件头）。
  */
 import * as path from 'node:path';
 import { MediaFileType } from '@tencent-connect/qqbot-nodejs';
@@ -12,8 +14,8 @@ import { createPluginLogger } from '../utils/plugin-logger.js';
 import { parseTarget } from './target.js';
 import {
   checkAndConsumePassiveReplyQuota,
+  checkPassiveReplyQuota,
   clearQuotaCacheForAccount,
-  rollbackPassiveReplyQuota,
 } from '../features/quota-manager.js';
 import { peekMsgIdReceivedAt } from '../features/msgid-cache.js';
 
@@ -43,10 +45,23 @@ globalRegistry[GATEWAYS_REGISTRY_KEY] = gateways;
 // 环半初始化状态下崩溃），且日志失败绝不影响发送。
 let svcLog: ReturnType<typeof createPluginLogger> | undefined;
 
-function logFallbackInfo(msg: string): void {
+/**
+ * 惰性初始化的模块级 logger（循环依赖环上必须惰性，见上）。
+ * 供 reservePassiveReply 等无调用方 logger 的路径透传给 quota-manager
+ * （超限观测 INFO 等日志此前在主出站路径上是 no-op——评审 #86-F1）。
+ */
+function getOutboundLogger(): { debug?: (m: string) => void; info?: (m: string) => void } | undefined {
   try {
     svcLog ??= createPluginLogger({ prefix: '[outbound]' });
-    svcLog.info(msg);
+  } catch {
+    return undefined;
+  }
+  return svcLog;
+}
+
+function logFallbackInfo(msg: string): void {
+  try {
+    getOutboundLogger()?.info?.(msg);
   } catch {
     /* logging must never break sends */
   }
@@ -81,6 +96,9 @@ function reservePassiveReply(params: {
     ...(params.targetId
       ? { receivedAt: peekMsgIdReceivedAt(params.scope, params.targetId, params.replyToId) }
       : {}),
+    // 模块级 logger 兜底：dispatch 主回复/进度卡/static 收尾/失败兜底都走
+    // 本函数，透传后超限观测 INFO 才能在主路径真正落盘（评审 #86-F1）
+    log: getOutboundLogger(),
   });
   return {
     msgId: reservation.canReply ? params.replyToId : undefined,
@@ -90,21 +108,17 @@ function reservePassiveReply(params: {
 }
 
 /**
- * 尝试为 typing 指示器占用一个被动回复配额（带 msg_id 发送）。
+ * 探测 typing 指示器可用的被动锚点是否存活（纯探测，不消耗、不发号）。
  *
- * typing 通知与回复消息共享同一 msg_id 的被动回复配额，必须经统一
- * quota-manager 记账。配额不可用时调用方应降级为主动发送（不带 msg_id）。
+ * 反应式模型（2026-11-03）：平台实测 typing（msg_type=6）不占回复额度，
+ * 这里只判 msg_id 是否在 TTL 窗口内/是否被判死——过期或判死的锚点挂上
+ * 去也是平台 40034005 确定性拒绝。
  *
- * @returns 是否占得被动配额；false 表示应不带 msg_id 主动发送
+ * @returns true = 可带 msg_id 发送；false = 应不带 msg_id 发送
  */
-export function tryAcquirePassiveSlot(accountId: string, msgId: string | undefined): boolean {
+export function probePassiveAnchorAlive(accountId: string, msgId: string | undefined): boolean {
   if (!msgId) return false; // 无 msg_id 无法走被动通道
-  return checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' }).canReply;
-}
-
-export function rollbackPassiveSlot(accountId: string, msgId: string | undefined): void {
-  if (!msgId) return;
-  rollbackPassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
+  return checkPassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
 }
 
 export function registerGateway(accountId: string, gw: QQBotGateway): void {
@@ -180,18 +194,6 @@ export function notRunningError(accountId: string): string {
   return `Bot "${accountId}" not running${running.length ? ` (running accounts: ${running.join(', ')})` : ''}`;
 }
 
-/**
- * 解析发送/配额记账实际使用的账号 ID（含单账号回退）。
- *
- * sendText 经 resolveGatewayForSend 预留配额时用的是**回退后**的
- * resolved.accountId；进度卡片等发送前的配额探测必须用同一账号键，
- * 否则回退场景下探测与记账错位（探测乐观、实际耗尽），卡片会吃掉
- * 最终回复的被动配额槽。
- */
-export function resolveQuotaAccountId(accountId: string): string {
-  return resolveGatewayForSend(accountId)?.accountId ?? accountId;
-}
-
 // ── 媒体类型映射 ──
 
 export type MediaKind = 'image' | 'voice' | 'video' | 'file';
@@ -246,8 +248,8 @@ export async function sendText(params: {
     targetId: target.targetId,
     quotaReserved: params.quotaReserved,
   });
-  // passiveOnly：未占得被动槽（无 msg_id 可挂 / 配额耗尽 / TOCTOU 竞态）
-  // → 不发送。绝不落到主动通道。
+  // passiveOnly：无存活锚点（无 msg_id 可挂 / 过期 / 判死）→ 不发送。
+  // 绝不落到主动通道。
   if (params.passiveOnly && !reservation.msgId) {
     return { error: 'passive-quota-exhausted' };
   }

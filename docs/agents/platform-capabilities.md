@@ -35,12 +35,13 @@ QQ 跟 Telegram 的最大差异在**回复机制**:
 
 | 模式 | 触发 | 配额 | 有效期 |
 |------|------|------|--------|
-| **被动回复** (passive) | `msg_id` 或 `event_id` 二选一 | 私聊 4 次/msg,群 5 次/msg | 私聊 60 min,群 5 min |
+| **被动回复** (passive) | `msg_id` 或 `event_id` 二选一 | 私聊 4 次/msg,群 5 次/msg（**文档口径，平台实测不执行**，见下） | 私聊 60 min,群 5 min |
 | **主动推送** (proactive) | 都不传 | 私聊 Bot 维度 10/qps(未认证 5/qps + 30/qpm),群 60/qpm;接收方 20/qpm,1 天最多 1000 条 | 无 |
 | **互动召回** (wakeup) | `is_wakeup=true`,与 msg_id/event_id 互斥 | 30 天内 4 周期,每周期 1 条 | 30 天 |
 
 - 接口级统一 QPS 上限 100。
 - 错误码 `40034128` = 被动回复时间/次数超限;`40034100` = 主动消息超限;`40034122` = 互动召回达上限。
+- **「4/5 次 per msg_id」平台实测不执行（2026-11-02 探针，官方 WebSocket 收 C2C + 撤回接口自证）**：同一 msg_id 连发 25 次被动回复全部 HTTP 200 且真实送达（撤回自证），25s 慢速间隔复测同样全过；typing（msg_type=6）不占回复额度。平台真实硬约束只有 **msg_id 时效窗口**（40034005）与 **msg_id+msg_seq 唯一性**（40054005）。这正是插件「反应式配额」模型的依据（本地不按次数阻断，平台真拒绝再兜底转主动，见 docs/agents/outbound-and-quota.md）。唯一性是**本地必须防**的约束（单调 seq 发号）；次数是**文档写了但平台不做**的约束——本地 preemptive 阻断等于替平台做决定。
 
 ### "流式"是另一种发送通道,不是回复模式
 
@@ -48,8 +49,8 @@ QQ 跟 Telegram 的最大差异在**回复机制**:
   - `openStream` 创建流(仅 c2c,群不支持流式参数)
   - `session.update` 多次替换(已发送的 prefix 不可修改)
   - `session.complete` 收尾
-- 流式**没有"流式配额"**,但流式通道里的回复消息(`session.update` 推送)仍走 C2C 被动回复配额(同上表,4 次/msg/60 min)。
-- 见 `src/middleware/typing.ts`:`typing` 通知复用 `ReplyLimiter`(4/msg 配额),与真回复共享额度 — 防止 thinking 流把配额烧光。
+- 流式**没有"流式配额"**,但流式通道里的回复消息(`session.update` 推送)仍是 C2C 被动回复(同上表口径;次数上限实测不执行,60 min 窗口真实)。
+- 见 `src/middleware/typing.ts`:typing 只做锚点存活探测(判 TTL/死锚点),不占回复额度(实测) — 锚点过期/判死后转不带 msg_id 发送。
 - 见 `src/outbound/reply-limiter.ts`(`ReplyLimiter`,默认 4/msg_id,10k LRU,C2C TTL 60 min)。
 - 见 `src/features/msgid-cache.ts`:C2C `msg_id` 缓存 60 分钟、群 5 分钟——与 quota-manager 共用 `PLATFORM_PASSIVE_WINDOW`（平台被动回复窗口），条目时间戳为平台事件时间。
 

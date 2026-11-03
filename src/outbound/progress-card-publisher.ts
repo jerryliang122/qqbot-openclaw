@@ -10,13 +10,16 @@
  * edit）；流式 openStream/update 只接受前缀增长文本，而 checklist 更新必然
  * 改动已下发行（✅/▸ 标记移动），不符合前缀不变约束。
  *
- * 配额红线（QQ 平台被动回复限额 c2c 4 条/msg_id、group 5 条/msg_id）：
- * - 卡片消息**只走被动回复**：发送前用 getPassiveReplyQuotaRemaining 纯探测，
- *   剩余额度不足（≤ reserveQuota，为最终回复保槽）直接丢弃，绝不烧每日
- *   主动预算；outbound sendText 的 passiveOnly 兜住探测→发送之间的竞态。
+ * 配额口径（反应式模型，2026-11-03）：
+ * - 卡片消息**只走被动回复**（sendText 的 passiveOnly）：本地无次数门
+ *   （平台实测不执行「c2c 4 条/group 5 条每 msg_id」，见
+ *   features/quota-manager.ts 文件头），唯一本地保险丝是 maxPerTurn。
+ * - 锚点无存活（无 msg_id / TTL 过期 / 判死）时 outbound 返回
+ *   passive-quota-exhausted——本地拦截、确定未发出；锚点过期/判死对
+ *   本轮是永久状态（卡片锚点固定为 turn 源消息），首次遇到即停止本轮
+ *   发布；绝不烧每日主动预算。
  * - 发送结果未知的失败（平台报错/网络异常——消息可能已落地）记录为
- *   「已发送」防重发；passive-quota-exhausted（本地拦截，确定未发出）
- *   不记录，同状态更新仍可重试。
+ *   「已发送」防重发。
  * - 卡片是锦上添花，正文优先：任何失败都不重试、不影响 turn。
  *
  * 渲染复用框架共享渲染器 formatPlanChecklistLines（与 telegram 文本模式
@@ -59,8 +62,6 @@ export interface ProgressCardPublisherDeps {
   config: Required<ProgressCardConfig>;
   /** 发送一条卡片消息（返回 error 时视为失败/配额不可用，静默丢弃） */
   sendCard: (text: string) => Promise<{ error?: string } | void>;
-  /** 被动配额剩余额度探测（getPassiveReplyQuotaRemaining 的绑定） */
-  quotaRemaining: () => number;
   /** turn 级中止信号（combinedAbortSignal） */
   signal?: AbortSignal;
   log?: PluginLogger;
@@ -232,13 +233,6 @@ export class ProgressCardPublisher {
       return;
     }
 
-    // 配额红线：剩余额度不足（为最终回复保槽）直接丢弃
-    const remaining = this.deps.quotaRemaining();
-    if (remaining <= this.deps.config.reserveQuota) {
-      this.deps.log?.info(`[progress-card] skipped (passive quota remaining=${remaining} ≤ reserve=${this.deps.config.reserveQuota})`);
-      return;
-    }
-
     let result: { error?: string } | void;
     try {
       result = await this.deps.sendCard(text);
@@ -249,8 +243,13 @@ export class ProgressCardPublisher {
       return;
     }
     if (result?.error === 'passive-quota-exhausted') {
-      // 本地拦截（探测→发送竞态）：确定未发出，同状态更新仍可重试
-      this.deps.log?.warn('[progress-card] send rejected: passive-quota-exhausted');
+      // 反应式模型下该错误只剩「锚点过期/判死」一个来源，而卡片锚点固定为
+      // turn 源消息——对本轮是**永久**状态。首次遇到即停止本轮发布，
+      // 不再逐快照重试刷 WARN（评审 #86-F4）。
+      this.deps.log?.warn(
+        '[progress-card] passive anchor unavailable (expired/dead); stopping card publishing for this turn',
+      );
+      this.stop('passive anchor unavailable');
       return;
     }
     if (result?.error) {

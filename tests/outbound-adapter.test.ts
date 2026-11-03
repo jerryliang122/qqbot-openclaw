@@ -1,5 +1,5 @@
 import { strict as assert } from 'assert';
-import { clearQuotaCache, __test_getQuotaCache } from '../src/features/quota-manager.js';
+import { clearQuotaCache, registerMsgIdWindow, invalidateMsgIdQuota, __test_getQuotaCache } from '../src/features/quota-manager.js';
 import { createQQBotOutboundAdapter } from '../src/outbound-adapter.js';
 import type { ResolvedQQBotAccount } from '../src/types.js';
 
@@ -108,7 +108,7 @@ async function main() {
     assert(capturedReplyToId === 'original-msg-id', 'Should include replyToId when quota available');
   });
 
-  await test('sendTextWithQuota: 配额耗尽时省略 replyToId', async () => {
+  await test('sendTextWithQuota: 超文档上限仍带 replyToId（反应式，次数不阻断）', async () => {
     clearQuotaCache();
     
     let capturedReplyToId: string | undefined;
@@ -119,7 +119,7 @@ async function main() {
       },
     });
 
-    // 消耗所有配额（C2C: 4次）
+    // 消耗文档口径的全部配额（C2C: 4 次）
     for (let i = 0; i < 4; i++) {
       await adapter.sendTextWithQuota({
         to: 'qqbot:c2c:user456',
@@ -129,7 +129,7 @@ async function main() {
       });
     }
 
-    // 第5次发送应该省略 replyToId
+    // 第 5 次：反应式模型下仍带 replyToId（count 仅观测，平台实测不执行 4 次上限）
     capturedReplyToId = undefined;
     await adapter.sendTextWithQuota({
       to: 'qqbot:c2c:user456',
@@ -138,7 +138,32 @@ async function main() {
       account: mockAccount,
     });
 
-    assert(capturedReplyToId === undefined, 'Should omit replyToId when quota exhausted');
+    assert(capturedReplyToId === 'msg-id-exhausted', '反应式：超文档上限不省略 replyToId');
+  });
+
+  await test('sendTextWithQuota: 锚点判死时省略 replyToId（转主动）', async () => {
+    clearQuotaCache();
+    
+    let capturedReplyToId: string | undefined;
+    const adapter = createQQBotOutboundAdapter({
+      sendText: async ({ replyToId }) => {
+        capturedReplyToId = replyToId;
+        return { messageId: 'msg-2b' };
+      },
+    });
+
+    // 模拟平台 40034128/40034005 判死锚点
+    registerMsgIdWindow({ accountId: mockAccount.accountId, msgId: 'msg-id-dead', scope: 'c2c', receivedAt: Date.now() });
+    invalidateMsgIdQuota({ accountId: mockAccount.accountId, msgId: 'msg-id-dead', scope: 'c2c' });
+
+    await adapter.sendTextWithQuota({
+      to: 'qqbot:c2c:user456',
+      text: 'hello',
+      replyToId: 'msg-id-dead',
+      account: mockAccount,
+    });
+
+    assert(capturedReplyToId === undefined, '判死锚点应省略 replyToId（降级主动）');
   });
 
   await test('sendMediaWithQuota: 有配额时包含 replyToId', async () => {
@@ -162,7 +187,7 @@ async function main() {
     assert(capturedReplyToId === 'original-media-msg-id', 'Should include replyToId when quota available');
   });
 
-  await test('sendMediaWithQuota: 配额耗尽时省略 replyToId', async () => {
+  await test('sendMediaWithQuota: 锚点判死时省略 replyToId（转主动）', async () => {
     clearQuotaCache();
     
     let capturedReplyToId: string | undefined;
@@ -173,26 +198,18 @@ async function main() {
       },
     });
 
-    // 消耗所有配额
-    for (let i = 0; i < 4; i++) {
-      await adapter.sendMediaWithQuota({
-        to: 'qqbot:c2c:user999',
-        source: 'https://example.com/image.png',
-        replyToId: 'msg-id-media-exhausted',
-        account: mockAccount,
-      });
-    }
+    // 反应式模型下次数不阻断，能触发「省略」的是判死/过期锚点
+    registerMsgIdWindow({ accountId: mockAccount.accountId, msgId: 'msg-id-media-dead', scope: 'c2c', receivedAt: Date.now() });
+    invalidateMsgIdQuota({ accountId: mockAccount.accountId, msgId: 'msg-id-media-dead', scope: 'c2c' });
 
-    // 第5次发送应该省略 replyToId
-    capturedReplyToId = undefined;
     await adapter.sendMediaWithQuota({
       to: 'qqbot:c2c:user999',
       source: 'https://example.com/image.png',
-      replyToId: 'msg-id-media-exhausted',
+      replyToId: 'msg-id-media-dead',
       account: mockAccount,
     });
 
-    assert(capturedReplyToId === undefined, 'Should omit replyToId when quota exhausted');
+    assert(capturedReplyToId === undefined, '判死锚点应省略 replyToId（降级主动）');
   });
 
   await test('canSendTyping: C2C 有配额且有 replyToId 返回 true', async () => {
@@ -234,22 +251,16 @@ async function main() {
     assert(canSend === false, 'Should NOT allow typing without replyToId');
   });
 
-  await test('canSendTyping: 配额耗尽返回 false', async () => {
+  await test('canSendTyping: 锚点判死返回 false（反应式：次数不阻断）', async () => {
     clearQuotaCache();
-    
+
     const adapter = createQQBotOutboundAdapter({
       sendText: async () => ({ messageId: 'msg' }),
     });
 
-    // 消耗所有配额
-    for (let i = 0; i < 4; i++) {
-      await adapter.sendTextWithQuota({
-        to: 'qqbot:c2c:user333',
-        text: 'test',
-        replyToId: 'quota-msg-id',
-        account: mockAccount,
-      });
-    }
+    // 反应式模型下 count 不再阻断 typing——能触发 false 的是判死锚点
+    registerMsgIdWindow({ accountId: mockAccount.accountId, msgId: 'quota-msg-id', scope: 'c2c', receivedAt: Date.now() });
+    invalidateMsgIdQuota({ accountId: mockAccount.accountId, msgId: 'quota-msg-id', scope: 'c2c' });
 
     const canSend = await adapter.canSendTyping({
       to: 'qqbot:c2c:user333',
@@ -257,7 +268,7 @@ async function main() {
       replyToId: 'quota-msg-id',
     });
 
-    assert(canSend === false, 'Should NOT allow typing when quota exhausted');
+    assert(canSend === false, '判死锚点不应再带 msg_id 发 typing');
   });
 
   await test('配额检查与发送之间过期', async () => {
@@ -320,7 +331,7 @@ async function main() {
     assert(capturedAccountId === mockAccount.accountId, 'Should fallback to account.accountId when accountId not provided');
   });
 
-  await test('默认发送链路只计数一次且群聊允许 5 次被动回复', async () => {
+  await test('默认发送链路只计数一次且群聊超文档上限仍全程被动（反应式）', async () => {
     const { registerGateway, unregisterGateway } = await import('../src/outbound/outbound-service.js');
     clearQuotaCache();
     const sentMsgIds: Array<string | undefined> = [];
@@ -341,8 +352,9 @@ async function main() {
           account: mockAccount,
         });
       }
-      assert.deepEqual(sentMsgIds.slice(0, 5), Array(5).fill('group-source-msg'));
-      assert.equal(sentMsgIds[5], undefined, '第 6 次才应降级为主动消息');
+      // 反应式（2026-11-03）：群「5 次/msg_id」文档上限不再本地阻断——
+      // 6 次全部被动（count 仅观测），绝不因次数降级主动
+      assert.deepEqual(sentMsgIds, Array(6).fill('group-source-msg'));
     } finally {
       unregisterGateway(mockAccount.accountId);
     }

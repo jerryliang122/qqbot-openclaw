@@ -180,9 +180,9 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
   //     忙碌信号由插件自建（features/group-session-busy.ts：dispatch 的
   //     promise 覆盖整个 turn）。中间件链本身不做 busy-buffering。
 
-  // 11. C2C 输入状态指示器（配额感知：优先占被动回复配额，耗尽后与回复
-  //     消息一样降级为主动发送；续期间隔默认 20s 且不低于 20s，
-  //     详见 src/middleware/typing.ts）
+  // 11. C2C 输入状态指示器（反应式配额：typing 不占回复额度，仅做锚点
+  //     存活探测——过期/判死后转不带 msg_id 发送；续期间隔默认 20s 且
+  //     不低于 20s，详见 src/middleware/typing.ts）
   const typingCfg = account.config.typing;
   if (typingCfg?.enabled !== false) {
     bot.use(c2cTypingIndicator({

@@ -341,8 +341,8 @@ export interface ProgressCardConfig {
   enabled?: boolean;
   /**
    * 生效范围（默认 'c2c'）：
-   * - 'c2c'   仅私聊发送卡片（默认——私聊被动配额 4 条/msg_id，60min 有效）
-   * - 'group' 仅群聊（群被动配额仅 5 条/msg_id、5min 有效，卡片极易挤占正文）
+   * - 'c2c'   仅私聊发送卡片（默认）
+   * - 'group' 仅群聊（群被动锚点 TTL 仅 5min，卡片需显式开启）
    * - 'both'  私聊 + 群聊
    */
   scope?: 'c2c' | 'group' | 'both';
@@ -352,8 +352,9 @@ export interface ProgressCardConfig {
    */
   minIntervalMs?: number;
   /**
-   * 每个 turn 最多发送的卡片条数（默认 3，保险丝——c2c 被动硬上限 4 条
-   * /msg_id，配额探测 + reserveQuota 保证最终回复永远有槽）
+   * 每个 turn 最多发送的卡片条数（默认 3，保险丝——反应式配额下本地
+   * 无被动次数门（平台实测不执行），正文可达性由 passiveOnly + 平台
+   * 拒绝的转主动兜底保证，此值仅防工具密集期刷屏）
    */
   maxPerTurn?: number;
   /**
@@ -361,11 +362,6 @@ export interface ProgressCardConfig {
    * 完成尾部 + 当前步 + 待办尾部，与 telegram 文本模式同源渲染器）
    */
   maxLines?: number;
-  /**
-   * 为最终回复保留的被动配额槽（默认 1）：发送卡片前若剩余槽位 ≤ 此值
-   * 则跳过，保证正文优先
-   */
-  reserveQuota?: number;
 }
 
 /**
@@ -374,9 +370,8 @@ export interface ProgressCardConfig {
  * QQ 客户端行为：退出聊天界面再进入后，指示器会消失，只有收到新的
  * input_notify 推送才会重新显示，因此处理期间需要周期性续期。
  *
- * 配额说明：typing 通知与回复消息共享同一 msg_id 的被动回复配额
- * （QQ 开放平台同一条消息被动回复上限约 5 条）。被动配额耗尽后，
- * typing 与回复消息一样自动降级为主动发送（不带 msg_id），续期不中断。
+ * 配额口径（反应式模型）：typing（msg_type=6）不占回复额度（平台探针
+ * 实测），仅做锚点存活探测——过期/判死后转不带 msg_id 发送，续期不中断。
  *
  * 中间消息：机器人发出消息（如思维链中间输出）后，QQ 客户端会终止
  * 指示器显示。若框架任务仍在进行，插件会在消息发出 5 秒后补发一次
