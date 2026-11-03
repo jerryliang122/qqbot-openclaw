@@ -8,6 +8,9 @@ import {
   invalidateMsgIdQuota,
   getQuotaStats,
   PLATFORM_PASSIVE_WINDOW,
+  ANCHOR_DEAD_CODES,
+  isAnchorDeadError,
+  isAnchorDeadBizCode,
   __test_getQuotaCache,
 } from '../src/features/quota-manager.js';
 
@@ -379,6 +382,28 @@ await test('诚实重建：条目缺失时按 receivedAt 重建窗口（非当�
   // 无 receivedAt（调用方无从得知接收时间）→ 旧兜底 now+TTL 放行
   const legacy = checkAndConsumePassiveReplyQuota({ accountId, msgId: 'RB_LEGACY', scope: 'c2c' });
   assert.equal(legacy.canReply, true);
+});
+
+// ── 锚点已死判定（共享） ──
+
+await test('isAnchorDeadError：40034005 / 40034128 判死，其余不判', () => {
+  // SDK ApiError 的业务码字段名是 bizCode（鸭子类型判定，不依赖 instanceof）
+  assert.equal(isAnchorDeadError({ bizCode: 40034005 }), true);
+  assert.equal(isAnchorDeadError({ bizCode: 40034128 }), true);
+  assert.equal(isAnchorDeadError({ bizCode: 40034100 }), false, '主动消息超限不是锚点死');
+  assert.equal(isAnchorDeadError({ bizCode: 40054005 }), false, 'seq 重复不是锚点死');
+  assert.equal(isAnchorDeadError(new Error('boom')), false);
+  assert.equal(isAnchorDeadError(undefined), false);
+  assert.equal(isAnchorDeadError(null), false);
+});
+
+await test('isAnchorDeadBizCode：与 isAnchorDeadError 同口径', () => {
+  assert.equal(isAnchorDeadBizCode(40034005), true);
+  assert.equal(isAnchorDeadBizCode(40034128), true);
+  assert.equal(isAnchorDeadBizCode(40034122), false);
+  assert.equal(isAnchorDeadBizCode(undefined), false);
+  assert.equal(ANCHOR_DEAD_CODES.has(40034005), true);
+  assert.equal(ANCHOR_DEAD_CODES.has(40034128), true);
 });
 
 console.log('All quota manager tests passed');

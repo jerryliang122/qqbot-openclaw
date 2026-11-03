@@ -5,7 +5,8 @@
  * - 续期间隔钳制（QPS 约束：不低于 20s）
  * - ReplyLimiter.tryAcquire 的占用语义
  * - 中间件行为：C2C-only、首次立即发送、完成后清理定时器、
- *   锚点过期/判死后降级为主动发送（不带 msg_id）且续期不中断
+ *   **锚点过期/判死 ⇒ 本轮停发（绝不降级为主动形态）**、
+ *   平台拒收（40034005）⇒ 停发 + 标记死锚点
  * - 出站消息后 5s 补发续期（QQ 客户端收到消息会终止输入状态显示），
  *   任务完成后不再补发；补发同样受 20s QPS 间距保护
  * - 反应式配额：typing 不占回复额度（平台探针实测），仅锚点存活探测
@@ -155,8 +156,8 @@ await test('C2C 消息立即发送一次（带 msg_id 被动发送），处理�
   assert.strictEqual(calls[0], 'cm1:60', '应带 msgId（被动）和 60s 窗口');
 });
 
-await test('锚点判死后降级为主动发送（不带 msg_id）', async () => {
-  // 反应式模型：次数不再阻断，判死锚点（平台 40034005/40034128）才降级
+await test('锚点判死 → 本轮不再发送 typing（绝不降级为主动形态）', async () => {
+  // 反应式模型：次数不再阻断；判死锚点（平台 40034005/40034128）⇒ 本轮停发
   clearQuotaCache();
   registerMsgIdWindow({ accountId: 'acct-c2', msgId: 'cm2', scope: 'c2c', receivedAt: Date.now() });
   invalidateMsgIdQuota({ accountId: 'acct-c2', msgId: 'cm2', scope: 'c2c' });
@@ -167,9 +168,76 @@ await test('锚点判死后降级为主动发送（不带 msg_id）', async () =
   await mw(makeCtx('c2c', 'cm2', calls) as any, async () => {
     nextCalled = true;
   });
-  assert.strictEqual(calls.length, 1, '锚点判死不应中断 typing');
-  assert.strictEqual(calls[0], 'undefined:60', '应不带 msgId（主动）发送');
+  assert.strictEqual(calls.length, 0, '锚点判死 ⇒ 本轮不发送 typing');
   assert.strictEqual(nextCalled, true, 'next 应被调用');
+});
+
+await test('turn 中途锚点判死 → 续期时停发', async () => {
+  clearQuotaCache();
+  registerMsgIdWindow({ accountId: 'acct-c2b', msgId: 'cm2b', scope: 'c2c', receivedAt: Date.now() });
+  const calls: string[] = [];
+  const origSetInterval = globalThis.setInterval;
+  const origClearInterval = globalThis.clearInterval;
+  let captured: { cb: () => void } | undefined;
+  globalThis.setInterval = ((cb: (...a: unknown[]) => void) => {
+    captured = { cb: cb as () => void };
+    return 1 as unknown as NodeJS.Timeout;
+  }) as unknown as typeof globalThis.setInterval;
+  globalThis.clearInterval = (() => {}) as unknown as typeof globalThis.clearInterval;
+  try {
+    const mw = c2cTypingIndicator({ accountId: 'acct-c2b' });
+    let releaseNext!: () => void;
+    const nextDone = new Promise<void>((r) => { releaseNext = r; });
+    const chainPromise = mw(makeCtx('c2c', 'cm2b', calls) as any, () => nextDone);
+
+    assert.strictEqual(calls.length, 1, '锚点存活 → 初始发送一次');
+    assert.ok(captured, '应创建续期定时器');
+
+    // turn 中途锚点判死（平台 40034005 路径）
+    invalidateMsgIdQuota({ accountId: 'acct-c2b', msgId: 'cm2b', scope: 'c2c' });
+
+    captured!.cb();
+    assert.strictEqual(calls.length, 1, '锚点判死后不应再发送 typing');
+
+    releaseNext();
+    await chainPromise;
+  } finally {
+    globalThis.setInterval = origSetInterval;
+    globalThis.clearInterval = origClearInterval;
+  }
+});
+
+await test('平台拒收 typing（40034005）→ 停发并标记死锚点', async () => {
+  clearQuotaCache();
+  registerMsgIdWindow({ accountId: 'acct-c2c', msgId: 'cm2c', scope: 'c2c', receivedAt: Date.now() });
+  const calls: string[] = [];
+  const ctxMock = makeCtx('c2c', 'cm2c', calls);
+  ctxMock.bot.sendTyping = async () => {
+    calls.push('cm2c:60');
+    const err = new Error('reply msg_id expired') as Error & { bizCode?: number };
+    err.bizCode = 40034005;
+    throw err;
+  };
+  const mw = c2cTypingIndicator({ accountId: 'acct-c2c' });
+  await mw(ctxMock as any, async () => {
+    await sleep(10); // 给 .catch 一个微任务窗口
+  });
+  assert.strictEqual(calls.length, 1, '仅首次发送');
+  const entry = __test_getQuotaCache().get('acct-c2c:c2c:cm2c');
+  assert.ok(entry, '应存在配额条目');
+  assert.strictEqual(entry!.dead, true, '平台拒收 ⇒ 锚点应标记为死（后续消息不得走被动）');
+});
+
+await test('不变量：typing 调用永远带 msgId（不占主动额度）', async () => {
+  clearQuotaCache();
+  registerMsgIdWindow({ accountId: 'acct-c2d', msgId: 'cm2d', scope: 'c2c', receivedAt: Date.now() });
+  const calls: string[] = [];
+  const mw = c2cTypingIndicator({ accountId: 'acct-c2d' });
+  await mw(makeCtx('c2c', 'cm2d', calls) as any, async () => {});
+  assert.ok(calls.length >= 1, '应有 typing 调用');
+  for (const c of calls) {
+    assert.ok(!c.startsWith('undefined:'), `typing 不得以主动形态发送：${c}`);
+  }
 });
 
 await test('续期定时器间隔为 20s，续期全程被动（次数不失效）', async () => {

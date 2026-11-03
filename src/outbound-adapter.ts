@@ -221,6 +221,9 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
       }
 
       // 锚点存活探测（typing 不占回复额度，只判 TTL/死锚点）
+      // 与 middleware/typing.ts、typing-lifecycle.ts 同口径：**锚点不可用
+      // ⇒ 不发 typing**，绝不降级为不带 msg_id 的主动形态（主动额度留给
+      // 正文与前置消息）。
       const anchorAlive = await checkPassiveReplyQuota({
         accountId,
         msgId: replyToId,

@@ -45,6 +45,34 @@ const QUOTA_LIMITS = {
 };
 
 /**
+ * 平台「锚点已死」确定性拒绝码（单一事实源）：
+ * - 40034005：回复消息 msg_id 已过期（时效窗口 c2c 60min / group 5min）
+ * - 40034128：被动回复次数超限（历史事故码；平台实测不执行次数上限，
+ *   实际以 40034005 为主）
+ *
+ * 命中 ⇒ 该 msg_id 本轮**不再能走被动回复**：网关剔除死锚点并置 dead 标记，
+ * 后续发送一律转主动；typing 侧据此本轮停发（不降级主动形态）。
+ */
+export const ANCHOR_DEAD_CODES: ReadonlySet<number> = new Set([40034005, 40034128]);
+
+/**
+ * 错误对象是否携带「锚点已死」业务码。
+ *
+ * 用鸭子类型而非 `instanceof ApiError`：SDK 的 ApiError 字段名是
+ * `bizCode`（见 @tencent-connect/qqbot-nodejs protocol/types），跨模块
+ * 实例时 instanceof 不可靠；本模块刻意不引入 SDK 运行时依赖。
+ */
+export function isAnchorDeadError(err: unknown): boolean {
+  const bizCode = (err as { bizCode?: unknown } | null | undefined)?.bizCode;
+  return typeof bizCode === 'number' && ANCHOR_DEAD_CODES.has(bizCode);
+}
+
+/** 业务码是否属于「锚点已死」（供 SendResult.qqBizCode 判定） */
+export function isAnchorDeadBizCode(bizCode: number | undefined): boolean {
+  return typeof bizCode === 'number' && ANCHOR_DEAD_CODES.has(bizCode);
+}
+
+/**
  * 容量控制：超限时**先清扫过期条目**（窗口已过的普通条目与 dead 锚点），
  * 仍超限才按插入序 FIFO 淘汰存活条目。
  *
