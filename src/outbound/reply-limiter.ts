@@ -110,7 +110,10 @@ export class ReplyLimiter {
 
   /**
    * 尝试占用一个被动回复配额（检查 + 记录原子完成）。
-   * 用于 typing 等非回复用途：占用失败时调用方应降级为主动发送（不带 msg_id）。
+   *
+   * ⚠️ 本类与 quota-manager 无关，是历史遗留工具（主路径已改用 quota-manager
+   * 的反应式配额）。占用失败时的降级由调用方决定——**typing 已不再使用它**：
+   * typing 锚点不可用时直接停发，不降级为主动形态（见 middleware/typing.ts）。
    */
   tryAcquire(messageId: string): boolean {
     const result = this.checkLimit(messageId);

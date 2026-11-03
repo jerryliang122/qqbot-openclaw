@@ -1,8 +1,12 @@
 /**
- * QQBot Typing 续期管理
+ * QQBot Typing 续期管理（心跳适配器路径）
  *
  * 续期时机：50 秒后
  * 最大续期：10 次（约 10 分钟）
+ *
+ * 配额口径（2026-11-03）：与 turn 内中间件（middleware/typing.ts）同口径——
+ * typing 不占回复额度，但**绝不降级为主动形态**：锚点不可用（TTL 过期 /
+ * 死锚点）⇒ 不启动 / 停止续期。主动额度留给正文与前置消息。
  */
 
 import type { TypingParams, TypingState } from './types-plugin.js';
@@ -41,19 +45,21 @@ export async function startTypingWithRenewal(
   // 20 次 typing + 5 次回复同 msg_id 全部送达）。typing 的平台侧 msg_seq
   // 由 SDK sendInputNotify 准随机注入（无透传位），不受插件单调计数器控制
   // ——同 msg_id 上小概率与正文 seq 碰撞（单次 ~4/65536，失败自愈）。
+  //
+  // 锚点不可用 ⇒ **不启动 typing**（绝不降级为不带 msg_id 的主动形态：
+  // 主动额度要留给正文与前置消息）。
   const anchorAlive = checkPassiveReplyQuota({
     accountId,
     msgId: replyToId,
     scope: 'c2c',
   });
 
-  const msgIdToSend = anchorAlive ? replyToId : undefined;
-
   if (!anchorAlive) {
-    log?.debug?.(`[${accountId}] typing falling back to proactive mode: anchor expired or dead`);
+    log?.debug?.(`[${accountId}] typing not started: passive anchor unavailable (expired/dead)`);
+    return;
   }
 
-  const sent = await sendTyping({ to, msgId: msgIdToSend });
+  const sent = await sendTyping({ to, msgId: replyToId });
   if (!sent) {
     log?.debug?.(`[${accountId}] typing start failed: send failed`);
     return;
@@ -104,19 +110,21 @@ async function handleTypingRenewal(
   // 锚点存活探测（不消耗）——typing 的平台侧 msg_seq 由 SDK sendInputNotify
   // 准随机注入（无透传位），不受插件单调计数器控制——同 msg_id 上小概率
   // 与正文 seq 碰撞（失败自愈）。
+  //
+  // 锚点不可用 ⇒ **停止续期**（不降级为主动形态）。
   const anchorAlive = checkPassiveReplyQuota({
     accountId,
     msgId: replyToId,
     scope: 'c2c',
   });
 
-  const msgIdToSend = anchorAlive ? replyToId : undefined;
-
   if (!anchorAlive) {
-    log?.debug?.(`[${accountId}] typing renewal falling back to proactive mode: anchor expired or dead`);
+    log?.debug?.(`[${accountId}] typing renewal stopped: passive anchor unavailable (expired/dead)`);
+    activeTypingSessions.delete(sessionKey);
+    return;
   }
 
-  const renewed = await sendTyping({ to, msgId: msgIdToSend });
+  const renewed = await sendTyping({ to, msgId: replyToId });
   if (!renewed) {
     log?.debug?.(`[${accountId}] typing renewal failed: send failed`);
     activeTypingSessions.delete(sessionKey);

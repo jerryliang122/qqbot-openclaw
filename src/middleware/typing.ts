@@ -4,10 +4,12 @@
  * 与 SDK 版的三点差异：
  * 1. 续期间隔默认 20s 且强制不低于 20s（QPS 约束，事件触发的续期
  *    同样受此间距保护）
- * 2. 配额口径（反应式模型，2026-11-03）：typing 不占回复额度（平台探针
- *    实测 20 次 typing + 5 次回复同 msg_id 全过），因此只做锚点存活探测
- *    （TTL/死锚点）决定是否带 msg_id；锚点过期/判死后转不带 msg_id 发送，
- *    续期不会中断
+ * 2. 配额口径（2026-11-03 反应式 + 2026-11-03 修订）：typing 不占回复
+ *    额度（平台探针实测 20 次 typing + 5 次回复同 msg_id 全过），只做
+ *    锚点存活探测（TTL/死锚点）——**锚点不可用（TTL 过期 / 死锚点 /
+ *    平台 40034005·40034128 拒收）⇒ 本轮停发**。**绝不降级为「不带
+ *    msg_id 的主动形态」**：主动额度（每日 1000 条）要留给正文与前置
+ *    消息，typing 不参与竞争。
  * 3. 出站消息后续期：QQ 客户端收到机器人消息（如思维链中间输出）
  *    会自动终止"正在输入"显示。若框架任务仍在进行，本中间件在
  *    每条消息发出 POST_MESSAGE_REFRESH_DELAY_MS 后补发一次续期；
@@ -19,6 +21,7 @@
 import type { Middleware } from '@tencent-connect/qqbot-nodejs';
 import { probePassiveAnchorAlive } from '../outbound/outbound-service.js';
 import { subscribeOutboundMessage } from '../features/typing-refresh.js';
+import { invalidateMsgIdQuota, isAnchorDeadError } from '../features/quota-manager.js';
 
 /** QPS 约束：续期间隔不得低于 20s */
 export const MIN_TYPING_INTERVAL_MS = 20_000;
@@ -53,16 +56,49 @@ export function c2cTypingIndicator(opts: TypingIndicatorMiddlewareOptions): Midd
     let refresh: NodeJS.Timeout | null = null;
     let lastSentAt = 0;
     let active = true;
+    let unsubscribe: (() => void) | null = null;
+
+    /**
+     * 本轮停发：锚点不可用或平台拒收 ⇒ 本 turn 不再发任何 input_notify。
+     *
+     * 幂等（active 守卫）；清定时器 + 退订出站信号订阅。只打 debug 日志，
+     * 不给用户发提示（停发是内部降级，不该变成用户可见噪音）。
+     */
+    const stopTyping = (reason: string): void => {
+      if (!active) return;
+      active = false;
+      if (periodic) {
+        clearInterval(periodic);
+        periodic = null;
+      }
+      if (refresh) {
+        clearTimeout(refresh);
+        refresh = null;
+      }
+      unsubscribe?.();
+      unsubscribe = null;
+      ctx.log?.debug?.(`[typing] stopped: ${reason}`);
+    };
 
     const sendNow = (): void => {
       if (!active) return;
-      // 锚点存活 → 带 msg_id 发送（typing 不占回复额度，见文件头）；
-      // 过期/判死/缺失 → 不带 msg_id 发送，续期不中断
-      const passive = probePassiveAnchorAlive(accountId, ctx.replyTarget.msgId);
-      const target = passive
-        ? ctx.replyTarget
-        : { scope: 'c2c' as const, targetId: ctx.replyTarget.targetId };
-      ctx.bot.sendTyping(target, TYPING_DURATION_SEC).catch((err: unknown) => {
+      // 锚点存活探测（不消耗额度）：typing 永不降级为主动形态——
+      // 锚点不可用 ⇒ 本轮停发（主动额度留给正文/前置消息）。
+      if (!probePassiveAnchorAlive(accountId, ctx.replyTarget.msgId)) {
+        stopTyping('passive anchor unavailable (expired/dead) — typing will not fall back to proactive');
+        return;
+      }
+      ctx.bot.sendTyping(ctx.replyTarget, TYPING_DURATION_SEC).catch((err: unknown) => {
+        if (isAnchorDeadError(err)) {
+          // 平台判定该 msg_id 已过期/不可用（40034005 / 40034128）⇒
+          // 标记死锚点：本轮后续消息一律不得走被动回复（转主动）。
+          const msgId = ctx.replyTarget.msgId;
+          if (msgId) {
+            invalidateMsgIdQuota({ accountId, msgId, scope: 'c2c' });
+          }
+          stopTyping('platform rejected typing (anchor dead)');
+          return;
+        }
         ctx.log?.debug?.(`[typing] failed: ${err instanceof Error ? err.message : String(err)}`);
       });
       lastSentAt = Date.now();
@@ -91,7 +127,7 @@ export function c2cTypingIndicator(opts: TypingIndicatorMiddlewareOptions): Midd
     };
 
     // 订阅本会话的出站消息信号（ accountId + targetId 对应同一 C2C 用户）
-    const unsubscribe = subscribeOutboundMessage(
+    unsubscribe = subscribeOutboundMessage(
       accountId, 'c2c', ctx.replyTarget.targetId, schedulePostMessageRefresh,
     );
 
@@ -100,10 +136,7 @@ export function c2cTypingIndicator(opts: TypingIndicatorMiddlewareOptions): Midd
     try {
       await next();
     } finally {
-      active = false;
-      unsubscribe();
-      if (periodic) clearInterval(periodic);
-      if (refresh) clearTimeout(refresh);
+      stopTyping('turn ended');
     }
   };
 }

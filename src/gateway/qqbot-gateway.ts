@@ -29,7 +29,7 @@ import { recordOutboundMessageId } from '../features/outbound-echo-store.js';
 import { recordOutboundToGroupHistory } from '../features/history-store.js';
 import { resolveGroupConfigFromAccount } from '../config.js';
 import { resolveGroupRoomEventPolicy } from '../features/room-event.js';
-import { invalidateMsgIdQuota } from '../features/quota-manager.js';
+import { invalidateMsgIdQuota, ANCHOR_DEAD_CODES } from '../features/quota-manager.js';
 import { recordProactiveSend } from '../features/proactive-budget.js';
 import { evictMsgId } from '../features/msgid-cache.js';
 import { notifyOutboundMessageSent } from '../features/typing-refresh.js';
@@ -72,6 +72,10 @@ export interface SendOptions {
    * 只走被动（progress card 等非正文消息）：死锚点被平台确定性拒绝时
    * 剔除锚点后**原错误上抛、不转主动重发**——上游按 passiveOnly 语义
    * 丢弃（绝不烧每日主动预算）。无显式 msgId 时预留阶段已拦截，不会到网关。
+   *
+   * ⚠️ **网关层永不降级主动**，但**上层（进度卡片发布器）会自行降级**：
+   * 卡片按「前置消息」处理，锚点死亡时改发主动消息（见
+   * outbound/progress-card-publisher.ts 的 anchorLost 逻辑）。
    */
   passiveOnly?: boolean;
   text?: string;
@@ -83,14 +87,13 @@ export interface SendOptions {
 }
 
 /**
- * 「锚点失效」平台业务码集合——均为**确定性拒绝**（内容未投递，主动重发
- * 无重复风险），触发死锚点剔除 + 同内容转主动重发一次：
- * - 40034005：回复消息 msg_id 已过期
- * - 40034128：回复次数超限（本仓库历史事故记载的硬失败码）
- * 线上发现其他确定性未投递的平台码加入本集合即可。网络/超时
- * （httpStatus===0，结果不明）与其他业务码不重发。
+ * 「锚点失效」平台业务码集合（40034005 msg_id 已过期 / 40034128 回复次数
+ * 超限）——均为**确定性拒绝**（内容未投递，主动重发无重复风险），触发死锚点
+ * 剔除 + 同内容转主动重发一次。网络/超时（httpStatus===0，结果不明）与
+ * 其他业务码不重发。
+ *
+ * 集合本体在 features/quota-manager.ts（单一事实源，typing 侧共用）。
  */
-const ANCHOR_DEAD_CODES = new Set<number>([40034005, 40034128]);
 
 // ── 超时常量 ──
 

@@ -181,7 +181,8 @@ export function setupMiddlewares(bot: QQBot, account: ResolvedQQBotAccount, opts
   //     promise 覆盖整个 turn）。中间件链本身不做 busy-buffering。
 
   // 11. C2C 输入状态指示器（反应式配额：typing 不占回复额度，仅做锚点
-  //     存活探测——过期/判死后转不带 msg_id 发送；续期间隔默认 20s 且
+  //     存活探测——**锚点过期/判死 ⇒ 本轮停发**，绝不降级为不带 msg_id
+  //     的主动形态（主动额度留给正文与前置消息）；续期间隔默认 20s 且
   //     不低于 20s，详见 src/middleware/typing.ts）
   const typingCfg = account.config.typing;
   if (typingCfg?.enabled !== false) {
