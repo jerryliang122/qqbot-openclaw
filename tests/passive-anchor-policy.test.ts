@@ -141,6 +141,20 @@ await test('群 scope 同样不选池：缓存锚点在场 → 无 opts.msgId �
   assert.equal(recorded[0]!.target.msgId, undefined);
 });
 
+await test('target 裸挂 msgId（无 opts.msgId）→ 剥离，主动发送 + 计数（Sourcery #85-1）', async () => {
+  clearQuotaCache();
+  _resetProactiveBudget();
+  const { gw, recorded } = makeGateway({});
+  const before = getProactiveUsage('gwtest').count;
+  // 调用方把 msgId 挂在 target 上（而非 opts）——旧实现会原样透传成
+  // 无记账/无 seq 的被动发送；显式锚点只认 opts.msgId，裸锚点必须剥离
+  await gw.sendText({ scope: 'c2c', targetId: 'gw-bare', msgId: 'BARE_M' } as any, 'hi');
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0]!.kind, 'sendText', '应走主动 bot.sendText');
+  assert.equal(recorded[0]!.target.msgId, undefined, 'target 裸 msgId 必须被剥离');
+  assert.equal(getProactiveUsage('gwtest').count, before + 1, '剥离后按主动发送计数');
+});
+
 // ── 锚点失效兜底（显式锚点）──
 
 group('锚点失效兜底（40034005/40034128 → 转主动重发一次）');

@@ -653,6 +653,13 @@ export class QQBotGateway {
     if (opts?.msgId) {
       return { target: { ...target, msgId: opts.msgId }, msgSeq: opts.msgSeq, rollback: () => {} };
     }
+    // 显式锚点只认 opts.msgId：调用方挂在 target 上的裸 msgId 一律剥离
+    // （那会绕过配额记账与 msg_seq 发号，成为不受控被动发送——Sourcery
+    // 评审 #85 意见 1）。需要被动回复的调用方必须走 opts.msgId（quotaReserved
+    // 链）或 SDK 直发（access-notice/secret-capture 惯例，自担配额）。
+    if (target.msgId !== undefined) {
+      return { target: { ...target, msgId: undefined }, rollback: () => {} };
+    }
     return { target, rollback: () => {} };
   }
 
