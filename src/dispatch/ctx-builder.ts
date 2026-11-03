@@ -99,8 +99,8 @@ export function buildCtxPayload(params: CtxPayloadParams): any {
        * message_id == reply_to_id —— 被上层 agent 的 AGENTS 规则判为「内部
        * 回灌、非新指令」而拒绝响应（2026-09-22 事故）。
        *
-       * QQ 被动回复锚点不依赖此字段：deliverCtx.replyToId 显式透传 /
-       * 网关 attachMsgIdWithQuota 旧配额优先选取均独立取值，
+       * QQ 被动回复锚点不依赖此字段：deliverCtx.replyToId 显式透传、
+       * 网关无显式锚点一律主动（池化选取已于 2026-11-03 移除），
        * threading resolveReplyToMode='off' 阻断框架隐式回复线程。
        *
        * 防御守卫：即使上游异常传入当前消息 ID（自引用），也强制置空——

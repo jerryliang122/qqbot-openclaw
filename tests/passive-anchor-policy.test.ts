@@ -1,25 +1,26 @@
 /**
- * 被动锚点选取（旧配额优先）+ msg_seq 显式发号 + 锚点失效兜底
+ * 出站锚点策略（显式锚点 or 主动）+ msg_seq 发号 + 锚点失效兜底
  *
- * 覆盖：
- * - selectMsgIdForPassiveReply：旧→新遍历、窗口过期/额度耗尽跳过、全空降级、
- *   c2c 60min 窗口对齐（45min 龄候选可选）
- * - 网关 attachMsgIdWithQuota：选取+发号收敛；bot.send 携带 extra.msg_seq 单调
+ * 2026-11-03 移除池化选取后的行为锁定：
+ * - 网关 resolveOutboundAnchor：**无显式 opts.msgId 一律主动发送**——即使
+ *   msgid-cache 里有新鲜锚点也不得锚定（挂 msg_id = 对该消息的回复，
+ *   池化挑锚=挂错引用；本组用例就是防「池化被修回来」的守卫）
+ * - 显式锚点透传：bot.send 被动 + extra.msg_seq 透传
  * - 锚点失效兜底：40034005/40034128 → 剔除死锚点 + 同内容转主动重发一次；
- *   网络错/其他业务码不重发
- * - adapter：显式锚点 seq 透传；无锚点不再查 msgid-cache（收敛到网关）
+ *   网络错/其他业务码不重发；passiveOnly 不重发
+ * - adapter：显式锚点 seq 发号/失败回滚；无锚点不预选取；诚实重建窗口
+ * - msgid-cache：仅剩「接收时刻登记表」职责（peek/evict），无选取面
  */
 import { strict as assert } from 'assert';
 import { ApiError } from '@tencent-connect/qqbot-nodejs';
 import {
   clearQuotaCache,
   getPassiveReplyQuotaRemaining,
-  checkAndConsumePassiveReplyQuota,
 } from '../src/features/quota-manager.js';
 import {
   cacheMsgId,
-  selectMsgIdForPassiveReply,
   evictMsgId,
+  peekMsgIdReceivedAt,
   clearMsgIdCache,
 } from '../src/features/msgid-cache.js';
 import { _resetProactiveBudget, getProactiveUsage } from '../src/features/proactive-budget.js';
@@ -43,96 +44,6 @@ function test(name: string, fn: () => Promise<void> | void) {
 function group(name: string) {
   console.log(`— ${name}`);
 }
-
-// ── 选取（纯探测）──
-
-group('selectMsgIdForPassiveReply（旧配额优先）');
-
-await test('两个可用候选 → 选最旧', () => {
-  clearQuotaCache();
-  clearMsgIdCache('c2c', 'sel-u1');
-  const now = Date.now();
-  cacheMsgId('c2c', 'sel-u1', 'M_OLD', { accountId: 'sel', receivedAt: now - 60_000 });
-  cacheMsgId('c2c', 'sel-u1', 'M_NEW', { accountId: 'sel', receivedAt: now - 10_000 });
-  assert.equal(
-    selectMsgIdForPassiveReply({ accountId: 'sel', scope: 'c2c', targetId: 'sel-u1' }),
-    'M_OLD',
-  );
-});
-
-await test('最旧群候选超 5 分钟平台窗口 → 跳选取次旧', () => {
-  clearQuotaCache();
-  clearMsgIdCache('group', 'sel-g1');
-  const now = Date.now();
-  cacheMsgId('group', 'sel-g1', 'G_EXPIRED', { accountId: 'sel', receivedAt: now - 6 * 60_000 });
-  cacheMsgId('group', 'sel-g1', 'G_FRESH', { accountId: 'sel', receivedAt: now - 60_000 });
-  assert.equal(
-    selectMsgIdForPassiveReply({ accountId: 'sel', scope: 'group', targetId: 'sel-g1' }),
-    'G_FRESH',
-  );
-});
-
-await test('最旧额度耗尽 → 跳选取次旧', () => {
-  clearQuotaCache();
-  clearMsgIdCache('c2c', 'sel-u2');
-  const now = Date.now();
-  cacheMsgId('c2c', 'sel-u2', 'M_EXH', { accountId: 'sel', receivedAt: now - 60_000 });
-  cacheMsgId('c2c', 'sel-u2', 'M_AVAIL', { accountId: 'sel', receivedAt: now - 30_000 });
-  // 烧干 M_EXH 的 4 次额度
-  for (let i = 0; i < 4; i++) {
-    const { canReply } = checkAndConsumePassiveReplyQuota({ accountId: 'sel', msgId: 'M_EXH', scope: 'c2c' });
-    assert.equal(canReply, true);
-  }
-  assert.equal(
-    selectMsgIdForPassiveReply({ accountId: 'sel', scope: 'c2c', targetId: 'sel-u2' }),
-    'M_AVAIL',
-  );
-});
-
-await test('全部耗尽/过期 → undefined（降级主动）', () => {
-  clearQuotaCache();
-  clearMsgIdCache('c2c', 'sel-u3');
-  const now = Date.now();
-  cacheMsgId('c2c', 'sel-u3', 'M_ONLY', { accountId: 'sel', receivedAt: now - 61 * 60_000 });
-  assert.equal(
-    selectMsgIdForPassiveReply({ accountId: 'sel', scope: 'c2c', targetId: 'sel-u3' }),
-    undefined,
-  );
-});
-
-await test('c2c 45min 龄候选可选（TTL 对齐平台 60min）', () => {
-  clearQuotaCache();
-  clearMsgIdCache('c2c', 'sel-u4');
-  // 旧实现 msgid-cache c2c TTL=30min 会漏掉 30~60min 区间的合法锚点
-  cacheMsgId('c2c', 'sel-u4', 'M_45MIN', { accountId: 'sel', receivedAt: Date.now() - 45 * 60_000 });
-  assert.equal(
-    selectMsgIdForPassiveReply({ accountId: 'sel', scope: 'c2c', targetId: 'sel-u4' }),
-    'M_45MIN',
-  );
-});
-
-await test('平台 timestamp 缺失（NaN）→ 本地时钟兜底登记可选', () => {
-  clearQuotaCache();
-  clearMsgIdCache('c2c', 'sel-u5');
-  cacheMsgId('c2c', 'sel-u5', 'M_NOTS'); // 无 receivedAt → Date.now()
-  assert.equal(
-    selectMsgIdForPassiveReply({ accountId: 'sel', scope: 'c2c', targetId: 'sel-u5' }),
-    'M_NOTS',
-  );
-});
-
-await test('evictMsgId：剔除后不再被选取', () => {
-  clearQuotaCache();
-  clearMsgIdCache('c2c', 'sel-u6');
-  const now = Date.now();
-  cacheMsgId('c2c', 'sel-u6', 'M_A', { accountId: 'sel', receivedAt: now - 60_000 });
-  cacheMsgId('c2c', 'sel-u6', 'M_B', { accountId: 'sel', receivedAt: now - 30_000 });
-  evictMsgId('c2c', 'sel-u6', 'M_A');
-  assert.equal(
-    selectMsgIdForPassiveReply({ accountId: 'sel', scope: 'c2c', targetId: 'sel-u6' }),
-    'M_B',
-  );
-});
 
 // ── 网关层（真实 QQBotGateway 原型 + mock bot）──
 
@@ -174,76 +85,63 @@ function makeGateway(botOverrides: {
   return { gw, recorded, account };
 }
 
-function seedAnchor(targetId: string, msgId: string, ageMs = 60_000, scope: 'c2c' | 'group' = 'c2c') {
-  clearMsgIdCache(scope, targetId);
-  cacheMsgId(scope, targetId, msgId, { accountId: 'gwtest', receivedAt: Date.now() - ageMs });
-}
+group('网关：显式锚点 or 主动（无锚点绝不选池）');
 
-group('网关：选取收敛 + msg_seq 发号');
-
-await test('被动 sendText 走 bot.send 且 extra.msg_seq 单调（1,2,3）', async () => {
+await test('显式 opts.msgId → bot.send 被动 + extra.msg_seq 透传（1,2,3）', async () => {
   clearQuotaCache();
-  seedAnchor('gw-u1', 'GW_M1');
   const { gw, recorded } = makeGateway({});
   const target = { scope: 'c2c' as const, targetId: 'gw-u1' };
   for (let i = 0; i < 3; i++) {
-    await gw.sendText(target, `msg-${i}`);
+    await gw.sendText(target, `msg-${i}`, { msgId: 'EX_M', msgSeq: i + 1 });
   }
   assert.equal(recorded.length, 3);
-  assert.ok(recorded.every((r) => r.kind === 'send'), '带锚点应全部走 bot.send');
-  assert.ok(recorded.every((r) => r.target.msgId === 'GW_M1'));
-  assert.deepEqual(recorded.map((r) => r.extra?.msg_seq), [1, 2, 3], 'msg_seq 应从 1 单调递增');
+  assert.ok(recorded.every((r) => r.kind === 'send'), '显式锚点应全部走 bot.send（被动）');
+  assert.ok(recorded.every((r) => r.target.msgId === 'EX_M'));
+  assert.deepEqual(recorded.map((r) => r.extra?.msg_seq), [1, 2, 3], 'msg_seq 应原样透传');
   // markdownSupport=true → markdown 字段下发（与 bot.sendText 的 msg_type=2 等价）
   assert.ok(recorded[0]!.text !== undefined);
 });
 
 await test('markdownSupport=false → content 字段下发（msg_type=0 等价）', async () => {
   clearQuotaCache();
-  seedAnchor('gw-u2', 'GW_M2');
   const { gw, recorded } = makeGateway({});
   gw.account.markdownSupport = false;
-  await gw.sendText({ scope: 'c2c', targetId: 'gw-u2' }, 'plain');
+  await gw.sendText({ scope: 'c2c', targetId: 'gw-u2' }, 'plain', { msgId: 'EX_M2', msgSeq: 1 });
   assert.equal(recorded.length, 1);
   assert.equal(recorded[0]!.kind, 'send');
   assert.equal(recorded[0]!.text, 'plain');
 });
 
-await test('无候选 → bot.sendText 主动（无 msgId）+ 预算计数', async () => {
+await test('核心策略：缓存里有新鲜锚点但无显式 opts.msgId → 主动发送（不选池）', async () => {
   clearQuotaCache();
-  clearMsgIdCache('c2c', 'gw-quiet');
   _resetProactiveBudget();
+  // 池化时代的缓存形态：同 target 两个新鲜锚点——新模型下必须**无视**它们
+  const now = Date.now();
+  clearMsgIdCache('c2c', 'gw-pool');
+  cacheMsgId('c2c', 'gw-pool', 'STALE_M', { accountId: 'gwtest', receivedAt: now - 60_000 });
+  cacheMsgId('c2c', 'gw-pool', 'FRESH_M', { accountId: 'gwtest', receivedAt: now - 10_000 });
   const { gw, recorded } = makeGateway({});
   const before = getProactiveUsage('gwtest').count;
-  await gw.sendText({ scope: 'c2c', targetId: 'gw-quiet' }, 'hi');
+  await gw.sendText({ scope: 'c2c', targetId: 'gw-pool' }, 'hi');
   assert.equal(recorded.length, 1);
-  assert.equal(recorded[0]!.kind, 'sendText');
-  assert.equal(recorded[0]!.target.msgId, undefined, '主动发送不带 msg_id');
-  assert.equal(getProactiveUsage('gwtest').count, before + 1);
+  assert.equal(recorded[0]!.kind, 'sendText', '无显式锚点应走 bot.sendText（主动）');
+  assert.equal(recorded[0]!.target.msgId, undefined, '主动发送不带 msg_id（挂 msg_id=对该消息的回复，禁止选池）');
+  assert.equal(getProactiveUsage('gwtest').count, before + 1, '应计入每日主动预算');
 });
 
-await test('连发 3 条消息场景：无锚点发送依次烧旧配额（旧→新）', async () => {
+await test('群 scope 同样不选池：缓存锚点在场 → 无 opts.msgId 仍主动', async () => {
   clearQuotaCache();
   const now = Date.now();
-  clearMsgIdCache('c2c', 'gw-multi');
-  cacheMsgId('c2c', 'gw-multi', 'MM1', { accountId: 'gwtest', receivedAt: now - 3 * 60_000 });
-  cacheMsgId('c2c', 'gw-multi', 'MM2', { accountId: 'gwtest', receivedAt: now - 2 * 60_000 });
-  cacheMsgId('c2c', 'gw-multi', 'MM3', { accountId: 'gwtest', receivedAt: now - 60_000 });
+  clearMsgIdCache('group', 'gw-gpool');
+  cacheMsgId('group', 'gw-gpool', 'G_M', { accountId: 'gwtest', receivedAt: now - 30_000 });
   const { gw, recorded } = makeGateway({});
-  const target = { scope: 'c2c' as const, targetId: 'gw-multi' };
-  // MM1 4 槽烧干 → 切 MM2
-  for (let i = 0; i < 5; i++) {
-    await gw.sendText(target, `t${i}`);
-  }
-  const anchors = recorded.map((r) => r.target.msgId);
-  assert.deepEqual(
-    anchors,
-    ['MM1', 'MM1', 'MM1', 'MM1', 'MM2'],
-    '前 4 次烧最旧 MM1，耗尽自动切 MM2',
-  );
-  assert.deepEqual(recorded.map((r) => r.extra?.msg_seq), [1, 2, 3, 4, 1], 'seq 按 msg_id 各自从 1 计数');
+  await gw.sendText({ scope: 'group', targetId: 'gw-gpool' }, 'hi');
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0]!.kind, 'sendText');
+  assert.equal(recorded[0]!.target.msgId, undefined);
 });
 
-// ── 锚点失效兜底 ──
+// ── 锚点失效兜底（显式锚点）──
 
 group('锚点失效兜底（40034005/40034128 → 转主动重发一次）');
 
@@ -251,10 +149,11 @@ function makeApiError(bizCode: number, httpStatus = 400): ApiError {
   return new ApiError(`API Error [/v2/users/x/messages]: code=${bizCode}`, httpStatus, '/v2/users/x/messages', bizCode, 'platform reject');
 }
 
-await test('40034005（msg_id 已过期）→ 同内容转主动重发一次', async () => {
+await test('40034005（msg_id 已过期）→ 同内容转主动重发一次 + 死锚点剔除', async () => {
   clearQuotaCache();
-  seedAnchor('gw-dead1', 'DEAD_M1');
   _resetProactiveBudget();
+  clearMsgIdCache('c2c', 'gw-dead1');
+  cacheMsgId('c2c', 'gw-dead1', 'DEAD_M1', { accountId: 'gwtest', receivedAt: Date.now() - 60_000 });
   let passiveAttempt = 0;
   const { gw, recorded } = makeGateway({
     send: async () => {
@@ -262,7 +161,10 @@ await test('40034005（msg_id 已过期）→ 同内容转主动重发一次', a
       throw makeApiError(40034005);
     },
   });
-  const result = await gw.sendText({ scope: 'c2c', targetId: 'gw-dead1' }, 'must-deliver');
+  const result = await gw.sendText(
+    { scope: 'c2c', targetId: 'gw-dead1' }, 'must-deliver',
+    { msgId: 'DEAD_M1', msgSeq: 1 },
+  );
   assert.ok(result.id, '重发应成功返回');
   assert.equal(passiveAttempt, 1, '先尝试被动发送一次');
   // 被动失败后必须主动重发一次：无 msgId、同内容
@@ -271,20 +173,17 @@ await test('40034005（msg_id 已过期）→ 同内容转主动重发一次', a
   assert.equal(recorded[0]!.target.msgId, undefined);
   assert.equal(recorded[0]!.text, 'must-deliver');
   assert.equal(getProactiveUsage('gwtest').count, 1, '主动重发应计入每日预算');
-  // 死锚点被剔除：后续选取不再命中
-  assert.equal(
-    selectMsgIdForPassiveReply({ accountId: 'gwtest', scope: 'c2c', targetId: 'gw-dead1' }),
-    undefined,
-  );
+  // 死锚点被剔除（登记表查不到）+ 配额判死
+  assert.equal(peekMsgIdReceivedAt('c2c', 'gw-dead1', 'DEAD_M1'), undefined, '死锚点应从登记表剔除');
+  assert.equal(getPassiveReplyQuotaRemaining({ accountId: 'gwtest', msgId: 'DEAD_M1', scope: 'c2c' }), 0, '死锚点配额应判死');
 });
 
 await test('40034128（回复次数超限）同 class 兜底', async () => {
   clearQuotaCache();
-  seedAnchor('gw-dead2', 'DEAD_M2');
   const { gw, recorded } = makeGateway({
     send: async () => { throw makeApiError(40034128); },
   });
-  await gw.sendText({ scope: 'c2c', targetId: 'gw-dead2' }, 'x');
+  await gw.sendText({ scope: 'c2c', targetId: 'gw-dead2' }, 'x', { msgId: 'DEAD_M2', msgSeq: 1 });
   assert.equal(recorded.length, 1);
   assert.equal(recorded[0]!.kind, 'sendText', '应转主动重发');
 });
@@ -295,8 +194,9 @@ group('passiveOnly：死锚点不转主动重发');
 
 await test('passiveOnly 死锚点 → 原错误上抛、不重发、不计预算、锚点仍剔除', async () => {
   clearQuotaCache();
-  seedAnchor('gw-po', 'PO_M');
   _resetProactiveBudget();
+  clearMsgIdCache('c2c', 'gw-po');
+  cacheMsgId('c2c', 'gw-po', 'PO_M', { accountId: 'gwtest', receivedAt: Date.now() - 60_000 });
   const { gw, recorded } = makeGateway({
     send: async () => { throw makeApiError(40034005); },
   });
@@ -311,11 +211,7 @@ await test('passiveOnly 死锚点 → 原错误上抛、不重发、不计预算
   );
   assert.equal(recorded.length, 0, 'passiveOnly 不得转主动重发');
   assert.equal(getProactiveUsage('gwtest').count, before, '不得计入每日主动预算');
-  assert.equal(
-    selectMsgIdForPassiveReply({ accountId: 'gwtest', scope: 'c2c', targetId: 'gw-po' }),
-    undefined,
-    '死锚点仍应剔除（防后续选取再撞）',
-  );
+  assert.equal(peekMsgIdReceivedAt('c2c', 'gw-po', 'PO_M'), undefined, '死锚点仍应剔除（防后续再撞）');
   assert.equal(
     getPassiveReplyQuotaRemaining({ accountId: 'gwtest', msgId: 'PO_M', scope: 'c2c' }),
     0,
@@ -356,49 +252,40 @@ await test('outbound sendText 把 passiveOnly 透传网关 opts（死锚点决�
 
 await test('重发再失败 → 抛出重发错误（不循环）', async () => {
   clearQuotaCache();
-  seedAnchor('gw-dead3', 'DEAD_M3');
   const { gw } = makeGateway({
     send: async () => { throw makeApiError(40034005); },
     sendText: async () => { throw new Error('proactive also failed'); },
   });
   await assert.rejects(
-    () => gw.sendText({ scope: 'c2c', targetId: 'gw-dead3' }, 'x'),
+    () => gw.sendText({ scope: 'c2c', targetId: 'gw-dead3' }, 'x', { msgId: 'DEAD_M3', msgSeq: 1 }),
     /proactive also failed/,
     '应抛出重发错误',
   );
 });
 
-await test('网络错（httpStatus=0，结果不明）→ 不重发，原错误上抛，配额回滚', async () => {
+await test('网络错（httpStatus=0，结果不明）→ 不重发，原错误上抛', async () => {
   clearQuotaCache();
-  seedAnchor('gw-net', 'NET_M');
   const { gw, recorded } = makeGateway({
     send: async () => { throw makeApiError(0, 0); }, // 网络层失败无业务码
   });
   await assert.rejects(
-    () => gw.sendText({ scope: 'c2c', targetId: 'gw-net' }, 'x'),
+    () => gw.sendText({ scope: 'c2c', targetId: 'gw-net' }, 'x', { msgId: 'NET_M', msgSeq: 1 }),
     /API Error/i,
   );
   assert.equal(recorded.length, 0, '不应有重发（结果不明，重发有重复风险）');
-  // 配额已回滚：剩余额度恢复满额
-  assert.equal(
-    getPassiveReplyQuotaRemaining({ accountId: 'gwtest', msgId: 'NET_M', scope: 'c2c' }),
-    4,
-  );
 });
 
 await test('其他业务码（如内容超长）→ 不重发，原错误上抛', async () => {
   clearQuotaCache();
-  seedAnchor('gw-other', 'OTHER_M');
   const { gw, recorded } = makeGateway({
     send: async () => { throw makeApiError(400001); },
   });
-  await assert.rejects(() => gw.sendText({ scope: 'c2c', targetId: 'gw-other' }, 'x'));
+  await assert.rejects(() => gw.sendText({ scope: 'c2c', targetId: 'gw-other' }, 'x', { msgId: 'OTHER_M', msgSeq: 1 }));
   assert.equal(recorded.length, 0, '其他业务码不应触发主动重发');
 });
 
-await test('媒体 sendMedia 撞 40034005 → 同样转主动重发一次', async () => {
+await test('媒体 sendMedia 显式锚点撞 40034005 → 同样转主动重发一次', async () => {
   clearQuotaCache();
-  seedAnchor('gw-media', 'MEDIA_M', 60_000, 'group');
   const { gw, recorded } = makeGateway({
     sendMedia: async (params: any) => {
       recorded.push({ kind: 'sendMedia', target: params.target });
@@ -406,16 +293,19 @@ await test('媒体 sendMedia 撞 40034005 → 同样转主动重发一次', asyn
       return { message: { id: 'media-retry-ok', timestamp: Date.now() } };
     },
   });
-  const result = await gw.sendMedia({ scope: 'group', targetId: 'gw-media' }, 'https://example.com/a.png');
+  const result = await gw.sendMedia(
+    { scope: 'group', targetId: 'gw-media' }, 'https://example.com/a.png',
+    { msgId: 'MEDIA_M', msgSeq: 1 },
+  );
   assert.equal(result.id, 'media-retry-ok');
   assert.equal(recorded.length, 2);
-  assert.ok(recorded[0]!.target.msgId, '首次应带锚点（被动）');
+  assert.equal(recorded[0]!.target.msgId, 'MEDIA_M', '首次应带显式锚点（被动）');
   assert.equal(recorded[1]!.target.msgId, undefined, '重发不带 msg_id');
 });
 
 // ── adapter 层 ──
 
-group('adapter：显式锚点 seq 透传 / 无锚点收敛到网关');
+group('adapter：显式锚点 seq 发号 / 失败回滚 / 无锚点不预选取');
 
 await test('sendTextWithQuota：显式锚点 → msgSeq/quotaReserved 随链下传', async () => {
   clearQuotaCache();
@@ -438,9 +328,9 @@ await test('sendTextWithQuota：显式锚点 → msgSeq/quotaReserved 随链下�
   assert.equal(captured.quotaReserved, true);
 });
 
-await test('sendTextWithQuota：无锚点 → 不再查 msgid-cache（replyToId=undefined）', async () => {
+await test('sendTextWithQuota：无锚点 → replyToId=undefined（不查缓存，网关也不再选池）', async () => {
   clearQuotaCache();
-  // 该 target 有缓存的 msg_id——adapter 层也不应锚定（选取收敛到网关）
+  // 该 target 有缓存的 msg_id——adapter 层不得预选取，网关层也不得锚定
   clearMsgIdCache('c2c', 'ad-u2');
   cacheMsgId('c2c', 'ad-u2', 'CACHED_M', { accountId: 'adacc', receivedAt: Date.now() });
   const { createQQBotOutboundAdapter } = await import('../src/outbound-adapter.ts');
@@ -461,34 +351,88 @@ await test('sendTextWithQuota：无锚点 → 不再查 msgid-cache（replyToId=
   assert.equal(captured.quotaReserved, false);
 });
 
-// ── 诚实重建（容量淘汰后的选取路径）──
-
-group('诚实重建：配额条目被淘汰后按真实接收时间重建窗口');
-
-await test('选取路径：条目缺失时窗口按 receivedAt 重建（网关 peek 接线）', async () => {
+await test('sendTextWithQuota：发送失败 → 回滚已消耗的配额', async () => {
   clearQuotaCache();
-  // 候选 59min 龄（c2c 窗口 60min 内）——模拟配额条目被容量控制淘汰
-  seedAnchor('gw-rb', 'RB_M', 59 * 60_000);
-  const { __test_getQuotaCache } = await import('../src/features/quota-manager.ts');
-  __test_getQuotaCache().delete(`gwtest:c2c:RB_M`);
-  assert.equal(__test_getQuotaCache().has(`gwtest:c2c:RB_M`), false, '前提：条目已缺失');
-
-  const { gw, recorded } = makeGateway({});
-  await gw.sendText({ scope: 'c2c', targetId: 'gw-rb' }, 'rebuild-test');
-  // receivedAt=59min 前 → 重建窗口 59min+60min，仍在窗口内 → 被动放行
-  assert.equal(recorded.length, 1);
-  assert.equal(recorded[0]!.kind, 'send');
-  assert.equal(recorded[0]!.target.msgId, 'RB_M', '诚实重建窗口内应正常锚定');
-
-  // 若为旧式 now+TTL 重建，expiresAt 会落在「此刻+60min」；诚实重建下
-  // 应锚定真实接收时刻（59min 前 + 60min ≈ 此刻+1min）
-  const entry = __test_getQuotaCache().get(`gwtest:c2c:RB_M`);
-  assert.ok(entry, '消耗后条目应存在');
-  const now = Date.now();
-  assert.ok(
-    entry!.expiresAt > now && entry!.expiresAt <= now + 2 * 60_000,
-    `重建窗口应锚定真实接收时刻（receivedAt+60min≈此刻+1min），实际 expiresAt 距今 ${((entry!.expiresAt - now) / 60000).toFixed(1)}min`,
+  const { createQQBotOutboundAdapter } = await import('../src/outbound-adapter.ts');
+  const adapter = createQQBotOutboundAdapter({
+    sendText: async () => ({ messageId: undefined, error: 'send failed' }),
+  });
+  const result = await adapter.sendTextWithQuota({
+    to: 'qqbot:c2c:ad-u3',
+    text: 'hi',
+    account: { accountId: 'adacc' } as any,
+    replyToId: 'ROLLBACK_M',
+  });
+  assert.ok(result.error, '失败结果应原样返回');
+  assert.equal(
+    getPassiveReplyQuotaRemaining({ accountId: 'adacc', msgId: 'ROLLBACK_M', scope: 'c2c' }),
+    4,
+    '发送失败后配额应回滚至满额',
   );
 });
 
-console.log('All passive anchor selection tests passed');
+// ── 诚实重建（显式锚点的 adapter 消耗路径）──
+
+group('诚实重建：配额条目被淘汰后按真实接收时间重建窗口');
+
+await test('adapter 消耗路径：条目缺失时窗口按 receivedAt（登记表）重建', async () => {
+  clearQuotaCache();
+  // 锚点 59min 龄（c2c 窗口 60min 内）——模拟配额条目被容量控制淘汰
+  const now = Date.now();
+  clearMsgIdCache('c2c', 'rb-u1');
+  cacheMsgId('c2c', 'rb-u1', 'RB_M', { accountId: 'adacc', receivedAt: now - 59 * 60_000 });
+  const { __test_getQuotaCache } = await import('../src/features/quota-manager.ts');
+  __test_getQuotaCache().delete(`adacc:c2c:RB_M`);
+  assert.equal(__test_getQuotaCache().has(`adacc:c2c:RB_M`), false, '前提：条目已缺失');
+
+  const { createQQBotOutboundAdapter } = await import('../src/outbound-adapter.ts');
+  let captured: any = null;
+  const adapter = createQQBotOutboundAdapter({
+    sendText: async (params) => {
+      captured = params;
+      return { messageId: 'ok' };
+    },
+  });
+  await adapter.sendTextWithQuota({
+    to: 'qqbot:c2c:rb-u1',
+    text: 'rebuild-test',
+    account: { accountId: 'adacc' } as any,
+    replyToId: 'RB_M',
+  });
+  assert.equal(captured.replyToId, 'RB_M', '重建窗口内应正常锚定');
+  assert.ok((captured.msgSeq as number) >= 1);
+
+  // 若为旧式 now+TTL 重建，expiresAt 会落在「此刻+60min」；诚实重建下
+  // 应锚定真实接收时刻（59min 前 + 60min ≈ 此刻+1min）
+  const entry = __test_getQuotaCache().get(`adacc:c2c:RB_M`);
+  assert.ok(entry, '消耗后条目应存在');
+  const after = Date.now();
+  assert.ok(
+    entry!.expiresAt > after && entry!.expiresAt <= after + 2 * 60_000,
+    `重建窗口应锚定真实接收时刻（receivedAt+60min≈此刻+1min），实际 expiresAt 距今 ${((entry!.expiresAt - after) / 60000).toFixed(1)}min`,
+  );
+});
+
+// ── msgid-cache：登记表职责（无选取面）──
+
+group('msgid-cache：登记表职责（peek/evict，无选取）');
+
+await test('cacheMsgId 登记 + peekMsgIdReceivedAt 返回平台事件时间', () => {
+  clearMsgIdCache('c2c', 'reg-u1');
+  const ts = Date.now() - 123_000;
+  cacheMsgId('c2c', 'reg-u1', 'REG_M', { accountId: 'reg', receivedAt: ts });
+  assert.equal(peekMsgIdReceivedAt('c2c', 'reg-u1', 'REG_M'), ts);
+  assert.equal(peekMsgIdReceivedAt('c2c', 'reg-u1', 'MISSING'), undefined);
+});
+
+await test('evictMsgId：剔除指定条目，其余保留', () => {
+  clearMsgIdCache('c2c', 'reg-u2');
+  const now = Date.now();
+  cacheMsgId('c2c', 'reg-u2', 'R_A', { accountId: 'reg', receivedAt: now - 60_000 });
+  cacheMsgId('c2c', 'reg-u2', 'R_B', { accountId: 'reg', receivedAt: now - 30_000 });
+  evictMsgId('c2c', 'reg-u2', 'R_A');
+  assert.equal(peekMsgIdReceivedAt('c2c', 'reg-u2', 'R_A'), undefined);
+  assert.equal(peekMsgIdReceivedAt('c2c', 'reg-u2', 'R_B'), now - 30_000);
+});
+
+console.log('All passive anchor policy tests passed');

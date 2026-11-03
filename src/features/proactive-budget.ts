@@ -2,9 +2,10 @@
  * 主动消息每日预算观测
  *
  * QQ Bot 平台主动消息（不带 msg_id）有每日额度（接收方维度约 1000 条/天），
- * 被动回复（带 msg_id）不占此预算。插件全链路被动优先（msgid-cache 挂接 +
- * 配额预检），主动仅在「静群超 TTL」或「被动配额耗尽」时触发——本模块对
- * 这些残余的主动发送按账号计数，接近阈值告警，供排障与预算复核。
+ * 被动回复（带 msg_id）不占此预算。2026-11-03 起插件按「显式锚点 or 主动」
+ * 模型出站：只有显式锚点（turn 回复/进度卡等）走被动；message 工具无
+ * replyTo、定时提醒、框架通知等无锚点发送**按设计走主动**——本模块对
+ * 主动发送按账号计数，接近阈值告警，供排障与预算复核。
  */
 import { createPluginLogger } from '../utils/plugin-logger.js';
 
@@ -36,7 +37,7 @@ export function recordProactiveSend(accountId: string): void {
   if (counter.count === warnAt || (counter.count > warnAt && counter.count % WARN_EVERY === 0)) {
     log.warn(
       `proactive daily budget ${counter.count}/${DAILY_PROACTIVE_LIMIT} used (accountId=${accountId}); ` +
-        `passive replies (msg_id) don't count — check msgid-cache TTL / passive quota if unexpected`,
+        `passive replies (msg_id) don't count — anchorless sends are proactive by design (explicit-anchor-or-proactive model)`,
     );
   }
 }

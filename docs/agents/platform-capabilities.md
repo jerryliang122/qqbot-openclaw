@@ -84,7 +84,7 @@ QQ 跟 Telegram 的最大差异在**回复机制**:
 | DM topic / forum / thread | `message_thread_id` | **不存在** |
 | 频道/Guild | channel | 独立 QQ 频道产品(走 `qqbot-channel` skill) |
 | Markdown 渲染 | 服务端 `parse_mode: HTML` | 客户端原生 `msg_type: markdown` |
-| 引用回复 | `reply_to_message_id` / `reply_parameters` | `msg_id` 被动回复 |
+| 引用回复 | `reply_to_message_id` / `reply_parameters` | `msg_id` 被动回复（锚点必须来自**显式回复意图**——挂 msg_id = 对该消息的回复，池化挑锚=挂错引用，2026-11-03 已移除） |
 | 编辑消息 | `editMessageText` 自由改 | `openStream` 多次 `session.update` 替换,prefix 不可修改 |
 | Typing | `sendChatAction(action=typing)` | `sendTyping` (仅 c2c) |
 | 流式 | editMessageText 多次 | `openStream` + `session.update/complete` (仅 c2c) |

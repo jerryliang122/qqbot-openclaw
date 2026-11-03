@@ -8,6 +8,14 @@
 
 ---
 
+## [Unreleased]
+
+### 变更（Breaking）
+
+- **移除 msg_id 池化锚点选取——出站回到「显式锚点 or 主动」模型**。平台语义上，携带 `msg_id` 的被动消息 = 「对用户消息的回复」（官方《消息收发概述》）；而池化选取（`selectMsgIdForPassiveReply` 旧配额优先，为省每日主动预算引入：`7a59a2c` 取最新 → `bbed520` passive-first → `e3e2be7` 旧配额优先）会把无上下文的发送挂到**更早**的入站消息上，等于把回复引用挂到错误的消息。本次移除：网关 `attachMsgIdWithQuota` → `resolveOutboundAnchor`，只透传显式 `opts.msgId`；**无显式锚点的发送（message 工具不带 replyTo、remind/cron 定时投递、框架直发通知如 💾 Learned）一律不挂锚点、走主动消息**。`msgid-cache` 降级为「入站接收时刻登记表」（诚实重建 + 死锚点簿记），不再是锚点池。显式锚点的全部配额机制保留不变：msg_seq 单调发号、40034005/40034128 死锚点「剔除+转主动重发一次」兜底、诚实重建窗口、预注册配额窗口、配额缓存容量控制。主回复/进度卡/typing/access-notice/secret-capture 路径不受影响（本就显式锚点或 SDK 直发）。**行为代价（有意接受）**：① 无锚点发送消耗每日 1000 条/关系主动预算（`proactive-budget` 80% WARN 与 `/bot-group-info` 可观测）；② 用户在 QQ 客户端关闭「允许主动发送」时该类消息平台拒发；③ 群主动消息受 20/qpm/关系限频。守卫：`tests/passive-anchor-selection.test.ts` 重写为 `tests/passive-anchor-policy.test.ts`（无锚点=主动 + 显式透传 + 死锚点兜底）；红线记入 `AGENTS.md` 与 `docs/agents/outbound-and-quota.md`：**禁止重新引入池化选取**。
+
+---
+
 ## [3.1.3] - 2026-11-02
 
 ### 修复

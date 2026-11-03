@@ -128,12 +128,10 @@ async function notifyNotAllowlisted(
   try {
     // 被动回复锚点取自 ctx.replyTarget.msgId —— SDK 的 deriveReplyTarget 在
     // handleInboundMessage 组链之前就把入站 messageId 挂到 replyTarget 上，
-    // sendText 见 msgId 即下发 body.msg_id。
-    //
-    // 注意**不能**改走网关 attachMsgIdWithQuota：被拒消息的 msg_id 并不在
-    // msgid-cache 里（插件 cacheMsgId 挂在链尾 downstream 的 bot.on('message')
-    // 上，ctx.stop 不调 next() 时它根本不执行），网关会挑到更早的缓存 msg_id
-    // 或降级主动，把每日预算暴露给刷屏者。
+    // sendText 见 msgId 即下发 body.msg_id（SDK 直发，锚点=被拒消息自身，
+    // 不占配额记账）。历史上不能改走网关是因池化选取会挑到更早的缓存
+    // msg_id——2026-11-03 池化已移除（显式锚点 or 主动模型），SDK 直发
+    // 行为保持不变。
     //
     // 套本地超时：请求挂住就永远走不到 ctx.stop。
     await withNoticeTimeout(ctx.bot.sendText(ctx.replyTarget, text), opts.timeoutMs);
