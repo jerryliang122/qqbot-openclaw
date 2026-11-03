@@ -1087,6 +1087,10 @@ export async function dispatchToOpenClaw(
                         phase?: string;
                         title?: string;
                         explanation?: string;
+                        // 契约字段：note 形态（markdown-only）投影的 "plain"
+                        // 标记——与 PlanUpdatePayload 保持一致，将来重构做字段
+                        // 挑选时不静默丢字段（评审 #87-F3）
+                        explanationFormat?: string;
                         source?: string;
                         steps?: Array<{ step?: unknown; status?: unknown }>;
                       }) => {

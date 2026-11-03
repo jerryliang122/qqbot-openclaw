@@ -55,6 +55,7 @@
 import { formatPlanChecklistLines } from 'openclaw/plugin-sdk/channel-outbound';
 import type { ProgressCardConfig } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
+import { resolveFindGraphemeChunkEnd } from './grapheme.js';
 
 /** 框架 plan 事件载荷（宽容解析：未知字段忽略，2026.9.1 只保证 phase/steps） */
 export interface PlanUpdatePayload {
@@ -125,6 +126,45 @@ function truncate(text: string, maxChars: number): string {
 }
 
 /**
+ * 字形簇安全截断（**note 形态专用**）。
+ *
+ * 为什么不能用上面的 truncate()：它按 UTF-16 码元硬切，切点落在代理对
+ * （emoji / 增补平面字符）中间会留下**落单高代理**——编码后变成 U+FFFD
+ * 豆腐块或被平台拒收。AGENTS.md 的分块红线同样适用本路径：note 是第一
+ * 条会截断 agent 自撰文本的路径（checklist 形态的 explanation 恒为框架
+ * 的 ASCII 自动计数 "N/M complete"，永远触发不了截断）。
+ *
+ * 复用 outbound/grapheme.ts 的合规助手：官方 findGraphemeChunkEnd（字形
+ * 簇边界吸附）+ 本地 Intl.Segmenter 等价回退——两者都保证不切开代理对。
+ */
+function truncateGraphemeSafe(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  // 为省略号留 1 个码元
+  const budget = Math.max(0, maxChars - 1);
+
+  let cut = 0;
+  try {
+    cut = resolveFindGraphemeChunkEnd()(text, 0, budget);
+  } catch {
+    cut = 0;
+  }
+
+  if (cut <= 0) {
+    // 助手不可用/异常 → 手工兜底：退到不切开代理对的切点
+    cut = budget;
+    const code = text.charCodeAt(cut - 1);
+    if (code >= 0xd800 && code <= 0xdbff) cut -= 1; // 高代理后半 → 前移
+  } else if (cut > budget) {
+    // 本地回退的 avoidTrailingHighSurrogateBreak 在「预算只剩 1 码元且是
+    // 高代理前半」时会返回 end+1（带走完整代理对、超预算 1 码元）——宁可
+    // 略超也不产生落单代理。
+    cut = Math.min(cut, text.length);
+  }
+
+  return `${text.slice(0, cut)}…`;
+}
+
+/**
  * 渲染一条卡片消息：
  *
  *   📋 进度 1/4
@@ -159,7 +199,7 @@ export function renderProgressCardText(
  * 无计数头（与 checklist 的 `📋 进度 N/M` 区分——note 没有步骤计数）。
  */
 export function renderProgressCardNoteText(note: string): string {
-  return ['📋 状态', truncate(note, NOTE_MAX_CHARS)].join('\n');
+  return ['📋 状态', truncateGraphemeSafe(note, NOTE_MAX_CHARS)].join('\n');
 }
 
 export class ProgressCardPublisher {
@@ -245,9 +285,17 @@ export class ProgressCardPublisher {
     }
     this.cleared = false;
 
+    // checklist 形态：框架投影恒设 explanation = "N/M complete"（自动计数，
+    // 与 `📋 进度 N/M` 头重复）。抑制该行——只保留框架自动计数之外的
+    // explanation（理论上的自定义注记），避免卡片出现「N/M complete」
+    // 这种与中文头重复的英文行（评审 #87-F2）。
+    const completed = steps.filter((s) => s.status === 'completed').length;
+    const autoCount = `${completed}/${steps.length} complete`;
+    const note = payload.explanation === autoCount ? undefined : payload.explanation;
+
     const text = noteOnly
       ? renderProgressCardNoteText(payload.explanation!.trim())
-      : renderProgressCardText(steps, payload.explanation, this.deps.config.maxLines);
+      : renderProgressCardText(steps, note, this.deps.config.maxLines);
 
     // 去重：无任何状态变化的重复写卡不重发（步骤状态变化必然改变 ✅/▸ 标记）
     if (text === this.lastSentText) return;

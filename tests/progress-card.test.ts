@@ -46,6 +46,7 @@ const {
   ProgressCardPublisher,
   normalizePlanSteps,
   renderProgressCardText,
+  renderProgressCardNoteText,
 } = await import('../src/outbound/progress-card-publisher.ts');
 const { resolveProgressCardConfig } = await import('../src/config.ts');
 const {
@@ -493,6 +494,61 @@ await test('explanationFormat 在场不影响判定（宽容解析回归）', as
   await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A, explanation: '2/4 complete', explanationFormat: 'plain' });
   assert.equal(h.sends.length, 2);
   assert.ok(h.sends[1]!.startsWith('📋 进度 1/4'));
+});
+
+// ── 2d. 字形安全截断 + 计数行抑制（评审 #87-F1 / #87-F2）──
+
+group('字形安全与渲染细节');
+
+await test('renderProgressCardNoteText：直接单测（📋 状态 + note）', () => {
+  const text = renderProgressCardNoteText('hello world');
+  assert.equal(text, '📋 状态\nhello world');
+});
+
+await test('note 截断不切开代理对——无落单高代理（评审 #87-F1）', () => {
+  // 构造代理对正好跨在切点：298 个 a + 🚀 + 后缀
+  // 旧实现按码元硬切会留下落单高代理（→ U+FFFD 豆腐块）
+  const text = `${'a'.repeat(298)}🚀tail`;
+  const rendered = renderProgressCardNoteText(text);
+  const noteLine = rendered.split('\n')[1]!;
+  assert.ok(noteLine.length <= 300, `截断后长度 ${noteLine.length} 应 ≤ 300`);
+  assert.ok(noteLine.endsWith('…'));
+  // 关键断言：不得出现落单代理
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  assert.ok(!lone.test(noteLine), `截断后不得有落单代理：${JSON.stringify(noteLine.slice(-8))}`);
+  // 且被截掉的高代理不得残留在正文里（不成对）
+  const tail = noteLine.slice(0, -1); // 去掉省略号
+  assert.equal(
+    tail.split('').filter((ch) => ch.codePointAt(0)! > 0xffff).length % 2,
+    0,
+    '代理对不得只留一半',
+  );
+});
+
+await test('note 截断：emoji 落在切点内时整簇保留或整簇丢弃', () => {
+  const text = `${'a'.repeat(298)}🚀tail`;
+  const noteLine = renderProgressCardNoteText(text).split('\n')[1]!;
+  const body = noteLine.slice(0, -1);
+  assert.ok(
+    body.endsWith('a') || body.endsWith('🚀'),
+    `emoji 应整簇保留或整簇丢弃，实际结尾：${JSON.stringify(body.slice(-4))}`,
+  );
+});
+
+await test('checklist 形态抑制框架自动计数行（评审 #87-F2）', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  // 框架投影在 steps>0 时恒设 explanation = "N/M complete"
+  await h.publisher.onPlanUpdate({
+    phase: 'update', steps: STEPS_A, explanation: '1/4 complete', explanationFormat: 'plain',
+  });
+  assert.equal(h.sends.length, 1);
+  const lines = h.sends[0]!.split('\n');
+  assert.equal(lines[0], '📋 进度 1/4', '头保留计数');
+  assert.ok(
+    !lines.includes('1/4 complete'),
+    `不应出现与头重复的自动计数行，实际：${JSON.stringify(lines)}`,
+  );
+  assert.ok(lines[1]!.startsWith('✅'), '计数行之后直接是 checklist 行');
 });
 
 // ── 3. 配置解析 ──

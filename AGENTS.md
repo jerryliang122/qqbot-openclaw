@@ -158,7 +158,7 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 - **锚点失效兜底**：被动发送被平台 **40034005**（过期）/ **40034128**（超限）确定性拒绝 → rollback + 驱逐 + 标记 dead → 同内容**转主动重发一次**。网络错（`httpStatus===0`，结果不明）**不重发**（有重复风险）。`passiveOnly` 发送（progress card）**不做主动重发**。
 - **QQ 语音投递口径以「体积」为准，不是「时长」**——平台文档里没有任何语音时长限制，「60 秒以内是语音条」是相关性错觉。格式只认 silk/mp3/wav/ogg 四种；超 20MB 软限制由 `resolveOutboundMediaKind` **显式**降级为文件投递。
 - **表情表态仅频道支持**（单聊/群聊 ❌），故 `capabilities.reactions: false` 是对的。
-- **Progress card 只走被动回复**（`passiveOnly`，绝不烧每日主动预算），支持 checklist（`📋 进度 N/M`）与 note 双形态（markdown-only 卡片 → `📋 状态`，判定式 `steps=[] && explanation 非空`；混合形态的 markdown 在框架投影层被丢弃——插件侧无解）——反应式配额下无本地次数门（`reserveQuota` 保槽配置已删除，残留会被 schema 拒收），唯一保险丝是 `maxPerTurn`；锚点无存活时 outbound 本地拦截丢弃并**停止本轮卡片发布**（反应式下该错误对本轮永久，不逐快照重试）。
+- **Progress card 只走被动回复**（`passiveOnly`，绝不烧每日主动预算），支持 checklist（`📋 进度 N/M`，框架自动计数行被抑制）与 note 双形态（markdown-only 卡片 → `📋 状态`，判定式 `steps=[] && explanation 非空`；note 截断必须**字形簇安全**——复用 `outbound/grapheme.ts`，禁止按码元硬切切碎代理对；混合形态的 markdown 在框架投影层被丢弃——插件侧无解）——反应式配额下无本地次数门（`reserveQuota` 保槽配置已删除，残留会被 schema 拒收），唯一保险丝是 `maxPerTurn`；锚点无存活时 outbound 本地拦截丢弃并**停止本轮卡片发布**（反应式下该错误对本轮永久，不逐快照重试）。
 
 ### 群聊与 room_event（[详情](docs/agents/group-and-room-event.md)）
 

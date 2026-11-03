@@ -23,6 +23,13 @@
 - **进度卡 `passive-quota-exhausted` 从偶发竞态变本轮终态（评审 #86-F4）**：反应式下该错误只剩「锚点过期/判死」一个来源，而卡片锚点固定为 turn 源消息——对本轮永久。原实现不 markSent、每个快照重复本地拦截并刷一条 WARN。修法：首次遇到即 `stop()` 停止本轮卡片发布。
 - **中间件链注释仍写 typing 的旧配额语义（评审 #86-F5）**：`gateway/middleware-setup.ts` 仍写「优先占被动回复配额，耗尽后降级主动」——#86 已把 typing 改为纯锚点存活探测。注释同步更新。
 
+### 修复
+
+- **note 截断会切开代理对——命中仓库自己的分块红线（评审 #87-F1）**：note 是第一条会截断 agent 自撰文本的路径（checklist 形态的 explanation 恒为框架的 ASCII 自动计数，永远触发不了截断）。原 `truncate()` 按 UTF-16 码元硬切，切点落在代理对中间会留下**落单高代理**→ 编码后变 U+FFFD 豆腐块或被平台拒收（已实证：`'a'.repeat(298) + '🚀'` 在切点 299 产出 `\ud83d` 落单代理）。修法：新增 `truncateGraphemeSafe()`，复用 `outbound/grapheme.ts` 的合规助手（官方 `findGraphemeChunkEnd` + 本地 `Intl.Segmenter` 等价回退，均保证不切开代理对），助手不可用时退化为不切碎代理对的手工切点；新增 emoji 跨切点用例（含落单代理正则断言）。
+- **checklist 形态多出一行与头重复的自动计数（评审 #87-F2）**：框架投影在 steps>0 时恒设 `explanation = "N/M complete"`，与 `📋 进度 N/M` 头重复（此前卡片显示为「头 + 1/4 complete + ✅ 行」）。修法：渲染前识别并抑制该自动计数行（仅当与框架格式 `N/M complete` 精确匹配时才抑制，其他 explanation 保留）。文档描述同步改为与实际输出一致。
+- **dispatch 摄取边界的载荷类型缺 `explanationFormat`（评审 #87-F3）**：`dispatch.ts` 的 `onPlanUpdate` 内联类型未声明该契约字段（运行时无影响，但将来重构做字段挑选会静默丢字段而 TS 抓不到）。已补齐，与 `PlanUpdatePayload` 对齐。
+- **进度卡用例数陈旧（评审 #87-F4）**：`docs/agents/outbound-and-quota.md` 仍写 37 用例 → 实际 52，已更正。
+
 ### 变更
 
 - **Progress card 支持 note 形态（markdown-only 卡片）**。openclaw 的 `progress_card` 工具支持 markdown/plan 双输入，且框架引导把 markdown 列为**首选形态**（可测量工作 prefer a leading progress bar；暂停/阻塞状态明确指示 in markdown and omit plan）——但框架投影把 markdown-only 卡片投影为 `{steps: [], explanation: <剥格式纯文本单行>}`，此前发布器把 `steps=[]` 一律当「清卡」静默丢弃，导致 agent 越遵循引导、QQ 用户越看不到卡片内容。现按 `steps=[] && explanation 非空` 判定为 note 形态，渲染 `📋 状态` 头 + note 文本（截断 300 字符）发送；去重/防抖/maxPerTurn/清卡抑制（`steps=[]` 且无 explanation）全部复用既有管线。note ↔ checklist ↔ 清卡三态互转自然工作。已知限制（插件侧无解）：混合形态（plan+markdown）的 markdown 叙事在框架投影层就被丢弃，插件只能收到 steps + 自动计数。
