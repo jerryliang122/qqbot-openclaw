@@ -22,8 +22,22 @@
  *   「已发送」防重发。
  * - 卡片是锦上添花，正文优先：任何失败都不重试、不影响 turn。
  *
- * 渲染复用框架共享渲染器 formatPlanChecklistLines（与 telegram 文本模式
- * checklist 同源）：✅ completed / ▸ in_progress / ▢ pending，步数超限时
+ * 双形态（2026-11-03 note 形态支持）：框架把 progress_card 工具调用投影为
+ * plan 事件（projectProgressCardChannelUpdate）：
+ * - checklist 形态（带 plan）→ steps + 自动计数 explanation（"N/M complete"）
+ *   → 渲染 `📋 进度 N/M` 头 + checklist
+ * - note 形态（仅 markdown）→ steps=[] + explanation=剥格式纯文本单行
+ *   （explanationFormat:"plain"）→ 渲染 `📋 状态` 头 + note（截断
+ *   NOTE_MAX_CHARS）。框架引导把 markdown 列为首选形态（可测量工作
+ *   prefer a leading progress bar；阻塞状态 in markdown and omit plan），
+ *   此前 steps=[] 一律当清卡会让该形态被静默丢弃。
+ * - 清卡（双空）→ steps=[] 且无 explanation 键 → 不发消息、抑制发布。
+ * 已知限制：混合形态（plan+markdown）的 markdown 叙事在**框架投影层**
+ * 就被丢弃（explanation 被自动计数覆盖），插件只能收到 steps——无法
+ * 插件侧修复。
+ *
+ * checklist 渲染复用框架共享渲染器 formatPlanChecklistLines（与 telegram
+ * 文本模式同源）：✅ completed / ▸ in_progress / ▢ pending，步数超限时
  * 压缩为 "✅ N/M done" 头 + 完成尾部 + 当前步 + 待办尾部。
  *
  * 生命周期：每 turn 一次性对象（dispatch 闭包内创建）。
@@ -41,12 +55,20 @@
 import { formatPlanChecklistLines } from 'openclaw/plugin-sdk/channel-outbound';
 import type { ProgressCardConfig } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
+import { resolveFindGraphemeChunkEnd } from './grapheme.js';
 
 /** 框架 plan 事件载荷（宽容解析：未知字段忽略，2026.9.1 只保证 phase/steps） */
 export interface PlanUpdatePayload {
   phase?: string;
   title?: string;
   explanation?: string;
+  /**
+   * note 形态（markdown-only 卡片）的投影标记，框架恒传 "plain"。
+   * 不参与 noteOnly 判定——steps>0 时 explanation 恒为框架自动计数
+   * （"N/M complete"），steps=[] + explanation 非空已无歧义；记入接口
+   * 仅为契约留档（宽容解析、可缺省）。
+   */
+  explanationFormat?: string;
   source?: string;
   steps?: Array<{ step?: unknown; status?: unknown }>;
 }
@@ -69,6 +91,12 @@ export interface ProgressCardPublisherDeps {
 
 /** explanation 行截断长度（字符） */
 const EXPLANATION_MAX_CHARS = 80;
+/**
+ * note 形态（markdown-only 卡片）截断长度（字符）。框架引导 markdown 为
+ * "compact narrative"，QQ 卡片定位一眼可读；框架投影已剥格式并折叠空白
+ * 为单行，截断只做长度保险。
+ */
+const NOTE_MAX_CHARS = 300;
 /** checklist 单行截断长度（与框架 compact renderer 默认上限对齐的保守值） */
 const LINE_MAX_CHARS = 80;
 
@@ -98,6 +126,45 @@ function truncate(text: string, maxChars: number): string {
 }
 
 /**
+ * 字形簇安全截断（**note 形态专用**）。
+ *
+ * 为什么不能用上面的 truncate()：它按 UTF-16 码元硬切，切点落在代理对
+ * （emoji / 增补平面字符）中间会留下**落单高代理**——编码后变成 U+FFFD
+ * 豆腐块或被平台拒收。AGENTS.md 的分块红线同样适用本路径：note 是第一
+ * 条会截断 agent 自撰文本的路径（checklist 形态的 explanation 恒为框架
+ * 的 ASCII 自动计数 "N/M complete"，永远触发不了截断）。
+ *
+ * 复用 outbound/grapheme.ts 的合规助手：官方 findGraphemeChunkEnd（字形
+ * 簇边界吸附）+ 本地 Intl.Segmenter 等价回退——两者都保证不切开代理对。
+ */
+function truncateGraphemeSafe(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  // 为省略号留 1 个码元
+  const budget = Math.max(0, maxChars - 1);
+
+  let cut = 0;
+  try {
+    cut = resolveFindGraphemeChunkEnd()(text, 0, budget);
+  } catch {
+    cut = 0;
+  }
+
+  if (cut <= 0) {
+    // 助手不可用/异常 → 手工兜底：退到不切开代理对的切点
+    cut = budget;
+    const code = text.charCodeAt(cut - 1);
+    if (code >= 0xd800 && code <= 0xdbff) cut -= 1; // 高代理后半 → 前移
+  } else if (cut > budget) {
+    // 本地回退的 avoidTrailingHighSurrogateBreak 在「预算只剩 1 码元且是
+    // 高代理前半」时会返回 end+1（带走完整代理对、超预算 1 码元）——宁可
+    // 略超也不产生落单代理。
+    cut = Math.min(cut, text.length);
+  }
+
+  return `${text.slice(0, cut)}…`;
+}
+
+/**
  * 渲染一条卡片消息：
  *
  *   📋 进度 1/4
@@ -121,6 +188,18 @@ export function renderProgressCardText(
   });
   const note = explanation?.trim() ? truncate(explanation.replace(/\s+/g, ' ').trim(), EXPLANATION_MAX_CHARS) : undefined;
   return [header, ...(note ? [note] : []), ...lines].join('\n');
+}
+
+/**
+ * 渲染一条 note 形态卡片消息（markdown-only 卡片，框架投影为纯文本单行）：
+ *
+ *   📋 状态
+ *   Update remains open and paused. Waiting for the source owner…
+ *
+ * 无计数头（与 checklist 的 `📋 进度 N/M` 区分——note 没有步骤计数）。
+ */
+export function renderProgressCardNoteText(note: string): string {
+  return ['📋 状态', truncateGraphemeSafe(note, NOTE_MAX_CHARS)].join('\n');
 }
 
 export class ProgressCardPublisher {
@@ -187,9 +266,14 @@ export class ProgressCardPublisher {
 
     const steps = normalizePlanSteps(payload.steps ?? []);
 
+    // note 形态（markdown-only 卡片）：steps=[] 但 explanation 非空——框架
+    // 投影把 markdown 剥成纯文本单行放这里。必须与清卡区分，否则该形态
+    // （框架引导的首选形态）被静默丢弃。
+    const noteOnly = steps.length === 0 && Boolean(payload.explanation?.trim());
+
     // 清空卡片：不发消息，本 turn 停止发布（后续再有非空 update 则恢复）。
-    // 同时重置去重状态——恢复的同文本 checklist 是新一轮，必须重新发布。
-    if (steps.length === 0) {
+    // 同时重置去重状态——恢复的同文本 checklist/note 是新一轮，必须重新发布。
+    if (steps.length === 0 && !noteOnly) {
       if (!this.cleared) {
         this.cleared = true;
         this.lastSentText = '';
@@ -201,7 +285,17 @@ export class ProgressCardPublisher {
     }
     this.cleared = false;
 
-    const text = renderProgressCardText(steps, payload.explanation, this.deps.config.maxLines);
+    // checklist 形态：框架投影恒设 explanation = "N/M complete"（自动计数，
+    // 与 `📋 进度 N/M` 头重复）。抑制该行——只保留框架自动计数之外的
+    // explanation（理论上的自定义注记），避免卡片出现「N/M complete」
+    // 这种与中文头重复的英文行（评审 #87-F2）。
+    const completed = steps.filter((s) => s.status === 'completed').length;
+    const autoCount = `${completed}/${steps.length} complete`;
+    const note = payload.explanation === autoCount ? undefined : payload.explanation;
+
+    const text = noteOnly
+      ? renderProgressCardNoteText(payload.explanation!.trim())
+      : renderProgressCardText(steps, note, this.deps.config.maxLines);
 
     // 去重：无任何状态变化的重复写卡不重发（步骤状态变化必然改变 ✅/▸ 标记）
     if (text === this.lastSentText) return;
@@ -273,10 +367,12 @@ export class ProgressCardPublisher {
     this.clearTrailingTimer();
   }
 
-  /** 从渲染文本头部提取 N/M（仅日志用） */
+  /** 从渲染文本头部提取 N/M（仅日志用；note 形态头无计数） */
   private countFromText(text: string): [string, string] {
     const m = /^📋 进度 (\d+)\/(\d+)$/.exec(text.split('\n')[0] ?? '');
-    return m ? [m[1]!, m[2]!] : ['?', '?'];
+    if (m) return [m[1]!, m[2]!];
+    if (text.split('\n')[0] === '📋 状态') return ['note', 'note'];
+    return ['?', '?'];
   }
 
   /** 安排尾随补发定时器（已有定时器则不重复安排——pendingText 已更新为最新） */

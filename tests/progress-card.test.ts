@@ -46,6 +46,7 @@ const {
   ProgressCardPublisher,
   normalizePlanSteps,
   renderProgressCardText,
+  renderProgressCardNoteText,
 } = await import('../src/outbound/progress-card-publisher.ts');
 const { resolveProgressCardConfig } = await import('../src/config.ts');
 const {
@@ -388,6 +389,166 @@ await test('drain：等待 in-flight 发送落地（卡片先于答案完成）'
   await Promise.all([pending, drained]);
   assert.equal(sends.length, 1, 'in-flight 卡片最终落地（早于正文放行）');
   assert.equal(settled, true);
+});
+
+// ── 2c. note 形态（markdown-only 卡片，2026-11-03 支持）──
+
+group('note 形态（markdown-only）');
+
+await test('note-only update（steps=[] + explanation）→ 发送 📋 状态 卡', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  await h.publisher.onPlanUpdate({
+    phase: 'update', steps: [],
+    explanation: 'Update remains open and paused. Waiting for the source owner.',
+    explanationFormat: 'plain',
+  });
+  assert.equal(h.sends.length, 1, 'note 形态必须发出（此前被当清卡静默丢弃）');
+  const lines = h.sends[0]!.split('\n');
+  assert.equal(lines[0], '📋 状态', 'note 卡头为 📋 状态（无计数）');
+  assert.equal(lines[1], 'Update remains open and paused. Waiting for the source owner.');
+  assert.equal(lines.length, 2, 'note 卡只有头 + 正文两行');
+});
+
+await test('note 去重：同文本重复 update 不重发', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'still blocked', explanationFormat: 'plain' });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'still blocked', explanationFormat: 'plain' });
+  assert.equal(h.sends.length, 1);
+});
+
+await test('note 变更：不同文本发出新卡', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'first note' });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'second note' });
+  assert.equal(h.sends.length, 2);
+  assert.ok(h.sends[1]!.includes('second note'));
+});
+
+await test('note-only 后清卡（steps=[] 无 explanation）→ 不发消息、进入抑制态', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'working' });
+  assert.equal(h.sends.length, 1);
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [] });
+  assert.equal(h.sends.length, 1, '清卡不发消息');
+  // 抑制态：后续 note 更新恢复发布
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'resumed' });
+  assert.equal(h.sends.length, 2, '清卡后的 note 是新一轮，重新发布');
+});
+
+await test('清卡重置去重：同文本 note 在清卡后会重新发布', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'same note' });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [] }); // 清卡
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'same note' }); // 同文本恢复
+  assert.equal(h.sends.length, 2, '清卡重置去重——同文本 note 必须重新发布');
+});
+
+await test('checklist → note-only 转换：note 卡正常发出（不被当清卡）', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'paused, waiting on owner' });
+  assert.equal(h.sends.length, 2, '转换必须发 note 卡');
+  assert.ok(h.sends[1]!.startsWith('📋 状态'));
+});
+
+await test('note-only → checklist 转换：checklist 卡正常渲染', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'starting' });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
+  assert.equal(h.sends.length, 2);
+  assert.ok(h.sends[1]!.startsWith('📋 进度 1/4'), 'checklist 卡恢复计数头渲染');
+});
+
+await test('长 note 截断：≤300 字符且以 … 结尾', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  const longNote = 'x'.repeat(500);
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: longNote });
+  assert.equal(h.sends.length, 1);
+  const noteLine = h.sends[0]!.split('\n')[1]!;
+  assert.ok(noteLine.length <= 300, `截断后长度 ${noteLine.length} 应 ≤ 300`);
+  assert.ok(noteLine.endsWith('…'));
+});
+
+await test('框架 fallback 文本 "Progress updated" 原样送达', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'Progress updated' });
+  assert.equal(h.sends.length, 1);
+  assert.ok(h.sends[0]!.includes('Progress updated'));
+});
+
+await test('note-only 计入 maxPerTurn 保险丝', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0, maxPerTurn: 2 } });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'n1' });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'n2' });
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'n3' });
+  assert.equal(h.sends.length, 2, 'maxPerTurn=2 后停发（note 与 checklist 同口径）');
+});
+
+await test('explanationFormat 在场不影响判定（宽容解析回归）', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  // 缺省 explanationFormat（宽容解析）：note 判定只看 steps+explanation
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: [], explanation: 'no format field' });
+  assert.equal(h.sends.length, 1);
+  assert.ok(h.sends[0]!.startsWith('📋 状态'));
+  // steps>0 时 explanationFormat 在场仍走 checklist 渲染
+  await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A, explanation: '2/4 complete', explanationFormat: 'plain' });
+  assert.equal(h.sends.length, 2);
+  assert.ok(h.sends[1]!.startsWith('📋 进度 1/4'));
+});
+
+// ── 2d. 字形安全截断 + 计数行抑制（评审 #87-F1 / #87-F2）──
+
+group('字形安全与渲染细节');
+
+await test('renderProgressCardNoteText：直接单测（📋 状态 + note）', () => {
+  const text = renderProgressCardNoteText('hello world');
+  assert.equal(text, '📋 状态\nhello world');
+});
+
+await test('note 截断不切开代理对——无落单高代理（评审 #87-F1）', () => {
+  // 构造代理对正好跨在切点：298 个 a + 🚀 + 后缀
+  // 旧实现按码元硬切会留下落单高代理（→ U+FFFD 豆腐块）
+  const text = `${'a'.repeat(298)}🚀tail`;
+  const rendered = renderProgressCardNoteText(text);
+  const noteLine = rendered.split('\n')[1]!;
+  assert.ok(noteLine.length <= 300, `截断后长度 ${noteLine.length} 应 ≤ 300`);
+  assert.ok(noteLine.endsWith('…'));
+  // 关键断言：不得出现落单代理
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  assert.ok(!lone.test(noteLine), `截断后不得有落单代理：${JSON.stringify(noteLine.slice(-8))}`);
+  // 且被截掉的高代理不得残留在正文里（不成对）
+  const tail = noteLine.slice(0, -1); // 去掉省略号
+  assert.equal(
+    tail.split('').filter((ch) => ch.codePointAt(0)! > 0xffff).length % 2,
+    0,
+    '代理对不得只留一半',
+  );
+});
+
+await test('note 截断：emoji 落在切点内时整簇保留或整簇丢弃', () => {
+  const text = `${'a'.repeat(298)}🚀tail`;
+  const noteLine = renderProgressCardNoteText(text).split('\n')[1]!;
+  const body = noteLine.slice(0, -1);
+  assert.ok(
+    body.endsWith('a') || body.endsWith('🚀'),
+    `emoji 应整簇保留或整簇丢弃，实际结尾：${JSON.stringify(body.slice(-4))}`,
+  );
+});
+
+await test('checklist 形态抑制框架自动计数行（评审 #87-F2）', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  // 框架投影在 steps>0 时恒设 explanation = "N/M complete"
+  await h.publisher.onPlanUpdate({
+    phase: 'update', steps: STEPS_A, explanation: '1/4 complete', explanationFormat: 'plain',
+  });
+  assert.equal(h.sends.length, 1);
+  const lines = h.sends[0]!.split('\n');
+  assert.equal(lines[0], '📋 进度 1/4', '头保留计数');
+  assert.ok(
+    !lines.includes('1/4 complete'),
+    `不应出现与头重复的自动计数行，实际：${JSON.stringify(lines)}`,
+  );
+  assert.ok(lines[1]!.startsWith('✅'), '计数行之后直接是 checklist 行');
 });
 
 // ── 3. 配置解析 ──
