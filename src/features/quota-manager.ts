@@ -1,22 +1,33 @@
 /**
- * QQBot 被动回复配额管理
+ * QQBot 被动回复配额管理（反应式模型，2026-11-03）
  *
- * C2C: 4 次/msg_id, 60 分钟
- * Group: 5 次/msg_id, 5 分钟
+ * 平台事实（2026-11-02 探针实测，官方 WebSocket + 撤回接口自证）：
+ * - 官方文档写「单聊 4 次/msg_id、群 5 次/msg_id」，但**平台并不执行**——
+ *   同一 msg_id 连发 25 次被动回复全部送达，25s 慢速间隔复测同样全过；
+ *   typing（msg_type=6）也不占回复额度（20 次 typing + 5 次回复全过）。
+ * - 平台真实硬约束只有两个：
+ *   ① msg_id 时效窗口（c2c 60min / group 5min，过期 40034005 确定性拒绝）
+ *   ② msg_id + msg_seq 唯一性（重复 → 40054005）
  *
- * 重要说明：
- * - QQ Bot 平台的 msg_id 有时效性限制（C2C: 60分钟，Group: 5分钟）
- * - 过期窗口以**平台事件 timestamp**（消息产生时刻）起算——入站登记时经
- *   registerMsgIdWindow 预注册（幂等）。窗口起点锚定平台时间、不再随
- *   「首次消耗时刻」漂移；但比对仍用本地时钟——本地与平台若有偏差 Δ，
- *   判定会等量放宽/收紧 Δ（并非与本地时钟无关）
- * - 过期后的 msg_id 不能再用于被动回复（API 会返回错误 40034128/40034005）
- * - 这是平台限制，不是"配额恢复"
- * - 因此 checkPassiveReplyQuota 在 msg_id 过期时返回 false，而非重置配额
+ * 反应式模型：
+ * - 本地**不再**以「次数耗尽」阻断被动发送——count 仅作观测（超文档上限
+ *   打一次 INFO 留证，供平台未来收紧时定位）。此前本地 preemptive 阻断
+ *   是替平台做决定：逼正文降级主动、白烧每日 1000 条主动预算，还会让
+ *   进度卡被静默跳过。
+ * - 本地仍强制的两个约束：TTL 窗口预检（40034005 确定性拒绝，预检省一次
+ *   必败请求）与 msg_seq 单调发号（40054005 硬错误，不可本地跳过）。
+ * - 平台若真的拒绝（40034005/40034128），由网关 retryOnDeadAnchor 剔除
+ *   死锚点并同内容转主动重发一次（gateway/qqbot-gateway.ts）。
+ *
+ * 窗口口径：过期窗口以**平台事件 timestamp**（消息产生时刻）起算——入站
+ * 登记时经 registerMsgIdWindow 预注册（幂等）。窗口起点锚定平台时间、不随
+ * 「首次消耗时刻」漂移；但比对仍用本地时钟——本地与平台若有偏差 Δ，
+ * 判定会等量放宽/收紧 Δ（并非与本地时钟无关）。
  *
  * 使用方式：
- * 1. 推荐：使用 checkAndConsumePassiveReplyQuota 进行原子操作（失败用 rollback 回滚）
- * 2. 纯探测（不消耗配额）：checkPassiveReplyQuota / getPassiveReplyQuotaRemaining
+ * 1. 消耗（含 msg_seq 发号）：checkAndConsumePassiveReplyQuota（失败用
+ *    rollback 回滚观测计数；TTL/死锚点拒绝时 canReply=false）
+ * 2. 存活探测（不消耗）：checkPassiveReplyQuota（typing 等）
  */
 
 import type { QuotaState, QuotaCheckParams } from '../types-plugin.js';
@@ -25,6 +36,10 @@ const quotaCache = new Map<string, QuotaState>();
 const MAX_CACHE_SIZE = 10000;
 
 const QUOTA_LIMITS = {
+  /**
+   * 文档口径的回复次数上限（c2c 4 / group 5）——**仅观测用**：平台实测
+   * 不执行（见文件头），count 超过该值只打一条 INFO 留证、不阻断发送。
+   */
   c2c: { count: 4, ttlMs: 60 * 60 * 1000 },
   group: { count: 5, ttlMs: 5 * 60 * 1000 },
 };
@@ -96,8 +111,13 @@ export function registerMsgIdWindow(params: {
 }
 
 /**
- * 检查被动回复配额（纯探测，不消耗配额）。
- * 需要同时消耗配额时使用 checkAndConsumePassiveReplyQuota。
+ * 锚点存活探测（纯探测，不消耗、不发号）。
+ *
+ * 反应式模型下只判两件事：TTL 窗口（c2c 60min / group 5min，过期 =
+ * 平台 40034005 确定性拒绝，本地预检省一次必败请求）与死锚点（平台
+ * 40034128/40034005 判死后登记）。**不判次数**——平台实测不执行文档
+ * 口径的 4/5 次上限（见文件头）。typing 等非正文发送用它决定是否带
+ * msg_id；需要发号的正文发送用 checkAndConsumePassiveReplyQuota。
  */
 export function checkPassiveReplyQuota(params: QuotaCheckParams): boolean {
   const { accountId, msgId, scope } = params;
@@ -112,7 +132,7 @@ export function checkPassiveReplyQuota(params: QuotaCheckParams): boolean {
   const cached = quotaCache.get(key);
   if (cached) {
     // msg_id 过期后不能再用于被动回复
-    // 这是 QQ Bot 平台限制，API 会返回错误 40034128
+    // 这是 QQ Bot 平台限制，API 会返回错误 40034005
     if (now > cached.expiresAt) {
       quotaCache.delete(key);
       return false;
@@ -123,45 +143,11 @@ export function checkPassiveReplyQuota(params: QuotaCheckParams): boolean {
       return false;
     }
 
-    const limit = QUOTA_LIMITS[scope].count;
-    if (cached.count >= limit) {
-      return false;
-    }
-
     // LRU 触达：被探测的活跃锚点沉到队尾
     touchCacheEntry(key, cached);
   }
 
   return true;
-}
-
-/**
- * 查询某 msg_id 的被动回复剩余额度（纯探测，不消耗配额）。
- *
- * progress card 等非正文消息发送前用：剩余额度不足时直接放弃发送，
- * 为最终回复保留槽位。无缓存条目 = 全额度可用；msg_id 缺失/过期 = 0。
- */
-export function getPassiveReplyQuotaRemaining(params: QuotaCheckParams): number {
-  const { accountId, msgId, scope } = params;
-
-  if (!msgId) {
-    return 0;
-  }
-
-  const key = `${accountId}:${scope}:${msgId}`;
-  const cached = quotaCache.get(key);
-  if (!cached) {
-    return QUOTA_LIMITS[scope].count;
-  }
-  if (cached.dead) {
-    return 0;
-  }
-  if (Date.now() > cached.expiresAt) {
-    return 0;
-  }
-  // LRU 触达：被探测的活跃锚点沉到队尾（死/过期条目不触达，留给容量清扫）
-  touchCacheEntry(key, cached);
-  return Math.max(0, QUOTA_LIMITS[scope].count - cached.count);
 }
 
 /**
@@ -183,15 +169,15 @@ export function rollbackPassiveReplyQuota(params: {
 }
 
 /**
- * 原子操作：检查并消耗被动回复配额
- * 推荐使用此函数，避免 check-then-consume 竞态
+ * 原子操作：检查并消耗被动回复配额（含 msg_seq 发号）
  *
- * 消耗成功时同时为该 msg_id 发号 msg_seq（单调递增、从不回滚——浪费序号
- * 无害，相同 msg_id+msg_seq 精确重复才是平台硬错误）。
+ * 反应式模型下「检查」只判 TTL 窗口与死锚点（不判次数）；count 仅观测
+ * 计数。消耗成功时同时为该 msg_id 发号 msg_seq（单调递增、从不回滚——
+ * 浪费序号无害，相同 msg_id+msg_seq 精确重复才是平台硬错误 40054005）。
  */
 export function checkAndConsumePassiveReplyQuota(
   params: QuotaCheckParams & {
-    log?: { debug?: (message: string) => void };
+    log?: { debug?: (message: string) => void; info?: (message: string) => void };
     /**
      * 该 msg_id 的接收时刻（msgid-cache 登记的平台事件时间）。条目缺失
      * （被容量控制淘汰等）重建窗口时以此为起点——**诚实重建**：窗口仍是
@@ -216,19 +202,16 @@ export function checkAndConsumePassiveReplyQuota(
   let cached = quotaCache.get(key);
 
   // 检查过期：msg_id 过期后不能用于被动回复
-  // 这是 QQ Bot 平台限制，API 会返回错误 40034128
+  // 这是 QQ Bot 平台限制，API 会返回错误 40034005
   if (cached && now > cached.expiresAt) {
     // msg_id 已过期，不能用于被动回复（降级决策的日志在 adapter/gateway 层）
     log?.debug?.(`[${accountId}] passive quota denied (expired): ${key}`);
     return { canReply: false, seq: 0, rollback: () => {} };
   }
 
-  // 检查配额（死锚点=平台已判死，等同耗尽且不可回滚复活）
-  const limit = QUOTA_LIMITS[scope].count;
-  if (cached && (cached.dead || cached.count >= limit)) {
-    log?.debug?.(
-      `[${accountId}] passive quota denied (${cached.dead ? 'dead anchor' : 'exhausted'}): ${key} count=${cached.count}/${limit}`,
-    );
+  // 检查死锚点（平台已判死，永不再挂接——rollback 也不得复活）
+  if (cached && cached.dead) {
+    log?.debug?.(`[${accountId}] passive quota denied (dead anchor): ${key}`);
     return { canReply: false, seq: 0, rollback: () => {} };
   }
 
@@ -236,7 +219,7 @@ export function checkAndConsumePassiveReplyQuota(
   // （诚实重建），否则旧兜底 now+TTL——非无声，DEBUG 留痕。重建出的窗口
   // 同样要过校验：接收时刻起算已超窗的（如条目被淘汰后残留的旧锚点）
   // 直接拒绝，不得以「当下起算」放行。注意重建会把 seq 归零（锚点失效
-  // 兜底自愈，见 AGENTS.md「出站被动优先」）
+  // 兜底自愈，见 AGENTS.md「出站与配额」）
   if (!cached) {
     const expiresAt = (receivedAt ?? now) + ttl;
     if (now > expiresAt) {
@@ -258,6 +241,17 @@ export function checkAndConsumePassiveReplyQuota(
   // 缓存大小控制：过期清扫优先，FIFO 兜底
   enforceCacheCapacity(now);
 
+  // 超限观测（一次性）：count 超过文档口径上限不阻断（平台实测不执行，
+  // 见文件头），但打一条 INFO 留证——若平台未来收紧，这是定位一线证据
+  const limit = QUOTA_LIMITS[scope].count;
+  if (cached.count > limit && !cached.overLimitLogged) {
+    cached.overLimitLogged = true;
+    log?.info?.(
+      `[${accountId}] passive reply count ${cached.count} exceeded documented limit ${limit} (${scope}); ` +
+        'platform probe 2026-11-02 showed the cap is not enforced — continuing passively',
+    );
+  }
+
   log?.debug?.(`[${accountId}] consumed passive quota: ${key} count=${cached.count} seq=${cached.seq}`);
 
   // 返回回滚函数（只回滚 count，不回滚 seq；死锚点不回滚——invalidate
@@ -274,10 +268,12 @@ export function checkAndConsumePassiveReplyQuota(
 }
 
 /**
- * 将某 msg_id 配额标记为死锚点（dead=true 且 count=limit）——平台
- * 40034005（msg_id 已过期）/40034128（回复次数超限）判死后调用：该锚点
- * 永不再被选取/允许消耗，rollback 也无法复活（防上游发送失败的补偿回滚
- * 把 count 减回 limit 以下）；不删条目（保留 seq 与窗口现场便于排障）。
+ * 将某 msg_id 配额标记为死锚点（dead=true）——平台 40034005（msg_id 已
+ * 过期）/40034128（回复次数超限）判死后调用：该锚点永不再被选取/允许
+ * 消耗，rollback 也无法复活（防上游发送失败的补偿回滚把死锚点再次挂接、
+ * 再吃一次平台确定性拒绝）。count 同步封顶到文档上限（观测口径对齐
+ * 「耗尽」；反应式模型下 count 无阻断作用）。不删条目（保留 seq 与窗口
+ * 现场便于排障）。
  */
 export function invalidateMsgIdQuota(params: {
   accountId: string;

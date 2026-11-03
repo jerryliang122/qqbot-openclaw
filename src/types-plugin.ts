@@ -46,14 +46,19 @@ export interface QQBotSessionRoute {
  *
  * `dead`：死锚点标记，平台 40034005/40034128 判死后由 invalidateMsgIdQuota
  * 置位。置位后该 msg_id 永不再被消耗，rollback 也不得复活——否则上游发送
- * 失败的补偿回滚会把 count 减回 limit 以下，死锚点被再次挂接、再吃一次
- * 平台确定性拒绝。
+ * 失败的补偿回滚会把死锚点再次挂接、再吃一次平台确定性拒绝。
+ *
+ * `count`：观测计数（反应式模型，2026-11-03）——平台实测不执行文档口径
+ * 的 4/5 次上限，count 超限不阻断发送，仅触发 `overLimitLogged` 一次的
+ * INFO 留证。
  */
 export interface QuotaState {
   count: number;
   expiresAt: number;
   seq?: number;
   dead?: boolean;
+  /** 超文档上限的观测日志已打过（每 msg_id 一次） */
+  overLimitLogged?: boolean;
 }
 
 /**

@@ -568,6 +568,30 @@ async function main() {
     assert.strictEqual(r2.ok, false, 'groups.<id> 的未知字段应被 additionalProperties:false 拒绝');
   });
 
+  await test('progressCard.reserveQuota 已删除：配置残留会被真实校验器拒收', () => {
+    // 反应式配额（2026-11-03）删除了 reserveQuota（保槽语义随本地次数门
+    // 一起失效）。反向断言：老配置残留该键时 validatePluginSchemaValue
+    // 必须拒收——证明配置键在 TS 与 schema 两侧都真删了，而不是「留着
+    // 被静默忽略」的死配置面。
+    const validator = fw.validator;
+    const r = validator.r({
+      origin: 'external',
+      schema: qqbotSchema,
+      cacheKey: 'channel:qqbot',
+      value: {
+        appId: '102030405',
+        clientSecret: 'x'.repeat(32),
+        progressCard: { reserveQuota: 1 },
+      },
+      applyDefaults: true,
+    });
+    assert.strictEqual(
+      r.ok,
+      false,
+      'progressCard.reserveQuota 应已从 schema 删除（残留配置被拒收是升级可见的 Breaking 信号，CHANGELOG 已注明）',
+    );
+  });
+
   await test('多账号配置能通过框架校验器', () => {
     fw.validator.n({
       schema: qqbotSchema,

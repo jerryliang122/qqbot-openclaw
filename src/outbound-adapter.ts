@@ -1,7 +1,8 @@
 /**
  * QQBot Outbound 适配器
  *
- * 封装 sendText/sendMedia 流式等出站操作，提供配额感知的发送能力。
+ * 封装 sendText/sendMedia 流式等出站操作，提供锚点感知的发送能力
+ * （反应式配额：TTL/死锚点本地预检，次数不阻断）。
  *
  * 两层结构：
  * - createQQBotOutboundAdapter —— 内部配额包装（sendTextWithQuota / sendMediaWithQuota），
@@ -169,7 +170,7 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
         rollback();
         log?.debug?.(`[${resolvedAccountId}] rollback quota: send failed`);
       } else if (!canReply) {
-        log?.info?.(`[${resolvedAccountId}] [quota] fallback to proactive send: quota exhausted or no msgId`);
+        log?.info?.(`[${resolvedAccountId}] [anchor] passive anchor unusable (absent/expired/dead) — sending proactively`);
       }
 
       return result;
@@ -206,7 +207,7 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
         rollback();
         log?.debug?.(`[${resolvedAccountId}] rollback quota: send failed`);
       } else if (!canReply) {
-        log?.info?.(`[${resolvedAccountId}] [quota] fallback to proactive media send: quota exhausted or no msgId`);
+        log?.info?.(`[${resolvedAccountId}] [anchor] passive anchor unusable (absent/expired/dead) — sending media proactively`);
       }
 
       return result;
@@ -219,13 +220,14 @@ export function createQQBotOutboundAdapter(params: QQBotOutboundAdapterParams): 
         return false;
       }
 
-      const canPassiveReply = await checkPassiveReplyQuota({
+      // 锚点存活探测（typing 不占回复额度，只判 TTL/死锚点）
+      const anchorAlive = await checkPassiveReplyQuota({
         accountId,
         msgId: replyToId,
         scope: 'c2c',
       });
 
-      if (!canPassiveReply) {
+      if (!anchorAlive) {
         return false;
       }
 
@@ -343,8 +345,8 @@ function peekReceivedAtFor(scope: 'c2c' | 'group', to: string, msgId?: string | 
  * 创建框架 ChannelOutboundAdapter 契约入口。
  *
  * 框架可用性判定要求 outbound.sendText 存在（channel-resolution.ts /
- * channel-bootstrap.runtime.ts），sendText/sendMedia 内部走配额感知包装，
- * 配额耗尽时自动降级主动消息。
+ * channel-bootstrap.runtime.ts），sendText/sendMedia 内部走锚点感知包装，
+ * 锚点无存活（缺失/过期/判死）时自动降级主动消息。
  */
 export function createQQBotChannelOutbound(params: QQBotOutboundAdapterParams = {}) {
   const quotaAdapter = createQQBotOutboundAdapter(params);

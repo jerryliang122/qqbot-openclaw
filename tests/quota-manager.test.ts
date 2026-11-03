@@ -6,7 +6,6 @@ import {
   inferQQBotScope,
   clearQuotaCache,
   registerMsgIdWindow,
-  getPassiveReplyQuotaRemaining,
   invalidateMsgIdQuota,
   getQuotaStats,
   PLATFORM_PASSIVE_WINDOW,
@@ -51,38 +50,59 @@ await test('checkPassiveReplyQuota: 初始状态允许', async () => {
   assert(canReply === true);
 });
 
-await test('checkAndConsumePassiveReplyQuota: C2C 配额消耗至上限', async () => {
+await test('反应式：count 超文档上限不阻断（平台实测不执行 4/5 次）', () => {
   clearQuotaCache();
   const accountId = 'test-account-2';
   const msgId = 'test-msg-2';
 
-  // 消耗 4 次（C2C 上限），前 4 次均允许
-  for (let i = 0; i < 4; i++) {
+  // 连续消耗 6 次（文档口径 c2c 上限 4）——反应式模型下全部放行
+  for (let i = 0; i < 6; i++) {
     const { canReply } = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
-    assert(canReply === true, `attempt ${i + 1} should be allowed`);
+    assert.equal(canReply, true, `attempt ${i + 1} should be allowed (count is observational)`);
   }
 
-  // 第 5 次 check 应该失败
-  const canReply = await checkPassiveReplyQuota({
-    accountId,
-    msgId,
-    scope: 'c2c',
-  });
-  assert(canReply === false);
+  // 存活探测同样不判次数
+  assert.equal(checkPassiveReplyQuota({ accountId, msgId, scope: 'c2c' }), true);
+
+  // count 仍如实观测
+  const entry = __test_getQuotaCache().get(`${accountId}:c2c:${msgId}`);
+  assert.ok(entry);
+  assert.equal(entry!.count, 6);
 });
 
-await test('rollbackPassiveReplyQuota: 回滚后配额恢复', async () => {
+await test('超文档上限只打一次 INFO 观测日志', () => {
+  clearQuotaCache();
+  const accountId = 'test-account-obs';
+  const msgId = 'test-msg-obs';
+  const infos: string[] = [];
+  const log = { info: (m: string) => infos.push(m), debug: () => {} };
+
+  // 前 4 次不触发
+  for (let i = 0; i < 4; i++) {
+    checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c', log });
+  }
+  assert.equal(infos.length, 0, '未超限不应打观测日志');
+
+  checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c', log }); // 第 5 次：超限
+  assert.equal(infos.length, 1, '首次超限打一条 INFO');
+  assert.ok(infos[0]!.includes('exceeded documented limit'), `日志应说明超文档上限：${infos[0]}`);
+
+  checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c', log }); // 第 6 次：不重复
+  assert.equal(infos.length, 1, '同一 msg_id 只打一次');
+});
+
+await test('rollbackPassiveReplyQuota: 只回滚观测计数（无阻断语义）', async () => {
   clearQuotaCache();
   const accountId = 'test-account-rollback';
   const msgId = 'test-msg-rollback';
 
-  for (let i = 0; i < 4; i++) {
-    checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
-  }
+  checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
+  checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
   rollbackPassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
 
-  const { canReply } = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
-  assert(canReply === true, 'quota should be restored after rollback');
+  const entry = __test_getQuotaCache().get(`${accountId}:c2c:${msgId}`);
+  assert.ok(entry);
+  assert.equal(entry!.count, 1, '回滚应递减观测计数');
 });
 
 await test('checkPassiveReplyQuota: 无 msgId 时返回 false', async () => {
@@ -135,9 +155,7 @@ await test('registerMsgIdWindow: 过期窗口自接收时刻起算（未消耗�
   });
   const { canReply } = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
   assert.equal(canReply, false, '窗口已过（按接收时刻）应拒绝，即使 count=0');
-
-  const remaining = getPassiveReplyQuotaRemaining({ accountId, msgId, scope: 'c2c' });
-  assert.equal(remaining, 0, '过期条目剩余额度应为 0');
+  assert.equal(checkPassiveReplyQuota({ accountId, msgId, scope: 'c2c' }), false, '探测同样应判过期');
 });
 
 await test('registerMsgIdWindow: 幂等——重复登记不重置窗口/计数', () => {
@@ -186,6 +204,19 @@ await test('checkAndConsumePassiveReplyQuota: 连续消耗发号 1,2,3…', () =
   assert.deepEqual(seqs, [1, 2, 3], 'seq 应从 1 起单调递增');
 });
 
+await test('超文档上限后 seq 仍单调发号（唯一性是平台硬约束）', () => {
+  clearQuotaCache();
+  const accountId = 'test-account-seq-over';
+  const msgId = 'test-msg-seq-over';
+  const seqs: number[] = [];
+  for (let i = 0; i < 6; i++) {
+    const { canReply, seq } = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
+    assert.equal(canReply, true, 'count 不阻断');
+    seqs.push(seq);
+  }
+  assert.deepEqual(seqs, [1, 2, 3, 4, 5, 6], '第 5/6 次仍要拿到新 msg_seq（40054005 防重复）');
+});
+
 await test('rollback 只回滚 count，seq 不回退', () => {
   clearQuotaCache();
   const accountId = 'test-account-seq-rb';
@@ -194,7 +225,7 @@ await test('rollback 只回滚 count，seq 不回退', () => {
   assert.equal(first.seq, 1);
   first.rollback(); // 模拟 API 失败
   const second = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
-  assert.equal(second.canReply, true, 'count 回滚后配额应恢复');
+  assert.equal(second.canReply, true);
   assert.equal(second.seq, 2, 'seq 单调不回退（防同 msg_id+msg_seq 精确重复）');
 });
 
@@ -207,8 +238,8 @@ await test('invalidateMsgIdQuota: 锚点判死后永不再可用', () => {
   registerMsgIdWindow({ accountId, msgId, scope: 'group', receivedAt: Date.now() });
   invalidateMsgIdQuota({ accountId, msgId, scope: 'group' });
   const { canReply } = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'group' });
-  assert.equal(canReply, false, '判死锚点应视为已耗尽');
-  assert.equal(getPassiveReplyQuotaRemaining({ accountId, msgId, scope: 'group' }), 0);
+  assert.equal(canReply, false, '判死锚点应不可消耗');
+  assert.equal(checkPassiveReplyQuota({ accountId, msgId, scope: 'group' }), false, '探测也应判死');
 });
 
 await test('invalidate 后 rollback 不得复活死锚点（dead 标记）', () => {
@@ -216,16 +247,11 @@ await test('invalidate 后 rollback 不得复活死锚点（dead 标记）', () 
   const accountId = 'test-account-dead-rb';
   const msgId = 'test-msg-dead-rb';
   // 模拟真实链路：adapter 消耗成功（拿到 rollback）→ 平台判死锚点 invalidate
-  // → 主动重发也失败 → 上游补偿 rollback()——不得把 count 减回 limit 以下
+  // → 主动重发也失败 → 上游补偿 rollback()——不得复活死锚点
   const { rollback } = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
   invalidateMsgIdQuota({ accountId, msgId, scope: 'c2c' });
   rollback();
   rollbackPassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
-  assert.equal(
-    getPassiveReplyQuotaRemaining({ accountId, msgId, scope: 'c2c' }),
-    0,
-    '回滚后死锚点仍应无额度',
-  );
   const again = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
   assert.equal(again.canReply, false, '死锚点经回滚不得复活');
   assert.equal(checkPassiveReplyQuota({ accountId, msgId, scope: 'c2c' }), false);
@@ -248,7 +274,7 @@ await test('getQuotaStats: 预注册的 count=0 条目不计入统计', () => {
 await test('容量控制：超限先清扫过期条目，早期活跃窗口不被 FIFO 淘汰', () => {
   clearQuotaCache();
   const accountId = 'test-account-evict';
-  // 活跃锚点 L：先登记、先消耗一次（count=1，剩余 3）
+  // 活跃锚点 L：先登记、先消耗一次（count=1）
   registerMsgIdWindow({ accountId, msgId: 'LIVE', scope: 'c2c', receivedAt: Date.now() });
   const c1 = checkAndConsumePassiveReplyQuota({ accountId, msgId: 'LIVE', scope: 'c2c' });
   assert.equal(c1.canReply, true);
@@ -260,9 +286,10 @@ await test('容量控制：超限先清扫过期条目，早期活跃窗口不�
     registerMsgIdWindow({ accountId, msgId: `EXP_${i}`, scope: 'c2c', receivedAt: old });
   }
 
-  // 判别：条目若被淘汰，探测会按「无条目=满额」返回 4；存活则 count 保留、剩余 3
-  const remaining = getPassiveReplyQuotaRemaining({ accountId, msgId: 'LIVE', scope: 'c2c' });
-  assert.equal(remaining, 3, '活跃锚点应经清扫存活（count 保留）');
+  // 判别：条目若被 FIFO 淘汰则 cache 中无此键；存活则 count 保留
+  const entry = __test_getQuotaCache().get(`${accountId}:c2c:LIVE`);
+  assert.ok(entry, '活跃锚点应经清扫存活');
+  assert.equal(entry!.count, 1, '存活条目的观测计数应保留');
 
   // 过期条目应已被清扫而非堆积
   const cache = __test_getQuotaCache();
@@ -277,7 +304,7 @@ await test('LRU 触达：消耗把条目沉到插入序队尾', () => {
 
   // Map.set 不改变既有 key 的插入序；消耗（触达）应把 A 沉到队尾
   checkAndConsumePassiveReplyQuota({ accountId, msgId: 'LRU_A', scope: 'c2c' });
-  getPassiveReplyQuotaRemaining({ accountId, msgId: 'LRU_A', scope: 'c2c' });
+  checkPassiveReplyQuota({ accountId, msgId: 'LRU_A', scope: 'c2c' });
 
   const keys = [...__test_getQuotaCache().keys()];
   assert.equal(keys[0], `${accountId}:c2c:LRU_B`, '未触达的 B 应在队首');

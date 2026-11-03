@@ -4,10 +4,10 @@
  * 与 SDK 版的三点差异：
  * 1. 续期间隔默认 20s 且强制不低于 20s（QPS 约束，事件触发的续期
  *    同样受此间距保护）
- * 2. 配额感知：typing 通知携带入站 msg_id 时属于被动回复、消耗该
- *    msg_id 的被动配额，与真正的回复消息共享额度（经同一 limiter
- *    记账）。被动配额耗尽后与回复消息一样自动降级为主动发送
- *    （不带 msg_id），续期不会中断
+ * 2. 配额口径（反应式模型，2026-11-03）：typing 不占回复额度（平台探针
+ *    实测 20 次 typing + 5 次回复同 msg_id 全过），因此只做锚点存活探测
+ *    （TTL/死锚点）决定是否带 msg_id；锚点过期/判死后转不带 msg_id 发送，
+ *    续期不会中断
  * 3. 出站消息后续期：QQ 客户端收到机器人消息（如思维链中间输出）
  *    会自动终止"正在输入"显示。若框架任务仍在进行，本中间件在
  *    每条消息发出 POST_MESSAGE_REFRESH_DELAY_MS 后补发一次续期；
@@ -17,7 +17,7 @@
  * input_notify 推送才会重新显示 —— 这是需要周期性续期的原因。
  */
 import type { Middleware } from '@tencent-connect/qqbot-nodejs';
-import { rollbackPassiveSlot, tryAcquirePassiveSlot } from '../outbound/outbound-service.js';
+import { probePassiveAnchorAlive } from '../outbound/outbound-service.js';
 import { subscribeOutboundMessage } from '../features/typing-refresh.js';
 
 /** QPS 约束：续期间隔不得低于 20s */
@@ -56,14 +56,13 @@ export function c2cTypingIndicator(opts: TypingIndicatorMiddlewareOptions): Midd
 
     const sendNow = (): void => {
       if (!active) return;
-      // 被动配额可用 → 占用并带 msg_id 发送；耗尽 → 不带 msg_id 主动发送，
-      // 与回复消息的降级策略一致（见 outbound-service 的统一配额预留）
-      const passive = tryAcquirePassiveSlot(accountId, ctx.replyTarget.msgId);
+      // 锚点存活 → 带 msg_id 发送（typing 不占回复额度，见文件头）；
+      // 过期/判死/缺失 → 不带 msg_id 发送，续期不中断
+      const passive = probePassiveAnchorAlive(accountId, ctx.replyTarget.msgId);
       const target = passive
         ? ctx.replyTarget
         : { scope: 'c2c' as const, targetId: ctx.replyTarget.targetId };
       ctx.bot.sendTyping(target, TYPING_DURATION_SEC).catch((err: unknown) => {
-        if (passive) rollbackPassiveSlot(accountId, ctx.replyTarget.msgId);
         ctx.log?.debug?.(`[typing] failed: ${err instanceof Error ? err.message : String(err)}`);
       });
       lastSentAt = Date.now();

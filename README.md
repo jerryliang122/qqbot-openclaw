@@ -1038,7 +1038,7 @@ OpenClaw agents can maintain a session-level progress card (the `progress_card` 
 ▢ 清理临时文件
 ```
 
-QQ has no message-editing API (Telegram renders the same feature by repeatedly editing one draft message), so each update arrives as a new message. Snapshots are **passive-only**: they reply to the triggering message and never burn the daily proactive budget — when the passive quota of the message is exhausted (or too low to keep a slot for the final reply), snapshots are simply dropped. Publishing also stops once the final answer starts delivering, so a card never lands after the answer.
+QQ has no message-editing API (Telegram renders the same feature by repeatedly editing one draft message), so each update arrives as a new message. Snapshots are **passive-only**: they reply to the triggering message and never burn the daily proactive budget — if the reply anchor is no longer usable (expired/dead), snapshots are simply dropped. Publishing also stops once the final answer starts delivering, so a card never lands after the answer.
 
 ```json
 {
@@ -1049,8 +1049,7 @@ QQ has no message-editing API (Telegram renders the same feature by repeatedly e
         "scope": "c2c",
         "minIntervalMs": 1500,
         "maxPerTurn": 3,
-        "maxLines": 8,
-        "reserveQuota": 1
+        "maxLines": 8
       }
     }
   }
@@ -1060,11 +1059,10 @@ QQ has no message-editing API (Telegram renders the same feature by repeatedly e
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `true` | Master switch — set `false` to turn the feature off entirely |
-| `scope` | `"c2c"` | Where snapshots are sent. `"c2c"` (default) private chats only; `"group"` / `"both"` opt groups in — group passive quota is only 5 replies per message per 5 min, so cards can crowd out the actual reply; tune `maxPerTurn`/`reserveQuota` accordingly |
+| `scope` | `"c2c"` | Where snapshots are sent. `"c2c"` (default) private chats only; `"group"` / `"both"` opt groups in — group reply anchors only live 5 min, so cards are off in groups by default |
 | `minIntervalMs` | `1500` | Debounce window between snapshots (only suppresses bursts when tools fire in quick succession; normal step updates pass) |
-| `maxPerTurn` | `3` | Fuse: max snapshots per turn. c2c passive quota is 4 per message, so the default keeps room for the final reply |
+| `maxPerTurn` | `3` | Fuse: max snapshots per turn (the only local limit — platform testing showed the documented 4/5-replies-per-message cap is not enforced, so nothing else reserves slots) |
 | `maxLines` | `8` | Max checklist lines; longer plans compress to a `✅ N/M done` header + completed tail + active + pending tail (same shared renderer as Telegram's text-mode checklist) |
-| `reserveQuota` | `1` | Passive slots reserved for the final reply: a snapshot is dropped when remaining quota ≤ this value |
 
 Notes:
 

@@ -13,6 +13,11 @@
 ### 变更（Breaking）
 
 - **移除 msg_id 池化锚点选取——出站回到「显式锚点 or 主动」模型**。平台语义上，携带 `msg_id` 的被动消息 = 「对用户消息的回复」（官方《消息收发概述》）；而池化选取（`selectMsgIdForPassiveReply` 旧配额优先，为省每日主动预算引入：`7a59a2c` 取最新 → `bbed520` passive-first → `e3e2be7` 旧配额优先）会把无上下文的发送挂到**更早**的入站消息上，等于把回复引用挂到错误的消息。本次移除：网关 `attachMsgIdWithQuota` → `resolveOutboundAnchor`，只透传显式 `opts.msgId`；**无显式锚点的发送（message 工具不带 replyTo、remind/cron 定时投递、框架直发通知如 💾 Learned）一律不挂锚点、走主动消息**。`msgid-cache` 降级为「入站接收时刻登记表」（诚实重建 + 死锚点簿记），不再是锚点池。显式锚点的全部配额机制保留不变：msg_seq 单调发号、40034005/40034128 死锚点「剔除+转主动重发一次」兜底、诚实重建窗口、预注册配额窗口、配额缓存容量控制。主回复/进度卡/typing/access-notice/secret-capture 路径不受影响（本就显式锚点或 SDK 直发）。**行为代价（有意接受）**：① 无锚点发送消耗每日 1000 条/关系主动预算（`proactive-budget` 80% WARN 与 `/bot-group-info` 可观测）；② 用户在 QQ 客户端关闭「允许主动发送」时该类消息平台拒发；③ 群主动消息受 20/qpm/关系限频。守卫：`tests/passive-anchor-selection.test.ts` 重写为 `tests/passive-anchor-policy.test.ts`（无锚点=主动 + 显式透传 + 死锚点兜底）；红线记入 `AGENTS.md` 与 `docs/agents/outbound-and-quota.md`：**禁止重新引入池化选取**。
+- **删除 progress card 配置键 `channels.qqbot.progressCard.reserveQuota`**（随下方「反应式配额」一起退役：本地次数门消失后，「为最终回复保槽」语义不复存在）。**升级注意**：配置里残留该键会被 schema 直接拒收（`additionalProperties: false`），需手动移除。守卫：`tests/manifest-config-schema.test.ts` 新增反向断言（残留配置必须被真实校验器拒收）。
+
+### 变更
+
+- **反应式被动配额——本地不再按「次数」阻断被动发送**。依据 2026-11-02 探针实测（官方 WebSocket 收 C2C + 撤回接口自证）：平台**不执行**文档口径的「私聊 4 次/msg_id、群 5 次/msg_id」上限——同一 msg_id 连发 25 次被动回复全部 HTTP 200 且真实送达，25s 慢速间隔复测同样全过；typing（msg_type=6）也不占回复额度。此前本地 preemptive 阻断（配额计数满 → 降级主动）等于替平台做决定：逼正文降级主动、白烧每日 1000 条/关系主动预算，进度卡还会被「保槽」逻辑静默跳过。现模型：① **count 降为观测**——`checkAndConsumePassiveReplyQuota` 超文档上限照常放行，仅打一次 INFO 留证（每 msg_id 一次，`overLimitLogged`）；② **本地保留两个平台真实硬约束**——TTL 窗口预检（c2c 60min/群 5min，40034005 确定性拒绝，预检省一次必败请求）与 msg_seq 单调发号（40054005 唯一性，不可跳过）；③ **平台真拒绝时兜底**——40034005/40034128 死锚点「剔除 + 同内容转主动重发一次」机制不变（这即「反应式」的落地形态）。连带清理：typing 三处（中间件/续期/探测）改为纯锚点存活探测，不再消耗计数、不再让 seq 跳号；`getPassiveReplyQuotaRemaining` 与 `resolveQuotaAccountId` 删除（唯一消费方是已退役的保槽探测）。红线记入 `AGENTS.md`：**禁止把 count 上限改回 preemptive 阻断**。守卫：`tests/quota-manager.test.ts`（超限放行 + 一次性观测日志 + 超限后 seq 仍单调）、`tests/typing-indicator.test.ts`（typing 不建配额条目、判死降级）、`tests/passive-anchor-policy.test.ts`、`tests/progress-card.test.ts` 更新。
 
 ---
 

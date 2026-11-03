@@ -791,7 +791,8 @@ export function resolveGroupCoalesceEnabled(cfg: OpenClawConfig, groupOpenid: st
  * 解析 Progress Card（进度卡片）运行配置。
  *
  * 账号级配置（channels.qqbot.progressCard 或 accounts.<id>.progressCard），
- * 未配置时返回默认值：c2c 启用、群关闭（群被动配额紧，需显式 scope 开启）。
+ * 未配置时返回默认值：c2c 启用、群关闭（群被动锚点 TTL 仅 5min，需显式
+ * scope 开启）。
  */
 export function resolveProgressCardConfig(
   account: ResolvedQQBotAccount,
@@ -803,6 +804,5 @@ export function resolveProgressCardConfig(
     minIntervalMs: typeof cfg?.minIntervalMs === 'number' && cfg.minIntervalMs >= 0 ? cfg.minIntervalMs : 1500,
     maxPerTurn: typeof cfg?.maxPerTurn === 'number' && cfg.maxPerTurn >= 0 ? Math.floor(cfg.maxPerTurn) : 3,
     maxLines: typeof cfg?.maxLines === 'number' && cfg.maxLines >= 1 ? Math.floor(cfg.maxLines) : 8,
-    reserveQuota: typeof cfg?.reserveQuota === 'number' && cfg.reserveQuota >= 0 ? Math.floor(cfg.reserveQuota) : 1,
   };
 }

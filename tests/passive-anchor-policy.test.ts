@@ -1,6 +1,11 @@
 /**
  * 出站锚点策略（显式锚点 or 主动）+ msg_seq 发号 + 锚点失效兜底
  *
+ * 2026-11-03 反应式配额后的行为锁定：
+ * - 本地不再以「次数耗尽」阻断被动发送（平台实测不执行 4/5 次上限），
+ *   count 仅观测；TTL/死锚点预检与 msg_seq 发号保留
+ * - 平台真拒绝（40034005/40034128）→ retryOnDeadAnchor 剔除 + 转主动
+ *
  * 2026-11-03 移除池化选取后的行为锁定：
  * - 网关 resolveOutboundAnchor：**无显式 opts.msgId 一律主动发送**——即使
  *   msgid-cache 里有新鲜锚点也不得锚定（挂 msg_id = 对该消息的回复，
@@ -15,7 +20,7 @@ import { strict as assert } from 'assert';
 import { ApiError } from '@tencent-connect/qqbot-nodejs';
 import {
   clearQuotaCache,
-  getPassiveReplyQuotaRemaining,
+  checkPassiveReplyQuota,
 } from '../src/features/quota-manager.js';
 import {
   cacheMsgId,
@@ -189,7 +194,7 @@ await test('40034005（msg_id 已过期）→ 同内容转主动重发一次 + �
   assert.equal(getProactiveUsage('gwtest').count, 1, '主动重发应计入每日预算');
   // 死锚点被剔除（登记表查不到）+ 配额判死
   assert.equal(peekMsgIdReceivedAt('c2c', 'gw-dead1', 'DEAD_M1'), undefined, '死锚点应从登记表剔除');
-  assert.equal(getPassiveReplyQuotaRemaining({ accountId: 'gwtest', msgId: 'DEAD_M1', scope: 'c2c' }), 0, '死锚点配额应判死');
+  assert.equal(checkPassiveReplyQuota({ accountId: 'gwtest', msgId: 'DEAD_M1', scope: 'c2c' }), false, '死锚点应判死');
 });
 
 await test('40034128（回复次数超限）同 class 兜底', async () => {
@@ -227,9 +232,9 @@ await test('passiveOnly 死锚点 → 原错误上抛、不重发、不计预算
   assert.equal(getProactiveUsage('gwtest').count, before, '不得计入每日主动预算');
   assert.equal(peekMsgIdReceivedAt('c2c', 'gw-po', 'PO_M'), undefined, '死锚点仍应剔除（防后续再撞）');
   assert.equal(
-    getPassiveReplyQuotaRemaining({ accountId: 'gwtest', msgId: 'PO_M', scope: 'c2c' }),
-    0,
-    '死锚点配额应判死（dead 标记）',
+    checkPassiveReplyQuota({ accountId: 'gwtest', msgId: 'PO_M', scope: 'c2c' }),
+    false,
+    '死锚点应判死（dead 标记）',
   );
 });
 
@@ -365,9 +370,10 @@ await test('sendTextWithQuota：无锚点 → replyToId=undefined（不查缓存
   assert.equal(captured.quotaReserved, false);
 });
 
-await test('sendTextWithQuota：发送失败 → 回滚已消耗的配额', async () => {
+await test('sendTextWithQuota：发送失败 → 回滚观测计数（count 归零）', async () => {
   clearQuotaCache();
   const { createQQBotOutboundAdapter } = await import('../src/outbound-adapter.ts');
+  const { __test_getQuotaCache } = await import('../src/features/quota-manager.ts');
   const adapter = createQQBotOutboundAdapter({
     sendText: async () => ({ messageId: undefined, error: 'send failed' }),
   });
@@ -378,11 +384,10 @@ await test('sendTextWithQuota：发送失败 → 回滚已消耗的配额', asyn
     replyToId: 'ROLLBACK_M',
   });
   assert.ok(result.error, '失败结果应原样返回');
-  assert.equal(
-    getPassiveReplyQuotaRemaining({ accountId: 'adacc', msgId: 'ROLLBACK_M', scope: 'c2c' }),
-    4,
-    '发送失败后配额应回滚至满额',
-  );
+  const entry = __test_getQuotaCache().get('adacc:c2c:ROLLBACK_M');
+  assert.ok(entry, '消耗后条目应存在');
+  assert.equal(entry!.count, 0, '发送失败后观测计数应回滚归零');
+  assert.ok((entry!.seq ?? 0) >= 1, 'seq 不回退（防同 msg_id+msg_seq 精确重复）');
 });
 
 // ── 诚实重建（显式锚点的 adapter 消耗路径）──

@@ -6,7 +6,7 @@
  */
 
 import type { TypingParams, TypingState } from './types-plugin.js';
-import { checkAndConsumePassiveReplyQuota, inferQQBotScope } from './features/quota-manager.js';
+import { checkPassiveReplyQuota, inferQQBotScope } from './features/quota-manager.js';
 
 const activeTypingSessions = new Map<string, TypingState>();
 
@@ -37,26 +37,24 @@ export async function startTypingWithRenewal(
     return;
   }
 
-  // 已知残余：typing 的平台侧 msg_seq 由 SDK sendInputNotify 准随机注入
-  // （无透传位），不受插件单调计数器控制——同 msg_id 上小概率与正文 seq
-  // （1..4/5）碰撞（单次 ~4/65536，失败自愈）；本次消耗会让计数器跳号
-  // （无害，见 AGENTS.md「出站被动优先」）。
-  const { canReply: canPassiveReply, rollback } = checkAndConsumePassiveReplyQuota({
+  // 锚点存活探测（不消耗——平台实测 typing 不占回复额度：2026-11-02 探针
+  // 20 次 typing + 5 次回复同 msg_id 全部送达）。typing 的平台侧 msg_seq
+  // 由 SDK sendInputNotify 准随机注入（无透传位），不受插件单调计数器控制
+  // ——同 msg_id 上小概率与正文 seq 碰撞（单次 ~4/65536，失败自愈）。
+  const anchorAlive = checkPassiveReplyQuota({
     accountId,
     msgId: replyToId,
     scope: 'c2c',
-    log,
   });
 
-  const msgIdToSend = canPassiveReply ? replyToId : undefined;
+  const msgIdToSend = anchorAlive ? replyToId : undefined;
 
-  if (!canPassiveReply) {
-    log?.debug?.(`[${accountId}] typing falling back to proactive mode: quota exhausted`);
+  if (!anchorAlive) {
+    log?.debug?.(`[${accountId}] typing falling back to proactive mode: anchor expired or dead`);
   }
 
   const sent = await sendTyping({ to, msgId: msgIdToSend });
   if (!sent) {
-    rollback();
     log?.debug?.(`[${accountId}] typing start failed: send failed`);
     return;
   }
@@ -103,25 +101,23 @@ async function handleTypingRenewal(
     return;
   }
 
-  // 已知残余：typing 的平台侧 msg_seq 由 SDK sendInputNotify 准随机注入
-  // （无透传位），不受插件单调计数器控制——同 msg_id 上小概率与正文 seq
-  // 碰撞（失败自愈）；消耗会让计数器跳号（无害）。
-  const { canReply: canPassiveReply, rollback } = checkAndConsumePassiveReplyQuota({
+  // 锚点存活探测（不消耗）——typing 的平台侧 msg_seq 由 SDK sendInputNotify
+  // 准随机注入（无透传位），不受插件单调计数器控制——同 msg_id 上小概率
+  // 与正文 seq 碰撞（失败自愈）。
+  const anchorAlive = checkPassiveReplyQuota({
     accountId,
     msgId: replyToId,
     scope: 'c2c',
-    log,
   });
 
-  const msgIdToSend = canPassiveReply ? replyToId : undefined;
+  const msgIdToSend = anchorAlive ? replyToId : undefined;
 
-  if (!canPassiveReply) {
-    log?.debug?.(`[${accountId}] typing renewal falling back to proactive mode: quota exhausted`);
+  if (!anchorAlive) {
+    log?.debug?.(`[${accountId}] typing renewal falling back to proactive mode: anchor expired or dead`);
   }
 
   const renewed = await sendTyping({ to, msgId: msgIdToSend });
   if (!renewed) {
-    rollback();
     log?.debug?.(`[${accountId}] typing renewal failed: send failed`);
     activeTypingSessions.delete(sessionKey);
     return;

@@ -15,7 +15,7 @@ import type { ResolvedQQBotAccount } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
 import { buildEnvelope } from './envelope-builder.js';
 import { assembleBody, type AssembledBody } from './body-assembler.js';
-import { sendText, getGateway, resolveQuotaAccountId } from '../outbound/outbound-service.js';
+import { sendText, getGateway } from '../outbound/outbound-service.js';
 import { sendMedia } from '../outbound/media-send.js';
 import { deliverReply, resolveMediaUrls, formatMediaFailureNotice, type DeliverPayload, type DeliverInfo, type DeliverContext } from '../outbound/deliver-pipeline.js';
 import { buildCtxPayload } from './ctx-builder.js';
@@ -23,7 +23,6 @@ import { buildCtxPayload } from './ctx-builder.js';
 import { DeliverDebouncer } from '../outbound/debounce.js';
 import { StreamingController, shouldUseStreaming } from '../outbound/streaming-controller.js';
 import { ProgressCardPublisher } from '../outbound/progress-card-publisher.js';
-import { getPassiveReplyQuotaRemaining } from '../features/quota-manager.js';
 import { getAdapters, type RuntimeAdapters } from '../adapter/resolve.js';
 import { clearGroupHistory, trimGroupHistoryAfterLastBot } from '../features/history-store.js';
 import {
@@ -940,8 +939,9 @@ export async function dispatchToOpenClaw(
   // agent 更新 progress_card 时把 checklist 快照作为独立 QQ 消息发送
   // （QQ 无消息编辑 API，做不到 telegram 的单条 draft 反复编辑）。
   // 启用条件：总开关 + scope 匹配（默认仅 c2c）+ 非 room_event（room_event
-  // 群框架本就不转发 plan 回调，这里是双保险）。卡片只走被动回复，
-  // 发送前探测剩余额度为最终回复保槽，绝不烧每日主动预算。
+  // 群框架本就不转发 plan 回调，这里是双保险）。卡片只走被动回复
+  // （passiveOnly，绝不烧每日主动预算）；反应式配额下无本地次数门，
+  // 锚点无存活时由 outbound 拦截丢弃。
   const progressCardConfig = resolveProgressCardConfig(account);
   const progressCardScopeMatch = envelope.chatScope === 'group'
     ? progressCardConfig.scope === 'group' || progressCardConfig.scope === 'both'
@@ -956,13 +956,6 @@ export async function dispatchToOpenClaw(
           replyToId: envelope.messageId,
           account,
           passiveOnly: true,
-        }),
-        quotaRemaining: () => getPassiveReplyQuotaRemaining({
-          // 与 sendText 预留配额同一账号键（含单账号回退），否则回退场景下
-          // 探测与记账错位，卡片会吃掉最终回复的被动配额槽
-          accountId: resolveQuotaAccountId(account.accountId),
-          msgId: envelope.messageId,
-          scope: envelope.chatScope === 'group' ? 'group' : 'c2c',
         }),
         signal: combinedAbortSignal,
         log: log?.child('progress-card'),
