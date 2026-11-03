@@ -44,6 +44,8 @@ async function replyToUser(
       accountId,
       msgId,
       scope: 'c2c',
+      // 透传 logger：超限观测 INFO 不因缺 logger 而丢失（评审 #86-F1）
+      log: ctx.log,
     });
     if (canReply) {
       try {

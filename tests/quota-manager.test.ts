@@ -2,7 +2,6 @@ import { strict as assert } from 'assert';
 import {
   checkPassiveReplyQuota,
   checkAndConsumePassiveReplyQuota,
-  rollbackPassiveReplyQuota,
   inferQQBotScope,
   clearQuotaCache,
   registerMsgIdWindow,
@@ -91,18 +90,60 @@ await test('超文档上限只打一次 INFO 观测日志', () => {
   assert.equal(infos.length, 1, '同一 msg_id 只打一次');
 });
 
-await test('rollbackPassiveReplyQuota: 只回滚观测计数（无阻断语义）', async () => {
+await test('观测标志不被无 logger 的消耗烧死（评审 #86-F1）', () => {
+  clearQuotaCache();
+  const accountId = 'test-account-obs2';
+  const msgId = 'test-msg-obs2';
+  const infos: string[] = [];
+
+  // 主出站路径形态：不传 logger——超限消耗不得置位一次性标志
+  for (let i = 0; i < 5; i++) {
+    checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
+  }
+  assert.equal(infos.length, 0);
+
+  // 之后带上 logger 的消耗（adapter 路径同 msg_id）：标志未被烧死，INFO 应发出
+  checkAndConsumePassiveReplyQuota({
+    accountId, msgId, scope: 'c2c',
+    log: { info: (m: string) => infos.push(m), debug: () => {} },
+  });
+  assert.equal(infos.length, 1, '无 logger 消耗不得烧死观测标志');
+
+  checkAndConsumePassiveReplyQuota({
+    accountId, msgId, scope: 'c2c',
+    log: { info: (m: string) => infos.push(m), debug: () => {} },
+  });
+  assert.equal(infos.length, 1, '发出后仍只一次');
+});
+
+await test('invalidate 不回截观测计数（评审 #86-F2）', () => {
+  clearQuotaCache();
+  const accountId = 'test-account-inv2';
+  const msgId = 'test-msg-inv2';
+  registerMsgIdWindow({ accountId, msgId, scope: 'c2c', receivedAt: Date.now() });
+  for (let i = 0; i < 6; i++) {
+    checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
+  }
+  invalidateMsgIdQuota({ accountId, msgId, scope: 'c2c' });
+  const entry = __test_getQuotaCache().get(`${accountId}:c2c:${msgId}`);
+  assert.ok(entry);
+  assert.equal(entry!.count, 6, '判死不得把超限观测计数回截到文档上限（保住证据）');
+  assert.equal(entry!.dead, true);
+});
+
+await test('rollback（闭包）：只回滚观测计数（无阻断语义）', async () => {
   clearQuotaCache();
   const accountId = 'test-account-rollback';
   const msgId = 'test-msg-rollback';
 
+  const first = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
   checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
-  checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
-  rollbackPassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
+  first.rollback(); // 模拟首次发送失败
 
   const entry = __test_getQuotaCache().get(`${accountId}:c2c:${msgId}`);
   assert.ok(entry);
   assert.equal(entry!.count, 1, '回滚应递减观测计数');
+  assert.equal(entry!.seq, 2, 'seq 不回退');
 });
 
 await test('checkPassiveReplyQuota: 无 msgId 时返回 false', async () => {
@@ -251,8 +292,9 @@ await test('invalidate 后 rollback 不得复活死锚点（dead 标记）', () 
   const { rollback } = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
   invalidateMsgIdQuota({ accountId, msgId, scope: 'c2c' });
   rollback();
-  rollbackPassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
+  // 判死后的消耗直接拒绝（rollback 为 no-op，复活不了）
   const again = checkAndConsumePassiveReplyQuota({ accountId, msgId, scope: 'c2c' });
+  again.rollback();
   assert.equal(again.canReply, false, '死锚点经回滚不得复活');
   assert.equal(checkPassiveReplyQuota({ accountId, msgId, scope: 'c2c' }), false);
 });
