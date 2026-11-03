@@ -8,12 +8,15 @@
 
 ---
 
-## [未发布]
+## [4.0.1] - 2026-11-03
 
 ### 变更
 
 - **typing 本轮停发——永不占用主动消息额度**。此前 typing（msg_type=6）在锚点不可用（TTL 过期 / 平台判死）时**降级为不带 msg_id 的主动形态**继续续期，与「主动额度留给正文与前置消息」的意图相悖。现改为：锚点不可用 ⇒ **本轮停发**（turn 内中间件 `src/middleware/typing.ts` 与心跳路径 `src/typing-lifecycle.ts` 同口径；框架出站适配器 `canSendTyping` 本就是「不可用即 false」）。平台当场拒收 typing（`40034005` msg_id 已过期 / `40034128` 次数超限）同样停发，并 `invalidateMsgIdQuota` 标记死锚点 —— 该 msg_id 本轮后续消息一律不得走被动回复（转主动）。新共享判定 `ANCHOR_DEAD_CODES` / `isAnchorDeadError` / `isAnchorDeadBizCode` 落在 `src/features/quota-manager.ts`（单一事实源）。**行为代价**：长 turn（>60min）或锚点失效后用户不再看到「正在输入」指示器（平台无取消 API，已在客户端停留的指示器最多再显示到 60s 上限）。
 - **进度卡片锚点失效时降级主动发送**。卡片此前只走被动回复（`passiveOnly`），锚点无存活时 outbound 返回 `passive-quota-exhausted` → **本轮卡片全停、用户完全看不到进度**。按「前置消息」口径改为：**先走被动；锚点无存活或平台判死（40034005/40034128）⇒ 降级为主动发送一次**（计入每日 1000 条主动预算，用户仍能看到进度），降级状态**本轮记忆**（后续快照直接走主动，不重复被动尝试与刷 WARN）。底层 `sendText(passiveOnly)` 语义不变（网关层永不降级主动），是卡片发布器上层通过 `allowActiveFallback` 请求降级。**代价**：锚点死亡的 turn 会消耗主动预算（仅此场景）。
+
+### 修复
+
 - **修复：`SendResult.qqBizCode` 永远为空**。`formatError` 只识别 `qqBizCode` 字段，而 SDK `ApiError` 的业务码字段名是 `bizCode` ⇒ 上层拿不到平台拒绝的业务码，无法区分「平台判死锚点」与「一般平台错误」。已补齐透传（保留既有字段名，向后兼容）。
 
 ### 守卫
