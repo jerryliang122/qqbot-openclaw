@@ -125,13 +125,13 @@ async function main(): Promise<void> {
     clearQuotaCache();
   });
 
-  // 测试 4: 配额管理器达到上限
-  await test('checkAndConsumePassiveReplyQuota 达到配额上限', async () => {
+  // 测试 4: 反应式配额——超文档上限不阻断（平台实测不执行 4/5 次口径）
+  await test('checkAndConsumePassiveReplyQuota 超文档上限仍放行（反应式）', async () => {
     const { checkAndConsumePassiveReplyQuota, clearQuotaCache } = await import('../src/features/quota-manager.js');
     
     clearQuotaCache();
     
-    // C2C 配额限制为 4 次
+    // 文档口径 C2C 4 次——前 4 次正常
     for (let i = 0; i < 4; i++) {
       const result = await checkAndConsumePassiveReplyQuota({
         accountId: 'test',
@@ -142,7 +142,7 @@ async function main(): Promise<void> {
       assert.ok(result.canReply, `第 ${i + 1} 次应该成功`);
     }
     
-    // 第 5 次应该失败
+    // 第 5 次超文档上限仍放行（count 仅观测），且继续发号 seq
     const result5 = await checkAndConsumePassiveReplyQuota({
       accountId: 'test',
       msgId: 'MSG_2',
@@ -150,7 +150,8 @@ async function main(): Promise<void> {
       log: { debug: () => {} },
     });
     
-    assert.ok(!result5.canReply, '达到配额上限应该失败');
+    assert.ok(result5.canReply, '反应式：超文档上限不阻断（平台实测不执行）');
+    assert.ok(result5.seq >= 5, '超限后仍要发新 msg_seq（40054005 唯一性）');
     
     clearQuotaCache();
   });

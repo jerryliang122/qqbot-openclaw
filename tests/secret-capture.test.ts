@@ -593,17 +593,16 @@ await test('执行失败 → 失败回执含原因 + 退出码，不触发 reloa
   assert.equal(findPendingSecretInput(ACCT, USER), undefined);
 });
 
-await test('quota 耗尽 → 降级主动发送（无 msgId）', async () => {
+await test('锚点判死 → 降级主动发送（无 msgId；反应式下次数不阻断）', async () => {
   clearPendingSecretInputs();
   registerPendingSecretInput(makePending('QUOTA_KEY', 'env'));
   const msgId = 'm-quota';
-  // 预先耗尽该 msgId 的 4 次被动配额
-  const { checkAndConsumePassiveReplyQuota } = await import(
+  // 反应式（2026-11-03）：count 不再阻断——改用判死锚点触发降级
+  const { registerMsgIdWindow, invalidateMsgIdQuota } = await import(
     '../src/features/quota-manager.js'
   );
-  for (let i = 0; i < 4; i += 1) {
-    checkAndConsumePassiveReplyQuota({ accountId: ACCT, msgId, scope: 'c2c' });
-  }
+  registerMsgIdWindow({ accountId: ACCT, msgId, scope: 'c2c', receivedAt: Date.now() });
+  invalidateMsgIdQuota({ accountId: ACCT, msgId, scope: 'c2c' });
   const h = makeCtx({ content: 'val', msgId });
   const mw = secretCapture({
     accountId: ACCT,

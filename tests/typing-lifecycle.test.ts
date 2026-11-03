@@ -50,19 +50,20 @@ await test('startTypingWithRenewal: 启动 typing with passive mode', async () =
   assert(sendTypingCalls[0].msgId === 'msg-1', 'Should send with msgId in passive mode');
   assert(isTypingActive('test-account', 'msg-1') === true, 'Should be active');
 
+  // 反应式（2026-11-03）：typing 不占回复额度（平台实测），纯存活探测——
+  // 不创建配额条目、不消耗 count、不发号
   const cache = __test_getQuotaCache();
-  const quotaKey = 'test-account:c2c:msg-1';
-  const quotaState = cache.get(quotaKey);
-  assert(quotaState?.count === 1, 'Should consume quota');
+  assert(!cache.has('test-account:c2c:msg-1'), 'typing 不应创建配额条目');
 });
 
-await test('startTypingWithRenewal: fallback to proactive mode when quota exhausted', async () => {
+await test('startTypingWithRenewal: fallback to proactive mode when anchor dead', async () => {
   cleanupAllTyping();
   clearQuotaCache();
   sendTypingCalls = [];
 
+  // 反应式：次数不阻断——判死锚点（平台 40034005/40034128）才降级主动
   const cache = __test_getQuotaCache();
-  cache.set('test-account:c2c:msg-2', { count: 4, expiresAt: Date.now() + 60000 });
+  cache.set('test-account:c2c:msg-2', { count: 2, seq: 2, expiresAt: Date.now() + 60000, dead: true });
 
   const params = {
     accountId: 'test-account',

@@ -7,7 +7,7 @@
  * 2. room_event turn：sourceReplyDeliveryMode='message_tool_only'、群 admission=exclusive
  *    且无 abortSignal（不打断）。
  * 3. 出站被动优先：有新鲜 msg_id → 被动（带 msgId）；配额耗尽（群 5 次/msg_id）
- *    → 第 6 次降级主动而非报错；静群（无缓存）→ 直接主动；主动计数正确。
+ *    → 反应式：全程被动（次数上限不本地阻断）；静群（无缓存）→ 直接主动；主动计数正确。
  *
  * 运行方式: npx tsx tests/room-event.test.ts
  */
@@ -334,7 +334,7 @@ await test('无显式 msgId → 主动发送（即使缓存里有新鲜锚点也
   assert.equal(sends[0]!.target.msgId, undefined, '无显式锚点应主动发送，不得挂缓存 msg_id');
 });
 
-await test('同 msg_id 连续 6 次群发送：第 6 次降级主动（无 msgId）而非报错', async () => {
+await test('同 msg_id 连续 6 次群发送：全程被动（反应式——群 5 次文档上限不再本地阻断）', async () => {
   const { sends } = installFakeGateway();
   cacheMsgId('group', 'GROUP_Q2', 'INBOUND_MSG_2');
   const { sendText } = await import('../src/outbound/outbound-service.ts');
@@ -344,10 +344,12 @@ await test('同 msg_id 连续 6 次群发送：第 6 次降级主动（无 msgId
     assert.ok(!result.error, `第 ${i} 次发送不应报错: ${result.error}`);
   }
   assert.equal(sends.length, 6);
-  // 群配额 5 次/msg_id：前 5 次被动（带 msgId），第 6 次主动（无 msgId）
+  // 反应式（2026-11-03）：平台实测不执行「群 5 次/msg_id」上限，count 仅观测
+  // ——6 次全部被动（带 msgId），且 msg_seq 单调发号（40054005 唯一性）
   const withMsgId = sends.filter((s) => s.opts?.msgId).length;
-  assert.equal(withMsgId, 5, `应 5 次被动，实际 ${withMsgId}`);
-  assert.equal(sends[5]!.opts?.msgId, undefined, '第 6 次应降级主动');
+  assert.equal(withMsgId, 6, `应 6 次全程被动，实际 ${withMsgId}`);
+  const seqs = sends.map((s) => s.opts?.msgSeq).filter((v): v is number => typeof v === 'number');
+  assert.deepEqual(seqs, [1, 2, 3, 4, 5, 6], 'msg_seq 应单调发号（超文档上限后仍不可重复）');
 });
 
 await test('静群（无缓存 msg_id）→ 直接主动发送并计数', async () => {
