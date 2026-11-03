@@ -17,6 +17,7 @@
 
 ### 变更
 
+- **Progress card 支持 note 形态（markdown-only 卡片）**。openclaw 的 `progress_card` 工具支持 markdown/plan 双输入，且框架引导把 markdown 列为**首选形态**（可测量工作 prefer a leading progress bar；暂停/阻塞状态明确指示 in markdown and omit plan）——但框架投影把 markdown-only 卡片投影为 `{steps: [], explanation: <剥格式纯文本单行>}`，此前发布器把 `steps=[]` 一律当「清卡」静默丢弃，导致 agent 越遵循引导、QQ 用户越看不到卡片内容。现按 `steps=[] && explanation 非空` 判定为 note 形态，渲染 `📋 状态` 头 + note 文本（截断 300 字符）发送；去重/防抖/maxPerTurn/清卡抑制（`steps=[]` 且无 explanation）全部复用既有管线。note ↔ checklist ↔ 清卡三态互转自然工作。已知限制（插件侧无解）：混合形态（plan+markdown）的 markdown 叙事在框架投影层就被丢弃，插件只能收到 steps + 自动计数。
 - **反应式被动配额——本地不再按「次数」阻断被动发送**。依据 2026-11-02 探针实测（官方 WebSocket 收 C2C + 撤回接口自证）：平台**不执行**文档口径的「私聊 4 次/msg_id、群 5 次/msg_id」上限——同一 msg_id 连发 25 次被动回复全部 HTTP 200 且真实送达，25s 慢速间隔复测同样全过；typing（msg_type=6）也不占回复额度。此前本地 preemptive 阻断（配额计数满 → 降级主动）等于替平台做决定：逼正文降级主动、白烧每日 1000 条/关系主动预算，进度卡还会被「保槽」逻辑静默跳过。现模型：① **count 降为观测**——`checkAndConsumePassiveReplyQuota` 超文档上限照常放行，仅打一次 INFO 留证（每 msg_id 一次，`overLimitLogged`）；② **本地保留两个平台真实硬约束**——TTL 窗口预检（c2c 60min/群 5min，40034005 确定性拒绝，预检省一次必败请求）与 msg_seq 单调发号（40054005 唯一性，不可跳过）；③ **平台真拒绝时兜底**——40034005/40034128 死锚点「剔除 + 同内容转主动重发一次」机制不变（这即「反应式」的落地形态）。连带清理：typing 三处（中间件/续期/探测）改为纯锚点存活探测，不再消耗计数、不再让 seq 跳号；`getPassiveReplyQuotaRemaining` 与 `resolveQuotaAccountId` 删除（唯一消费方是已退役的保槽探测）。红线记入 `AGENTS.md`：**禁止把 count 上限改回 preemptive 阻断**。守卫：`tests/quota-manager.test.ts`（超限放行 + 一次性观测日志 + 超限后 seq 仍单调）、`tests/typing-indicator.test.ts`（typing 不建配额条目、判死降级）、`tests/passive-anchor-policy.test.ts`、`tests/progress-card.test.ts` 更新。
 
 ---

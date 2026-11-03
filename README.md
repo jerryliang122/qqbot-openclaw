@@ -1038,7 +1038,7 @@ OpenClaw agents can maintain a session-level progress card (the `progress_card` 
 ▢ 清理临时文件
 ```
 
-QQ has no message-editing API (Telegram renders the same feature by repeatedly editing one draft message), so each update arrives as a new message. Snapshots are **passive-only**: they reply to the triggering message and never burn the daily proactive budget — if the reply anchor is no longer usable (expired/dead), snapshots are simply dropped. Publishing also stops once the final answer starts delivering, so a card never lands after the answer.
+QQ has no message-editing API (Telegram renders the same feature by repeatedly editing one draft message), so each update arrives as a new message. Both card forms are delivered: checklists render as `📋 进度 N/M` snapshots, and markdown-only notes (the framework's preferred form for measurable/blocked work) arrive as `📋 状态` plain-text messages, truncated to 300 chars. Snapshots are **passive-only**: they reply to the triggering message and never burn the daily proactive budget — if the reply anchor is no longer usable (expired/dead), snapshots are simply dropped. Publishing also stops once the final answer starts delivering, so a card never lands after the answer.
 
 ```json
 {
