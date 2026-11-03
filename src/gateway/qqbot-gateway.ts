@@ -29,9 +29,9 @@ import { recordOutboundMessageId } from '../features/outbound-echo-store.js';
 import { recordOutboundToGroupHistory } from '../features/history-store.js';
 import { resolveGroupConfigFromAccount } from '../config.js';
 import { resolveGroupRoomEventPolicy } from '../features/room-event.js';
-import { checkAndConsumePassiveReplyQuota, invalidateMsgIdQuota } from '../features/quota-manager.js';
+import { invalidateMsgIdQuota } from '../features/quota-manager.js';
 import { recordProactiveSend } from '../features/proactive-budget.js';
-import { selectMsgIdForPassiveReply, evictMsgId, peekMsgIdReceivedAt } from '../features/msgid-cache.js';
+import { evictMsgId } from '../features/msgid-cache.js';
 import { notifyOutboundMessageSent } from '../features/typing-refresh.js';
 import { installWebhookDispatchTracking, makeTrackedListener } from '../features/webhook-dispatch-tracker.js';
 
@@ -223,7 +223,7 @@ export class QQBotGateway {
   }
 
   async sendText(target: ReplyTarget, text: string, opts?: SendOptions): Promise<MessageResponse> {
-    const { target: resolved, msgSeq, rollback } = this.attachMsgIdWithQuota(target, opts);
+    const { target: resolved, msgSeq, rollback } = this.resolveOutboundAnchor(target, opts);
     if (!resolved.msgId) recordProactiveSend(this.account.accountId);
     const keyboard = opts?.keyboard;
     try {
@@ -323,7 +323,7 @@ export class QQBotGateway {
     source: string,
     opts?: SendOptions & { fileType?: MediaFileType },
   ): Promise<MessageResponse> {
-    const { target: resolvedTarget, rollback } = this.attachMsgIdWithQuota(target, opts);
+    const { target: resolvedTarget, rollback } = this.resolveOutboundAnchor(target, opts);
     if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
     const fileType = opts?.fileType ?? MediaFileType.IMAGE;
     const sourceOpts = resolveMediaSource(source);
@@ -358,7 +358,7 @@ export class QQBotGateway {
     source: { url?: string; base64?: string; localPath?: string },
     opts?: SendOptions,
   ): Promise<MessageResponse> {
-    const { target: resolvedTarget, rollback } = this.attachMsgIdWithQuota(target, opts);
+    const { target: resolvedTarget, rollback } = this.resolveOutboundAnchor(target, opts);
     if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
 
     const send = (dst: ReplyTarget, label: string) =>
@@ -401,7 +401,7 @@ export class QQBotGateway {
     source: string,
     opts?: SendOptions,
   ): Promise<MessageResponse> {
-    const { target: resolvedTarget, rollback } = this.attachMsgIdWithQuota(target, opts);
+    const { target: resolvedTarget, rollback } = this.resolveOutboundAnchor(target, opts);
     if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
     const sourceOpts = resolveMediaSource(source);
     const send = (dst: ReplyTarget, label: string) =>
@@ -435,7 +435,7 @@ export class QQBotGateway {
     source: string,
     opts?: SendOptions & { fileName?: string },
   ): Promise<MessageResponse> {
-    const { target: resolvedTarget, rollback } = this.attachMsgIdWithQuota(target, opts);
+    const { target: resolvedTarget, rollback } = this.resolveOutboundAnchor(target, opts);
     if (!resolvedTarget.msgId) recordProactiveSend(this.account.accountId);
     const sourceOpts = resolveMediaSource(source);
     const send = (dst: ReplyTarget, label: string) =>
@@ -634,43 +634,33 @@ export class QQBotGateway {
   }
 
   /**
-   * 配额感知的 msg_id 挂接（被动优先，旧配额优先选取）。
+   * 出站锚点解析（显式锚点 or 主动，2026-11-03 移除池化选取）。
    *
    * - 显式 msgId（opts.msgId）：上游 adapter/service 已做配额记账与发号
-   *   （quotaReserved 链），直接透传（msgSeq 一并透传），不重复消费。
-   * - 无显式 msgId：selectMsgIdForPassiveReply 按接收时间从旧到新选第一条
-   *   「平台窗口未过期 且 剩余额度 > 0」的候选（旧配额先用先耗尽，为最新
-   *   消息保留完整额度）；选中后原子消耗并发号 msg_seq。
-   * - 无候选/配额耗尽：不挂（降级主动）；API 抛错时由调用方 rollback
-   *   释放已扣减的额度。
+   *   （quotaReserved 链），直接透传（msgSeq 一并透传）。
+   * - 无显式 msgId：**不挂锚点**，主动发送（调用方 recordProactiveSend
+   *   计入每日预算）。
+   *
+   * 红线：**禁止重新引入「从缓存挑 msg_id」的池化选取**。平台语义上携带
+   * msg_id 的被动消息 = 「对用户消息的回复」（官方《消息收发概述》），把
+   * 无上下文发送挂到更早的入站消息上，等于把回复引用挂到错误的消息——
+   * 此前的池化选取（旧配额优先，为省主动预算）正是这个缺陷，已移除。
    */
-  private attachMsgIdWithQuota(
+  private resolveOutboundAnchor(
     target: ReplyTarget,
     opts?: SendOptions,
   ): { target: ReplyTarget; msgSeq?: number; rollback: () => void } {
     if (opts?.msgId) {
       return { target: { ...target, msgId: opts.msgId }, msgSeq: opts.msgSeq, rollback: () => {} };
     }
-    const candidate = selectMsgIdForPassiveReply({
-      accountId: this.account.accountId,
-      scope: target.scope,
-      targetId: target.targetId,
-    });
-    if (!candidate) return { target, rollback: () => {} };
-
-    const reservation = checkAndConsumePassiveReplyQuota({
-      accountId: this.account.accountId,
-      msgId: candidate,
-      scope: target.scope,
-      // 诚实重建：配额条目被容量控制淘汰时按真实接收时刻重建窗口
-      receivedAt: peekMsgIdReceivedAt(target.scope, target.targetId, candidate),
-    });
-    if (!reservation.canReply) {
-      // INFO：降级主动消耗每日预算，是出站行为的可观测分界点
-      this.log.info?.(`[quota] passive quota exhausted for msgId=${candidate}; falling back to proactive send`);
-      return { target, rollback: () => {} };
+    // 显式锚点只认 opts.msgId：调用方挂在 target 上的裸 msgId 一律剥离
+    // （那会绕过配额记账与 msg_seq 发号，成为不受控被动发送——Sourcery
+    // 评审 #85 意见 1）。需要被动回复的调用方必须走 opts.msgId（quotaReserved
+    // 链）或 SDK 直发（access-notice/secret-capture 惯例，自担配额）。
+    if (target.msgId !== undefined) {
+      return { target: { ...target, msgId: undefined }, rollback: () => {} };
     }
-    return { target: { ...target, msgId: candidate }, msgSeq: reservation.seq, rollback: reservation.rollback };
+    return { target, rollback: () => {} };
   }
 
   /**

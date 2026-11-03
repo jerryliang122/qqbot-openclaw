@@ -63,6 +63,10 @@ import {
   getBotForAccount,
 } from "../bot-instance.js";
 import { resolveQQBotAccount } from "../config.js";
+// 主动直发记账：本模块的两个直发 helper 绕过网关（bot.sendText SDK 直达），
+// 若不在此记账，/bot-group-info 的每日主动预算会低估真实发送量
+// （Sourcery 评审 #85 意见 3）。与网关口径一致：发送尝试即计数。
+import { recordProactiveSend } from "./proactive-budget.js";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 
 // ============ 用户存储管理 ============
@@ -319,6 +323,7 @@ export async function sendProactive(
     // 如果有图片，先发送图片
     if (imageUrl) {
       try {
+        recordProactiveSend(account.accountId);
         await bot.sendImage(target, { url: imageUrl });
         log.info(`Sent image to ${type}:${to}`);
       } catch (err) {
@@ -334,6 +339,7 @@ export async function sendProactive(
       };
     }
 
+    recordProactiveSend(account.accountId);
     const result = await bot.sendText(target, text);
     log.info(`Sent message to ${type}:${to}, id: ${result.id}`);
     
@@ -473,6 +479,7 @@ export async function sendProactiveMessageDirect(
   try {
     const bot = getBotForAccount(account.accountId);
     const target = { scope: type, targetId: to };
+    recordProactiveSend(account.accountId);
     const result = await bot.sendText(target, text);
     
     return {

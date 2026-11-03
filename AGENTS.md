@@ -153,7 +153,7 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 
 ### 出站与配额（[详情](docs/agents/outbound-and-quota.md)）
 
-- **出站被动优先（保 1000 条/天主动预算）**——被动锚点的选取/消耗/发号收敛到网关 `attachMsgIdWithQuota` 单点。无显式锚点时按接收时间**从旧到新**取候选（旧配额先用先耗尽）。
+- **出站锚点模型：显式锚点 or 主动（2026-11-03 移除池化选取）**——挂 msg_id 的被动消息在平台语义上是「对用户消息的回复」，锚点必须来自显式回复意图。网关 `resolveOutboundAnchor` 只透传显式 `opts.msgId`；**无显式锚点（message 工具不带 replyTo、remind/cron、框架直发）一律走主动发送**（烧每日预算）。**红线：禁止重新引入「从缓存挑 msg_id」的池化选取**——它会把回复引用挂到更早的错误消息上（历史演进 7a59a2c→bbed520→e3e2be7 为省预算引入，已按平台语义移除；代价：1000 条/天预算消耗、用户关「允许主动发送」时该类消息拒发）。
 - **锚点失效兜底**：被动发送被平台 **40034005**（过期）/ **40034128**（超限）确定性拒绝 → rollback + 驱逐 + 标记 dead → 同内容**转主动重发一次**。网络错（`httpStatus===0`，结果不明）**不重发**（有重复风险）。`passiveOnly` 发送（progress card）**不做主动重发**。
 - **QQ 语音投递口径以「体积」为准，不是「时长」**——平台文档里没有任何语音时长限制，「60 秒以内是语音条」是相关性错觉。格式只认 silk/mp3/wav/ogg 四种；超 20MB 软限制由 `resolveOutboundMediaKind` **显式**降级为文件投递。
 - **表情表态仅频道支持**（单聊/群聊 ❌），故 `capabilities.reactions: false` 是对的。
@@ -173,7 +173,7 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 ### 入站（[详情](docs/agents/inbound.md)）
 
 - **c2c 入站防抖合并**——配置优先级 `channels.qqbot.inboundDebounce.debounceMs`（0=关闭）→ 框架 `messages.inbound.byChannel.qqbot` → 默认 3000。**三类旁路必须在 `shouldDebounce` 内返回 false**（而非 enqueue 早退）：控制命令、斜杠命令、ask_user keyed 答案。**旁路不能被运行中的 turn 阻塞**——框架 enqueue 对旁路项会排队等 in-flight 任务链 settle，插嘴语义完全失效。
-- **白名单拒绝必须回告，不能静默丢弃**——c2c 恒回告（带被拒者自己的 OpenID + 配置路径），群仅在被 @ / 引用 bot 时回告（群提示是公开广播）。**`disabled` 是管理员显式拉下的总闸，此时保持静默**。@/引用判定必须与 mentionGate 同源（`isQuoteOfBotMessage` 共用）。发送锚点取自 `ctx.replyTarget.msgId`——**绝不能改走网关 `attachMsgIdWithQuota`**（会挑到更早的缓存锚点或降级主动，等于把每日主动预算暴露给刷屏者）。
+- **白名单拒绝必须回告，不能静默丢弃**——c2c 恒回告（带被拒者自己的 OpenID + 配置路径），群仅在被 @ / 引用 bot 时回告（群提示是公开广播）。**`disabled` 是管理员显式拉下的总闸，此时保持静默**。@/引用判定必须与 mentionGate 同源（`isQuoteOfBotMessage` 共用）。发送锚点取自 `ctx.replyTarget.msgId`（被拒消息自身，SDK 直发不占配额记账）——**保持 SDK 直发、不改走网关**（历史上池化时代网关会挑到更早的缓存锚点；池化已移除，但直发语义依旧正确）。
 - **入站事件守卫**拦三类非真实用户输入：出站回声（`skipSelfEcho` 必须 true）、重复推送（补 30min 长窗口，SDK 内置仅 5s）、空内容事件（**带 msg_elements 的 103 引用/转发必须放行**）。
 - **入站语音走框架转录管线**——配置只认框架 `tools.media.models`（**不是 `tools.media.audio.models`**），严格信框架：失败一律占位不回退平台转写。**平台转写来源的语音元数据整体静默**（正文已含全文，渲染会逐字重复）。`channels.qqbot.stt` 整块废弃被忽略。
 - **三层限流默认开**——sender 20/min、group 60/min、global 300/min。room_event 群务必保持启用。

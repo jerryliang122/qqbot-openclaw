@@ -163,7 +163,7 @@ function installFakeGateway() {
 /**
  * 原型构造真实 QQBotGateway（绕开 constructor 里的 new QQBot——那会触发
  * token 预取等副作用），手动注入 fake bot 与账号，用于测网关层逻辑
- * （attachMsgIdWithQuota 配额感知挂接 / 主动计数 / 失败回滚）。
+ * （resolveOutboundAnchor 显式锚点透传 / 主动计数 / 失败回滚）。
  */
 function installRealGatewayMethods(account: any) {
   const sends: Array<{ target: any; opts?: any }> = [];
@@ -180,7 +180,7 @@ function installRealGatewayMethods(account: any) {
     },
     sendText: async (target: any, _text: string) => {
       sends.push({ target, opts: undefined });
-      // target.msgId 由 attachMsgIdWithQuota 决定，记录最终形态
+      // target.msgId 由 resolveOutboundAnchor 决定，记录最终形态
       sends[sends.length - 1]!.target = target;
       return { id: `out-${sends.length}`, timestamp: Date.now() };
     },
@@ -314,23 +314,24 @@ await test('群聊 turn 不传 abortSignal（不打断正在处理的任务）',
   assert.equal(lifecycle.abortSignal, undefined);
 });
 
-group('出站被动优先（保 1000/天主动预算）');
+group('出站锚点：显式锚点 or 主动（池化已移除）');
 
-await test('网关无显式 msgId 时优先挂缓存 msg_id（被动）', async () => {
+await test('无显式 msgId → 主动发送（即使缓存里有新鲜锚点也不选池）', async () => {
   const account = makeAccount();
   const { sends } = installRealGatewayMethods(account);
-  // 刷新该群 msgid-cache（模拟刚收到群消息）
+  // 该群 msgid-cache 里有新鲜锚点（模拟刚收到群消息）——2026-11-03 起
+  // 无显式锚点**不得**挂它（挂 msg_id = 对该消息的回复，选池=挂错引用）
   cacheMsgId('group', 'GROUP_Q', 'INBOUND_MSG_1');
   const { sendText } = await import('../src/outbound/outbound-service.ts');
   const result = await sendText({
     to: 'qqbot:group:GROUP_Q',
     text: 'hello',
     account,
-    // 不传 replyToId —— 走网关 attachMsgIdWithQuota 的 msgid-cache 兜底
+    // 不传 replyToId —— 走主动发送（网关不再从缓存选锚点）
   });
   assert.ok(!result.error, `unexpected error: ${result.error}`);
   assert.equal(sends.length, 1);
-  assert.equal(sends[0]!.target.msgId, 'INBOUND_MSG_1', '应挂缓存 msg_id 走被动回复');
+  assert.equal(sends[0]!.target.msgId, undefined, '无显式锚点应主动发送，不得挂缓存 msg_id');
 });
 
 await test('同 msg_id 连续 6 次群发送：第 6 次降级主动（无 msgId）而非报错', async () => {
@@ -358,7 +359,7 @@ await test('静群（无缓存 msg_id）→ 直接主动发送并计数', async 
   const result = await sendText({ to: 'qqbot:group:GROUP_QUIET', text: 'hi', account });
   assert.ok(!result.error, `unexpected error: ${result.error}`);
   assert.equal(sends.length, 1);
-  assert.equal(sends[0]!.target.msgId, undefined, '无缓存应不带 msg_id（主动）');
+  assert.equal(sends[0]!.target.msgId, undefined, '无显式锚点应不带 msg_id（主动）');
   assert.equal(getProactiveUsage('test-account').count, before + 1, '主动发送应计数');
 });
 

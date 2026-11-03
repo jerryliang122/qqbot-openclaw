@@ -21,18 +21,17 @@
  *    「每条都回」；无节流时陌生者可把 bot 当回声板持续刷屏，并在锚点缺失时
  *    逐条消耗每日 1000 条主动预算。
  *
- * 发送通道：**被动回复锚点取自 `ctx.replyTarget.msgId`，不是 msgid-cache**。
- * SDK 在 `handleInboundMessage` 里先 `deriveReplyTarget(raw)` 把入站
+ * 发送通道：**被动回复锚点取自 `ctx.replyTarget.msgId`**（SDK 直发，不经
+ * 网关）。SDK 在 `handleInboundMessage` 里先 `deriveReplyTarget(raw)` 把入站
  * `messageId` 挂到 replyTarget 上，再 `createMiddlewareContext`、最后才组链
  * （`chain = [...middlewares, downstream]`，`downstream` 才是 emit("message")），
- * 因此**中间件运行前 replyTarget.msgId 已经就位**。
+ * 因此**中间件运行前 replyTarget.msgId 已经就位**——锚点就是被拒消息自身
+ * 的 msg_id，不占配额记账。
  *
- * 关键反直觉点：**被拒消息的 msg_id 并不在 msgid-cache 里**——插件的
- * `cacheMsgId` 挂在 `bot.on('message')`（即链尾的 downstream，经
- * `handleMessage` 调用），而 `ctx.stop()` 不调 `next()` 会让 `runMiddlewareChain`
- * 直接 return，downstream 根本不执行。故提示**不能**改走网关的
- * `attachMsgIdWithQuota`：它从 msgid-cache 选锚点，会挑到更早的缓存 msg_id，
- * 或无候选时降级主动——等于把每日 1000 条预算暴露给刷屏者。
+ * 历史注（池化已移除，2026-11-03）：这里曾刻意不走网关——当时网关的
+ * 池化选取会挑到更早的缓存 msg_id 或降级主动，把每日预算暴露给刷屏者。
+ * 现行模型「显式锚点 or 主动」下该隐患不复存在，但 SDK 直发行为保持
+ * 不变（锚点语义正确且不引入网关超时包装）。
  */
 import { isQuoteOfBotMessage } from './ref-index-store.js';
 

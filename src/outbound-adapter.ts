@@ -7,9 +7,9 @@
  * - createQQBotOutboundAdapter —— 内部配额包装（sendTextWithQuota / sendMediaWithQuota），
  *   供中间件/流式路径使用（显式锚点在此消耗配额并经 quotaReserved 链下传 msgSeq）；
  * - createQQBotChannelOutbound —— 框架 ChannelOutboundAdapter 契约入口
- *   （sendText / sendMedia / chunker / sanitizeText 等）。无显式 ctx.replyToId
- *   时不再做缓存兜底选取——被动锚点的选取（旧配额优先）/消耗/发号统一
- *   收敛到网关 attachMsgIdWithQuota 单点。
+ *   （sendText / sendMedia / chunker / sanitizeText 等）。无显式
+ *   ctx.replyToId 时不做任何锚点兜底——网关只透传显式锚点，无锚点一律
+ *   主动发送（显式锚点 or 主动模型，2026-11-03 移除池化选取）。
  *   openclaw 的 channel-selection 通过 outbound.sendText（或 message.send.text /
  *   deliveryMode === "gateway"）判定通道可用，缺失会导致
  *   "Channel is unavailable: qqbot"。
@@ -314,9 +314,10 @@ function readQQBotKeyboardFromChannelData(
 /**
  * 显式锚点透传：框架给的 ctx.replyToId（turn 回复锚点）原样透传。
  *
- * 无显式锚点时（message 工具 / 框架直发路径）返回 undefined——被动锚点的
- * 选取（旧配额优先）、配额消耗与 msg_seq 发号统一收敛到网关
- * attachMsgIdWithQuota 单点完成（账号键含单账号回退，与记账一致）。
+ * 无显式锚点时（message 工具 / 框架直发路径）返回 undefined——网关侧
+ * **不挂锚点、走主动发送**（显式锚点 or 主动模型，2026-11-03 移除池化
+ * 选取：挂 msg_id 在平台语义上=「对用户消息的回复」，池化锚点会把回复
+ * 挂到错误的消息上）。
  */
 function resolveExplicitReplyToId(explicitReplyToId?: string | null): string | undefined {
   return explicitReplyToId ?? undefined;

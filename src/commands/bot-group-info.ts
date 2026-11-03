@@ -78,7 +78,7 @@ export function botGroupInfo(account: ResolvedQQBotAccount, getRuntime?: () => a
         `历史缓存：${cfg.historyLimit} 条（0=禁用，模式 ${cfg.historyMode === 'rolling' ? 'rolling（bot 发言计入）' : 'clear（回复后清空）'}）`,
         `工具策略：${cfg.toolPolicy}`,
         '',
-        `今日主动消息用量：${usage.count}/${usage.limit}（被动回复不计数；异常增长说明 msgid-cache 常过期或被动配额常耗尽）`,
+        `今日主动消息用量：${usage.count}/${usage.limit}（被动回复不计数；message 工具无引用、定时提醒等无锚点发送按设计走主动）`,
       ].join('\n');
     },
   };

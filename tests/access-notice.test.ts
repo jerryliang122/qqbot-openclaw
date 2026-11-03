@@ -447,10 +447,11 @@ await test('提示走被动锚点：原样传 ctx.replyTarget（不改走网关�
   const h = makeCtx({ c2cMode: 'allowlist', allowFrom: [ALLOWED] }, { senderId: 'ANCHOR_USER', msgId: 'mm-1' });
   await mw(h.ctx as never, (async () => h.setNext(true)) as never);
   assert.equal(h.sent.length, 1);
-  // 被拒消息的 msg_id 不在 msgid-cache 里（cacheMsgId 挂在链尾 downstream，
-  // ctx.stop 不调 next() 时不执行），故只能靠 SDK 组链前挂好的
-  // ctx.replyTarget.msgId。断言「原对象透传 + msgId 未被替换」：一旦有人把
-  // 提示改走 attachMsgIdWithQuota（从 cache 选锚点），此用例即失效。
+  // 提示经 SDK 直发（ctx.bot.sendText），锚点是 SDK 组链前挂好的
+  // ctx.replyTarget.msgId（= 本条被拒消息自身）。断言「原对象透传 + msgId
+  // 未被替换」：一旦有人把提示改走网关（会丢掉自身锚点/引入配额记账），
+  // 此用例即失效。（历史上的池化隐患——网关会挑到更早的缓存 msg_id——
+  // 已随 2026-11-03 池化移除而消失，断言保留防回归。）
   assert.equal(h.sent[0].target, h.ctx.replyTarget, '必须原样透传 ctx.replyTarget，不得另行选取锚点');
   const target = h.sent[0].target as { targetId?: string; msgId?: string };
   assert.equal(target.targetId, 'ANCHOR_USER');
