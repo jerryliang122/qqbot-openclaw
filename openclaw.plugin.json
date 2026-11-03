@@ -1059,11 +1059,11 @@
         },
         "progressCard": {
           "label": "进度卡片",
-          "help": "把多步计划以 checklist 快照发到聊天。卡片只走被动回复（配额不足即丢弃，不烧主动消息预算）。"
+          "help": "把多步计划以 checklist 快照发到聊天。卡片先走被动回复；锚点失效（过期/判死）时降级为主动发送，可能消耗每日主动消息预算。"
         },
         "typing": {
           "label": "正在输入指示器",
-          "help": "仅 C2C 私聊生效。intervalMs 受 QPS 限制，低于 20000 会被钳制。"
+          "help": "仅 C2C 私聊生效。intervalMs 受 QPS 限制，低于 20000 会被钳制。锚点失效时本轮停发（不消耗主动消息额度）。"
         },
         "inboundDebounce": {
           "label": "私聊入站防抖",

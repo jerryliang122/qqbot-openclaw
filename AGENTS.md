@@ -158,7 +158,8 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 - **锚点失效兜底**：被动发送被平台 **40034005**（过期）/ **40034128**（超限）确定性拒绝 → rollback + 驱逐 + 标记 dead → 同内容**转主动重发一次**。网络错（`httpStatus===0`，结果不明）**不重发**（有重复风险）。`passiveOnly` 发送（progress card）**不做主动重发**。
 - **QQ 语音投递口径以「体积」为准，不是「时长」**——平台文档里没有任何语音时长限制，「60 秒以内是语音条」是相关性错觉。格式只认 silk/mp3/wav/ogg 四种；超 20MB 软限制由 `resolveOutboundMediaKind` **显式**降级为文件投递。
 - **表情表态仅频道支持**（单聊/群聊 ❌），故 `capabilities.reactions: false` 是对的。
-- **Progress card 只走被动回复**（`passiveOnly`，绝不烧每日主动预算），支持 checklist（`📋 进度 N/M`，框架自动计数行被抑制）与 note 双形态（markdown-only 卡片 → `📋 状态`，判定式 `steps=[] && explanation 非空`；note 截断必须**字形簇安全**——复用 `outbound/grapheme.ts`，禁止按码元硬切切碎代理对；混合形态的 markdown 在框架投影层被丢弃——插件侧无解）——反应式配额下无本地次数门（`reserveQuota` 保槽配置已删除，残留会被 schema 拒收），唯一保险丝是 `maxPerTurn`；锚点无存活时 outbound 本地拦截丢弃并**停止本轮卡片发布**（反应式下该错误对本轮永久，不逐快照重试）。
+- **Progress card 先走被动回复、锚点失效降级主动**（`passiveOnly` 首试；**锚点无存活（无 msg_id / TTL 过期 / 死锚点）或平台判死（40034005 / 40034128）⇒ 降级为主动发送**——卡片按「前置消息」处理，烧每日 1000 条主动预算但用户仍能看到进度；降级状态本轮记忆，后续快照直接走主动），支持 checklist（`📋 进度 N/M`，框架自动计数行被抑制）与 note 双形态（markdown-only 卡片 → `📋 状态`，判定式 `steps=[] && explanation 非空`；note 截断必须**字形簇安全**——复用 `outbound/grapheme.ts`，禁止按码元硬切切碎代理对；混合形态的 markdown 在框架投影层被丢弃——插件侧无解）——反应式配额下无本地次数门（`reserveQuota` 保槽配置已删除，残留会被 schema 拒收），唯一保险丝是 `maxPerTurn`。
+- **typing 永不占用主动额度（2026-11-03）**——typing（msg_type=6）不占被动回复额度，但**绝不降级为「不带 msg_id 的主动形态」**：锚点不可用（TTL 过期 / 死锚点 / 平台 40034005·40034128 拒收）⇒ **本轮停发**（turn 内中间件与心跳路径同口径）。主动额度（每日 1000 条）留给正文与前置消息，typing 不参与竞争。平台拒收 typing 时须 `invalidateMsgIdQuota` 标记死锚点（本轮后续消息一律不得走被动回复）。
 
 ### 群聊与 room_event（[详情](docs/agents/group-and-room-event.md)）
 
