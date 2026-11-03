@@ -233,6 +233,11 @@ export async function sendText(params: {
    * error（不调网关、不降级主动、不烧每日主动预算）；锚点被平台确定性
    * 拒绝（40034005/40034128）时网关剔除死锚点后原错误上抛、同样不转
    * 主动重发。调用方收到 error 应静默丢弃消息。
+   *
+   * ⚠️ **本层永不主动降级**——但**上层（进度卡片发布器）会自行降级主动**
+   * （卡片按「前置消息」处理：锚点死亡时改发主动消息，见
+   * outbound/progress-card-publisher.ts 的 anchorLost 逻辑）。别把
+   * passiveOnly 读成「这条消息永远不会走主动通道」。
    */
   passiveOnly?: boolean;
 }): Promise<SendResult> {
@@ -447,6 +452,12 @@ function formatError(err: unknown): SendResult {
     const result: SendResult = { error: err.message };
     if ('code' in err) result.errorCode = String((err as any).code);
     if ('qqBizCode' in err) result.qqBizCode = (err as any).qqBizCode;
+    // SDK ApiError 的业务码字段名是 `bizCode`（不是 `qqBizCode`）——不补这行
+    // 则 qqBizCode 永远为空，上层（如进度卡片）无法区分「平台判死锚点」
+    // 与一般平台错误。
+    if ('bizCode' in err && typeof (err as any).bizCode === 'number') {
+      result.qqBizCode = (err as any).bizCode;
+    }
     return result;
   }
   return { error: String(err) };
