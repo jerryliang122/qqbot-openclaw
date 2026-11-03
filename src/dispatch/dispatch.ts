@@ -939,9 +939,10 @@ export async function dispatchToOpenClaw(
   // agent 更新 progress_card 时把 checklist 快照作为独立 QQ 消息发送
   // （QQ 无消息编辑 API，做不到 telegram 的单条 draft 反复编辑）。
   // 启用条件：总开关 + scope 匹配（默认仅 c2c）+ 非 room_event（room_event
-  // 群框架本就不转发 plan 回调，这里是双保险）。卡片只走被动回复
-  // （passiveOnly，绝不烧每日主动预算）；反应式配额下无本地次数门，
-  // 锚点无存活时由 outbound 拦截丢弃。
+  // 群框架本就不转发 plan 回调，这里是双保险）。卡片**先走被动回复**
+  // （passiveOnly）；反应式配额下无本地次数门。锚点无存活 / 平台判死
+  // （40034005·40034128）⇒ 卡片按「前置消息」降级为主动发送（烧每日
+  // 1000 条主动预算，用户仍能看到进度），由发布器请求 allowActiveFallback。
   const progressCardConfig = resolveProgressCardConfig(account);
   const progressCardScopeMatch = envelope.chatScope === 'group'
     ? progressCardConfig.scope === 'group' || progressCardConfig.scope === 'both'
@@ -949,13 +950,15 @@ export async function dispatchToOpenClaw(
   const progressPublisher = progressCardConfig.enabled && progressCardScopeMatch && inboundEventKind !== 'room_event'
     ? new ProgressCardPublisher({
         config: progressCardConfig,
-        sendCard: (text) => sendText({
+        sendCard: (text, opts) => sendText({
           to: qualifiedTarget,
           text,
           accountId: account.accountId,
-          replyToId: envelope.messageId,
+          // 主动降级 ⇒ 不挂锚点、不走 passiveOnly ⇒ 网关走主动通道并计入
+          // 每日主动预算；否则挂 turn 源消息锚点走被动回复。
+          replyToId: opts?.allowActiveFallback ? undefined : envelope.messageId,
           account,
-          passiveOnly: true,
+          passiveOnly: !opts?.allowActiveFallback,
         }),
         signal: combinedAbortSignal,
         log: log?.child('progress-card'),

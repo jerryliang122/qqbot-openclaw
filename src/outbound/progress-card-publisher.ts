@@ -10,17 +10,20 @@
  * edit）；流式 openStream/update 只接受前缀增长文本，而 checklist 更新必然
  * 改动已下发行（✅/▸ 标记移动），不符合前缀不变约束。
  *
- * 配额口径（反应式模型，2026-11-03）：
- * - 卡片消息**只走被动回复**（sendText 的 passiveOnly）：本地无次数门
+ * 配额口径（2026-11-03 反应式 + 卡片降级主动）：
+ * - 卡片消息**先走被动回复**（sendText 的 passiveOnly）：本地无次数门
  *   （平台实测不执行「c2c 4 条/group 5 条每 msg_id」，见
  *   features/quota-manager.ts 文件头），唯一本地保险丝是 maxPerTurn。
- * - 锚点无存活（无 msg_id / TTL 过期 / 判死）时 outbound 返回
- *   passive-quota-exhausted——本地拦截、确定未发出；锚点过期/判死对
- *   本轮是永久状态（卡片锚点固定为 turn 源消息），首次遇到即停止本轮
- *   发布；绝不烧每日主动预算。
+ * - 锚点无存活（无 msg_id / TTL 过期 / 判死）或平台判死
+ *   （40034005 / 40034128）⇒ 卡片**降级为主动发送**（allowActiveFallback：
+ *   不挂锚点、不走 passiveOnly）——计入每日 1000 条主动预算，但用户仍能看到
+ *   进度。卡片按「前置消息」处理（正文之外的进度消息，与正文/流式分段
+ *   同等待遇）。
+ * - 降级状态**本轮记忆**（anchorLost）：后续快照直接走主动，不再重复本地
+ *   拦截与刷 WARN。
  * - 发送结果未知的失败（平台报错/网络异常——消息可能已落地）记录为
- *   「已发送」防重发。
- * - 卡片是锦上添花，正文优先：任何失败都不重试、不影响 turn。
+ *   「已发送」防重发，不重发。
+ * - 卡片是锦上添花，正文优先：任何失败都不影响 turn。
  *
  * 双形态（2026-11-03 note 形态支持）：框架把 progress_card 工具调用投影为
  * plan 事件（projectProgressCardChannelUpdate）：
@@ -55,6 +58,7 @@
 import { formatPlanChecklistLines } from 'openclaw/plugin-sdk/channel-outbound';
 import type { ProgressCardConfig } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
+import { isAnchorDeadBizCode } from '../features/quota-manager.js';
 import { resolveFindGraphemeChunkEnd } from './grapheme.js';
 
 /** 框架 plan 事件载荷（宽容解析：未知字段忽略，2026.9.1 只保证 phase/steps） */
@@ -82,8 +86,16 @@ export interface NormalizedPlanStep {
 export interface ProgressCardPublisherDeps {
   /** 已解析的运行配置（resolveProgressCardConfig 产物） */
   config: Required<ProgressCardConfig>;
-  /** 发送一条卡片消息（返回 error 时视为失败/配额不可用，静默丢弃） */
-  sendCard: (text: string) => Promise<{ error?: string } | void>;
+  /**
+   * 发送一条卡片消息（返回 error 时视为失败/配额不可用，静默丢弃）。
+   *
+   * `opts.allowActiveFallback` = true 时**不挂被动锚点**（走主动通道、
+   * 计入每日主动预算）——锚点已失效时的降级路径。
+   */
+  sendCard: (
+    text: string,
+    opts?: { allowActiveFallback?: boolean },
+  ) => Promise<{ error?: string; qqBizCode?: number } | void>;
   /** turn 级中止信号（combinedAbortSignal） */
   signal?: AbortSignal;
   log?: PluginLogger;
@@ -208,6 +220,11 @@ export class ProgressCardPublisher {
   private sentCount = 0;
   private lastSentText = '';
   private lastSentAt = 0;
+  /**
+   * 本轮锚点已失效（TTL 过期 / 平台判死 / 无 msg_id）⇒ 后续卡片直接走
+   * 主动通道（allowActiveFallback），不再重复被动尝试与本地拦截。
+   */
+  private anchorLost = false;
   /** 防抖窗口内被跳过的最新快照（尾随补发用；只保留最新一条） */
   private pendingText: string | undefined;
   private trailingTimer: ReturnType<typeof setTimeout> | undefined;
@@ -314,7 +331,7 @@ export class ProgressCardPublisher {
 
   /**
    * 执行一次快照发送（handle 直发与尾随补发共用）。包含全部守卫：
-   * stop/abort、去重、maxPerTurn 保险丝、配额探测。
+   * stop/abort、去重、maxPerTurn 保险丝、锚点失效降级主动。
    */
   private async trySend(text: string): Promise<void> {
     if (this.stopped) return;
@@ -327,25 +344,41 @@ export class ProgressCardPublisher {
       return;
     }
 
-    let result: { error?: string } | void;
+    let result: { error?: string; qqBizCode?: number } | void;
     try {
-      result = await this.deps.sendCard(text);
+      result = await this.deps.sendCard(text, { allowActiveFallback: this.anchorLost });
     } catch (err) {
       // 结果未知（消息可能已落地）：记为已发送防重发；丢弃、不重试、不影响 turn
       this.deps.log?.warn(`[progress-card] send failed: ${err instanceof Error ? err.message : String(err)}`);
       this.markSent(text);
       return;
     }
-    if (result?.error === 'passive-quota-exhausted') {
-      // 反应式模型下该错误只剩「锚点过期/判死」一个来源，而卡片锚点固定为
-      // turn 源消息——对本轮是**永久**状态。首次遇到即停止本轮发布，
-      // 不再逐快照重试刷 WARN（评审 #86-F4）。
+
+    // 锚点失效判定：
+    // - passive-quota-exhausted：本地拦截（TTL 过期 / 死锚点 / 无 msg_id）
+    // - qqBizCode ∈ {40034005, 40034128}：平台判死该 msg_id
+    // ⇒ 该 msg_id 本轮已不可被动回复 ⇒ 降级为主动发送一次（用户仍见进度）。
+    const anchorUnavailable =
+      result?.error === 'passive-quota-exhausted' ||
+      isAnchorDeadBizCode(result?.qqBizCode);
+
+    if (anchorUnavailable) {
+      this.anchorLost = true;
       this.deps.log?.warn(
-        '[progress-card] passive anchor unavailable (expired/dead); stopping card publishing for this turn',
+        '[progress-card] passive anchor unavailable (expired/dead); falling back to proactive send',
       );
-      this.stop('passive anchor unavailable');
-      return;
+      try {
+        result = await this.deps.sendCard(text, { allowActiveFallback: true });
+      } catch (err) {
+        // 结果未知（可能已落地）：记为已发送防重发；丢弃、不重试、不影响 turn
+        this.deps.log?.warn(
+          `[progress-card] proactive fallback failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        this.markSent(text);
+        return;
+      }
     }
+
     if (result?.error) {
       // 平台报错但结果未知（可能已落地）：记为已发送防重发；丢弃、不重试
       this.deps.log?.warn(`[progress-card] send rejected: ${String(result.error)}`);

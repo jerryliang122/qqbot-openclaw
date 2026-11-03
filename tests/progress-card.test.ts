@@ -6,8 +6,8 @@
  *    explanation 可选、超 maxLines 压缩为 N/M done 头）。
  * 2. 发布器：去重（无状态变化不重发）、防抖窗口、maxPerTurn 保险丝
  *    （反应式配额：无本地次数门，maxPerTurn 是唯一保险丝）、清卡
- *    （steps=[]）停止/恢复、passive-quota-exhausted 停止本轮发布、
- *    stop/dispose/abort 关闭。
+ *    （steps=[]）停止/恢复、**锚点失效降级主动**（passive-quota-exhausted /
+ *    平台判死 40034005 ⇒ 主动重发一次 + 本轮记忆）、stop/dispose/abort 关闭。
  * 3. 配置解析：resolveProgressCardConfig 默认值/覆盖/非法值钳制。
  * 4. outbound sendText passiveOnly：锚点判死返回 error 且不触达网关
  *    （不降级主动）；非 passiveOnly 判死后降级主动发送。
@@ -64,6 +64,8 @@ const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
 interface PublisherHarness {
   publisher: ProgressCardPublisher;
   sends: string[];
+  /** 每次 sendCard 尝试的详情（区分被动首试与主动降级重试） */
+  attempts: Array<{ text: string; active: boolean }>;
   failNext: () => void;
 }
 
@@ -72,6 +74,7 @@ function makePublisher(overrides: {
   signal?: AbortSignal;
 } = {}): PublisherHarness {
   const sends: string[] = [];
+  const attempts: Array<{ text: string; active: boolean }> = [];
   let failNext = false;
   const config = {
     enabled: true,
@@ -83,7 +86,9 @@ function makePublisher(overrides: {
   };
   const publisher = new ProgressCardPublisher({
     config: config as never,
-    sendCard: async (text: string) => {
+    sendCard: async (text: string, opts?: { allowActiveFallback?: boolean }) => {
+      const active = opts?.allowActiveFallback === true;
+      attempts.push({ text, active });
       if (failNext) {
         failNext = false;
         return { error: 'passive-quota-exhausted' };
@@ -97,6 +102,7 @@ function makePublisher(overrides: {
   return {
     publisher,
     sends,
+    attempts,
     failNext: () => { failNext = true; },
   };
 }
@@ -236,16 +242,47 @@ await test('反应式配额：本地无次数门，maxPerTurn 内连续快照全
   assert.equal(h.sends.length, 4, '反应式：次数不再是本地门（旧口径第 4 条会被 reserve 保槽拦截）');
 });
 
-await test('passive-quota-exhausted：锚点对本轮永久——首次即停止本轮发布（评审 #86-F4）', async () => {
+await test('passive-quota-exhausted：锚点失效 → 降级主动发送一次（卡片按前置消息处理）', async () => {
   const h = makePublisher({ config: { minIntervalMs: 0 } });
   h.failNext();
   await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
-  assert.equal(h.sends.length, 0, '被拒的卡片被丢弃');
-  assert.equal(h.publisher.sentCards, 0);
-  // 反应式下该错误只剩锚点过期/判死一个来源，对本轮永久——同状态/新状态都不再发布
+  assert.equal(h.attempts.length, 2, '首试被动被本地拦截 → 应再试一次主动');
+  assert.equal(h.attempts[0]!.active, false, '首试走被动');
+  assert.equal(h.attempts[1]!.active, true, '第二次走主动降级');
+  assert.equal(h.sends.length, 1, '卡片经主动通道发出（未被静默丢弃）');
+  assert.equal(h.publisher.sentCards, 1, '降级重发只计一次');
+});
+
+await test('锚点失效降级主动后本轮记忆：后续快照直接走主动', async () => {
+  const h = makePublisher({ config: { minIntervalMs: 0 } });
+  h.failNext();
   await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
+  assert.equal(h.attempts.length, 2);
+
+  // 本轮锚点已死 ⇒ 后续快照直接走主动（不再重复被动尝试与本地拦截）
   await h.publisher.onPlanUpdate({ phase: 'update', steps: STEPS_B });
-  assert.equal(h.sends.length, 0, '停止后不再逐快照重试');
+  assert.equal(h.attempts.length, 3, '第二次快照只应有一次尝试');
+  assert.equal(h.attempts[2]!.active, true, '后续快照直接走主动');
+  assert.equal(h.sends.length, 2);
+});
+
+await test('平台判死锚点（qqBizCode=40034005）→ 降级主动重试一次', async () => {
+  let calls = 0;
+  const publisher = new ProgressCardPublisher({
+    config: { enabled: true, scope: 'c2c', minIntervalMs: 0, maxPerTurn: 3, maxLines: 8 } as never,
+    sendCard: async (_text: string, opts?: { allowActiveFallback?: boolean }) => {
+      calls++;
+      if (calls === 1) {
+        // 平台确定性拒绝（40034005 msg_id 已过期）——网关已剔除死锚点
+        return { error: 'reply msg_id expired', qqBizCode: 40034005 };
+      }
+      assert.equal(opts?.allowActiveFallback, true, '降级重试应走主动');
+      return {};
+    },
+  });
+  await publisher.onPlanUpdate({ phase: 'update', steps: STEPS_A });
+  assert.equal(calls, 2, '平台判死后应降级重试一次');
+  assert.equal(publisher.sentCards, 1);
 });
 
 await test('发送异常：丢弃该条卡片不抛错（结果未知，保守计数为已发送）', async () => {
