@@ -100,7 +100,7 @@ import { assembleBody } from '../dispatch/body-assembler.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { runWithRequestContext } from '../request-context.js';
 import { dispatchToOpenClaw, type DispatchToOpenClawOptions } from '../dispatch/index.js';
-import { findPendingMultiQuestionByConversation } from './question-helpers.js';
+import { findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation } from './question-helpers.js';
 
 /** 默认防抖窗口：3 秒（QQ 客户端连发"文件 + 说明"的典型间隔内） */
 export const DEFAULT_C2C_INBOUND_DEBOUNCE_MS = 3000;
@@ -189,6 +189,13 @@ function shouldDebounceC2CItem(item: C2CInboundDebounceItem): boolean {
   // 会话键含 accountId（openid 是 per-account 的，跨账号同 targetId
   // 不共享 pending 记录）
   if (findPendingMultiQuestionByConversation(item.account.accountId, 'c2c', item.msg.replyTarget.targetId)) {
+    return false;
+  }
+
+  // 单问题 ask_user 的作答文本（PR1）：单题卡正文明确引导「直接回复」，
+  // 而合并会把答案改写成 `[消息 1/N]` 分节体 ⇒ 框架认领到的答案被污染。
+  // 与多问题 keyed 答案同款旁路：pending 期间该会话的文本一律不合并。
+  if (findPendingSingleQuestionByConversation(item.account.accountId, 'c2c', item.msg.replyTarget.targetId)) {
     return false;
   }
 

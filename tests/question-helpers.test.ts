@@ -23,6 +23,9 @@ import {
   findPendingMultiQuestionByConversation,
   markMultiQuestionResolved,
   markMultiQuestionResolveFailed,
+  registerPendingSingleQuestion,
+  findPendingSingleQuestionByConversation,
+  markSingleQuestionResolved,
   type MultiQuestionAnswer,
 } from '../src/features/question-helpers.js';
 
@@ -729,6 +732,39 @@ test('getPendingMultiQuestions：未登记 -> null，登记后返回题目定义
   assert.equal(getPendingMultiQuestions('ask_00000000000000000000000000000000'), null);
   resetPending();
   assert.equal(getPendingMultiQuestions(MULTI_ID)!.length, 2);
+});
+
+console.log('\n=== 11. 单问题 pending store（PR1）===');
+
+const SINGLE_ID = 'ask_11111111111111111111111111111111';
+
+test('登记后可按会话查到；清理后查不到', () => {
+  registerPendingSingleQuestion('test-account', SINGLE_ID, 'c2c', 'peer-1');
+  assert.deepEqual(findPendingSingleQuestionByConversation('test-account', 'c2c', 'peer-1'), {
+    questionId: SINGLE_ID,
+  });
+  markSingleQuestionResolved(SINGLE_ID);
+  assert.equal(findPendingSingleQuestionByConversation('test-account', 'c2c', 'peer-1'), undefined);
+});
+
+test('账号维度隔离：openid 是 per-account 的，他账号同 targetId 查不到', () => {
+  registerPendingSingleQuestion('test-account', SINGLE_ID, 'c2c', 'peer-1');
+  assert.equal(findPendingSingleQuestionByConversation('other-account', 'c2c', 'peer-1'), undefined);
+  assert.equal(findPendingSingleQuestionByConversation('test-account', 'group', 'peer-1'), undefined);
+  markSingleQuestionResolved(SINGLE_ID);
+});
+
+test('TTL 过期 -> 查不到', () => {
+  // ttl=0 ⇒ expiresAtMs = now ⇒ 立即视为过期（定时器也会清掉索引）
+  registerPendingSingleQuestion('test-account', SINGLE_ID, 'c2c', 'peer-1', 0);
+  assert.equal(findPendingSingleQuestionByConversation('test-account', 'c2c', 'peer-1'), undefined);
+});
+
+test('未登记 -> undefined', () => {
+  assert.equal(
+    findPendingSingleQuestionByConversation('test-account', 'c2c', 'never-registered'),
+    undefined,
+  );
 });
 
 console.log('\n==================================================');

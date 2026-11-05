@@ -186,6 +186,8 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 
 - **webhook 模式的 op:0 派发必须挂 detached 准入根**，且**光包 `runDetachedWebhookWork` 不够**——回调内还要等「本次委托派生的在途派发」全部落地才 settle，否则 detached 根随 ACK 释放、bug 原样复现。报错文案是四分支兜底句「temporarily unavailable」，**网关并没有 drain**。
 - **多问题 ask_user 绝不能程序化提交**——官方无多问题提交 API，合成入站用户消息会因框架 steer 进 ask_user-suspended run 而不被认领。**入站文本绝不拦截**——真实消息必须原样到达框架。
+- **ask_user 卡片由插件自渲染（单题 / 多题同构）**——渲染层在 `src/features/question-card.ts`：正文走插件自己的中文版式（去掉框架 3 行英文脚手架），按钮统一 `① ②` 前缀 + 截断。**单题文本反解失败 ⇒ 回退到「框架原文 + 旧键盘」**（不得产出半解析的卡片）。单题自由作答靠正文引导，**不加**「✍️ 其他」按钮（预填前缀会污染答案）。
+- **单题作答不得被防抖合并污染**——单题卡发出后登记单问题 pending（**仅 c2c**），c2c 防抖与 secret-capture 在 pending 期间放行该会话文本；pending 清理：按钮 resolve 成功 / 卡片发送失败 / 该会话下一条入站消息 / TTL 兜底。
 - **Secret input 的消息绝不进 AI transcript**——kind 恒为 `env`（agent 可读环境值）。**红线**：多问题 ask_user 待答时 capture 中间件必须放行。
 - **互动事件只有 type 11/12 需要 ack**——其余类型回应无意义（type=14 误 ack code=0 会触发「会话已清空」小灰条）。**配置面板事件按 `data.type` 匹配且必须在类型路由分支之前检查。**
 

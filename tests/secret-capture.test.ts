@@ -34,6 +34,8 @@ import { isSecretInputCancelKeyword, secretCapture } from '../src/middleware/sec
 import {
   markMultiQuestionResolved,
   registerPendingMultiQuestion,
+  registerPendingSingleQuestion,
+  markSingleQuestionResolved,
 } from '../src/features/question-helpers.js';
 import type { SecretsStoreSetResult } from '../src/features/secret-store-cli.js';
 
@@ -566,8 +568,36 @@ await test('红线：多问题 ask_user pending 中的会话 → 消息放行', 
   clearPendingSecretInputs();
 });
 
-await test('执行失败 → 失败回执含原因 + 退出码，不触发 reload', async () => {
+await test('红线：单问题 ask_user pending 中的会话 → 消息放行（PR1）', async () => {
   clearPendingSecretInputs();
+  registerPendingSecretInput(makePending());
+  // 同会话登记一个进行中的单问题 ask_user（单题卡正文引导「直接回复」）
+  registerPendingSingleQuestion(
+    'default',
+    'ask_11111111111111111111111111111111',
+    'c2c',
+    USER,
+    5 * 60 * 1000,
+  );
+  const h = makeCtx({ content: '2', msgId: 'm-single' });
+  let setCalls = 0;
+  const mw = secretCapture({
+    accountId: ACCT,
+    runSet: async () => {
+      setCalls += 1;
+      return okResult();
+    },
+    runReload: async () => true,
+  });
+  await mw(h.ctx as never, h.next);
+  assert.equal(h.nextCalled(), true, 'ask_user 作答消息必须放行');
+  assert.equal(setCalls, 0);
+  assert.ok(findPendingSecretInput(ACCT, USER), 'pending 保留（未被消费）');
+  markSingleQuestionResolved('ask_11111111111111111111111111111111'); // 清理，勿泄漏给后续用例
+  clearPendingSecretInputs();
+});
+
+await test('执行失败 → 失败回执含原因 + 退出码，不触发 reload', async () => {  clearPendingSecretInputs();
   registerPendingSecretInput(makePending('FAIL_KEY', 'env'));
   const h = makeCtx({ content: 'some value', msgId: 'm-fail' });
   let reloadCalls = 0;

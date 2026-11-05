@@ -21,6 +21,7 @@ import {
   parseMultiQuestionButtonData,
   recordMultiQuestionTap,
   markMultiQuestionResolveFailed,
+  markSingleQuestionResolved,
   getPendingMultiQuestions,
   getPendingMultiQuestionAnchor,
   buildMultiQuestionAnswerText,
@@ -426,6 +427,10 @@ async function handleQuestion(
       senderId: operatorId,
       clientDisplayName: 'QQBot question',
     });
+    // 单问题已作答 ⇒ 撤掉 c2c 旁路登记（该会话恢复防抖合并）
+    if (result.status === 'answered' || result.status === 'already-terminal') {
+      markSingleQuestionResolved(parsed.questionId);
+    }
     log.info(`[question] resolved questionId=${parsed.questionId} optionIndex=${parsed.optionIndex} status=${result.status} operator=${operatorId ?? 'unknown'}`);
   } catch (err) {
     log.error(`[question] resolve error: ${err instanceof Error ? err.message : String(err)}`);
