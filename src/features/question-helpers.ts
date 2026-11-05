@@ -2,19 +2,48 @@
  * ask_user 按钮辅助函数
  *
  * 与 approval-helpers.ts 模式一致：
- * - buildQuestionKeyboard: 构建 inline keyboard（单问题）
- * - buildMultiQuestionKeyboard: 构建多问题场景单题的 inline keyboard
+ * - buildQuestionKeyboard: 构建 inline keyboard（单问题，**解析失败时的回退形态**）
  * - parseQuestionButtonData / parseMultiQuestionButtonData: 解析 INTERACTION_CREATE 的 button_data
  * - isAskUserPayload / isNonSingleAskUserPayload: 判断 payload 是否为 ask_user（单/非单问题）
  * - parseMultiQuestionPrompt: 从多问题投递文本反解题目结构
  * - registerPendingMultiQuestion 等: 多问题答案暂存 store
+ * - registerPendingSingleQuestion 等: 单问题 pending 登记（c2c 旁路用）
  * - buildMultiQuestionConfirmKeyboard 等: 集齐后发"确认卡"——指令按钮
  *   (type=2, enter=true) 携带完整答案文本，由客户端以真实用户消息发出，
  *   走框架原生的 keyed 文本认领通道（不程序化提交，不合成入站消息）
+ *
+ * **卡片渲染已迁到 `question-card.ts`**（单题 / 多题共用渲染层，PR1）：
+ * 本文件保留 `buildQuestionKeyboard` 作为**单题文本反解失败时的回退形态**
+ * （= 改造前：框架原文 + 旧键盘）；其余渲染原语
+ * （`formatMultiQuestionCard` / `buildMultiQuestionKeyboard` /
+ * `splitOptionLabel` / `buildButtonLabel` …）从 `./question-card.js` 再导出，
+ * 既有 import 路径与测试保持可用。
  */
 
 import type { InlineKeyboard, KeyboardButton } from '../types.js';
 import { KEYBOARD_PERMISSION_EVERYONE } from '../types.js';
+import type { QuestionDef } from './question-card.js';
+// 确认卡正文按题展示已选内容时仍要用到这两个原语（再导出不产生本地绑定）
+import { splitOptionLabel, stripRecommendedSuffix } from './question-card.js';
+
+/**
+ * 卡片渲染层（单题 / 多题共用）。
+ *
+ * 迁移说明：`question-card.ts` **不 import** 本文件（避免与这里的再导出
+ * 形成循环依赖），依赖方向是单向的 `question-helpers → question-card`。
+ */
+export type { QuestionDef } from './question-card.js';
+export {
+  buildButtonLabel,
+  buildMultiQuestionKeyboard,
+  buildQuestionOptionKeyboard,
+  estimateLabelWidth,
+  formatMultiQuestionCard,
+  formatQuestionCard,
+  parseSingleQuestionPrompt,
+  splitOptionLabel,
+  stripRecommendedSuffix,
+} from './question-card.js';
 
 // ============ Constants ============
 
@@ -39,17 +68,15 @@ export interface ParsedQuestionAction {
 }
 
 /**
- * ask_user 多问题场景中从投递文本解析出的单题结构。
+ * ask_user 一道题的结构（单题 / 多题共用）。
+ *
  * 框架的多问题 payload 只有 questionId + 格式化文本（无结构化选项数据），
- * 题目结构需从文本反解。
+ * 题目结构需从文本反解；单题则由 `parseSingleQuestionPrompt` 反解
+ * （锚点是 `channelData.askUser.optionValues` 里的精确 label）。
+ *
+ * 定义已迁到 `question-card.ts`（渲染层），此处保留别名兼容既有引用。
  */
-export interface MultiQuestionDef {
-  header: string;
-  question: string;
-  options: string[];
-  /** 题目声明了 "Other: reply with your own answer."（允许自由文本作答） */
-  isOther?: boolean;
-}
+export type MultiQuestionDef = QuestionDef;
 
 export interface ParsedMultiQuestionAction {
   questionId: string;
@@ -289,178 +316,13 @@ export function buildQuestionKeyboard(
   };
 }
 
-/** 选项按钮的序号前缀，与正文里的加粗序号 1./2./3./4. 一一对应 */
-const OPTION_NUMBER_PREFIXES = ['①', '②', '③', '④'] as const;
-
-/**
- * 为 ask_user 多问题场景构建第 questionIndex 题的 inline keyboard。
- *
- * - 选项按钮：action.type=1（回调），button_data `qqbot:qm:<id>:<题号>:<选项号>`，
- *   group_id 按题隔离（`question-<i>`）保证同题互斥、跨题不互斥；
- *   标签带 ①②③ 序号前缀（截断时也能与正文选项对上号）
- * - isOther 题追加「✍️ 其他」指令按钮（action.type=2）：点击后客户端在
- *   输入框预填 `<题号>: `，用户续写自由答案后发送，天然就是 keyed 答案格式
- * - 按钮标签超过宽度预算时自动改为每行 2 个，避免文字显示不全
- */
-export function buildMultiQuestionKeyboard(
-  questionId: string,
-  questionIndex: number,
-  question: MultiQuestionDef,
-): InlineKeyboard {
-  const buttons: KeyboardButton[] = question.options.map((optionLine, optionIndex) => {
-    const prefix = OPTION_NUMBER_PREFIXES[optionIndex] ?? '';
-    // 前缀 + 空格的显示宽度（全角序号 2 + 空格 1）
-    const reserve = estimateLabelWidth(`${prefix} `);
-    return {
-      id: `q${questionIndex}_${optionIndex}`,
-      render_data: {
-        label: `${prefix} ${buildButtonLabel(optionLine, reserve)}`,
-        visited_label: '已选',
-        style: 1 as const,
-      },
-      action: {
-        type: 1 as const,
-        data: `${MULTI_QUESTION_CALLBACK_PREFIX}${questionId}:${questionIndex}:${optionIndex}`,
-        permission: { type: KEYBOARD_PERMISSION_EVERYONE },
-        click_limit: 1,
-      },
-      group_id: `question-${questionIndex}`,
-    };
-  });
-
-  if (question.isOther) {
-    buttons.push({
-      id: `q${questionIndex}_other`,
-      render_data: {
-        label: '✍️ 其他',
-        visited_label: '✍️ 其他',
-        style: 0 as const,
-      },
-      action: {
-        type: 2 as const,
-        // 点击后输入框预填 "题号: "，用户续写后手动发送
-        data: `${questionIndex + 1}: `,
-        enter: false,
-        permission: { type: KEYBOARD_PERMISSION_EVERYONE },
-        unsupport_tips: '当前客户端版本不支持，请直接回复「题号: 答案」',
-      },
-      // 指令按钮不属于互斥选项组
-    });
-  }
-
-  return {
-    content: {
-      rows: layoutButtonRows(buttons),
-    },
-  };
-}
-
-/** 自适应分行：标签全部较短时一行放满，否则每行 2 个 */
-function layoutButtonRows(buttons: KeyboardButton[]): Array<{ buttons: KeyboardButton[] }> {
-  const widest = buttons.reduce(
-    (max, b) => Math.max(max, estimateLabelWidth(b.render_data?.label ?? '')),
-    0,
-  );
-  if (widest <= SINGLE_ROW_MAX_LABEL_WIDTH || buttons.length <= 2) {
-    return [{ buttons }];
-  }
-  const rows: Array<{ buttons: KeyboardButton[] }> = [];
-  for (let i = 0; i < buttons.length; i += 2) {
-    rows.push({ buttons: buttons.slice(i, i + 2) });
-  }
-  return rows;
-}
-
-/**
- * 选项整行形如 "调研/方案 (Recommended) - 搜索、分析、对比、出方案。"，
- * 按第一个 " - " 拆出标签部分（拆不准时退回整行，不影响答案正确性——
- * 答案靠题号/选项号定位，不依赖标签文本）。
- */
-export function splitOptionLabel(optionLine: string): string {
-  const sep = optionLine.indexOf(' - ');
-  if (sep > 0) return optionLine.slice(0, sep).trim();
-  return optionLine.trim();
-}
-
-function splitOptionDescription(optionLine: string): string {
-  const label = splitOptionLabel(optionLine);
-  if (optionLine.length > label.length && optionLine.startsWith(label)) {
-    return optionLine.slice(label.length).replace(/^\s*-\s*/, '').trim();
-  }
-  return '';
-}
-
-/** 估算文字显示宽度：CJK/全角/emoji 记 2，其余记 1 */
-export function estimateLabelWidth(text: string): number {
-  let width = 0;
-  for (const ch of text) {
-    const code = ch.codePointAt(0) ?? 0;
-    const wide =
-      (code >= 0x1100 && code <= 0x115f) ||
-      (code >= 0x2e80 && code <= 0xa4cf) ||
-      (code >= 0xac00 && code <= 0xd7a3) ||
-      (code >= 0xf900 && code <= 0xfaff) ||
-      (code >= 0xfe30 && code <= 0xfe6f) ||
-      (code >= 0xff00 && code <= 0xff60) ||
-      (code >= 0xffe0 && code <= 0xffe6) ||
-      code >= 0x1f300;
-    width += wide ? 2 : 1;
-  }
-  return width;
-}
-
-/** 按钮标签安全宽度（约 12 个汉字），超出截断加省略号 */
-const MAX_BUTTON_LABEL_WIDTH = 24;
-/** 一行放满时允许的最大标签宽度，超过改为每行 2 个 */
-const SINGLE_ROW_MAX_LABEL_WIDTH = 20;
-
-/** 从选项整行生成按钮短标签：剥描述 → 剥 "(Recommended)" 后缀 → 超宽截断。
- * reserveWidth 为前缀（如选项序号）预留的显示宽度。 */
-export function buildButtonLabel(optionLine: string, reserveWidth = 0): string {
-  let label = stripRecommendedSuffix(splitOptionLabel(optionLine));
-  const max = MAX_BUTTON_LABEL_WIDTH - reserveWidth;
-  if (estimateLabelWidth(label) <= max) return label;
-  let truncated = '';
-  let width = 0;
-  for (const ch of label) {
-    const w = estimateLabelWidth(ch);
-    if (width + w > max - 2) break;
-    truncated += ch;
-    width += w;
-  }
-  return `${truncated.trimEnd()}…`;
-}
-
-/** 剥掉框架渲染在选项标签尾部的 "(Recommended)" 标记 */
-export function stripRecommendedSuffix(label: string): string {
-  return label.replace(/\s*\(\s*recommended\s*\)\s*$/i, '').trim();
-}
-
-/**
- * 格式化多问题卡片中单题的文本部分（QQ 客户端原生 Markdown 渲染）。
- * 完整选项（含描述）放在正文里，按钮只放截断后的短标签。
- * 正文选项用加粗序号，与按钮上的 ①②③ 前缀一一对应。
- */
-export function formatMultiQuestionCard(
-  question: MultiQuestionDef,
-  questionIndex: number,
-  total: number,
-): string {
-  const lines = [`**第 ${questionIndex + 1}/${total} 题 · ${question.header}**`];
-  if (question.question.trim()) {
-    lines.push('', question.question.trim());
-  }
-  for (const [optionIndex, optionLine] of question.options.entries()) {
-    const label = stripRecommendedSuffix(splitOptionLabel(optionLine));
-    const desc = splitOptionDescription(optionLine);
-    lines.push('', `**${optionIndex + 1}.** ${label}${desc ? ` —— ${desc}` : ''}`);
-  }
-  lines.push('', '👇 点下方按钮作答');
-  if (question.isOther) {
-    lines.push('', `选项不合适？点「✍️ 其他」后输入，或直接回复 "${questionIndex + 1}: 你的答案"`);
-  }
-  return lines.join('\n');
-}
+// ── 卡片渲染原语已迁至 `question-card.ts`（PR1）────────────────────
+// `formatMultiQuestionCard` / `buildMultiQuestionKeyboard` /
+// `splitOptionLabel` / `splitOptionDescription` / `estimateLabelWidth` /
+// `buildButtonLabel` / `stripRecommendedSuffix` / `layoutButtonRows` /
+// `OPTION_NUMBER_PREFIXES` 现在住在渲染层（单题与多题共用），
+// 本文件顶部已从 `./question-card.js` 再导出，既有 import 路径不变。
+// 多题的渲染输出**逐字未变**（既有回归用例即迁移安全的硬证据）。
 
 // ============ Button Data Parser ============
 
@@ -727,6 +589,122 @@ export function getPendingMultiQuestionAnchor(questionId: string): string | unde
   return entry.anchorMsgId;
 }
 
+// ============ 单问题 pending Store（PR1）============
+
+/**
+ * 单问题 pending 登记（**仅 c2c**）。
+ *
+ * ── 为什么需要 ───────────────────────────────────────────────────
+ * 单题卡正文现在明确写着「不想选按钮？直接回复…」，也就是**鼓励用户用
+ * 自由文本作答**（框架单题契约：整条文本即答案，序号 / 选项名 / 任意
+ * 文本都能命中，见 `normalizeAgentHarnessUserInputAnswer`）。
+ *
+ * 但 c2c 入站有 3 秒防抖合并：合并会把答案文本改写成 `[消息 1/N]` 分节体
+ * ⇒ 框架认领到的答案被污染（多问题路径早有同款问题，见
+ * `inbound-debounce.ts` 的 keyed 答案旁路）。
+ *
+ * 因此单题卡发出后登记一条 pending，让**该会话的下一条 c2c 文本不被合并**
+ * （与多问题 keyed 答案旁路同款机制），并顺带保护 secret-capture
+ * 中间件不把答案当密钥吞掉（红线）。
+ *
+ * ── 生命周期 ─────────────────────────────────────────────────────
+ * - 登记：单题卡**发送前**（先登记后发，避免「先点后登记」竞态）
+ * - 清理：① 按钮 resolve 成功；② 卡片发送失败（用户没看到卡）；
+ *   ③ 该会话下一条 c2c 入站消息（答案必然是用户看到卡后的第一条消息）；
+ *   ④ TTL 定时器兜底
+ * - 群聊**不登记**（群合批旁路本 PR 不动，群行为与改造前一致）
+ */
+interface PendingSingleQuestion {
+  accountId: string;
+  scope: 'c2c' | 'group';
+  targetId: string;
+  /** 本轮 inbound 的 msg_id（显式锚点，非池化选取） */
+  anchorMsgId?: string;
+  expiresAtMs: number;
+  cleanupTimer: ReturnType<typeof setTimeout>;
+}
+
+/** gateway 默认问题超时 15min，这里留 10min 余量兜住投递延迟 */
+const DEFAULT_SINGLE_QUESTION_TTL_MS = 25 * 60 * 1000;
+
+const pendingSingleQuestions = new Map<string, PendingSingleQuestion>();
+/**
+ * `${accountId}:${scope}:${targetId}` -> questionId（与多问题同款会话键）。
+ * accountId 必须入键：QQ openid 是 per-account 的（bot A 与 bot B 的同
+ * 字符串 targetId 指向不同用户），不带账号维度会让 A 账号的 pending 误命中
+ * B 账号同 targetId 的会话。
+ */
+const pendingSingleByConversation = new Map<string, string>();
+
+/**
+ * 登记一次单问题 ask_user 投递（供 c2c 旁路识别）。
+ *
+ * @param anchorMsgId 本轮 inbound 的 msg_id（显式锚点）——仅作留痕，
+ *   单题卡本身在 dispatch 里直接用当轮锚点发送。
+ */
+export function registerPendingSingleQuestion(
+  accountId: string,
+  questionId: string,
+  scope: 'c2c' | 'group',
+  targetId: string,
+  ttlMs: number = DEFAULT_SINGLE_QUESTION_TTL_MS,
+  anchorMsgId?: string,
+): void {
+  const existing = pendingSingleQuestions.get(questionId);
+  if (existing) clearTimeout(existing.cleanupTimer);
+
+  const entry: PendingSingleQuestion = {
+    accountId,
+    scope,
+    targetId,
+    ...(anchorMsgId ? { anchorMsgId } : {}),
+    expiresAtMs: Date.now() + ttlMs,
+    cleanupTimer: setTimeout(() => {
+      if (pendingSingleQuestions.get(questionId) === entry) {
+        pendingSingleQuestions.delete(questionId);
+      }
+      const key = conversationKey(accountId, scope, targetId);
+      if (pendingSingleByConversation.get(key) === questionId) {
+        pendingSingleByConversation.delete(key);
+      }
+    }, ttlMs),
+  };
+  entry.cleanupTimer.unref?.();
+  pendingSingleQuestions.set(questionId, entry);
+  pendingSingleByConversation.set(conversationKey(accountId, scope, targetId), questionId);
+}
+
+/**
+ * 按会话查找进行中的单问题（已过期 / 已清理不算）；会话键含账号维度。
+ */
+export function findPendingSingleQuestionByConversation(
+  accountId: string,
+  scope: 'c2c' | 'group',
+  targetId: string,
+): { questionId: string } | undefined {
+  const questionId = pendingSingleByConversation.get(conversationKey(accountId, scope, targetId));
+  if (!questionId) return undefined;
+  const entry = pendingSingleQuestions.get(questionId);
+  if (!entry || entry.expiresAtMs <= Date.now()) {
+    return undefined;
+  }
+  return { questionId };
+}
+
+/**
+ * 清理单问题 pending（按钮已作答 / 卡片发送失败 / 用户已回话）。
+ */
+export function markSingleQuestionResolved(questionId: string): void {
+  const entry = pendingSingleQuestions.get(questionId);
+  if (!entry) return;
+  clearTimeout(entry.cleanupTimer);
+  pendingSingleQuestions.delete(questionId);
+  const key = conversationKey(entry.accountId, entry.scope, entry.targetId);
+  if (pendingSingleByConversation.get(key) === questionId) {
+    pendingSingleByConversation.delete(key);
+  }
+}
+
 /**
  * 合成整单答案文本："1: 3\n2: 1"（数字选项走框架原生 keyed 文本解析，
  * 由客户端以真实用户消息发出后，框架认领并 resolve 挂起的 ask_user）。
@@ -740,7 +718,6 @@ export function buildMultiQuestionAnswerText(
       `${questionIdx + 1}: ${'optionIndex' in answer ? answer.optionIndex + 1 : answer.text}`)
     .join('\n');
 }
-
 /** 确认卡正文：按题展示人话版的已选内容 */
 export function formatMultiQuestionConfirmCard(
   questions: readonly MultiQuestionDef[],
