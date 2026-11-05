@@ -597,7 +597,8 @@ await test('红线：单问题 ask_user pending 中的会话 → 消息放行（
   clearPendingSecretInputs();
 });
 
-await test('执行失败 → 失败回执含原因 + 退出码，不触发 reload', async () => {  clearPendingSecretInputs();
+await test('执行失败 → 失败回执含原因 + 退出码，不触发 reload', async () => {
+  clearPendingSecretInputs();
   registerPendingSecretInput(makePending('FAIL_KEY', 'env'));
   const h = makeCtx({ content: 'some value', msgId: 'm-fail' });
   let reloadCalls = 0;

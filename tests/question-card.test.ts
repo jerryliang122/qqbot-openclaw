@@ -233,6 +233,43 @@ test('单题卡正文：无描述时不留悬空破折号', () => {
   assert.ok(!card.includes('甲 ——'));
 });
 
+console.log('\n=== 3b. formatQuestionCard（keyboardAttached:false 纯文本兜底形态）===');
+
+test('单题 isOther：不指引点按钮，引导改为「直接回复」', () => {
+  const def = parseSingleQuestionPrompt(REAL_SINGLE_TEXT, REAL_OPTION_VALUES);
+  assert.ok(def);
+  const card = formatQuestionCard(def, { variant: 'single', keyboardAttached: false });
+  assert.ok(!card.includes('👇 点下方按钮作答'), '兜底正文不得指引点按钮');
+  assert.ok(!card.includes('不想选按钮？'), '没有按钮就谈不上「不想选按钮」');
+  assert.ok(card.includes('直接回复「序号 / 选项名 / 你的答案」'));
+  // 主体内容保留：标题 / 题干 / 编号选项
+  assert.ok(card.includes('**6336条款**'));
+  assert.ok(card.includes('**1.** DDU —— 以门点文字原文为准'));
+});
+
+test('单题非 isOther：仍给「序号 / 选项名」引导（没有按钮时直接回复是唯一作答方式）', () => {
+  const def = parseSingleQuestionPrompt(
+    ['Question for you:', '', '标题', '题干', '1. 甲', '2. 乙'].join('\n'),
+    ['甲', '乙'],
+  );
+  assert.ok(def);
+  assert.equal(def.isOther, false);
+  const card = formatQuestionCard(def, { variant: 'single', keyboardAttached: false });
+  assert.ok(!card.includes('👇 点下方按钮作答'));
+  assert.ok(card.includes('直接回复「序号 / 选项名」'));
+  assert.ok(!card.includes('你的答案」'), '非 isOther 题不引导自由文本作答');
+});
+
+test('多题 isOther：兜底形态的「其他」引导不带按钮字样', () => {
+  const card = formatQuestionCard(
+    { header: '乙', question: '第二题？', options: ['b1', 'b2'], isOther: true },
+    { variant: 'multi', index: 1, total: 2, keyboardAttached: false },
+  );
+  assert.ok(!card.includes('👇 点下方按钮作答'));
+  assert.ok(!card.includes('「✍️ 其他」'));
+  assert.ok(card.includes('选项不合适？直接回复 "2: 你的答案"'));
+});
+
 console.log('\n=== 4. buildQuestionOptionKeyboard（单题按钮）===');
 
 test('单题按钮：① 前缀 + 回调 data + group_id + click_limit', () => {

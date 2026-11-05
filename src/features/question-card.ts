@@ -58,6 +58,13 @@ export interface QuestionCardOpts {
   total?: number;
   /** 单题 / 多题（决定标题形态与结尾提示） */
   variant: 'single' | 'multi';
+  /**
+   * 卡片是否伴随按钮键盘投递（默认 true）。
+   * 键盘发送失败后的**纯文本兜底**传 false：去掉「点下方按钮作答」
+   * 指引、引导行改为「直接回复」文案——否则正文在指引用户点不存在的
+   * 按钮（2026-11-05 评审 F1）。
+   */
+  keyboardAttached?: boolean;
 }
 
 /** 选项按钮渲染参数 */
@@ -189,6 +196,7 @@ function layoutButtonRows(buttons: KeyboardButton[]): Array<{ buttons: KeyboardB
 export function formatQuestionCard(def: QuestionDef, opts: QuestionCardOpts): string {
   const index = opts.index ?? 0;
   const total = opts.total ?? 1;
+  const keyboardAttached = opts.keyboardAttached ?? true;
   const lines: string[] = [];
 
   if (opts.variant === 'multi') {
@@ -205,12 +213,23 @@ export function formatQuestionCard(def: QuestionDef, opts: QuestionCardOpts): st
     const desc = splitOptionDescription(optionLine);
     lines.push('', `**${optionIndex + 1}.** ${label}${desc ? ` —— ${desc}` : ''}`);
   }
-  lines.push('', '👇 点下方按钮作答');
+  if (keyboardAttached) {
+    lines.push('', '👇 点下方按钮作答');
+  }
 
   if (opts.variant === 'multi') {
     if (def.isOther) {
-      lines.push('', `选项不合适？点「✍️ 其他」后输入，或直接回复 "${index + 1}: 你的答案"`);
+      lines.push(
+        '',
+        keyboardAttached
+          ? `选项不合适？点「✍️ 其他」后输入，或直接回复 "${index + 1}: 你的答案"`
+          : `选项不合适？直接回复 "${index + 1}: 你的答案"`,
+      );
     }
+  } else if (!keyboardAttached) {
+    // 单题纯文本兜底：没有按钮可点，直接回复是唯一作答方式——无论
+    // isOther 都要给引导行（非 isOther 题不收自由文本，只引导序号/选项名）
+    lines.push('', def.isOther ? '直接回复「序号 / 选项名 / 你的答案」' : '直接回复「序号 / 选项名」');
   } else if (def.isOther) {
     // 单题自由文本作答走框架的「整条文本即答案」通道（isOther 恒为 true，
     // 见 normalizeAskUserParams）⇒ 序号 / 选项名 / 任意文本都能作答。
