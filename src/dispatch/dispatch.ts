@@ -34,7 +34,6 @@ import {
   formatMultiQuestionCard,
   parseMultiQuestionPrompt,
   registerPendingMultiQuestion,
-  getQuestionGatewayRuntime,
 } from '../features/question-helpers.js';
 import { resolveGroupConfigFromAccount, resolveMentionPatterns, resolveProgressCardConfig } from '../config.js';
 import { markGroupTurnFinished, markGroupTurnStarted } from '../features/group-session-busy.js';
@@ -633,65 +632,62 @@ export async function dispatchToOpenClaw(
           return;
         }
         const { questionId, optionValues } = (payloadWithChannelData as any).channelData.askUser;
-        const questionRuntime = await getQuestionGatewayRuntime();
-        {
-          const keyboard = buildQuestionKeyboard(questionId, optionValues);
-          // ask_user 前先固化已累积的流式内容（评审意见 6）：stream 模式封口
-          // 当前段（等待用户作答期间草稿气泡不该悬挂）；static 模式 flush 缓冲
-          // （问题卡片之前的前置文本先落地）。两者均不终态化——作答后 run
-          // 续跑，新一段照常另起。
-          // static 的 flush 走 tolerant：前置文本发送失败**不**终态化 controller
-          // ——终态化会让作答后的 partial/final 全被 isTerminal 守卫丢弃，
-          // 用户看到问题卡片却看不到答案（PR #81 评审 N1）。
-          if (streamingController?.isStaticSendMode) {
-            await streamingController.flushSegment({ signal: combinedAbortSignal, tolerant: true });
-          } else {
-            await streamingController?.closeSegment('ask_user', { signal: combinedAbortSignal });
-          }
-          // 前置文本发送失败 → 缓冲处于「未送达残留」状态。此时**不能**标记
-          // 「内容已外部投递」：那会关掉终稿的 rescue 补发路径，作答后的
-          // 答案正文将永久丢失（PR #81 复审 R1）。
-          const preambleFailed = streamingController?.hasStaleBuffer === true;
-          if (preambleFailed) {
-            dlog?.warn('[question] ask_user preamble not delivered — keeping final rescue path open');
-          }
-          // 卡片发送前二次复查取消信号：flush/close 是 await 期间可能已被取消
-          // （PR #81 复审 R1：取消后仍发卡片）
-          if (combinedAbortSignal.aborted) {
-            dlog?.info('[question] skipped: turn cancelled before card');
+        const keyboard = buildQuestionKeyboard(questionId, optionValues);
+        // ask_user 前先固化已累积的流式内容（评审意见 6）：stream 模式封口
+        // 当前段（等待用户作答期间草稿气泡不该悬挂）；static 模式 flush 缓冲
+        // （问题卡片之前的前置文本先落地）。两者均不终态化——作答后 run
+        // 续跑，新一段照常另起。
+        // static 的 flush 走 tolerant：前置文本发送失败**不**终态化 controller
+        // ——终态化会让作答后的 partial/final 全被 isTerminal 守卫丢弃，
+        // 用户看到问题卡片却看不到答案（PR #81 评审 N1）。
+        if (streamingController?.isStaticSendMode) {
+          await streamingController.flushSegment({ signal: combinedAbortSignal, tolerant: true });
+        } else {
+          await streamingController?.closeSegment('ask_user', { signal: combinedAbortSignal });
+        }
+        // 前置文本发送失败 → 缓冲处于「未送达残留」状态。此时**不能**标记
+        // 「内容已外部投递」：那会关掉终稿的 rescue 补发路径，作答后的
+        // 答案正文将永久丢失（PR #81 复审 R1）。
+        const preambleFailed = streamingController?.hasStaleBuffer === true;
+        if (preambleFailed) {
+          dlog?.warn('[question] ask_user preamble not delivered — keeping final rescue path open');
+        }
+        // 卡片发送前二次复查取消信号：flush/close 是 await 期间可能已被取消
+        // （PR #81 复审 R1：取消后仍发卡片）
+        if (combinedAbortSignal.aborted) {
+          dlog?.info('[question] skipped: turn cancelled before card');
+          return;
+        }
+        // 问题卡走**被动回复**（锚点 = 本轮 inbound 的 msg_id）：不耗每日
+        // 主动预算，用户关闭「允许主动发送」时也能收到问题；锚点不可用
+        // （TTL 过期 / 平台判死）时自动降级为主动发送一次。
+        try {
+          const cardResult = await sendQuestionMessage({
+            account,
+            accountId: account.accountId,
+            to: qualifiedTarget,
+            text,
+            keyboard: keyboard as never,
+            anchorMsgId: envelope.messageId,
+            log: dlog,
+          });
+          if (!cardResult.error) {
+            outboundSendOk++;
+            // 标记流式控制器：内容已通过外部通道投递，finalize 不走 fallback
+            // （前置文本没能送达时不标记——否则终稿救不回来）
+            if (!preambleFailed) streamingController?.markDeliveredExternally();
+            dlog?.debug(`[question] sent ask_user with keyboard questionId=${questionId} options=${optionValues.length}`);
             return;
           }
-          // 问题卡走**被动回复**（锚点 = 本轮 inbound 的 msg_id）：不耗每日
-          // 主动预算，用户关闭「允许主动发送」时也能收到问题；锚点不可用
-          // （TTL 过期 / 平台判死）时自动降级为主动发送一次。
-          try {
-            const cardResult = await sendQuestionMessage({
-              account,
-              accountId: account.accountId,
-              to: qualifiedTarget,
-              text,
-              keyboard: keyboard as never,
-              anchorMsgId: envelope.messageId,
-              log: dlog,
-            });
-            if (!cardResult.error) {
-              outboundSendOk++;
-              // 标记流式控制器：内容已通过外部通道投递，finalize 不走 fallback
-              // （前置文本没能送达时不标记——否则终稿救不回来）
-              if (!preambleFailed) streamingController?.markDeliveredExternally();
-              dlog?.debug(`[question] sent ask_user with keyboard questionId=${questionId} options=${optionValues.length}`);
-              return;
-            }
-            outboundSendFail++;
-            dlog?.error(`[question] question card send failed: ${cardResult.error}`);
-          } catch (err) {
-            outboundSendFail++;
-            dlog?.error(
-              `[question] question card send threw: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-          // fallback 到纯文本发送
+          outboundSendFail++;
+          dlog?.error(`[question] question card send failed: ${cardResult.error}`);
+        } catch (err) {
+          outboundSendFail++;
+          dlog?.error(
+            `[question] question card send threw: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
+        // fallback 到纯文本发送
       }
 
       // ── 0b. ask_user 多问题投递：每题一条带按钮的消息。
