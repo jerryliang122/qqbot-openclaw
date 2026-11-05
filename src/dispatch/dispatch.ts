@@ -16,6 +16,7 @@ import type { PluginLogger } from '../utils/plugin-logger.js';
 import { buildEnvelope } from './envelope-builder.js';
 import { assembleBody, type AssembledBody } from './body-assembler.js';
 import { sendText, getGateway } from '../outbound/outbound-service.js';
+import { sendQuestionMessage } from '../outbound/question-send.js';
 import { sendMedia } from '../outbound/media-send.js';
 import { deliverReply, resolveMediaUrls, formatMediaFailureNotice, type DeliverPayload, type DeliverInfo, type DeliverContext } from '../outbound/deliver-pipeline.js';
 import { buildCtxPayload } from './ctx-builder.js';
@@ -35,7 +36,6 @@ import {
   registerPendingMultiQuestion,
   getQuestionGatewayRuntime,
 } from '../features/question-helpers.js';
-import { tryGetBotForAccount } from '../bot-instance.js';
 import { resolveGroupConfigFromAccount, resolveMentionPatterns, resolveProgressCardConfig } from '../config.js';
 import { markGroupTurnFinished, markGroupTurnStarted } from '../features/group-session-busy.js';
 import { detectEventMention, matchesNamePattern } from '../utils/mention.js';
@@ -636,51 +636,61 @@ export async function dispatchToOpenClaw(
         const questionRuntime = await getQuestionGatewayRuntime();
         {
           const keyboard = buildQuestionKeyboard(questionId, optionValues);
-          const bot = tryGetBotForAccount(account.accountId);
-          if (bot) {
-            const replyTarget = {
-              scope: envelope.chatScope === 'group' ? 'group' as const : 'c2c' as const,
-              targetId: peerId,
-            };
-            // ask_user 前先固化已累积的流式内容（评审意见 6）：stream 模式封口
-            // 当前段（等待用户作答期间草稿气泡不该悬挂）；static 模式 flush 缓冲
-            // （问题卡片之前的前置文本先落地）。两者均不终态化——作答后 run
-            // 续跑，新一段照常另起。
-            // static 的 flush 走 tolerant：前置文本发送失败**不**终态化 controller
-            // ——终态化会让作答后的 partial/final 全被 isTerminal 守卫丢弃，
-            // 用户看到问题卡片却看不到答案（PR #81 评审 N1）。
-            if (streamingController?.isStaticSendMode) {
-              await streamingController.flushSegment({ signal: combinedAbortSignal, tolerant: true });
-            } else {
-              await streamingController?.closeSegment('ask_user', { signal: combinedAbortSignal });
-            }
-            // 前置文本发送失败 → 缓冲处于「未送达残留」状态。此时**不能**标记
-            // 「内容已外部投递」：那会关掉终稿的 rescue 补发路径，作答后的
-            // 答案正文将永久丢失（PR #81 复审 R1）。
-            const preambleFailed = streamingController?.hasStaleBuffer === true;
-            if (preambleFailed) {
-              dlog?.warn('[question] ask_user preamble not delivered — keeping final rescue path open');
-            }
-            // 卡片发送前二次复查取消信号：flush/close 是 await 期间可能已被取消
-            // （PR #81 复审 R1：取消后仍发卡片）
-            if (combinedAbortSignal.aborted) {
-              dlog?.info('[question] skipped: turn cancelled before card');
-              return;
-            }
-            try {
-              await bot.sendTextWithKeyboard(replyTarget, text, keyboard as never);
+          // ask_user 前先固化已累积的流式内容（评审意见 6）：stream 模式封口
+          // 当前段（等待用户作答期间草稿气泡不该悬挂）；static 模式 flush 缓冲
+          // （问题卡片之前的前置文本先落地）。两者均不终态化——作答后 run
+          // 续跑，新一段照常另起。
+          // static 的 flush 走 tolerant：前置文本发送失败**不**终态化 controller
+          // ——终态化会让作答后的 partial/final 全被 isTerminal 守卫丢弃，
+          // 用户看到问题卡片却看不到答案（PR #81 评审 N1）。
+          if (streamingController?.isStaticSendMode) {
+            await streamingController.flushSegment({ signal: combinedAbortSignal, tolerant: true });
+          } else {
+            await streamingController?.closeSegment('ask_user', { signal: combinedAbortSignal });
+          }
+          // 前置文本发送失败 → 缓冲处于「未送达残留」状态。此时**不能**标记
+          // 「内容已外部投递」：那会关掉终稿的 rescue 补发路径，作答后的
+          // 答案正文将永久丢失（PR #81 复审 R1）。
+          const preambleFailed = streamingController?.hasStaleBuffer === true;
+          if (preambleFailed) {
+            dlog?.warn('[question] ask_user preamble not delivered — keeping final rescue path open');
+          }
+          // 卡片发送前二次复查取消信号：flush/close 是 await 期间可能已被取消
+          // （PR #81 复审 R1：取消后仍发卡片）
+          if (combinedAbortSignal.aborted) {
+            dlog?.info('[question] skipped: turn cancelled before card');
+            return;
+          }
+          // 问题卡走**被动回复**（锚点 = 本轮 inbound 的 msg_id）：不耗每日
+          // 主动预算，用户关闭「允许主动发送」时也能收到问题；锚点不可用
+          // （TTL 过期 / 平台判死）时自动降级为主动发送一次。
+          try {
+            const cardResult = await sendQuestionMessage({
+              account,
+              accountId: account.accountId,
+              to: qualifiedTarget,
+              text,
+              keyboard: keyboard as never,
+              anchorMsgId: envelope.messageId,
+              log: dlog,
+            });
+            if (!cardResult.error) {
               outboundSendOk++;
               // 标记流式控制器：内容已通过外部通道投递，finalize 不走 fallback
               // （前置文本没能送达时不标记——否则终稿救不回来）
               if (!preambleFailed) streamingController?.markDeliveredExternally();
               dlog?.debug(`[question] sent ask_user with keyboard questionId=${questionId} options=${optionValues.length}`);
               return;
-            } catch (err) {
-              outboundSendFail++;
-              dlog?.error(`[question] sendTextWithKeyboard failed: ${err instanceof Error ? err.message : String(err)}`);
-              // fallback 到纯文本发送
             }
+            outboundSendFail++;
+            dlog?.error(`[question] question card send failed: ${cardResult.error}`);
+          } catch (err) {
+            outboundSendFail++;
+            dlog?.error(
+              `[question] question card send threw: ${err instanceof Error ? err.message : String(err)}`,
+            );
           }
+          // fallback 到纯文本发送
         }
       }
 
@@ -697,46 +707,64 @@ export async function dispatchToOpenClaw(
         const { questionId } = (payloadWithChannelData as any).channelData.askUser;
         const questions = parseMultiQuestionPrompt(text);
         if (questions) {
-          const bot = tryGetBotForAccount(account.accountId);
-          if (bot) {
-            const scope = envelope.chatScope === 'group' ? 'group' as const : 'c2c' as const;
-            const replyTarget = { scope, targetId: peerId };
-            // 先登记再发送，避免用户先点按钮时查无此单
-            registerPendingMultiQuestion(account.accountId, questionId, scope, peerId, questions);
-            // ask_user 前先固化已累积的流式内容（同单问题分支，评审意见 6）
-            // static 的 flush 走 tolerant：前置文本发送失败不终态化 controller
-            // （PR #81 评审 N1）
-            if (streamingController?.isStaticSendMode) {
-              await streamingController.flushSegment({ signal: combinedAbortSignal, tolerant: true });
-            } else {
-              await streamingController?.closeSegment('ask_user', { signal: combinedAbortSignal });
-            }
-            // 前置文本未送达 → 不标记「内容已外部投递」（保住终稿 rescue 路径）
-            const preambleFailed = streamingController?.hasStaleBuffer === true;
-            if (preambleFailed) {
-              dlog?.warn('[question] ask_user preamble not delivered (multi) — keeping final rescue path open');
-            }
-            // 卡片发送前二次复查取消信号（await 期间可能已取消）
-            if (combinedAbortSignal.aborted) {
-              dlog?.info('[question] skipped: turn cancelled before cards (multi)');
-              return;
-            }
-            try {
-              for (const [index, question] of questions.entries()) {
-                const cardText = formatMultiQuestionCard(question, index, questions.length);
-                const keyboard = buildMultiQuestionKeyboard(questionId, index, question);
-                await bot.sendTextWithKeyboard(replyTarget, cardText, keyboard as never);
-                outboundSendOk++;
+          const scope = envelope.chatScope === 'group' ? 'group' as const : 'c2c' as const;
+          // 先登记再发送，避免用户先点按钮时查无此单；锚点（本轮 inbound
+          // 的 msg_id）一并登记——续卡 / 确认卡 / 状态回执据此走被动回复。
+          registerPendingMultiQuestion(
+            account.accountId,
+            questionId,
+            scope,
+            peerId,
+            questions,
+            undefined,
+            envelope.messageId,
+          );
+          // ask_user 前先固化已累积的流式内容（同单问题分支，评审意见 6）
+          // static 的 flush 走 tolerant：前置文本发送失败不终态化 controller
+          // （PR #81 评审 N1）
+          if (streamingController?.isStaticSendMode) {
+            await streamingController.flushSegment({ signal: combinedAbortSignal, tolerant: true });
+          } else {
+            await streamingController?.closeSegment('ask_user', { signal: combinedAbortSignal });
+          }
+          // 前置文本未送达 → 不标记「内容已外部投递」（保住终稿 rescue 路径）
+          const preambleFailed = streamingController?.hasStaleBuffer === true;
+          if (preambleFailed) {
+            dlog?.warn('[question] ask_user preamble not delivered (multi) — keeping final rescue path open');
+          }
+          // 卡片发送前二次复查取消信号（await 期间可能已取消）
+          if (combinedAbortSignal.aborted) {
+            dlog?.info('[question] skipped: turn cancelled before cards (multi)');
+            return;
+          }
+          try {
+            for (const [index, question] of questions.entries()) {
+              const cardText = formatMultiQuestionCard(question, index, questions.length);
+              const keyboard = buildMultiQuestionKeyboard(questionId, index, question);
+              // 每张卡都挂**同一个显式锚点**（本轮 inbound msg_id）走被动
+              // 回复；锚点不可用时逐张降级主动。
+              const cardResult = await sendQuestionMessage({
+                account,
+                accountId: account.accountId,
+                to: qualifiedTarget,
+                text: cardText,
+                keyboard: keyboard as never,
+                anchorMsgId: envelope.messageId,
+                log: dlog,
+              });
+              if (cardResult.error) {
+                throw new Error(`question card send failed: ${cardResult.error}`);
               }
-              // 标记流式控制器：内容已通过外部通道投递，finalize 不走 fallback
-              if (!preambleFailed) streamingController?.markDeliveredExternally();
-              dlog?.debug(`[question] sent multi-question ask_user questionId=${questionId} questions=${questions.length}`);
-              return;
-            } catch (err) {
-              outboundSendFail++;
-              dlog?.error(`[question] multi-question send failed: ${err instanceof Error ? err.message : String(err)}`);
-              // 已发出的卡片仍可点选；此处走纯文本兜底补全未送达部分
+              outboundSendOk++;
             }
+            // 标记流式控制器：内容已通过外部通道投递，finalize 不走 fallback
+            if (!preambleFailed) streamingController?.markDeliveredExternally();
+            dlog?.debug(`[question] sent multi-question ask_user questionId=${questionId} questions=${questions.length}`);
+            return;
+          } catch (err) {
+            outboundSendFail++;
+            dlog?.error(`[question] multi-question send failed: ${err instanceof Error ? err.message : String(err)}`);
+            // 已发出的卡片仍可点选；此处走纯文本兜底补全未送达部分
           }
         } else {
           dlog?.debug(`[question] multi-question prompt unparseable questionId=${questionId}; plain text`);

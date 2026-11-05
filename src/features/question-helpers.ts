@@ -529,6 +529,15 @@ interface PendingMultiQuestion {
   terminal: boolean;
   /** 正在合成入站提交（防并发重复提交） */
   resolving: boolean;
+  /**
+   * 本轮 inbound 消息的 msg_id（**显式锚点**）——多题的续卡 / 确认卡 /
+   * 状态回执复用它走被动回复。
+   *
+   * 取值只来自 dispatch 当轮的 `envelope.messageId`（**不是** msgid-cache
+   * 池化选取：挂错引用等于把回复挂到错误的消息上，见 AGENTS.md 红线）。
+   * 锚点过期（群聊 5min / c2c 60min）或被平台判死时，发送侧降级为主动。
+   */
+  anchorMsgId?: string;
   expiresAtMs: number;
   cleanupTimer: ReturnType<typeof setTimeout>;
 }
@@ -549,6 +558,9 @@ function conversationKey(accountId: string, scope: 'c2c' | 'group', targetId: st
 /**
  * 登记一次多问题 ask_user 投递，供按钮回调 / 入站文字按题缓冲答案。
  * 必须在发送按钮消息之前调用，避免「先点后登记」竞态。
+ *
+ * @param anchorMsgId 本轮 inbound 的 msg_id（显式锚点）——续卡 / 确认卡 /
+ *   状态回执据此走被动回复；缺省则后续消息一律主动发送。
  */
 export function registerPendingMultiQuestion(
   accountId: string,
@@ -557,6 +569,7 @@ export function registerPendingMultiQuestion(
   targetId: string,
   questions: MultiQuestionDef[],
   ttlMs: number = DEFAULT_MULTI_QUESTION_TTL_MS,
+  anchorMsgId?: string,
 ): void {
   const existing = pendingMultiQuestions.get(questionId);
   if (existing) clearTimeout(existing.cleanupTimer);
@@ -568,6 +581,7 @@ export function registerPendingMultiQuestion(
     answers: new Map(),
     terminal: false,
     resolving: false,
+    ...(anchorMsgId ? { anchorMsgId } : {}),
     expiresAtMs: Date.now() + ttlMs,
     cleanupTimer: setTimeout(() => {
       if (pendingMultiQuestions.get(questionId) === entry) {
@@ -698,6 +712,19 @@ export function getPendingMultiQuestions(questionId: string): MultiQuestionDef[]
   const entry = pendingMultiQuestions.get(questionId);
   if (!entry || entry.expiresAtMs <= Date.now()) return null;
   return entry.questions;
+}
+
+/**
+ * 读取登记的被动锚点（本轮 inbound 的 msg_id）。
+ *
+ * 用于多题的续卡 / 确认卡 / 状态回执走被动回复。返回 undefined 表示
+ * 「无可用锚点」（pending 不存在 / 已过期 / 登记时未带锚点）⇒ 发送侧
+ * 直接走主动。
+ */
+export function getPendingMultiQuestionAnchor(questionId: string): string | undefined {
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry || entry.expiresAtMs <= Date.now()) return undefined;
+  return entry.anchorMsgId;
 }
 
 /**
