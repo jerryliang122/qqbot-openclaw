@@ -22,6 +22,7 @@ import {
   recordMultiQuestionTap,
   markMultiQuestionResolveFailed,
   getPendingMultiQuestions,
+  getPendingMultiQuestionAnchor,
   buildMultiQuestionAnswerText,
   formatMultiQuestionConfirmCard,
   buildMultiQuestionConfirmKeyboard,
@@ -36,7 +37,8 @@ import { recordPushAuthorizeEvent } from '../features/push-authorization-store.j
 import { getAdapters } from '../adapter/resolve.js';
 import { resolveGroupConfigFromAccount, resolveGroupConfigKey, resolveGroupPolicy, resolveMentionPatterns } from '../config.js';
 import { getPackageVersion } from '../utils/pkg-version.js';
-import { getOpenClawVersion, tryGetBotForAccount } from '../bot-instance.js';
+import { getOpenClawVersion } from '../bot-instance.js';
+import { sendQuestionMessage } from '../outbound/question-send.js';
 import type { ParsedMultiQuestionAction } from '../features/question-helpers.js';
 
 export async function handleMessage(
@@ -462,7 +464,7 @@ async function handleMultiQuestionTap(
 
   if (tap.status === 'unknown' || tap.status === 'terminal') {
     log.info(`[question] multi tap ignored id=${parsed.questionId} status=${tap.status}`);
-    await sendMultiQuestionFeedback(event, account, '该问题已提交或已过期', log);
+    await sendMultiQuestionFeedback(event, account, '该问题已提交或已过期', log, parsed.questionId);
     return;
   }
   if (tap.status === 'resolving') {
@@ -477,6 +479,7 @@ async function handleMultiQuestionTap(
       account,
       `✅ 已记录 ${tap.answeredCount}/${tap.total}\n还剩：${pendingTitles.join('、')}`,
       log,
+      parsed.questionId,
     );
     return;
   }
@@ -499,6 +502,10 @@ async function handleMultiQuestionTap(
  * 「✅ 提交」（enter=true，客户端自动以用户身份发出答案文本）与
  * 「✏️ 改一改」（填入输入框，用户编辑后手动发送）。
  * 发出后复位 resolving 锁——用户可以继续点选修改答案，再拿到新确认卡。
+ *
+ * 出站走**被动回复**：锚点 = 登记 pending 时记下的本轮 inbound msg_id
+ * （与问题卡同一个锚点）——不耗每日主动预算，用户关闭「允许主动发送」
+ * 时也能收到；锚点不可用（TTL 过期 / 平台判死）时自动降级为主动。
  */
 async function sendMultiQuestionConfirmCard(
   questionId: string,
@@ -514,35 +521,37 @@ async function sendMultiQuestionConfirmCard(
     ? formatMultiQuestionConfirmCard(questions, answers)
     : `**✅ 答案确认**\n\n${answerText}`;
 
-  const bot = tryGetBotForAccount(account.accountId);
-  if (!bot) {
-    markMultiQuestionResolveFailed(questionId);
-    log.error(`[question] confirm card send failed: bot unavailable id=${questionId}`);
-    await sendMultiQuestionFeedbackText(scope, peerId, account, '⚠️ 提交卡发送失败，请直接文字回复答案', log);
+  const result = await sendQuestionMessage({
+    account,
+    accountId: account.accountId,
+    to: formatQuestionTarget(scope, peerId),
+    text: cardText,
+    keyboard: buildMultiQuestionConfirmKeyboard(answerText) as never,
+    anchorMsgId: getPendingMultiQuestionAnchor(questionId),
+    log,
+  }).catch((err) => ({ error: err instanceof Error ? err.message : String(err) }));
+  // 复位锁，允许继续改答案（无论发送成功与否——锁的作用是防并发提交）
+  markMultiQuestionResolveFailed(questionId);
+  if (result.error) {
+    log.error(`[question] confirm card send error id=${questionId}: ${result.error}`);
+    await sendMultiQuestionFeedbackText(scope, peerId, account, '⚠️ 提交卡发送失败，请直接文字回复答案', log, questionId);
     return;
   }
-  try {
-    await bot.sendTextWithKeyboard({ scope, targetId: peerId }, cardText, buildMultiQuestionConfirmKeyboard(answerText) as never);
-    markMultiQuestionResolveFailed(questionId); // 复位锁，允许继续改答案
-    log.info(`[question] confirm card sent id=${questionId} answers=${JSON.stringify(answerText)}`);
-  } catch (err) {
-    markMultiQuestionResolveFailed(questionId);
-    log.error(`[question] confirm card send error id=${questionId}: ${err instanceof Error ? err.message : String(err)}`);
-    await sendMultiQuestionFeedbackText(scope, peerId, account, '⚠️ 提交卡发送失败，请直接文字回复答案', log);
-  }
+  log.info(`[question] confirm card sent id=${questionId} answers=${JSON.stringify(answerText)}`);
 }
 
-/** 尽力而为的状态回执（主动消息），失败仅记日志不影响主流程 */
+/** 尽力而为的状态回执，失败仅记日志不影响主流程 */
 async function sendMultiQuestionFeedback(
   event: InteractionEvent,
   account: ResolvedQQBotAccount,
   text: string,
   log?: PluginLogger,
+  questionId?: string,
 ): Promise<void> {
   const scope = event.group_openid ? 'group' as const : 'c2c' as const;
   const targetId = event.group_openid ?? event.user_openid;
   if (!targetId) return;
-  await sendMultiQuestionFeedbackText(scope, targetId, account, text, log);
+  await sendMultiQuestionFeedbackText(scope, targetId, account, text, log, questionId);
 }
 
 async function sendMultiQuestionFeedbackText(
@@ -551,15 +560,31 @@ async function sendMultiQuestionFeedbackText(
   account: ResolvedQQBotAccount,
   text: string,
   log?: PluginLogger,
+  questionId?: string,
 ): Promise<void> {
-  const bot = tryGetBotForAccount(account.accountId);
-  if (!bot) return;
+  // 锚点 = pending 登记的本轮 inbound msg_id（无锚点 ⇒ 主动发送）
+  const anchorMsgId = questionId ? getPendingMultiQuestionAnchor(questionId) : undefined;
   try {
-    await bot.sendText({ scope, targetId }, text);
+    const result = await sendQuestionMessage({
+      account,
+      accountId: account.accountId,
+      to: formatQuestionTarget(scope, targetId),
+      text,
+      ...(anchorMsgId ? { anchorMsgId } : {}),
+      log,
+    });
+    if (result.error) {
+      // 回执是锦上添花，吞掉即可（仅 DEBUG 留痕）
+      log?.debug(`[question] feedback send failed scope=${scope}: ${result.error}`);
+    }
   } catch (err) {
-    // 主动消息可能触发平台限频；回执是锦上添花，吞掉即可（仅 DEBUG 留痕）
-    log?.debug(`[question] feedback send failed scope=${scope}: ${err instanceof Error ? err.message : String(err)}`);
+    log?.debug(`[question] feedback send threw scope=${scope}: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/** ask_user 出站目标串（与 dispatch 的 qualifiedTarget 同构） */
+function formatQuestionTarget(scope: 'c2c' | 'group', targetId: string): string {
+  return scope === 'group' ? `qqbot:group:${targetId}` : `qqbot:c2c:${targetId}`;
 }
 
 const CHANNEL_VER = getPackageVersion();

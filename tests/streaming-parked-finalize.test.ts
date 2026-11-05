@@ -302,12 +302,20 @@ function installFakeGateway(opts: { failFirstTextSend?: boolean; failFirstMediaS
   let textSendCount = 0;
   let mediaSendCount = 0;
   const gw = {
-    sendText: async (_target: any, text: string) => {
+    sendText: async (_target: any, text: string, sendOpts?: any) => {
       textSendCount++;
       // outbound-service.sendText 只把 gateway 的【抛错】当失败（返回值一律视为
       // 成功，error 由其 catch formatError 产生）——模拟失败必须 throw
       if (opts.failFirstTextSend && textSendCount === 1) {
         throw new Error('boom (failFirstTextSend)');
+      }
+      // ask_user 问题卡走 outbound-service → 网关 sendText（带 keyboard），
+      // 与正文同一条出口——按是否带 keyboard 区分记录（PR3：卡片不再走
+      // SDK 直发，改挂本轮 inbound 的显式锚点走被动回复）
+      if (sendOpts?.keyboard) {
+        botCardTexts.push(text);
+        events.push(`card:${text}`);
+        return { id: `card-${botCardTexts.length}` };
       }
       sentTexts.push(text);
       events.push(`text:${text}`);
@@ -338,14 +346,6 @@ function installFakeGateway(opts: { failFirstTextSend?: boolean; failFirstMediaS
           return { id: 'stream-done', timestamp: Date.now() };
         },
       };
-    },
-    // tryGetBotForAccount 走 getGateway(accountId).bot——ask_user 卡片经此发出
-    bot: {
-      sendTextWithKeyboard: async (_target: any, text: string) => {
-        botCardTexts.push(text);
-        events.push(`card:${text}`);
-        return { id: `card-${botCardTexts.length}` };
-      },
     },
   } as any;
   registerGateway('test-account', gw);
@@ -602,7 +602,7 @@ await test('M2: static ask_user 前置文本在问题卡片之前送达', async 
   await captured.replyOptions?.onPartialReply?.({ text: '前置说明' });
   await captured.dispatcherOptions?.deliver?.(ASK_USER_PAYLOAD('要继续吗？'), { kind: 'final' });
   assert.deepStrictEqual(sentTexts, ['前置说明'], '前置文本应在卡片前 flush 送达（不悬挂到作答后）');
-  assert.deepStrictEqual(botCardTexts, ['要继续吗？'], '问题卡片经 bot.sendTextWithKeyboard 送达');
+  assert.deepStrictEqual(botCardTexts, ['要继续吗？'], '问题卡片经网关 sendText（带 keyboard）送达');
   // 顺序断言必须落在同一事件序列上：分开断言只能证明「都发生过」，
   // 证明不了「文本在卡片之前」（PR #81 评审 N9）
   const textIdx = events.indexOf('text:前置说明');
