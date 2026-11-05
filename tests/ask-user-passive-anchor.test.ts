@@ -223,6 +223,52 @@ await test('单问题卡正文与按钮 = 插件自渲染（PR1），不再直�
   assert.equal(buttons[1].action.data, `qqbot:q:${QID}:1`);
 });
 
+await test('卡片发送失败 ⇒ 纯文本兜底不带按钮指引（keyboardAttached:false）+ 撤掉单问题 pending', async () => {
+  clearQuotaCache();
+  const sent: RecordedSend[] = [];
+  const gw: any = {
+    sendText: async (target: any, text: string, sendOpts: any) => {
+      sent.push({ target, text, opts: sendOpts });
+      // 模拟键盘被平台拒收：带 keyboard 的发送一律失败，纯文本放行
+      if (sendOpts?.keyboard) throw new Error('keyboard not permitted');
+      return { id: `out-${sent.length}` };
+    },
+    sendMedia: async () => ({ id: 'media-out' }),
+  };
+  registerGateway(ACCOUNT_ID, gw);
+  const runtime = makeFakeRuntime({
+    onInboundRun: async (params: any) => {
+      const plan = params.adapter.resolveTurn({}, 'provider_message_sending', {});
+      await plan.runDispatch();
+      return { dispatched: true };
+    },
+    dispatchReply: async (params2: any) => {
+      await params2.dispatcherOptions.deliver?.(SINGLE_QUESTION_PAYLOAD, { kind: 'final' });
+      return { queuedFinal: true, counts: { final: 1 } };
+    },
+  });
+  try {
+    _resetAdaptersCache();
+    const { msg, ctx } = makeMsgAndCtx({ messageId: 'M_SINGLE_KBFAIL' });
+    await dispatchToOpenClaw(ctx, msg, makeAccount(), runtime);
+    assert.equal(sent.length, 2, `应有卡片（失败）+ 纯文本兜底两次发送，实际 ${sent.length}`);
+    const fallback = sent[1]!;
+    assert.ok(!fallback.opts?.keyboard, '兜底不得携带 keyboard');
+    assert.ok(!fallback.text.includes('👇 点下方按钮作答'), '兜底正文不得指引点不存在的按钮（评审 F1）');
+    assert.ok(!fallback.text.includes('Question for you:'), '兜底正文仍是渲染后的中文卡片');
+    assert.ok(fallback.text.includes('**甲**'), '兜底正文保留渲染标题');
+    assert.ok(fallback.text.includes('直接回复「序号 / 选项名」'), 'isOther=false 的兜底应给直接回复引导');
+    // 卡片没送达 ⇒ 单问题 pending 应已撤掉（该会话恢复防抖合并）
+    assert.equal(
+      findPendingSingleQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      undefined,
+      '卡片发送失败应撤掉单问题 pending',
+    );
+  } finally {
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
 await test('下一条 c2c 入站消息清理单问题 pending（该会话恢复防抖合并）', async () => {
   clearQuotaCache();
   const { sent, gw } = installFakeGateway();
@@ -256,7 +302,8 @@ await test('下一条 c2c 入站消息清理单问题 pending（该会话恢复�
   }
 });
 
-await test('单题文本反解失败 ⇒ 回退到框架原文 + 旧键盘（零回归）', async () => {  clearQuotaCache();
+await test('单题文本反解失败 ⇒ 回退到框架原文 + 旧键盘（零回归）', async () => {
+  clearQuotaCache();
   const sent = await deliverAskUser(
     {
       // 结构异常：选项行与 optionValues 不匹配

@@ -690,13 +690,11 @@ export async function dispatchToOpenClaw(
           dlog?.warn('[question] ask_user preamble not delivered — keeping final rescue path open');
         }
         // 卡片发送前二次复查取消信号：flush/close 是 await 期间可能已被取消
-        // （PR #81 复审 R1：取消后仍发卡片）
+        // （PR #81 复审 R1：取消后仍发卡片）。单问题 pending 尚未登记——
+        // 登记在下方、紧贴发送前，此处早退无需清理（2026-11-05 评审 F2：
+        // 此前这里有一个 no-op 的 markSingleQuestionResolved，删）
         if (combinedAbortSignal.aborted) {
           dlog?.info('[question] skipped: turn cancelled before card');
-          // 卡片没发出去 ⇒ 撤掉刚登记的单问题 pending（否则该会话白挂 25min 旁路）
-          if (envelope.chatScope !== 'group') {
-            markSingleQuestionResolved(questionId);
-          }
           return;
         }
         // 问题卡走**被动回复**（锚点 = 本轮 inbound 的 msg_id）：不耗每日
@@ -749,10 +747,15 @@ export async function dispatchToOpenClaw(
         if (envelope.chatScope !== 'group') {
           markSingleQuestionResolved(questionId);
         }
-        // 纯文本兜底改用**渲染后的卡片正文**（框架原文带 3 行英文脚手架）。
-        // 用新对象而非原地改，避免动到框架持有的 payload。
+        // 纯文本兜底改用**渲染后的卡片正文**（框架原文带 3 行英文脚手架），
+        // 但以 keyboardAttached:false 重渲——键盘没发出去，正文不得再指引
+        // 用户「点下方按钮」（2026-11-05 评审 F1）。用新对象而非原地改，
+        // 避免动到框架持有的 payload。
         if (singleDef) {
-          payload = { ...payload, text: cardText };
+          payload = {
+            ...payload,
+            text: formatQuestionCard(singleDef, { variant: 'single', keyboardAttached: false }),
+          };
         }
         // fallback 到纯文本发送（正文用渲染后的卡片文本）
       }
