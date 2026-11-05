@@ -46,7 +46,7 @@ const { registerGateway, unregisterGateway } = await import('../src/outbound/out
 const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
 const { clearQuotaCache } = await import('../src/features/quota-manager.ts');
 const { cacheMsgId, clearMsgIdCache } = await import('../src/features/msgid-cache.ts');
-const { registerPendingMultiQuestion } = await import('../src/features/question-helpers.ts');
+const { registerPendingMultiQuestion, registerPendingSingleQuestion, findPendingSingleQuestionByConversation } = await import('../src/features/question-helpers.ts');
 const { handleInteraction } = await import('../src/gateway/event-handlers.ts');
 
 // ── 测试基础设施（沿用 dispatch-lifecycle.test.ts 的形态）──
@@ -203,6 +203,75 @@ await test('单问题卡带显式锚点 + keyboard + passiveOnly', async () => {
     (call.opts?.keyboard?.content?.rows ?? []).length > 0,
     'keyboard 必须有按钮行',
   );
+});
+
+await test('单问题卡正文与按钮 = 插件自渲染（PR1），不再直吐框架原文', async () => {
+  clearQuotaCache();
+  const sent = await deliverAskUser(SINGLE_QUESTION_PAYLOAD, { messageId: 'M_SINGLE_RENDER' });
+  assert.equal(sent.length, 1);
+  const call = sent[0]!;
+  const body = String(call.text ?? '');
+  assert.ok(body.includes('**甲**'), '正文应是渲染后的卡片（标题加粗）');
+  assert.ok(body.includes('**1.** Yes'), '正文应是渲染后的编号选项');
+  assert.ok(body.includes('👇 点下方按钮作答'), '正文应是渲染后的引导行');
+  assert.ok(!body.includes('Question for you:'), '框架英文脚手架不得出现在正文里');
+  const buttons = (call.opts?.keyboard?.content?.rows ?? []).flatMap((r: any) => r.buttons ?? []);
+  assert.equal(buttons.length, 2);
+  assert.equal(buttons[0].render_data.label, '① Yes');
+  assert.equal(buttons[1].render_data.label, '② No');
+  assert.equal(buttons[0].action.data, `qqbot:q:${QID}:0`);
+  assert.equal(buttons[1].action.data, `qqbot:q:${QID}:1`);
+});
+
+await test('下一条 c2c 入站消息清理单问题 pending（该会话恢复防抖合并）', async () => {
+  clearQuotaCache();
+  const { sent, gw } = installFakeGateway();
+  const runtime = makeFakeRuntime({
+    onInboundRun: async () => ({ dispatched: true }),
+    dispatchReply: async () => ({ queuedFinal: true, counts: { final: 1 } }),
+  });
+  try {
+    // 第一轮：发出问题卡（登记 pending）
+    _resetAdaptersCache();
+    const first = makeMsgAndCtx({ messageId: 'M_SINGLE_Q1' });
+    await dispatchToOpenClaw(first.ctx, first.msg, makeAccount(), runtime);
+    // 手动模拟「卡片已发 + pending 已登记」（deliver 回调在真实链路里登记）
+    registerPendingSingleQuestion(ACCOUNT_ID, QID, 'c2c', 'USER_123', undefined, 'M_SINGLE_Q1');
+    assert.ok(
+      findPendingSingleQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      'pending 应已登记',
+    );
+
+    // 第二轮：用户回话 ⇒ pending 被清理（该会话恢复防抖合并）
+    _resetAdaptersCache();
+    const second = makeMsgAndCtx({ messageId: 'M_SINGLE_Q2' });
+    await dispatchToOpenClaw(second.ctx, second.msg, makeAccount(), runtime);
+    assert.equal(
+      findPendingSingleQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      undefined,
+      '下一条入站消息应清理单问题 pending',
+    );
+  } finally {
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('单题文本反解失败 ⇒ 回退到框架原文 + 旧键盘（零回归）', async () => {  clearQuotaCache();
+  const sent = await deliverAskUser(
+    {
+      // 结构异常：选项行与 optionValues 不匹配
+      text: 'Question for you:\n\n甲\n选哪个？\n1. Alpha\n2. Beta',
+      channelData: { askUser: { questionId: QID, optionValues: ['Yes', 'No'] } },
+    },
+    { messageId: 'M_SINGLE_FALLBACK' },
+  );
+  assert.equal(sent.length, 1);
+  const call = sent[0]!;
+  assert.equal(call.text, 'Question for you:\n\n甲\n选哪个？\n1. Alpha\n2. Beta');
+  const buttons = (call.opts?.keyboard?.content?.rows ?? []).flatMap((r: any) => r.buttons ?? []);
+  assert.equal(buttons.length, 2);
+  assert.equal(buttons[0].render_data.label, 'Yes');
+  assert.equal(buttons[0].action.data, `qqbot:q:${QID}:0`);
 });
 
 // ── 2. 多问题卡：每张都带同一个锚点 ──

@@ -86,7 +86,7 @@ const {
 } = await import('../src/features/inbound-debounce.ts');
 const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
 const { registerGateway } = await import('../src/outbound/outbound-service.ts');
-const { registerPendingMultiQuestion } = await import('../src/features/question-helpers.ts');
+const { registerPendingMultiQuestion, registerPendingSingleQuestion } = await import('../src/features/question-helpers.ts');
 
 // ── 测试基础设施（对齐 room-event.test.ts）──
 
@@ -470,6 +470,28 @@ await test('多问题 keyed 答案旁路：原样直发不被合并（认领文�
   assert.equal(await keepAlive(fire(scenario, answer)), true);
   assert.equal(scenario.captured.length, 1, 'keyed answer must bypass debounce immediately');
   assert.equal(scenario.captured[0]!.ingest.textForCommands, '1: 3\n2: 1');
+});
+
+await test('单问题作答旁路（PR1）：原样直发不被合并（答案文本不被改写）', async () => {
+  const scenario = setupScenario({ debounceMs: W });
+  // 独立 sender：pending 记录 TTL（200ms）内仍在注册表里，同 sender 会
+  // 让后续用例的消息误命中单题旁路（跨测试污染）
+  const answer = makeC2CMsgAndCtx({
+    senderId: 'USER_SINGLE',
+    content: '2',
+    assembledBody: { webBody: '2', agentBody: '2', rawBody: '2' },
+  });
+  registerPendingSingleQuestion(
+    'test-account',
+    'q-single-bypass-test',
+    'c2c',
+    answer.msg.replyTarget.targetId,
+    200, // 短 TTL：cleanup timer 不悬挂测试进程
+    'msg-anchor',
+  );
+  assert.equal(await keepAlive(fire(scenario, answer)), true);
+  assert.equal(scenario.captured.length, 1, 'single-question answer must bypass debounce immediately');
+  assert.equal(scenario.captured[0]!.ingest.textForCommands, '2');
 });
 
 await test('keyed 旁路按账号隔离：他账号的 pending 不影响本账号合并', async () => {

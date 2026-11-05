@@ -34,7 +34,15 @@ import {
   formatMultiQuestionCard,
   parseMultiQuestionPrompt,
   registerPendingMultiQuestion,
+  registerPendingSingleQuestion,
+  markSingleQuestionResolved,
+  findPendingSingleQuestionByConversation,
 } from '../features/question-helpers.js';
+import {
+  parseSingleQuestionPrompt,
+  formatQuestionCard,
+  buildQuestionOptionKeyboard,
+} from '../features/question-card.js';
 import { resolveGroupConfigFromAccount, resolveMentionPatterns, resolveProgressCardConfig } from '../config.js';
 import { markGroupTurnFinished, markGroupTurnStarted } from '../features/group-session-busy.js';
 import { detectEventMention, matchesNamePattern } from '../utils/mention.js';
@@ -357,6 +365,22 @@ export async function dispatchToOpenClaw(
   // 并发触发 QQ 平台 500），私聊用 senderId（允许用户"插嘴"，新消息取消旧消息）。
   const peerId = resolveDispatchPeerId(envelope.chatScope, envelope.groupId, envelope.senderId);
 
+  // 单问题 pending 清理（PR1）：c2c 会话里，用户看到问题卡后的**第一条**
+  // 入站消息就是它的作答（或放弃）⇒ 此刻起该会话恢复防抖合并。
+  //
+  // 注意不会误清「发卡那一轮」：那条 pending 是在该轮的 deliver 回调里
+  // 才登记的，晚于本行（dispatch 起点）。
+  if (envelope.chatScope !== 'group') {
+    const pendingSingle = findPendingSingleQuestionByConversation(
+      account.accountId,
+      'c2c',
+      peerId,
+    );
+    if (pendingSingle) {
+      markSingleQuestionResolved(pendingSingle.questionId);
+    }
+  }
+
   const route = adapters.resolveAgentRoute?.({
     cfg,
     channel: 'qqbot',
@@ -632,7 +656,20 @@ export async function dispatchToOpenClaw(
           return;
         }
         const { questionId, optionValues } = (payloadWithChannelData as any).channelData.askUser;
-        const keyboard = buildQuestionKeyboard(questionId, optionValues);
+        // 单题卡自渲染（PR1）：从框架文本反解题目结构，渲染成与多题卡同构的
+        // 中文卡片（去掉框架 3 行英文脚手架 + 按钮带 ① 序号前缀）。
+        // 反解失败 ⇒ 回退到改造前的形态（框架原文 + 旧键盘），零回归。
+        const singleDef = parseSingleQuestionPrompt(text, optionValues);
+        const cardText = singleDef ? formatQuestionCard(singleDef, { variant: 'single' }) : text;
+        const keyboard = singleDef
+          ? buildQuestionOptionKeyboard(singleDef, {
+              questionId,
+              buildActionData: (optionIndex) => `qqbot:q:${questionId}:${optionIndex}`,
+              groupId: 'question',
+              idPrefix: 'q',
+              visitedLabel: '已回答',
+            })
+          : buildQuestionKeyboard(questionId, optionValues);
         // ask_user 前先固化已累积的流式内容（评审意见 6）：stream 模式封口
         // 当前段（等待用户作答期间草稿气泡不该悬挂）；static 模式 flush 缓冲
         // （问题卡片之前的前置文本先落地）。两者均不终态化——作答后 run
@@ -656,17 +693,36 @@ export async function dispatchToOpenClaw(
         // （PR #81 复审 R1：取消后仍发卡片）
         if (combinedAbortSignal.aborted) {
           dlog?.info('[question] skipped: turn cancelled before card');
+          // 卡片没发出去 ⇒ 撤掉刚登记的单问题 pending（否则该会话白挂 25min 旁路）
+          if (envelope.chatScope !== 'group') {
+            markSingleQuestionResolved(questionId);
+          }
           return;
         }
         // 问题卡走**被动回复**（锚点 = 本轮 inbound 的 msg_id）：不耗每日
         // 主动预算，用户关闭「允许主动发送」时也能收到问题；锚点不可用
         // （TTL 过期 / 平台判死）时自动降级为主动发送一次。
+        // 登记单问题 pending（**紧贴发送前**，避免用户秒点时查无此单；
+        // 放这里而不是更早，是为了让「取消 / flush 异常」两条早退路径
+        // 不留下幽灵 pending）：供 c2c 防抖旁路与 secret-capture 旁路识别
+        // 「本条文本很可能是作答」，避免答案被防抖合并改写、或被当成
+        // 密钥值吞掉。仅 c2c 登记（群合批旁路本 PR 不动）。
+        if (envelope.chatScope !== 'group') {
+          registerPendingSingleQuestion(
+            account.accountId,
+            questionId,
+            'c2c',
+            peerId,
+            undefined,
+            envelope.messageId,
+          );
+        }
         try {
           const cardResult = await sendQuestionMessage({
             account,
             accountId: account.accountId,
             to: qualifiedTarget,
-            text,
+            text: cardText,
             keyboard: keyboard as never,
             anchorMsgId: envelope.messageId,
             log: dlog,
@@ -676,7 +732,9 @@ export async function dispatchToOpenClaw(
             // 标记流式控制器：内容已通过外部通道投递，finalize 不走 fallback
             // （前置文本没能送达时不标记——否则终稿救不回来）
             if (!preambleFailed) streamingController?.markDeliveredExternally();
-            dlog?.debug(`[question] sent ask_user with keyboard questionId=${questionId} options=${optionValues.length}`);
+            dlog?.debug(
+              `[question] sent ask_user with keyboard questionId=${questionId} options=${optionValues.length} rendered=${singleDef ? 'card' : 'fallback'}`,
+            );
             return;
           }
           outboundSendFail++;
@@ -687,7 +745,16 @@ export async function dispatchToOpenClaw(
             `[question] question card send threw: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-        // fallback 到纯文本发送
+        // 卡片没送达 ⇒ 撤掉单问题 pending（否则该会话后续消息一直不被合并）
+        if (envelope.chatScope !== 'group') {
+          markSingleQuestionResolved(questionId);
+        }
+        // 纯文本兜底改用**渲染后的卡片正文**（框架原文带 3 行英文脚手架）。
+        // 用新对象而非原地改，避免动到框架持有的 payload。
+        if (singleDef) {
+          payload = { ...payload, text: cardText };
+        }
+        // fallback 到纯文本发送（正文用渲染后的卡片文本）
       }
 
       // ── 0b. ask_user 多问题投递：每题一条带按钮的消息。

@@ -12,7 +12,7 @@
  * 会导致挂起的 ask_user 永不成单（AGENTS.md 2026-08-24 事故）。
  */
 import type { Middleware } from '@tencent-connect/qqbot-nodejs';
-import { findPendingMultiQuestionByConversation } from '../features/question-helpers.js';
+import { findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation } from '../features/question-helpers.js';
 import { checkAndConsumePassiveReplyQuota } from '../features/quota-manager.js';
 import {
   runSecretsReload,
@@ -107,6 +107,13 @@ export function secretCapture(params: SecretCaptureParams): Middleware {
 
     // 红线：多问题 ask_user 进行中 → 其答案/确认卡消息优先，绝不拦截
     if (findPendingMultiQuestionByConversation(accountId, 'c2c', senderId)) {
+      await next();
+      return;
+    }
+
+    // 红线：单问题 ask_user 进行中（PR1）→ 其作答消息优先，绝不拦截
+    // （单题卡正文引导「直接回复」，答案文本绝不能被当成密钥值吞掉）
+    if (findPendingSingleQuestionByConversation(accountId, 'c2c', senderId)) {
       await next();
       return;
     }
