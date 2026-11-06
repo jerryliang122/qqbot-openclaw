@@ -724,6 +724,29 @@ export function buildSequentialAnswerPrefix(
   return lines.join('\n');
 }
 
+/**
+ * 顺序发题失败兜底的**全量**手打草稿：每题一行「题号: 答案」，已答填值
+ * （选项序号 1-based / 自由文本），未答**留空**。
+ *
+ * 用于续卡发送失败的回执（评审 F1）：中间题卡正文不含 keyed 手打格式，
+ * 用户没有自救入口——回执直接给出可补全的草稿。未答行**留空**与
+ * `buildSequentialAnswerPrefix` 的末题占位同口径：空值会被框架
+ * `validateAnswers` 拒绝并重问，原样发送不会静默收单。
+ */
+export function buildSequentialFullAnswerDraft(
+  answers: ReadonlyMap<number, MultiQuestionAnswer>,
+  total: number,
+): string {
+  const lines: string[] = [];
+  for (let i = 0; i < total; i++) {
+    const answer = answers.get(i);
+    lines.push(
+      `${i + 1}: ${answer ? ('optionIndex' in answer ? String(answer.optionIndex + 1) : answer.text) : ''}`,
+    );
+  }
+  return lines.join('\n');
+}
+
 /** 答案的人话版展示（确认卡 / 顺序卡「已记录」区共用） */
 export function formatMultiQuestionAnswerDisplay(
   question: MultiQuestionDef,

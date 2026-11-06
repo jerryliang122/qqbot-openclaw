@@ -359,10 +359,12 @@ export interface SequentialCardOpts {
   /** 提交态：前序已记录的答案（人话版），逐题展示 */
   collected?: ReadonlyArray<{ header: string; display: string }>;
   /**
-   * 提交态：手打兜底的答案模板（keyed 文本，最后一题留占位）。
+   * 提交态：手打兜底的答案模板（keyed 文本，最后一题**留空**占位）。
    *
    * 指令按钮需要客户端版本 8983+；老客户端上按钮不可用 ⇒ 给用户一段
    * 可直接复制的答案文本（含格式），保证「答不了」退化为「手打也能答」。
+   * 末题必须留空（不得填占位文案）：ask_user 恒 isOther，非数字文案会被
+   * 框架当合法自由文本收单，原样复制会静默提交占位文案（评审 F2）。
    */
   submitTemplate?: string;
   /**
@@ -417,7 +419,16 @@ export function formatSequentialQuestionCard(
       }
     }
     if (opts.submitTemplate) {
-      lines.push('', '**或直接回复下面这段提交**', '', '```', opts.submitTemplate, '```');
+      // 模板末题留空（构建侧见 question-flow.ts）：占位文案会被框架当
+      // 自由文本静默收单，空值则被拒收重问——指引要写明在哪补答案。
+      lines.push(
+        '',
+        '**或直接回复下面这段提交**（在最后一行冒号后补上答案）',
+        '',
+        '```',
+        opts.submitTemplate,
+        '```',
+      );
     }
     // 「✍️ 其他」按钮存在时（def.isOther）才提它——不得指引不存在的按钮
     if (def.isOther) {

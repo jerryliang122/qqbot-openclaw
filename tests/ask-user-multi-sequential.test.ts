@@ -56,6 +56,7 @@ const { clearQuotaCache } = await import('../src/features/quota-manager.ts');
 const { handleInteraction } = await import('../src/gateway/event-handlers.ts');
 const {
   buildSequentialAnswerPrefix,
+  buildSequentialFullAnswerDraft,
   registerPendingMultiQuestion,
   getPendingMultiQuestionState,
   recordSequentialAnswer,
@@ -286,6 +287,28 @@ await test('点第 1 题选项 → 续发第 2 题卡（仍是收集态，挂同
   }
 });
 
+await test('续卡发送失败 ⇒ 回执含全量手打草稿，不静默（评审 F1）', async () => {
+  clearQuotaCache();
+  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEQ_F1' });
+  try {
+    // 让第 2 题卡（续卡）发送失败；其余消息（含失败回执本身）正常发出——
+    // 模拟「卡发送持续失败但纯文本仍可达」的不对称故障形态
+    const origSendText = gw.sendText.bind(gw);
+    gw.sendText = async (target: any, text: string, sendOpts: any) => {
+      if (String(text).includes('第 2/3 题')) throw new Error('simulated send failure');
+      return origSendText(target, text, sendOpts);
+    };
+    await tap(`qqbot:qm:${QID}:0:0`, account, runtime);
+    const feedback = sent.find((s) => String(s.text).includes('下一题发送失败'));
+    assert.ok(feedback, '续卡失败必须回执——点选后石沉大海 = 流程静默死路');
+    assert.ok(String(feedback.text).includes('1: 1'), '回执草稿应带已答部分（填值）');
+    assert.ok(String(feedback.text).includes('2: '), '回执草稿未答题留空供用户补全');
+    assert.ok(!feedback.opts?.keyboard, '回执是纯文本（尽力而为，不带键盘）');
+  } finally {
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
 await test('点第 2 题选项 → 续发最后一题卡（提交态：type=2 + enter=true + 全量答案）', async () => {
   clearQuotaCache();
   const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEQ_4' });
@@ -382,7 +405,7 @@ await test('最后一题带「✍️ 其他」时，中间题正文要指路过�
   }
 });
 
-await test('最后一题正文给出可复制的手打兜底模板（老客户端无指令按钮时可用）', async () => {
+await test('最后一题正文给出可复制的手打兜底模板（末题留空，评审 F2）', async () => {
   clearQuotaCache();
   const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEQ_6C' });
   try {
@@ -390,8 +413,12 @@ await test('最后一题正文给出可复制的手打兜底模板（老客户�
     await tap(`qqbot:qm:${QID}:1:0`, account, runtime);
     const body = String(sent[2]!.text);
     assert.ok(body.includes('或直接回复下面这段提交'), '最后一题应给出手打兜底指引');
-    assert.ok(body.includes('1: 1\n2: 1'), '兜底模板应含前序题的 keyed 答案');
-    assert.ok(body.includes('3: 你的答案'), '兜底模板应留最后一题占位');
+    assert.ok(body.includes('1: 1\n2: 1\n3: '), '兜底模板应是全量 keyed 形态（前序填值、末题留空）');
+    assert.ok(
+      !body.includes('你的答案'),
+      '模板不得带占位文案——ask_user 恒 isOther，占位文案会被框架当自由文本静默收单；'
+        + '末题留空则被 validateAnswers 拒绝并重问（与「✍️ 其他」预填同口径）',
+    );
   } finally {
     unregisterGateway(ACCOUNT_ID, gw);
   }
@@ -464,6 +491,14 @@ await test('buildSequentialAnswerPrefix：数字=选项序号(1-based)，非数�
     [1, { text: '我自己写的' }],
   ]);
   assert.equal(buildSequentialAnswerPrefix(answers, 3), '1: 2\n2: 我自己写的');
+});
+
+await test('buildSequentialFullAnswerDraft：已答填值、未答留空（F1 回执草稿）', () => {
+  const answers = new Map<number, MultiQuestionAnswer>([
+    [0, { optionIndex: 1 }],
+    [2, { text: '自定义' }],
+  ]);
+  assert.equal(buildSequentialFullAnswerDraft(answers, 3), '1: 2\n2: \n3: 自定义');
 });
 
 await test('recordSequentialAnswer：正常推进 / 点更早题回到流程位置 / 越界保护', () => {
