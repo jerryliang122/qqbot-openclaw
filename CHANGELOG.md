@@ -8,6 +8,27 @@
 
 ---
 
+## [4.1.0] - 2026-11-06
+
+ask_user 交互形态整体改造（issue #93，三个 PR：#94 / #95 / #96）：问题卡被动化 + 单题卡自渲染 + 多题顺序发题。
+
+### 变更
+
+- **ask_user 问题卡改被动回复（显式锚点化）**。问题卡（单问题卡 / 多题卡 / 确认卡 / 状态回执）此前走 SDK 直发（`bot.sendTextWithKeyboard` / `bot.sendText`，请求体不带 `msg_id`）⇒ 平台按**主动消息**处理：白烧每日 1000 条/关系主动预算，且用户在 QQ 客户端关闭「允许主动发送」时问题卡**根本发不出去**——模型只能空等 `ask_user` 超时（默认 900s）。现统一走新出站 helper `src/outbound/question-send.ts`：锚点 = 本轮 inbound 的 `envelope.messageId`（多题的续卡 / 确认卡 / 状态回执复用登记在 pending 里的同一锚点），**先走被动**（`passiveOnly: true`，msg_seq 由配额链单调发号）；锚点不可用（本地 TTL 预检判死 / 平台判死 40034005·40034128）⇒ **降级为主动发送一次并保留 keyboard**（同进度卡口径）；其他错误（网络错 `httpStatus===0` 结果不明等）原样返回不重发。**刻意不让**网关 `retryOnDeadAnchor` 兜底——那条主动重发路径不携带 keyboard（用户会看到题干却无从作答），降级必须由问题卡层自己做。红线记入 `AGENTS.md`：禁止改回 SDK 直发。
+- **单问题卡改为插件自渲染（与多题卡同构）**。此前单题卡直接把框架投递原文当正文发出——用户看到的是框架 3 行英文脚手架（`Question for you:` / `Other: reply with your own answer.` / `Reply with the number…`）加与按钮重复的选项清单，且按钮标签既无序号前缀也不截断。现抽出共用渲染层 `src/features/question-card.ts`（单题 / 多题同一套原语）：`parseSingleQuestionPrompt` 以 `channelData.askUser.optionValues` 的精确 label 为锚点反解题目结构（比多题的结构推断稳），正文走插件中文版式、按钮统一 `①②③` 序号前缀 + 超宽截断 + 自适应分行。**反解失败一律回退到「框架原文 + 旧键盘」**（= 改造前形态，绝不产出半解析的卡片）；键盘发送失败后的纯文本兜底以 `keyboardAttached:false` 重渲（不指引点不存在的按钮）。单题自由作答靠正文引导行（框架契约：整条文本即答案，序号 / 选项名 / 任意文本都能命中），**不加**「✍️ 其他」按钮（预填前缀会污染答案）。
+- **单问题 pending 与 c2c 旁路（PR1）**。单题卡正文现在明确引导「直接回复」，但 c2c 入站 3 秒防抖合并会把答案改写成 `[消息 1/N]` 分节体（框架认领到的答案被污染），secret-capture 也可能把答案当密钥值吞掉。现单题卡发送前登记 pending（仅 c2c）：防抖与 secret-capture 在 pending 期间放行该会话文本。清理四条路径：按钮 resolve 成功 / 卡片发送失败 / 该会话下一条入站消息（dispatch 起点清理）/ TTL 兜底（25min，框架默认 15min 超时 + 10min 投递余量）。
+- **多问题 c2c 顺序发题——最后一题卡即提交点，确认卡消失（PR2）**。此前多题一次性把 2–3 张卡全发出去、全部答完还要再点一次「✅ 提交」。现 c2c 单聊只发第 1 题，用户答完第 k 题才发第 k+1 题（续卡经 interaction 回调续发，复用同一被动锚点）；**最后一题的选项按钮是指令型**（`type=2` + `enter=true`，data 写全量 keyed 答案文本 `"1: 3\n2: 1"`），QQ 客户端以真实用户身份发出 ⇒ 框架 keyed 认领通道 resolve——总点击数 = 题目数，消息条数 = 题目数（各少一条确认卡）。中间题选项仍是回调型（只收集不提交：框架 `validateAnswers` 逐题要求非空，整单提交是硬约束）。**每题卡只有选项按钮**——不挂「✏️ 改一改」：想改前面的题，在最后一题点「✍️ 其他」（输入框带上全部已答内容，改哪行都行）；点更早那张卡的选项 ⇒ 记答案并重发当前卡（刷新全量提交文本）。手打兜底：最后一题正文给出可复制的 keyed 模板（**末题留空**——ask_user 恒 `isOther`，占位文案会被当合法自由文本静默收单，留空则被框架拒收重问）；续卡发送失败时回执附全量手打草稿（已答填值、未答留空）。提交只靠客户端代发的真实用户消息——不程序化提交、不合成入站消息（红线）。**群聊保持改造前形态**（全部题卡 + 确认卡）：群里默认拿不到 `ask_user` 工具（restricted 白名单不含），多题在群里基本不会发生，不动群路径 = 零回归。
+
+### 守卫
+
+- `tests/ask-user-passive-anchor.test.ts`（新增）：单题/多题卡挂显式锚点 + keyboard + passiveOnly；TTL 预检 / 平台判死 40034005 ⇒ 降级主动且键盘保留；网络错不重发；状态回执与确认卡挂同一锚点；**dispatch.ts / event-handlers.ts 源码级禁令：不得再出现 `sendTextWithKeyboard`**
+- `tests/question-card.test.ts`（新增）：共用渲染层——单题反解（optionValues 精确锚点 / 结构异常回退 null）、按钮标签截断与序号前缀、`keyboardAttached:false` 兜底文案、多题输出与迁移前逐字一致
+- `tests/ask-user-multi-sequential.test.ts`（新增）：顺序发题全链路——首轮只发 1 张卡、中间题回调型 / 末题指令型全量提交、续发失败回执含手打草稿（F1）、末题模板留空（F2）、无「✏️ 改一改」与 `qqbot:qme:` 前缀（源码级）、群聊仍旧路径（源码级）、不程序化提交 / 不合成入站消息（源码级）
+- `tests/inbound-debounce.test.ts` / `tests/secret-capture.test.ts`：单问题 pending 期间该会话文本旁路放行；下一条入站消息后恢复合并
+- `tests/streaming-parked-finalize.test.ts`：ask_user 前置文本与卡片的送达顺序断言改为网关 sendText（带 keyboard）口径
+
+---
+
 ## [4.0.1] - 2026-11-03
 
 ### 变更
