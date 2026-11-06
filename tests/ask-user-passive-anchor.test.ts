@@ -100,7 +100,14 @@ function makeMsgAndCtx(opts: { scope?: 'group' | 'c2c'; targetId?: string; messa
     replyTarget: { scope, targetId },
     timestamp: Date.now(),
   } as any;
-  const ctx = { state: {}, message: { content: 'hello' }, signal: undefined } as any;
+  // ctx.signal 必须是**真实** AbortSignal：群聊路径下
+  // `combinedAbortSignal = ctx.signal`（群 turn 不插嘴 ⇒ 不 combine），
+  // 给 undefined 会在 deliverHandler 里读 `.aborted` 抛 TypeError。
+  const ctx = {
+    state: {},
+    message: { content: 'hello' },
+    signal: new AbortController().signal,
+  } as any;
   return { msg, ctx };
 }
 
@@ -321,15 +328,32 @@ await test('单题文本反解失败 ⇒ 回退到框架原文 + 旧键盘（零
   assert.equal(buttons[0].action.data, `qqbot:q:${QID}:0`);
 });
 
-// ── 2. 多问题卡：每张都带同一个锚点 ──
+// ── 2. 多问题卡 ──
 
-group('2. 多问题卡 → 每张都挂同一个锚点');
+group('2. 多问题卡 → c2c 顺序发题（只发第 1 题）/ 群聊旧路径（全部发出）');
 
-await test('2 张卡都带同一 msgId + keyboard', async () => {
+await test('c2c 多题：只发第 1 题（PR2 顺序发题），带同一 msgId + keyboard', async () => {
   clearQuotaCache();
   const messageId = 'M_MULTI_1';
   const sent = await deliverAskUser(MULTI_QUESTION_PAYLOAD, { messageId });
-  assert.equal(sent.length, 2, `应发 2 张题卡，实际 ${sent.length}`);
+  assert.equal(sent.length, 1, `c2c 顺序发题应只发第 1 张卡，实际 ${sent.length}`);
+  assert.equal(sent[0]!.opts?.msgId, messageId, '题卡必须挂本轮 inbound 的 msg_id（被动回复）');
+  assert.equal(sent[0]!.opts?.passiveOnly, true, '题卡首尝试应 passiveOnly');
+  assert.ok(sent[0]!.opts?.keyboard, '题卡必须带 keyboard');
+  const body = String(sent[0]!.text ?? '');
+  assert.ok(body.includes('第 1/2 题'), '首卡应是第 1 题');
+  assert.ok(!body.includes('第 2/2 题'), '首卡不得含第 2 题（顺序发题）');
+});
+
+await test('群聊多题：旧路径仍一次发出全部题卡（零回归）', async () => {
+  clearQuotaCache();
+  const messageId = 'M_MULTI_GROUP';
+  const sent = await deliverAskUser(MULTI_QUESTION_PAYLOAD, {
+    messageId,
+    scope: 'group',
+    targetId: 'GROUP_1',
+  });
+  assert.equal(sent.length, 2, `群聊旧路径应发 2 张题卡，实际 ${sent.length}`);
   assert.ok(
     sent.every((s) => s.opts?.msgId === messageId),
     '每张题卡都应挂同一个显式锚点',

@@ -37,12 +37,14 @@ import {
   registerPendingSingleQuestion,
   markSingleQuestionResolved,
   findPendingSingleQuestionByConversation,
+  getPendingMultiQuestionState,
 } from '../features/question-helpers.js';
 import {
   parseSingleQuestionPrompt,
   formatQuestionCard,
   buildQuestionOptionKeyboard,
 } from '../features/question-card.js';
+import { sendSequentialQuestionCard } from '../features/question-flow.js';
 import { resolveGroupConfigFromAccount, resolveMentionPatterns, resolveProgressCardConfig } from '../config.js';
 import { markGroupTurnFinished, markGroupTurnStarted } from '../features/group-session-busy.js';
 import { detectEventMention, matchesNamePattern } from '../utils/mention.js';
@@ -760,11 +762,12 @@ export async function dispatchToOpenClaw(
         // fallback 到纯文本发送（正文用渲染后的卡片文本）
       }
 
-      // ── 0b. ask_user 多问题投递：每题一条带按钮的消息。
-      // 框架对多问题只投递纯文本（无结构化选项），这里从文本反解题目结构；
-      // 按钮点选 / isOther 题的文字回复在回调与入站侧缓冲，
-      // 集齐后合成一条"用户文本回复"走入站通道，由框架的文本应答
-      // 解析器 resolve 挂起的 ask_user ──
+      // ── 0b. ask_user 多问题投递。
+      // c2c 单聊：**顺序发题**（PR2）——一次只发第 1 题，用户答完才发下一题，
+      // 最后一题卡直接提交全量答案（无确认卡）；
+      // 群聊：保持改造前形态（全部题卡一次发出 + 集齐后确认卡）——
+      // 群里默认拿不到 ask_user 工具，多题在群里基本不会发生（issue #93
+      // 第十节），不动群路径 = 零回归。
       if (isNonSingleAskUserPayload(payloadWithChannelData as any) && text) {
         if (combinedAbortSignal.aborted) {
           dlog?.info('[question] skipped: turn cancelled (multi)');
@@ -774,8 +777,9 @@ export async function dispatchToOpenClaw(
         const questions = parseMultiQuestionPrompt(text);
         if (questions) {
           const scope = envelope.chatScope === 'group' ? 'group' as const : 'c2c' as const;
+          const sequential = scope === 'c2c';
           // 先登记再发送，避免用户先点按钮时查无此单；锚点（本轮 inbound
-          // 的 msg_id）一并登记——续卡 / 确认卡 / 状态回执据此走被动回复。
+          // 的 msg_id）一并登记——续卡 / 状态回执据此走被动回复。
           registerPendingMultiQuestion(
             account.accountId,
             questionId,
@@ -784,6 +788,7 @@ export async function dispatchToOpenClaw(
             questions,
             undefined,
             envelope.messageId,
+            sequential ? 'sequential' : 'legacy',
           );
           // ask_user 前先固化已累积的流式内容（同单问题分支，评审意见 6）
           // static 的 flush 走 tolerant：前置文本发送失败不终态化 controller
@@ -804,28 +809,45 @@ export async function dispatchToOpenClaw(
             return;
           }
           try {
-            for (const [index, question] of questions.entries()) {
-              const cardText = formatMultiQuestionCard(question, index, questions.length);
-              const keyboard = buildMultiQuestionKeyboard(questionId, index, question);
-              // 每张卡都挂**同一个显式锚点**（本轮 inbound msg_id）走被动
-              // 回复；锚点不可用时逐张降级主动。
-              const cardResult = await sendQuestionMessage({
+            if (sequential) {
+              // 只发第 1 题；后续题卡由用户点选后经 interaction 回调续发
+              const state = getPendingMultiQuestionState(questionId);
+              if (!state) throw new Error('multi-question pending missing');
+              const cardResult = await sendSequentialQuestionCard({
+                state,
+                index: 0,
                 account,
-                accountId: account.accountId,
                 to: qualifiedTarget,
-                text: cardText,
-                keyboard: keyboard as never,
-                anchorMsgId: envelope.messageId,
                 log: dlog,
               });
               if (cardResult.error) {
                 throw new Error(`question card send failed: ${cardResult.error}`);
               }
               outboundSendOk++;
+            } else {
+              for (const [index, question] of questions.entries()) {
+                const cardText = formatMultiQuestionCard(question, index, questions.length);
+                const keyboard = buildMultiQuestionKeyboard(questionId, index, question);
+                // 每张卡都挂**同一个显式锚点**（本轮 inbound msg_id）走被动
+                // 回复；锚点不可用时逐张降级主动。
+                const cardResult = await sendQuestionMessage({
+                  account,
+                  accountId: account.accountId,
+                  to: qualifiedTarget,
+                  text: cardText,
+                  keyboard: keyboard as never,
+                  anchorMsgId: envelope.messageId,
+                  log: dlog,
+                });
+                if (cardResult.error) {
+                  throw new Error(`question card send failed: ${cardResult.error}`);
+                }
+                outboundSendOk++;
+              }
             }
             // 标记流式控制器：内容已通过外部通道投递，finalize 不走 fallback
             if (!preambleFailed) streamingController?.markDeliveredExternally();
-            dlog?.debug(`[question] sent multi-question ask_user questionId=${questionId} questions=${questions.length}`);
+            dlog?.debug(`[question] sent multi-question ask_user questionId=${questionId} questions=${questions.length} sequential=${sequential}`);
             return;
           } catch (err) {
             outboundSendFail++;
