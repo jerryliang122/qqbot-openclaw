@@ -22,6 +22,7 @@ import {
   recordMultiQuestionTap,
   recordSequentialAnswer,
   getPendingMultiQuestionState,
+  buildSequentialFullAnswerDraft,
   markMultiQuestionResolveFailed,
   markSingleQuestionResolved,
   getPendingMultiQuestions,
@@ -491,13 +492,29 @@ async function handleMultiQuestionTap(
     }
     const nextState = getPendingMultiQuestionState(parsed.questionId);
     if (!nextState) return;
-    await sendSequentialQuestionCard({
+    const cardResult = await sendSequentialQuestionCard({
       state: nextState,
       index: result.nextIndex,
       account,
       to: formatQuestionTarget(scope, peerId),
       log,
     });
+    if (cardResult.error) {
+      // 续卡发送失败必须回执（镜像旧确认卡口径，评审 F1）：否则用户点选后
+      // 石沉大海——中间题卡正文不含 keyed 手打格式，没有自救入口。回执带
+      // 全量手打草稿（已答填值、未答留空）；回执本身尽力而为（发送可能
+      // 仍在失败，sendMultiQuestionFeedbackText 内部吞错仅 DEBUG 留痕）。
+      await sendMultiQuestionFeedbackText(
+        scope,
+        peerId,
+        account,
+        `⚠️ 下一题发送失败，请稍后重新点选重试；或直接回复完整答案`
+          + `（每行「题号: 答案」，选项填序号）：\n`
+          + buildSequentialFullAnswerDraft(nextState.answers, nextState.questions.length),
+        log,
+        parsed.questionId,
+      );
+    }
     return;
   }
 

@@ -119,10 +119,15 @@ export function renderSequentialCard(
       display: answer ? formatMultiQuestionAnswerDisplay(q, answer) : '（未作答）',
     };
   });
-  // 手打兜底模板：前 N-1 题的答案 + 最后一题占位（客户端不支持指令按钮时用）
+  // 手打兜底模板：前 N-1 题的答案 + 最后一题**留空**占位（客户端不支持
+  // 指令按钮时用）。末题占位必须是空值、不得填「你的答案」之类文案：
+  // ask_user 恒 isOther（框架 normalizeAskUserParams 强制），任何非数字
+  // 文本都会被当合法自由文本收单——原样复制模板会把占位文案静默提交成
+  // 末题答案；留空则被 validateAnswers 拒绝并重问，用户还有机会补全
+  // （评审 F2，与「✍️ 其他」预填 `"<N>: "` 同口径）。
   const submitTemplate = prefix
-    ? `${prefix}\n${total}: 你的答案`
-    : '1: 你的答案';
+    ? `${prefix}\n${total}: `
+    : '1: ';
 
   return {
     text: formatSequentialQuestionCard(question, {
