@@ -5,16 +5,18 @@
  * 「✅ 提交」（确认卡）。PR2 改成 **c2c 单聊顺序发题**：
  *
  * 1. 只发第 1 题，答完第 k 题才发第 k+1 题；
- * 2. 每题卡带「✏️ 改一改」入口（点它重发该题卡，可回改）；
+ * 2. 每题卡**只有选项按钮**（没有「✏️ 改一改」）——想改前面的题，在最后
+ *    一题点「✍️ 其他」，输入框会带上全部已答内容，用户改哪行都行；
  * 3. 最后一题卡**本身就是提交点**——选项按钮是指令型（type=2,
  *    enter=true），data 写全量 keyed 答案文本（`"1: 3\n2: 1"`），
  *    客户端以真实用户身份发出 ⇒ 框架 keyed 认领 ⇒ 确认卡整个消失。
  *
  * 本文件锁定：
- * - 首卡形态（收集态：type=1 选项 + 「✏️ 改一改」，**无**「✍️ 其他」）
+ * - 首卡形态（收集态：type=1 选项，**无**「✍️ 其他」、**无**「✏️ 改一改」）
  * - 逐题推进（点选 → 续发下一题）
  * - 最后一题提交态（type=2 + enter=true，data 带全量答案）
- * - 回改链路（改一改 → 重发该题卡 → 覆盖答案 → 回到流程位置）
+ * - 自由作答指引（正文写清「想自己写答案怎么办」，且只在按钮真实存在时提）
+ * - 「✏️ 改一改」已移除（按钮、回调前缀、状态机全部不存在）
  * - keyed 答案文本口径（数字=选项序号 1-based / 非数字=自由文本）
  * - 红线守卫：**不程序化提交**、**不合成入站消息**
  *
@@ -53,12 +55,10 @@ const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
 const { clearQuotaCache } = await import('../src/features/quota-manager.ts');
 const { handleInteraction } = await import('../src/gateway/event-handlers.ts');
 const {
-  parseMultiQuestionEditData,
   buildSequentialAnswerPrefix,
   registerPendingMultiQuestion,
   getPendingMultiQuestionState,
   recordSequentialAnswer,
-  beginSequentialEdit,
 } = await import('../src/features/question-helpers.ts');
 
 // ── 测试基础设施（沿用 ask-user-passive-anchor.test.ts 的形态）──
@@ -248,7 +248,7 @@ await test('c2c 多题首轮只发 1 张卡，正文是「第 1/3 题」', async
   }
 });
 
-await test('中间题：选项是回调型(type=1)，无「✍️ 其他」，有「✏️ 改一改」', async () => {
+await test('中间题：选项是回调型(type=1)，既无「✍️ 其他」也无「✏️ 改一改」', async () => {
   clearQuotaCache();
   const { sent, gw } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEQ_2' });
   try {
@@ -259,13 +259,8 @@ await test('中间题：选项是回调型(type=1)，无「✍️ 其他」，�
     assert.equal(optionButtons[0].action.data, `qqbot:qm:${QID}:0:0`, '选项回调 data 沿用旧契约');
     assert.equal(optionButtons[1].action.data, `qqbot:qm:${QID}:0:1`);
     assert.ok(!buttons.some((b: any) => b.render_data.label.includes('其他')), '中间题不给「✍️ 其他」按钮（框架要求整单齐备）');
-
-    const edit = buttonByLabel(sent[0]!, '✏️ 改一改');
-    assert.ok(edit, '中间题必须带「✏️ 改一改」入口');
-    assert.equal(edit.action.type, 1, '改一改必须是回调型（type=1），插件据此重发该题卡');
-    assert.equal(edit.action.data, `qqbot:qme:${QID}:0`, '改一改回调 data');
-    assert.ok(!edit.group_id, '改一改不得进选项互斥组（否则会把选项一起置成已选）');
-    assert.ok(!edit.action.click_limit, '改一改不应限次（可反复点）');
+    assert.ok(!buttons.some((b: any) => b.render_data.label.includes('改一改')), '中间题不得挂「✏️ 改一改」（回改统一走最后一题「✍️ 其他」）');
+    assert.equal(buttons.length, 2, '中间题只有选项按钮，不得多挂别的入口');
   } finally {
     unregisterGateway(ACCOUNT_ID, gw);
   }
@@ -356,17 +351,32 @@ await test('最后一题带「✍️ 其他」，data 预填「1: x\\n2: 」供�
   }
 });
 
-await test('中间题正文不得出现「✍️ 其他」引导（该题没有这个按钮）', async () => {
+await test('整组都没有「其他」选项时，中间题正文不得提「✍️ 其他」（按钮根本不存在）', async () => {
+  clearQuotaCache();
+  const { sent, gw } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEQ_6B' });
+  try {
+    const body = String(sent[0]!.text);
+    assert.ok(!body.includes('✍️ 其他'), '没有该按钮时正文不得指引用户去点它');
+    assert.ok(!body.includes('改一改'), '不得再指引已移除的「✏️ 改一改」');
+  } finally {
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('最后一题带「✍️ 其他」时，中间题正文要指路过去（说明怎么自由作答）', async () => {
   clearQuotaCache();
   const payload = {
     text: TWO_QUESTION_WITH_OTHER_TEXT,
     channelData: { askUser: { questionId: QID } },
   };
-  const { sent, gw } = await deliverAskUserKeepingGateway(payload, { messageId: 'M_SEQ_6B' });
+  const { sent, gw } = await deliverAskUserKeepingGateway(payload, { messageId: 'M_SEQ_6D' });
   try {
     const body = String(sent[0]!.text);
-    assert.ok(!body.includes('✍️ 其他'), '中间题正文不得指引点不存在的「✍️ 其他」按钮');
-    assert.ok(body.includes('✏️ 改一改'), '中间题正文应指引回改入口');
+    assert.ok(body.includes('想自己写答案'), '中间题正文要说明「想自己写答案怎么办」');
+    assert.ok(body.includes('最后一道题'), '指路必须说清入口在最后一题');
+    assert.ok(body.includes('✍️ 其他'), '指路要写明按钮名');
+    // 该题自己没有这个按钮——正文不得让人以为它就在这张卡上
+    assert.ok(!buttonsOf(sent[0]!).some((b: any) => b.render_data.label.includes('其他')), '中间题本身不得有「✍️ 其他」按钮');
   } finally {
     unregisterGateway(ACCOUNT_ID, gw);
   }
@@ -387,43 +397,43 @@ await test('最后一题正文给出可复制的手打兜底模板（老客户�
   }
 });
 
-// ── 4. 回改链路 ──
+// ── 4. 「✏️ 改一改」已移除 ──
 
-group('4. 「✏️ 改一改」→ 重发该题卡 → 覆盖答案 → 回到流程位置');
+group('4. 「✏️ 改一改」已移除：回改统一走最后一题的「✍️ 其他」');
 
-await test('点「✏️ 改一改」⇒ 重发该题卡（编辑态正文含「重新作答本题」）', async () => {
+await test('首卡 / 中间卡 / 最后一题卡都不出现「✏️ 改一改」按钮', async () => {
   clearQuotaCache();
-  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEQ_7' });
+  const payload = {
+    text: TWO_QUESTION_WITH_OTHER_TEXT,
+    channelData: { askUser: { questionId: QID } },
+  };
+  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(payload, { messageId: 'M_SEQ_7' });
   try {
-    await tap(`qqbot:qme:${QID}:0`, account, runtime);
-    assert.equal(sent.length, 2, '改一改应重发一张题卡');
-    const again = sent[1]!;
-    assert.ok(String(again.text).includes('第 1/3 题'), '重发的应是第 1 题卡');
-    assert.ok(String(again.text).includes('重新作答本题'), '重发的卡应是编辑态');
-    assert.equal(again.opts?.msgId, 'M_SEQ_7', '重发复用同一个显式锚点');
+    assert.ok(!buttonsOf(sent[0]!).some((b: any) => b.render_data.label.includes('改一改')), '首卡不得有「✏️ 改一改」');
+    await tap(`qqbot:qm:${QID}:0:0`, account, runtime); // 答第 1 题 → 续发最后一题
+    const last = sent[sent.length - 1]!;
+    assert.ok(!buttonsOf(last).some((b: any) => b.render_data.label.includes('改一改')), '最后一题不得有「✏️ 改一改」');
+    assert.ok(!String(last.text).includes('改一改'), '最后一题正文不得指引已移除的按钮');
   } finally {
     unregisterGateway(ACCOUNT_ID, gw);
   }
 });
 
-await test('回改完作答 ⇒ 回到流程位置（重发当前题卡）', async () => {
-  clearQuotaCache();
-  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEQ_8' });
-  try {
-    await tap(`qqbot:qm:${QID}:0:0`, account, runtime); // 答第 1 题 → 流程到第 2 题
-    assert.equal(sent.length, 2);
-    await tap(`qqbot:qme:${QID}:0`, account, runtime);   // 回头改第 1 题
-    assert.equal(sent.length, 3);
-    assert.ok(String(sent[2]!.text).includes('第 1/3 题'), '改一改重发第 1 题卡');
-    await tap(`qqbot:qm:${QID}:0:1`, account, runtime); // 改选第 1 题的第 2 项
-    assert.equal(sent.length, 4);
-    assert.ok(String(sent[3]!.text).includes('第 2/3 题'), '改完后回到流程位置（第 2 题）');
-  } finally {
-    unregisterGateway(ACCOUNT_ID, gw);
+await test('源码里不再有「qqbot:qme:」回调前缀与回改状态机', () => {
+  for (const file of [
+    'src/features/question-card.ts',
+    'src/features/question-helpers.ts',
+    'src/features/question-flow.ts',
+    'src/gateway/event-handlers.ts',
+  ]) {
+    const src = readFileSync(new URL(`../${file}`, import.meta.url), 'utf-8');
+    assert.ok(!src.includes('qqbot:qme:'), `${file} 不得再出现「qqbot:qme:」回调前缀`);
+    assert.ok(!src.includes('beginSequentialEdit'), `${file} 不得再有回改态入口`);
+    assert.ok(!src.includes('editingIndex'), `${file} 不得再有回改态字段`);
   }
 });
 
-await test('改更早的题 ⇒ 最后一题的提交文本同步更新', async () => {
+await test('点更早那张卡的选项 ⇒ 记答案并重发当前卡（刷新全量提交文本）', async () => {
   clearQuotaCache();
   const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEQ_9' });
   try {
@@ -432,10 +442,11 @@ await test('改更早的题 ⇒ 最后一题的提交文本同步更新', async 
     const lastBefore = sent[2]!;
     const optionBefore = buttonsOf(lastBefore).find((b: any) => b.render_data.label.startsWith('①'));
     assert.equal(optionBefore.action.data, '1: 1\n2: 1\n3: 1');
-    // 回头改第 1 题
-    await tap(`qqbot:qme:${QID}:0`, account, runtime);
+    // 回头改第 1 题（点更早那张卡上的选项）
     await tap(`qqbot:qm:${QID}:0:1`, account, runtime); // 改成第 2 项
-    const lastAfter = sent[sent.length - 1]!;
+    assert.equal(sent.length, 4, '应重发当前卡刷新全量文本');
+    const lastAfter = sent[3]!;
+    assert.ok(String(lastAfter.text).includes('第 3/3 题'), '重发的应是当前（最后一题）卡');
     const optionAfter = buttonsOf(lastAfter).find((b: any) => b.render_data.label.startsWith('①'));
     assert.equal(optionAfter.action.data, '1: 2\n2: 1\n3: 1', '提交文本必须用改后的答案');
   } finally {
@@ -455,15 +466,7 @@ await test('buildSequentialAnswerPrefix：数字=选项序号(1-based)，非数�
   assert.equal(buildSequentialAnswerPrefix(answers, 3), '1: 2\n2: 我自己写的');
 });
 
-await test('parseMultiQuestionEditData：合法 / 非法输入', () => {
-  assert.deepEqual(parseMultiQuestionEditData(`qqbot:qme:${QID}:2`), { questionId: QID, questionIndex: 2 });
-  assert.equal(parseMultiQuestionEditData(`qqbot:qm:${QID}:2:0`), null, '不是改一改前缀');
-  assert.equal(parseMultiQuestionEditData('qqbot:qme:ask_xxx:0'), null, 'questionId 格式错');
-  assert.equal(parseMultiQuestionEditData(`qqbot:qme:${QID}:9`), null, '题号越界');
-  assert.equal(parseMultiQuestionEditData(`qqbot:qme:${QID}:x`), null, '题号非数字');
-});
-
-await test('recordSequentialAnswer：正常推进 / 回改回到流程位置 / 越界保护', () => {
+await test('recordSequentialAnswer：正常推进 / 点更早题回到流程位置 / 越界保护', () => {
   registerPendingMultiQuestion(
     ACCOUNT_ID,
     QID,
@@ -482,9 +485,7 @@ await test('recordSequentialAnswer：正常推进 / 回改回到流程位置 / �
   let r = recordSequentialAnswer(QID, 0, 1);
   assert.equal(r.status, 'ok');
   assert.equal((r as any).nextIndex, 1);
-  // 回改第 1 题 → 置位 editingIndex
-  assert.equal(beginSequentialEdit(QID, 0).status, 'ok');
-  // 改完作答 → 回到流程位置（第 2 题）
+  // 改更早的题（点更早那张卡）⇒ 回到流程位置（重发当前卡）
   r = recordSequentialAnswer(QID, 0, 0);
   assert.equal(r.status, 'ok');
   assert.equal((r as any).nextIndex, 1, '改更早的题后应回到流程位置');
@@ -495,11 +496,12 @@ await test('recordSequentialAnswer：正常推进 / 回改回到流程位置 / �
   assert.equal(recordSequentialAnswer(`ask_${'c'.repeat(32)}`, 0, 0).status, 'unknown');
 });
 
-await test('getPendingMultiQuestionState：暴露 cursor / editingIndex', () => {
+await test('getPendingMultiQuestionState：暴露 cursor，且没有回改态字段', () => {
   const state = getPendingMultiQuestionState(QID);
   assert.ok(state, 'pending 应可读');
   assert.equal(state!.mode, 'sequential');
   assert.equal(state!.cursor, 1, 'cursor 停在流程位置');
+  assert.ok(!('editingIndex' in state!), '快照不得再暴露回改态字段');
 });
 
 // ── 6. 红线守卫 ──
