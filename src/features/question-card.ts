@@ -334,6 +334,237 @@ export function buildMultiQuestionKeyboard(
   });
 }
 
+// ============ 顺序发题（多题 c2c，PR2）============
+
+/**
+ * 顺序发题的按钮形态。
+ *
+ * - `collect`：**中间题**——选项是回调型（type=1），点选只把答案记进
+ *   pending store，**不提交**（框架要求整单齐备，见 issue #93 根因 2）。
+ * - `submit`：**最后一题**——选项是指令型（type=2, enter=true），data 里
+ *   直接写**全量 keyed 答案文本**（`"1: 3\n2: 1"`），QQ 客户端以真实
+ *   用户身份发出 ⇒ 框架 keyed 认领通道 resolve 掉挂起的 ask_user。
+ *   这就是「去掉确认卡」的实现：**最后一题卡本身就是提交点**。
+ */
+export type SequentialCardMode = 'collect' | 'submit';
+
+/** 顺序发题卡片的正文渲染参数 */
+export interface SequentialCardOpts {
+  /** 0-based 题序号 */
+  index: number;
+  /** 总题数 */
+  total: number;
+  /** 按钮形态（collect=中间题 / submit=最后一题） */
+  mode: SequentialCardMode;
+  /** 编辑态：本次是「✏️ 改一改」重发的题卡 */
+  editing?: boolean;
+  /** 提交态：前序已记录的答案（人话版），逐题展示 */
+  collected?: ReadonlyArray<{ header: string; display: string }>;
+  /**
+   * 提交态：手打兜底的答案模板（keyed 文本，最后一题留占位）。
+   *
+   * 指令按钮需要客户端版本 8983+；老客户端上按钮不可用 ⇒ 给用户一段
+   * 可直接复制的答案文本（含格式），保证「答不了」退化为「手打也能答」。
+   */
+  submitTemplate?: string;
+}
+
+/**
+ * 顺序发题的卡片正文。
+ *
+ * 与 `formatQuestionCard(variant:'multi')` 的差异（**刻意不复用**）：
+ * - 中间题**不给**「✍️ 其他」按钮（框架要求整单齐备，中间题的自由文本
+ *   单独提交会被判「requires an answer」整单拒绝 ⇒ 中间题的自由作答
+ *   统一留到最后一题）；
+ * - 最后一题多一段「已记录」展示 + 「选完即提交」提示；
+ * - 编辑态多一行「重新作答本题」。
+ *
+ * `formatMultiQuestionCard`（群聊旧路径）**逐字不动**。
+ */
+export function formatSequentialQuestionCard(
+  def: QuestionDef,
+  opts: SequentialCardOpts,
+): string {
+  const lines: string[] = [];
+  lines.push(`**第 ${opts.index + 1}/${opts.total} 题 · ${def.header}**`);
+  if (def.question.trim()) {
+    lines.push('', def.question.trim());
+  }
+  for (const [optionIndex, optionLine] of def.options.entries()) {
+    const label = stripRecommendedSuffix(splitOptionLabel(optionLine));
+    const desc = splitOptionDescription(optionLine);
+    lines.push('', `**${optionIndex + 1}.** ${label}${desc ? ` —— ${desc}` : ''}`);
+  }
+  lines.push(
+    '',
+    opts.mode === 'submit'
+      ? '👇 点下方按钮作答（选完即提交全部答案）'
+      : '👇 点下方按钮作答',
+  );
+  if (opts.editing) {
+    lines.push('', '🔁 重新作答本题');
+  }
+  if (opts.mode === 'submit') {
+    if (opts.collected?.length) {
+      lines.push('', '**已记录**');
+      for (const item of opts.collected) {
+        lines.push(`**·** ${item.header}：${item.display}`);
+      }
+    }
+    if (opts.submitTemplate) {
+      lines.push('', '**或直接回复下面这段提交**', '', '```', opts.submitTemplate, '```');
+    }
+    const hints = ['想改前面的题？回到那张卡点「✏️ 改一改」'];
+    if (def.isOther) hints.push('想自由作答？点「✍️ 其他」编辑后发送');
+    lines.push('', `${hints.join('；')}。`);
+  } else {
+    lines.push('', '想改这一题？点「✏️ 改一改」重发本题。');
+  }
+  return lines.join('\n');
+}
+
+/**
+ * 顺序发题：**中间题**键盘（收集态）。
+ *
+ * - 选项：回调型（type=1），data = `qqbot:qm:<qid>:<题号>:<选项号>`
+ *   ——与旧路径的按钮契约**逐字一致**（`parseMultiQuestionButtonData`
+ *   不用改），点选只记答案、不提交；
+ * - 「✏️ 改一改」：回调型（type=1），data = `qqbot:qme:<qid>:<题号>`
+ *   ——插件据此**重发该题卡**（回改入口）。刻意**不带** `click_limit`
+ *   （可反复点），也**不进**选项的互斥组（`group_id` 留空），否则点它
+ *   会把选项按钮一起置成「已选」。
+ */
+export function buildSequentialCollectKeyboard(
+  questionId: string,
+  questionIndex: number,
+  question: QuestionDef,
+): InlineKeyboard {
+  const idPrefix = `q${questionIndex}_`;
+  const optionButtons: KeyboardButton[] = question.options.map((optionLine, optionIndex) => {
+    const prefix = OPTION_NUMBER_PREFIXES[optionIndex] ?? '';
+    const reserve = estimateLabelWidth(`${prefix} `);
+    return {
+      id: `${idPrefix}${optionIndex}`,
+      render_data: {
+        label: `${prefix} ${buildButtonLabel(optionLine, reserve)}`,
+        visited_label: '已选',
+        style: 1 as const,
+      },
+      action: {
+        type: 1 as const,
+        data: `qqbot:qm:${questionId}:${questionIndex}:${optionIndex}`,
+        permission: { type: KEYBOARD_PERMISSION_EVERYONE },
+        click_limit: 1,
+      },
+      group_id: `question-${questionIndex}`,
+    };
+  });
+
+  const editButton: KeyboardButton = {
+    id: `${idPrefix}edit`,
+    render_data: {
+      label: '✏️ 改一改',
+      visited_label: '✏️ 改一改',
+      style: 0 as const,
+    },
+    action: {
+      type: 1 as const,
+      data: `qqbot:qme:${questionId}:${questionIndex}`,
+      permission: { type: KEYBOARD_PERMISSION_EVERYONE },
+      unsupport_tips: '当前客户端版本不支持，请直接回复答案',
+    },
+  };
+
+  const rows = layoutButtonRows(optionButtons);
+  // 「✏️ 改一改」单独一行（不与选项挤在一行）
+  rows.push({ buttons: [editButton] });
+  return { content: { rows } };
+}
+
+/**
+ * 顺序发题：**最后一题**键盘（提交态）。
+ *
+ * - 选项：**指令型**（type=2, enter=true），data = 全量 keyed 答案文本
+ *   （前 N-1 题已答 + 本题该选项），点击即由客户端以**真实用户身份**
+ *   发出 ⇒ 框架认领并 resolve（**不程序化提交、不合成入站消息**）；
+ * - 「✏️ 改一改」：回调型（type=1），重发本题卡；
+ * - 「✍️ 其他」：指令型（type=2, enter=false），预填
+ *   `"<前 N-1 题>\n<N>: "` ——用户可在输入框里改任意一行（含最后一题
+ *   的自由文本）后手动发送。
+ *
+ * @param answerPrefix 前 N-1 题的 keyed 答案文本（`"1: 3\n2: 1"`）；
+ *   空串表示前序还没答（此时退化为只带本题号）。
+ */
+export function buildSequentialSubmitKeyboard(
+  questionId: string,
+  questionIndex: number,
+  question: QuestionDef,
+  answerPrefix: string,
+): InlineKeyboard {
+  const idPrefix = `q${questionIndex}_`;
+  const line = (value: string): string =>
+    answerPrefix ? `${answerPrefix}\n${questionIndex + 1}: ${value}` : `${questionIndex + 1}: ${value}`;
+
+  const optionButtons: KeyboardButton[] = question.options.map((optionLine, optionIndex) => {
+    const prefix = OPTION_NUMBER_PREFIXES[optionIndex] ?? '';
+    const reserve = estimateLabelWidth(`${prefix} `);
+    return {
+      id: `${idPrefix}${optionIndex}`,
+      render_data: {
+        label: `${prefix} ${buildButtonLabel(optionLine, reserve)}`,
+        visited_label: '已提交',
+        style: 1 as const,
+      },
+      action: {
+        type: 2 as const,
+        data: line(String(optionIndex + 1)),
+        enter: true,
+        permission: { type: KEYBOARD_PERMISSION_EVERYONE },
+        unsupport_tips: '当前客户端版本不支持，请直接回复下方给出的答案文本',
+      },
+      group_id: `question-${questionIndex}`,
+    };
+  });
+
+  const editButton: KeyboardButton = {
+    id: `${idPrefix}edit`,
+    render_data: {
+      label: '✏️ 改一改',
+      visited_label: '✏️ 改一改',
+      style: 0 as const,
+    },
+    action: {
+      type: 1 as const,
+      data: `qqbot:qme:${questionId}:${questionIndex}`,
+      permission: { type: KEYBOARD_PERMISSION_EVERYONE },
+      unsupport_tips: '当前客户端版本不支持，请直接回复答案',
+    },
+  };
+
+  const buttons = [...optionButtons];
+  if (question.isOther) {
+    buttons.push({
+      id: `${idPrefix}other`,
+      render_data: {
+        label: '✍️ 其他',
+        visited_label: '✍️ 其他',
+        style: 0 as const,
+      },
+      action: {
+        type: 2 as const,
+        data: line(''),
+        enter: false,
+        permission: { type: KEYBOARD_PERMISSION_EVERYONE },
+        unsupport_tips: '当前客户端版本不支持，请直接回复「题号: 答案」',
+      },
+    });
+  }
+
+  const rows = layoutButtonRows(buttons);
+  rows.push({ buttons: [editButton] });
+  return { content: { rows } };
+}
+
 // ============ 单题文本反解 ============
 
 /** 框架选项行：`<序号>. <label>[ - <描述>]` */

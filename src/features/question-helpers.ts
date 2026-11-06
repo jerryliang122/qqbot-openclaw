@@ -49,6 +49,8 @@ export {
 
 const QUESTION_CALLBACK_PREFIX = 'qqbot:q:';
 const MULTI_QUESTION_CALLBACK_PREFIX = 'qqbot:qm:';
+/** 多题「✏️ 改一改」回调前缀（PR2）：`qqbot:qme:<questionId>:<题号>` */
+const MULTI_QUESTION_EDIT_PREFIX = 'qqbot:qme:';
 
 /** questionId 格式: ask_<32位hex> */
 const QUESTION_ID_PATTERN = /^ask_[a-f0-9]{32}$/;
@@ -82,6 +84,12 @@ export interface ParsedMultiQuestionAction {
   questionId: string;
   questionIndex: number;
   optionIndex: number;
+}
+
+/** 多题「✏️ 改一改」回调（PR2） */
+export interface ParsedMultiQuestionEditAction {
+  questionId: string;
+  questionIndex: number;
 }
 
 /** 一次多问题整单的答案（题号 -> 按钮选项序号或自由文本） */
@@ -380,6 +388,31 @@ export function parseMultiQuestionButtonData(buttonData: string): ParsedMultiQue
   return { questionId, questionIndex, optionIndex };
 }
 
+/**
+ * 解析多题「✏️ 改一改」按钮的 button_data（PR2）。
+ *
+ * 格式: `qqbot:qme:<questionId>:<questionIndex>`
+ * 返回 null 表示不是改一改按钮。
+ */
+export function parseMultiQuestionEditData(buttonData: string): ParsedMultiQuestionEditAction | null {
+  if (!buttonData.startsWith(MULTI_QUESTION_EDIT_PREFIX)) return null;
+
+  const payload = buttonData.slice(MULTI_QUESTION_EDIT_PREFIX.length);
+  const parts = payload.split(':');
+  if (parts.length !== 2) return null;
+
+  const [questionId, questionIndexStr] = parts;
+  if (!QUESTION_ID_PATTERN.test(questionId)) return null;
+  if (!questionIndexStr) return null;
+
+  const questionIndex = Number(questionIndexStr);
+  if (!Number.isInteger(questionIndex) || questionIndex < 0 || questionIndex >= MAX_MULTI_QUESTIONS) {
+    return null;
+  }
+
+  return { questionId, questionIndex };
+}
+
 // ============ 多问题答案暂存 Store ============
 
 interface PendingMultiQuestion {
@@ -391,6 +424,27 @@ interface PendingMultiQuestion {
   terminal: boolean;
   /** 正在合成入站提交（防并发重复提交） */
   resolving: boolean;
+  /**
+   * 多题流程形态（PR2）。
+   *
+   * - `sequential`：**c2c 单聊**新形态——一次只发一题，逐题收集，
+   *   最后一题卡直接提交全量 keyed 文本（无确认卡）；
+   * - `legacy`：群聊旧形态——所有题一次性发出 + 集齐后发确认卡。
+   *
+   * 范围锁定见 issue #93 第十节：群里默认拿不到 `ask_user` 工具，
+   * 多题在群里基本不会发生，故群路径保持原样（零回归）。
+   */
+  mode: 'sequential' | 'legacy';
+  /**
+   * 顺序发题的**流程位置**（sequential 形态）：当前发出去的那张卡对应的
+   * 题号。`0` = 第 1 题。
+   */
+  cursor: number;
+  /**
+   * 正在回改的题号（sequential 形态）：用户点了「✏️ 改一改」后置位，
+   * 下一次作答落在该题上（覆盖旧答案），答完回到 `cursor`。
+   */
+  editingIndex?: number;
   /**
    * 本轮 inbound 消息的 msg_id（**显式锚点**）——多题的续卡 / 确认卡 /
    * 状态回执复用它走被动回复。
@@ -423,6 +477,8 @@ function conversationKey(accountId: string, scope: 'c2c' | 'group', targetId: st
  *
  * @param anchorMsgId 本轮 inbound 的 msg_id（显式锚点）——续卡 / 确认卡 /
  *   状态回执据此走被动回复；缺省则后续消息一律主动发送。
+ * @param mode 多题流程形态（PR2）：`sequential` = c2c 顺序发题（逐题收集、
+ *   最后一题直接提交）；`legacy` = 群聊旧形态（全部发出 + 确认卡）。
  */
 export function registerPendingMultiQuestion(
   accountId: string,
@@ -432,6 +488,7 @@ export function registerPendingMultiQuestion(
   questions: MultiQuestionDef[],
   ttlMs: number = DEFAULT_MULTI_QUESTION_TTL_MS,
   anchorMsgId?: string,
+  mode: 'sequential' | 'legacy' = 'legacy',
 ): void {
   const existing = pendingMultiQuestions.get(questionId);
   if (existing) clearTimeout(existing.cleanupTimer);
@@ -443,6 +500,8 @@ export function registerPendingMultiQuestion(
     answers: new Map(),
     terminal: false,
     resolving: false,
+    mode,
+    cursor: 0,
     ...(anchorMsgId ? { anchorMsgId } : {}),
     expiresAtMs: Date.now() + ttlMs,
     cleanupTimer: setTimeout(() => {
@@ -587,6 +646,167 @@ export function getPendingMultiQuestionAnchor(questionId: string): string | unde
   const entry = pendingMultiQuestions.get(questionId);
   if (!entry || entry.expiresAtMs <= Date.now()) return undefined;
   return entry.anchorMsgId;
+}
+
+// ============ 顺序发题状态机（PR2）============
+
+/**
+ * 多题 pending 的只读快照（顺序发题用）。
+ *
+ * 供渲染层决定「这张卡该长什么样」：第几题、是不是最后一题（提交态）、
+ * 前序已收了哪些答案、当前是否处于回改态。
+ */
+export interface PendingMultiQuestionState {
+  questionId: string;
+  questions: MultiQuestionDef[];
+  answers: ReadonlyMap<number, MultiQuestionAnswer>;
+  /** 流程位置：当前发出去的那张卡对应的题号 */
+  cursor: number;
+  /** 正在回改的题号（用户点了「✏️ 改一改」后置位） */
+  editingIndex?: number;
+  mode: 'sequential' | 'legacy';
+  scope: 'c2c' | 'group';
+  targetId: string;
+  anchorMsgId?: string;
+}
+
+/** 读取多题 pending 的快照；不存在 / 已过期 ⇒ null */
+export function getPendingMultiQuestionState(
+  questionId: string,
+): PendingMultiQuestionState | null {
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry || entry.expiresAtMs <= Date.now()) return null;
+  return {
+    questionId,
+    questions: entry.questions,
+    answers: new Map(entry.answers),
+    cursor: entry.cursor,
+    ...(entry.editingIndex !== undefined ? { editingIndex: entry.editingIndex } : {}),
+    mode: entry.mode,
+    scope: entry.scope,
+    targetId: entry.targetId,
+    ...(entry.anchorMsgId ? { anchorMsgId: entry.anchorMsgId } : {}),
+  };
+}
+
+/**
+ * 顺序发题：记录一次作答，返回**下一张要发的卡**的题号。
+ *
+ * ── 状态机 ─────────────────────────────────────────────────────────
+ * - 正常作答（点在当前卡上）⇒ 记答案 ⇒ 前进一题；
+ * - 回改作答（点在「✏️ 改一改」重发的那张卡上）⇒ 覆盖该题答案 ⇒
+ *   改的是**更早**的题就回到流程位置（重发当前卡，保证最后一题的
+ *   全量文本是最新的）；改的就是当前题就前进一题；
+ * - 误点更早那张卡的选项 ⇒ 记答案 ⇒ 重发当前卡（同上，刷新全量文本）。
+ *
+ * ⚠️ 框架要求**整单齐备**才 resolve（`validateAnswers`，见 issue #93
+ * 根因 2），所以这里只收集、**不提交**——提交发生在最后一题卡的
+ * 指令按钮上（客户端代发真实用户消息）。
+ */
+export type SequentialAnswerResult =
+  | { status: 'ok'; nextIndex: number }
+  | { status: 'unknown' }
+  | { status: 'terminal' };
+
+export function recordSequentialAnswer(
+  questionId: string,
+  questionIndex: number,
+  optionIndex: number,
+): SequentialAnswerResult {
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry) return { status: 'unknown' };
+  if (entry.expiresAtMs <= Date.now()) {
+    pendingMultiQuestions.delete(questionId);
+    clearTimeout(entry.cleanupTimer);
+    return { status: 'unknown' };
+  }
+  if (entry.terminal) return { status: 'terminal' };
+
+  const question = entry.questions[questionIndex];
+  if (!question) return { status: 'unknown' };
+  if (typeof question.options[optionIndex] !== 'string') return { status: 'unknown' };
+
+  entry.answers.set(questionIndex, { optionIndex });
+
+  const total = entry.questions.length;
+  let nextIndex: number;
+  if (entry.editingIndex === questionIndex) {
+    // 回改完成
+    entry.editingIndex = undefined;
+    nextIndex = questionIndex < entry.cursor ? entry.cursor : entry.cursor + 1;
+  } else if (entry.editingIndex !== undefined) {
+    // 回改期间点了别的卡 ⇒ 放弃回改，按普通作答处理
+    entry.editingIndex = undefined;
+    nextIndex = questionIndex === entry.cursor ? entry.cursor + 1 : entry.cursor;
+  } else if (questionIndex === entry.cursor) {
+    nextIndex = entry.cursor + 1;
+  } else {
+    // 点了更早那张卡的选项（改前面已答的题）⇒ 重发当前卡刷新全量文本
+    nextIndex = entry.cursor;
+  }
+  if (nextIndex >= total) nextIndex = total - 1;
+  if (nextIndex < 0) nextIndex = 0;
+  entry.cursor = nextIndex;
+  return { status: 'ok', nextIndex };
+}
+
+/**
+ * 顺序发题：进入第 k 题的**回改态**（「✏️ 改一改」回调）。
+ *
+ * 只置位 `editingIndex`——真正的「重发该题卡」由调用方做（它才有出站
+ * 通道与锚点）。
+ */
+export type SequentialEditResult =
+  | { status: 'ok' }
+  | { status: 'unknown' }
+  | { status: 'terminal' };
+
+export function beginSequentialEdit(
+  questionId: string,
+  questionIndex: number,
+): SequentialEditResult {
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry) return { status: 'unknown' };
+  if (entry.expiresAtMs <= Date.now()) {
+    pendingMultiQuestions.delete(questionId);
+    clearTimeout(entry.cleanupTimer);
+    return { status: 'unknown' };
+  }
+  if (entry.terminal) return { status: 'terminal' };
+  if (questionIndex < 0 || questionIndex >= entry.questions.length) return { status: 'unknown' };
+  entry.editingIndex = questionIndex;
+  return { status: 'ok' };
+}
+
+/**
+ * 构造最后一题卡的**提交前缀**：前 N-1 题的 keyed 答案文本
+ * （`"1: 3\n2: 1"`）。
+ *
+ * 纯数字 = 选项序号（1-based，框架 `normalizeAgentHarnessUserInputOption`
+ * 按 `Number(trimmed)-1` 反查）；非数字 = 自由文本（ask_user 恒有
+ * `isOther`，故自由文本原样保留）。
+ */
+export function buildSequentialAnswerPrefix(
+  answers: ReadonlyMap<number, MultiQuestionAnswer>,
+  total: number,
+): string {
+  const lines: string[] = [];
+  for (let i = 0; i < total - 1; i++) {
+    const answer = answers.get(i);
+    if (!answer) continue;
+    lines.push(`${i + 1}: ${'optionIndex' in answer ? answer.optionIndex + 1 : answer.text}`);
+  }
+  return lines.join('\n');
+}
+
+/** 答案的人话版展示（确认卡 / 顺序卡「已记录」区共用） */
+export function formatMultiQuestionAnswerDisplay(
+  question: MultiQuestionDef,
+  answer: MultiQuestionAnswer,
+): string {
+  return 'optionIndex' in answer
+    ? stripRecommendedSuffix(splitOptionLabel(question.options[answer.optionIndex] ?? ''))
+    : answer.text;
 }
 
 // ============ 单问题 pending Store（PR1）============

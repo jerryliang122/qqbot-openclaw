@@ -19,7 +19,11 @@ import {
   getQuestionGatewayRuntime,
   parseQuestionButtonData,
   parseMultiQuestionButtonData,
+  parseMultiQuestionEditData,
   recordMultiQuestionTap,
+  recordSequentialAnswer,
+  beginSequentialEdit,
+  getPendingMultiQuestionState,
   markMultiQuestionResolveFailed,
   markSingleQuestionResolved,
   getPendingMultiQuestions,
@@ -29,6 +33,7 @@ import {
   buildMultiQuestionConfirmKeyboard,
   type MultiQuestionAnswer,
 } from '../features/question-helpers.js';
+import { sendSequentialQuestionCard } from '../features/question-flow.js';
 import { recordKnownUser } from '../features/proactive.js';
 import { cacheMsgId } from '../features/msgid-cache.js';
 import { enqueueC2CInboundMessage } from '../features/inbound-debounce.js';
@@ -40,7 +45,7 @@ import { resolveGroupConfigFromAccount, resolveGroupConfigKey, resolveGroupPolic
 import { getPackageVersion } from '../utils/pkg-version.js';
 import { getOpenClawVersion } from '../bot-instance.js';
 import { sendQuestionMessage } from '../outbound/question-send.js';
-import type { ParsedMultiQuestionAction } from '../features/question-helpers.js';
+import type { ParsedMultiQuestionAction, ParsedMultiQuestionEditAction } from '../features/question-helpers.js';
 
 export async function handleMessage(
   ctx: MiddlewareContext,
@@ -210,9 +215,16 @@ export async function handleInteraction(
     return;
   }
 
-  // question 按钮（ask_user，含单问题 qqbot:q: 与多问题 qqbot:qm:）优先于审批按钮
+  // question 按钮（ask_user）优先于审批按钮：
+  // - `qqbot:q:` 单问题选项
+  // - `qqbot:qm:` 多问题选项
+  // - `qqbot:qme:` 多问题「✏️ 改一改」（PR2）
   const buttonData = event.data?.resolved?.button_data;
-  if (buttonData?.startsWith('qqbot:q:') || buttonData?.startsWith('qqbot:qm:')) {
+  if (
+    buttonData?.startsWith('qqbot:q:') ||
+    buttonData?.startsWith('qqbot:qm:') ||
+    buttonData?.startsWith('qqbot:qme:')
+  ) {
     await handleQuestion(event, account, runtime, log, acknowledgeInteraction);
     return;
   }
@@ -409,6 +421,11 @@ async function handleQuestion(
     const multiParsed = parseMultiQuestionButtonData(buttonData);
     if (multiParsed) {
       await handleMultiQuestionTap(multiParsed, event, account, runtime, log);
+      return;
+    }
+    const editParsed = parseMultiQuestionEditData(buttonData);
+    if (editParsed) {
+      await handleMultiQuestionEdit(editParsed, event, account, runtime, log);
     }
     return;
   }
@@ -465,6 +482,35 @@ async function handleMultiQuestionTap(
     `[question] multi tap id=${parsed.questionId} q=${parsed.questionIndex + 1} opt=${parsed.optionIndex + 1} operator=${operatorId ?? 'unknown'}`,
   );
 
+  // ── c2c 顺序发题（PR2）──
+  // 点选只**收集**答案（框架要求整单齐备，见 issue #93 根因 2），下一张
+  // 题卡由这里续发；最后一题的卡本身就是提交点（选项是指令按钮，data
+  // 带全量答案文本，客户端代发真实用户消息）。
+  const state = getPendingMultiQuestionState(parsed.questionId);
+  if (state?.mode === 'sequential') {
+    const result = recordSequentialAnswer(
+      parsed.questionId,
+      parsed.questionIndex,
+      parsed.optionIndex,
+    );
+    if (result.status !== 'ok') {
+      log.info(`[question] sequential tap ignored id=${parsed.questionId} status=${result.status}`);
+      await sendMultiQuestionFeedback(event, account, '该问题已提交或已过期', log, parsed.questionId);
+      return;
+    }
+    const nextState = getPendingMultiQuestionState(parsed.questionId);
+    if (!nextState) return;
+    await sendSequentialQuestionCard({
+      state: nextState,
+      index: result.nextIndex,
+      account,
+      to: formatQuestionTarget(scope, peerId),
+      log,
+    });
+    return;
+  }
+
+  // ── 群聊旧形态：全部题卡 + 集齐后的确认卡 ──
   const tap = recordMultiQuestionTap(parsed.questionId, parsed.questionIndex, parsed.optionIndex);
 
   if (tap.status === 'unknown' || tap.status === 'terminal') {
@@ -500,6 +546,49 @@ async function handleMultiQuestionTap(
     account,
     log,
   );
+}
+
+/**
+ * 多题「✏️ 改一改」回调（PR2）：**重发该题卡**。
+ *
+ * 用户点某张题卡上的「✏️ 改一改」⇒ 插件把那张卡再发一遍（编辑态，
+ * 正文多一行「🔁 重新作答本题」）⇒ 用户改选后覆盖该题答案 ⇒ 回到
+ * 流程位置继续往下走（见 `recordSequentialAnswer` 的状态机）。
+ *
+ * 刻意**不用**指令型按钮：指令型只能往输入框塞文本，要让插件「重新
+ * 出卡」必须走回调通道（INTERACTION_CREATE）。
+ */
+async function handleMultiQuestionEdit(
+  parsed: ParsedMultiQuestionEditAction,
+  event: InteractionEvent,
+  account: ResolvedQQBotAccount,
+  runtime: PluginRuntime,
+  log: PluginLogger,
+): Promise<void> {
+  const operatorId = resolveOperatorId(event);
+  const scope: 'group' | 'c2c' = event.group_openid ? 'group' : 'c2c';
+  const peerId = (scope === 'group' ? event.group_openid : event.user_openid) ?? '';
+  if (!peerId) return;
+
+  log.info(
+    `[question] multi edit id=${parsed.questionId} q=${parsed.questionIndex + 1} operator=${operatorId ?? 'unknown'}`,
+  );
+
+  const result = beginSequentialEdit(parsed.questionId, parsed.questionIndex);
+  if (result.status !== 'ok') {
+    log.info(`[question] multi edit ignored id=${parsed.questionId} status=${result.status}`);
+    await sendMultiQuestionFeedback(event, account, '该问题已提交或已过期', log, parsed.questionId);
+    return;
+  }
+  const state = getPendingMultiQuestionState(parsed.questionId);
+  if (!state) return;
+  await sendSequentialQuestionCard({
+    state,
+    index: parsed.questionIndex,
+    account,
+    to: formatQuestionTarget(scope, peerId),
+    log,
+  });
 }
 
 /**
