@@ -6,7 +6,8 @@
  * 「✅ 提交」（确认卡）。PR2 改成 **c2c 单聊顺序发题**：
  *
  * 1. 只发第 1 题；用户答完第 k 题才发第 k+1 题；
- * 2. 每一题卡带「✏️ 改一改」入口（点它重发该题卡，可回改）；
+ * 2. 每一题卡只有选项按钮（**没有**「✏️ 改一改」）；想改前面的题，在
+ *    最后一题点「✍️ 其他」——输入框会带上全部已答内容，用户改哪行都行；
  * 3. **最后一题卡本身就是提交点**——选项按钮是指令型（type=2,
  *    enter=true），data 里写全量 keyed 答案文本（`"1: 3\n2: 1"`），
  *    客户端以真实用户身份发出 ⇒ 框架 keyed 认领通道 resolve 掉挂起的
@@ -67,12 +68,25 @@ export function renderSequentialCard(
   if (!question) return null;
 
   const total = state.questions.length;
-  const editing = state.editingIndex === index;
   const isLast = index === total - 1;
+  /**
+   * 自由作答入口（最后一题的「✍️ 其他」）是否存在。
+   *
+   * - 中间题：**指路**到最后一题 ⇒ 最后一题带 `isOther` 才有那个按钮；
+   * - 最后一题：提交态时按钮就在这张卡上（由 `formatSequentialQuestionCard`
+   *   按 `def.isOther` 判断）；收集态（降级）时这张卡**没有**该按钮 ⇒
+   *   不得在正文里指引用户去点它。
+   */
+  const freeTextOnLast = Boolean(state.questions[total - 1]?.isOther);
 
   if (!isLast) {
     return {
-      text: formatSequentialQuestionCard(question, { index, total, mode: 'collect', editing }),
+      text: formatSequentialQuestionCard(question, {
+        index,
+        total,
+        mode: 'collect',
+        canFreeText: freeTextOnLast,
+      }),
       keyboard: buildSequentialCollectKeyboard(state.questionId, index, question),
     };
   }
@@ -87,7 +101,12 @@ export function renderSequentialCard(
   }
   if (!prefixComplete) {
     return {
-      text: formatSequentialQuestionCard(question, { index, total, mode: 'collect', editing }),
+      text: formatSequentialQuestionCard(question, {
+        index,
+        total,
+        mode: 'collect',
+        canFreeText: false,
+      }),
       keyboard: buildSequentialCollectKeyboard(state.questionId, index, question),
     };
   }
@@ -110,11 +129,10 @@ export function renderSequentialCard(
       index,
       total,
       mode: 'submit',
-      editing,
       collected,
       submitTemplate,
     }),
-    keyboard: buildSequentialSubmitKeyboard(state.questionId, index, question, prefix),
+    keyboard: buildSequentialSubmitKeyboard(index, question, prefix),
   };
 }
 

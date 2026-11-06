@@ -49,8 +49,6 @@ export {
 
 const QUESTION_CALLBACK_PREFIX = 'qqbot:q:';
 const MULTI_QUESTION_CALLBACK_PREFIX = 'qqbot:qm:';
-/** 多题「✏️ 改一改」回调前缀（PR2）：`qqbot:qme:<questionId>:<题号>` */
-const MULTI_QUESTION_EDIT_PREFIX = 'qqbot:qme:';
 
 /** questionId 格式: ask_<32位hex> */
 const QUESTION_ID_PATTERN = /^ask_[a-f0-9]{32}$/;
@@ -84,12 +82,6 @@ export interface ParsedMultiQuestionAction {
   questionId: string;
   questionIndex: number;
   optionIndex: number;
-}
-
-/** 多题「✏️ 改一改」回调（PR2） */
-export interface ParsedMultiQuestionEditAction {
-  questionId: string;
-  questionIndex: number;
 }
 
 /** 一次多问题整单的答案（题号 -> 按钮选项序号或自由文本） */
@@ -388,31 +380,6 @@ export function parseMultiQuestionButtonData(buttonData: string): ParsedMultiQue
   return { questionId, questionIndex, optionIndex };
 }
 
-/**
- * 解析多题「✏️ 改一改」按钮的 button_data（PR2）。
- *
- * 格式: `qqbot:qme:<questionId>:<questionIndex>`
- * 返回 null 表示不是改一改按钮。
- */
-export function parseMultiQuestionEditData(buttonData: string): ParsedMultiQuestionEditAction | null {
-  if (!buttonData.startsWith(MULTI_QUESTION_EDIT_PREFIX)) return null;
-
-  const payload = buttonData.slice(MULTI_QUESTION_EDIT_PREFIX.length);
-  const parts = payload.split(':');
-  if (parts.length !== 2) return null;
-
-  const [questionId, questionIndexStr] = parts;
-  if (!QUESTION_ID_PATTERN.test(questionId)) return null;
-  if (!questionIndexStr) return null;
-
-  const questionIndex = Number(questionIndexStr);
-  if (!Number.isInteger(questionIndex) || questionIndex < 0 || questionIndex >= MAX_MULTI_QUESTIONS) {
-    return null;
-  }
-
-  return { questionId, questionIndex };
-}
-
 // ============ 多问题答案暂存 Store ============
 
 interface PendingMultiQuestion {
@@ -440,11 +407,6 @@ interface PendingMultiQuestion {
    * 题号。`0` = 第 1 题。
    */
   cursor: number;
-  /**
-   * 正在回改的题号（sequential 形态）：用户点了「✏️ 改一改」后置位，
-   * 下一次作答落在该题上（覆盖旧答案），答完回到 `cursor`。
-   */
-  editingIndex?: number;
   /**
    * 本轮 inbound 消息的 msg_id（**显式锚点**）——多题的续卡 / 确认卡 /
    * 状态回执复用它走被动回复。
@@ -662,8 +624,6 @@ export interface PendingMultiQuestionState {
   answers: ReadonlyMap<number, MultiQuestionAnswer>;
   /** 流程位置：当前发出去的那张卡对应的题号 */
   cursor: number;
-  /** 正在回改的题号（用户点了「✏️ 改一改」后置位） */
-  editingIndex?: number;
   mode: 'sequential' | 'legacy';
   scope: 'c2c' | 'group';
   targetId: string;
@@ -681,7 +641,6 @@ export function getPendingMultiQuestionState(
     questions: entry.questions,
     answers: new Map(entry.answers),
     cursor: entry.cursor,
-    ...(entry.editingIndex !== undefined ? { editingIndex: entry.editingIndex } : {}),
     mode: entry.mode,
     scope: entry.scope,
     targetId: entry.targetId,
@@ -694,14 +653,16 @@ export function getPendingMultiQuestionState(
  *
  * ── 状态机 ─────────────────────────────────────────────────────────
  * - 正常作答（点在当前卡上）⇒ 记答案 ⇒ 前进一题；
- * - 回改作答（点在「✏️ 改一改」重发的那张卡上）⇒ 覆盖该题答案 ⇒
- *   改的是**更早**的题就回到流程位置（重发当前卡，保证最后一题的
- *   全量文本是最新的）；改的就是当前题就前进一题；
- * - 误点更早那张卡的选项 ⇒ 记答案 ⇒ 重发当前卡（同上，刷新全量文本）。
+ * - 点了更早那张卡的选项（改前面已答的题）⇒ 记答案 ⇒ 重发当前卡
+ *   （刷新最后一题的全量提交文本）。
  *
  * ⚠️ 框架要求**整单齐备**才 resolve（`validateAnswers`，见 issue #93
  * 根因 2），所以这里只收集、**不提交**——提交发生在最后一题卡的
  * 指令按钮上（客户端代发真实用户消息）。
+ *
+ * ⚠️ 本形态**没有**「回改态」：卡上不再挂「✏️ 改一改」按钮——想改前面的
+ * 题，在最后一题点「✍️ 其他」，输入框会带上全部已答内容，用户改哪一行
+ * 都行（见 issue #93 与 PR #96 评审结论）。
  */
 export type SequentialAnswerResult =
   | { status: 'ok'; nextIndex: number }
@@ -730,15 +691,7 @@ export function recordSequentialAnswer(
 
   const total = entry.questions.length;
   let nextIndex: number;
-  if (entry.editingIndex === questionIndex) {
-    // 回改完成
-    entry.editingIndex = undefined;
-    nextIndex = questionIndex < entry.cursor ? entry.cursor : entry.cursor + 1;
-  } else if (entry.editingIndex !== undefined) {
-    // 回改期间点了别的卡 ⇒ 放弃回改，按普通作答处理
-    entry.editingIndex = undefined;
-    nextIndex = questionIndex === entry.cursor ? entry.cursor + 1 : entry.cursor;
-  } else if (questionIndex === entry.cursor) {
+  if (questionIndex === entry.cursor) {
     nextIndex = entry.cursor + 1;
   } else {
     // 点了更早那张卡的选项（改前面已答的题）⇒ 重发当前卡刷新全量文本
@@ -748,34 +701,6 @@ export function recordSequentialAnswer(
   if (nextIndex < 0) nextIndex = 0;
   entry.cursor = nextIndex;
   return { status: 'ok', nextIndex };
-}
-
-/**
- * 顺序发题：进入第 k 题的**回改态**（「✏️ 改一改」回调）。
- *
- * 只置位 `editingIndex`——真正的「重发该题卡」由调用方做（它才有出站
- * 通道与锚点）。
- */
-export type SequentialEditResult =
-  | { status: 'ok' }
-  | { status: 'unknown' }
-  | { status: 'terminal' };
-
-export function beginSequentialEdit(
-  questionId: string,
-  questionIndex: number,
-): SequentialEditResult {
-  const entry = pendingMultiQuestions.get(questionId);
-  if (!entry) return { status: 'unknown' };
-  if (entry.expiresAtMs <= Date.now()) {
-    pendingMultiQuestions.delete(questionId);
-    clearTimeout(entry.cleanupTimer);
-    return { status: 'unknown' };
-  }
-  if (entry.terminal) return { status: 'terminal' };
-  if (questionIndex < 0 || questionIndex >= entry.questions.length) return { status: 'unknown' };
-  entry.editingIndex = questionIndex;
-  return { status: 'ok' };
 }
 
 /**
