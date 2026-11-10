@@ -907,8 +907,10 @@ export function formatMultiQuestionConfirmCard(
 
 /**
  * 确认卡键盘：两个指令按钮（action.type=2）携带完整答案文本。
- * - 提交：enter=true，客户端点击后自动以用户身份发出（真实消息，框架可认领）
- * - 改一改：enter=false，答案填入输入框，用户编辑后手动发送
+ * - 提交：enter=true，客户端点击后自动以用户身份发出（真实消息，框架可认领）；
+ *   click_limit=1 防连点重复发送（issue #99）
+ * - 改一改：enter=false，答案填入输入框，用户编辑后手动发送。不设
+ *   click_limit——只预填不发消息，重复点无害
  */
 export function buildMultiQuestionConfirmKeyboard(answerText: string): InlineKeyboard {
   const buttons: KeyboardButton[] = [
@@ -924,6 +926,7 @@ export function buildMultiQuestionConfirmKeyboard(answerText: string): InlineKey
         data: answerText,
         enter: true,
         permission: { type: KEYBOARD_PERMISSION_EVERYONE },
+        click_limit: 1,
         unsupport_tips: '当前客户端不支持，请手动回复上方答案文本',
       },
     },

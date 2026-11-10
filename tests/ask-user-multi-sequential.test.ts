@@ -19,6 +19,9 @@
  * - 「✏️ 改一改」已移除（按钮、回调前缀、状态机全部不存在）
  * - keyed 答案文本口径（数字=选项序号 1-based / 非数字=自由文本）
  * - 红线守卫：**不程序化提交**、**不合成入站消息**
+ * - issue #99：多题 pending 在同会话下一条入站时置终态（keyed 旁路失效、
+ *   恢复防抖合并）；提交型按钮（末题选项 / 群确认卡「✅ 提交」）带
+ *   click_limit=1 防连点重复发送
  *
  * 运行方式: npx tsx tests/ask-user-multi-sequential.test.ts
  */
@@ -57,9 +60,11 @@ const { handleInteraction } = await import('../src/gateway/event-handlers.ts');
 const {
   buildSequentialAnswerPrefix,
   buildSequentialFullAnswerDraft,
+  buildMultiQuestionConfirmKeyboard,
   registerPendingMultiQuestion,
   getPendingMultiQuestionState,
   recordSequentialAnswer,
+  findPendingMultiQuestionByConversation,
 } = await import('../src/features/question-helpers.ts');
 
 // ── 测试基础设施（沿用 ask-user-passive-anchor.test.ts 的形态）──
@@ -169,6 +174,21 @@ async function deliverAskUserKeepingGateway(payload: any, opts: { messageId: str
   const { sent, gw } = installFakeGateway();
   await dispatchToOpenClaw(ctx, msg, account, runtime);
   return { sent, gw, account, runtime };
+}
+
+/**
+ * 同会话派发一条**普通** c2c 入站消息（不投递任何 payload）——模拟
+ * issue #99 里末题指令按钮代发的 keyed 作答文本到达 dispatch 的那一刻。
+ * dispatch 起点的多题 pending 终态标记不区分消息内容。
+ */
+async function dispatchPlainInbound(opts: { messageId: string; targetId?: string }) {
+  _resetAdaptersCache();
+  const { msg, ctx } = makeMsgAndCtx({ ...opts, targetId: opts.targetId ?? 'USER_123' });
+  const runtime = makeFakeRuntime({
+    onInboundRun: async () => ({ dispatched: true }),
+    dispatchReply: async () => ({ queuedFinal: true, counts: { final: 0 } }),
+  });
+  await dispatchToOpenClaw(ctx, msg, makeAccount(), runtime);
 }
 
 const fakeLog = {
@@ -572,6 +592,106 @@ await test('顺序发题只在 c2c 生效（群聊仍旧路径）', () => {
     /const sequential = scope === 'c2c'/.test(src),
     'dispatch 必须按 scope 区分：c2c 顺序发题、群聊旧路径',
   );
+});
+
+// ── 7. issue #99 守卫：多题 pending 终态 ──
+
+group('7. issue #99：多题 pending 终态标记（keyed 旁路在作答受理后失效）');
+
+await test('发卡那一轮不自清：ask_user 投递后 pending 仍武装（keyed 旁路可用）', async () => {
+  clearQuotaCache();
+  const { sent, gw } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_I99_1' });
+  try {
+    assert.equal(sent.length, 1, '顺序发题首轮只发 1 张卡');
+    const pending = findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123');
+    assert.ok(pending, '发卡那一轮的 dispatch 起点不得清掉自己（deliver 回调里）刚登记的 pending');
+    assert.equal(pending!.questionId, QID);
+  } finally {
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('同会话下一条入站 dispatch ⇒ pending 置终态（旁路失效，恢复防抖合并）', async () => {
+  clearQuotaCache();
+  const { gw } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_I99_2' });
+  try {
+    assert.ok(
+      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      '前置：作答到达前 keyed 旁路处于武装态',
+    );
+    // 末题指令按钮代发的 keyed 答案 = 该会话的下一条入站消息；这里用一条
+    // 普通 c2c 入站模拟（dispatch 起点的终态标记不区分消息内容）
+    await dispatchPlainInbound({ messageId: 'M_I99_2_ANSWER' });
+    assert.equal(
+      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      undefined,
+      '首份作答受理后 keyed 旁路必须失效——否则 25 分钟 TTL 内同一份作答的'
+        + '重复投递（连点 / 平台重推）各自独立成轮次（issue #99 实录 3 条 USER）',
+    );
+    assert.equal(
+      recordSequentialAnswer(QID, 0, 0).status,
+      'terminal',
+      '终态后继续点旧卡应按 terminal 处理，不再重复发卡',
+    );
+  } finally {
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('源码守卫：dispatch.ts 必须接线 markMultiQuestionResolved（不得只定义不调用）', () => {
+  const src = readFileSync(new URL('../src/dispatch/dispatch.ts', import.meta.url), 'utf-8');
+  assert.ok(
+    src.includes('markMultiQuestionResolved(pendingMulti.questionId)'),
+    'dispatch 必须在 c2c 入站受理时把多题 pending 置终态'
+      + '（issue #99 主因：函数定义了但全包零调用）',
+  );
+});
+
+// ── 8. issue #99 守卫：提交型按钮防连点 ──
+
+group('8. issue #99：提交型按钮 click_limit（防连点重复发送）');
+
+await test('末题提交键盘：选项按钮 click_limit=1；「✍️ 其他」不设（可重复预填）', async () => {
+  clearQuotaCache();
+  const payload = {
+    text: TWO_QUESTION_WITH_OTHER_TEXT,
+    channelData: { askUser: { questionId: QID } },
+  };
+  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(payload, { messageId: 'M_I99_3' });
+  try {
+    await tap(`qqbot:qm:${QID}:0:0`, account, runtime); // 答第 1 题 → 续发最后一题
+    const last = sent[1]!;
+    const options = buttonsOf(last).filter((b: any) => b.render_data.label.startsWith('①') || b.render_data.label.startsWith('②'));
+    assert.equal(options.length, 2, '末题应有 2 个选项按钮');
+    for (const b of options) {
+      assert.equal(b.action.type, 2, '末题选项是指令型（type=2）');
+      assert.equal(
+        b.action.click_limit,
+        1,
+        '末题选项必须 click_limit=1——每次点击都让客户端代发整份答案文本，'
+          + '连点 = 同一份作答重复投递（issue #99 缺陷 2）',
+      );
+    }
+    const other = buttonByLabel(last, '✍️ 其他');
+    assert.ok(other, '末题带「✍️ 其他」');
+    assert.equal(
+      other.action.click_limit,
+      undefined,
+      '「✍️ 其他」只预填不发消息，不设 click_limit（清空输入框后再要一次模板是真实用法）',
+    );
+  } finally {
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('群确认卡键盘：「✅ 提交」click_limit=1；「✏️ 改一改」不设', () => {
+  const kb: any = buildMultiQuestionConfirmKeyboard('1: 3\n2: 1');
+  const buttons = (kb.content.rows ?? []).flatMap((r: any) => r.buttons ?? []);
+  const submit = buttons.find((b: any) => b.id === 'confirm_submit');
+  const edit = buttons.find((b: any) => b.id === 'confirm_edit');
+  assert.ok(submit && edit, '确认卡应有「✅ 提交」与「✏️ 改一改」两个按钮');
+  assert.equal(submit.action.click_limit, 1, '「✅ 提交」每次点击代发答案文本，必须限一次');
+  assert.equal(edit.action.click_limit, undefined, '「✏️ 改一改」只预填输入框，可重复点');
 });
 
 // ── 结果 ──

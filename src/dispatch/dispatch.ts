@@ -36,7 +36,9 @@ import {
   registerPendingMultiQuestion,
   registerPendingSingleQuestion,
   markSingleQuestionResolved,
+  markMultiQuestionResolved,
   findPendingSingleQuestionByConversation,
+  findPendingMultiQuestionByConversation,
   getPendingMultiQuestionState,
 } from '../features/question-helpers.js';
 import {
@@ -380,6 +382,32 @@ export async function dispatchToOpenClaw(
     );
     if (pendingSingle) {
       markSingleQuestionResolved(pendingSingle.questionId);
+    }
+  }
+
+  // 多问题 pending 清理（issue #99，与上面单问题分支对称）：c2c 顺序发题下
+  // 中间题走回调点选（type=1，不产生入站消息），末题卡后的**第一条**入站
+  // 文本就是全量 keyed 作答（指令按钮代发 / 手打）⇒ 此刻置终态，该会话
+  // 恢复防抖合并。不置终态的后果（issue #99 实录）：keyed 旁路在 25 分钟
+  // TTL 内常驻武装，同一份作答的重复投递（末题按钮连点 / 平台重推）各自
+  // 独立成轮次——一次作答 3 条 USER、3 条雷同回复。terminal 同时让
+  // recordSequentialAnswer 对后续点选恢复 terminal 语义，不再重复发卡。
+  //
+  // 同样不会误清「发卡那一轮」：多题 pending 在该轮 deliver 回调里登记
+  // （registerPendingMultiQuestion 晚于本行）。「作答被框架拒收需重答」的
+  // 场景：重答通常是一条独立消息，防抖窗口内单条不合并、原文转发；只有
+  // 3 秒内连发多条才会合并改写——与单题 PR1 同款取舍。
+  if (envelope.chatScope !== 'group') {
+    const pendingMulti = findPendingMultiQuestionByConversation(
+      account.accountId,
+      'c2c',
+      peerId,
+    );
+    if (pendingMulti) {
+      markMultiQuestionResolved(pendingMulti.questionId);
+      dlog?.debug(
+        `[question] multi pending resolved on inbound (restore debounce merge) questionId=${pendingMulti.questionId}`,
+      );
     }
   }
 

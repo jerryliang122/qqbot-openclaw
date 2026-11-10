@@ -499,9 +499,12 @@ export function buildSequentialCollectKeyboard(
  * - 选项：**指令型**（type=2, enter=true），data = 全量 keyed 答案文本
  *   （前 N-1 题已答 + 本题该选项），点击即由客户端以**真实用户身份**
  *   发出 ⇒ 框架认领并 resolve（**不程序化提交、不合成入站消息**）；
+ *   `click_limit: 1` 防连点——每次点击都会把整份答案文本再发一遍，
+ *   重复投递在 pending 置终态前各自成为独立轮次（issue #99）；
  * - 「✍️ 其他」：指令型（type=2, enter=false），预填
  *   `"<前 N-1 题>\n<N>: "` ——用户可在输入框里改任意一行（含最后一题
- *   的自由文本）后手动发送。
+ *   的自由文本）后手动发送。不设 click_limit：只预填不发消息，重复点
+ *   无害，且「清空输入框后想再要一次模板」是真实用法。
  *
  * @param answerPrefix 前 N-1 题的 keyed 答案文本（`"1: 3\n2: 1"`）；
  *   空串表示前序还没答（此时退化为只带本题号）。
@@ -530,6 +533,7 @@ export function buildSequentialSubmitKeyboard(
         data: line(String(optionIndex + 1)),
         enter: true,
         permission: { type: KEYBOARD_PERMISSION_EVERYONE },
+        click_limit: 1,
         unsupport_tips: '当前客户端版本不支持，请直接回复下方给出的答案文本',
       },
       group_id: `question-${questionIndex}`,
