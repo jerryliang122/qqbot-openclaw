@@ -65,6 +65,7 @@ const {
   getPendingMultiQuestionState,
   recordSequentialAnswer,
   findPendingMultiQuestionByConversation,
+  claimPendingMultiQuestionIfKeyedAnswer,
 } = await import('../src/features/question-helpers.ts');
 
 // ── 测试基础设施（沿用 ask-user-passive-anchor.test.ts 的形态）──
@@ -178,12 +179,17 @@ async function deliverAskUserKeepingGateway(payload: any, opts: { messageId: str
 
 /**
  * 同会话派发一条**普通** c2c 入站消息（不投递任何 payload）——模拟
- * issue #99 里末题指令按钮代发的 keyed 作答文本到达 dispatch 的那一刻。
- * dispatch 起点的多题 pending 终态标记不区分消息内容。
+ * issue #99 里末题指令按钮代发的 keyed 作答文本到达 dispatch 的那一刻
+ * （防抖关闭配置走直发路径，不经 shouldDebounce；本 helper 同样绕过
+ * 防抖器，覆盖 dispatch 起点的兜底认领点）。
  */
-async function dispatchPlainInbound(opts: { messageId: string; targetId?: string }) {
+async function dispatchPlainInbound(opts: { messageId: string; targetId?: string; content?: string }) {
   _resetAdaptersCache();
   const { msg, ctx } = makeMsgAndCtx({ ...opts, targetId: opts.targetId ?? 'USER_123' });
+  if (opts.content !== undefined) {
+    msg.content = opts.content;
+    ctx.message = { content: opts.content };
+  }
   const runtime = makeFakeRuntime({
     onInboundRun: async () => ({ dispatched: true }),
     dispatchReply: async () => ({ queuedFinal: true, counts: { final: 0 } }),
@@ -594,9 +600,9 @@ await test('顺序发题只在 c2c 生效（群聊仍旧路径）', () => {
   );
 });
 
-// ── 7. issue #99 守卫：多题 pending 终态 ──
+// ── 7. issue #99 守卫：多题 pending 认领 ──
 
-group('7. issue #99：多题 pending 终态标记（keyed 旁路在作答受理后失效）');
+group('7. issue #99：多题 pending 认领（keyed 旁路在作答受理后失效）');
 
 await test('发卡那一轮不自清：ask_user 投递后 pending 仍武装（keyed 旁路可用）', async () => {
   clearQuotaCache();
@@ -611,7 +617,7 @@ await test('发卡那一轮不自清：ask_user 投递后 pending 仍武装（ke
   }
 });
 
-await test('同会话下一条入站 dispatch ⇒ pending 置终态（旁路失效，恢复防抖合并）', async () => {
+await test('keyed 形态作答入站 dispatch ⇒ pending 置终态（旁路失效，恢复防抖合并）', async () => {
   clearQuotaCache();
   const { gw } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_I99_2' });
   try {
@@ -619,13 +625,12 @@ await test('同会话下一条入站 dispatch ⇒ pending 置终态（旁路失�
       findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
       '前置：作答到达前 keyed 旁路处于武装态',
     );
-    // 末题指令按钮代发的 keyed 答案 = 该会话的下一条入站消息；这里用一条
-    // 普通 c2c 入站模拟（dispatch 起点的终态标记不区分消息内容）
-    await dispatchPlainInbound({ messageId: 'M_I99_2_ANSWER' });
+    // 末题指令按钮代发的 keyed 答案 = 该会话的下一条入站消息（3 题 × 2 选项）
+    await dispatchPlainInbound({ messageId: 'M_I99_2_ANSWER', content: '1: 1\n2: 1\n3: 1' });
     assert.equal(
       findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
       undefined,
-      '首份作答受理后 keyed 旁路必须失效——否则 25 分钟 TTL 内同一份作答的'
+      '可认领作答受理后 keyed 旁路必须失效——否则 25 分钟 TTL 内同一份作答的'
         + '重复投递（连点 / 平台重推）各自独立成轮次（issue #99 实录 3 条 USER）',
     );
     assert.equal(
@@ -638,12 +643,88 @@ await test('同会话下一条入站 dispatch ⇒ pending 置终态（旁路失�
   }
 });
 
-await test('源码守卫：dispatch.ts 必须接线 markMultiQuestionResolved（不得只定义不调用）', () => {
-  const src = readFileSync(new URL('../src/dispatch/dispatch.ts', import.meta.url), 'utf-8');
+await test('无关文本不认领（评审一轮）：答题中途发普通消息，卡片流程继续存活', async () => {
+  clearQuotaCache();
+  const { gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_I99_2B' });
+  try {
+    // 用户没点按钮，先发了条无关文本（"这题什么意思？"）——框架侧只会把它
+    // 当第 1 题答案拒收并重问，问卷继续存活；插件侧若也置终态，顺序发题
+    // 状态机就死了（不再续发题卡），两侧状态分裂
+    await dispatchPlainInbound({ messageId: 'M_I99_2B_ASK', content: '这题什么意思？' });
+    assert.ok(
+      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      '无关文本不得认领 pending（评审一轮：无条件置终态会打死顺序发题状态机）',
+    );
+    // 卡片流程确实还活着：点选仍被受理（不是 terminal）
+    const r = recordSequentialAnswer(QID, 0, 0);
+    assert.equal(r.status, 'ok', '无关文本后点选第 1 题仍应正常推进');
+    void account; void runtime;
+  } finally {
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('claimPendingMultiQuestionIfKeyedAnswer：认领形态逐项判定（与框架 validateAnswers 对齐）', () => {
+  const questions = [
+    { header: '甲', question: 'q1', options: ['a1', 'a2'] },
+    { header: '乙', question: 'q2', options: ['b1', 'b2', 'b3'] },
+    { header: '丙', question: 'q3', options: ['c1'], isOther: true },
+  ];
+  const cases: Array<{ text: string; expected: boolean; why: string }> = [
+    { text: '1: 1\n2: 3\n3: 自由文本', expected: true, why: '标准形态：序号在选项范围内，isOther 题收自由文本' },
+    { text: '1: 2\n2: 1\n3: 1', expected: true, why: 'isOther 题用序号作答也合法' },
+    { text: '1: 1\n2: 1', expected: false, why: '行数不足 3（框架 validateAnswers 逐题非空，认领必失败）' },
+    { text: '1: 1\n2: 1\n3: 1\n4: 1', expected: false, why: '行数超题数' },
+    { text: '1: 3\n2: 1\n3: 1', expected: false, why: '第 1 题只有 2 个选项，序号越界（框架拒收重问，卡片必须仍活）' },
+    { text: '1: 1\n2: 1\n3: ', expected: false, why: '末题空值（validateAnswers 拒空）' },
+    { text: '1：1\n2：1\n3：1', expected: false, why: '全角冒号框架解析不了（卡片也从不产出）' },
+    { text: '第一题: 1\n第二题: 1\n第三题: 1', expected: false, why: '非题号 key——卡片不指引这种写法，宁可漏认领' },
+    { text: '1: 1\n2: 2\n3: 随便写', expected: true, why: '自由文本落在 isOther 题上' },
+  ];
+  for (const { text, expected, why } of cases) {
+    // 每例独立 pending（认领会置终态，复用会串味）
+    const qid = `ask_shape_${Math.random().toString(36).slice(2, 10)}`;
+    registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_SHAPE', questions, 200);
+    assert.equal(
+      claimPendingMultiQuestionIfKeyedAnswer(qid, text),
+      expected,
+      `「${text.replace(/\n/g, '⏎')} }」应${expected ? '认领' : '不认领'}：${why}`,
+    );
+  }
+  // 非 isOther 题收自由文本 ⇒ 不认领（框架 !isOther 的门会拦）
+  {
+    const qid = `ask_shape_${Math.random().toString(36).slice(2, 10)}`;
+    registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_SHAPE', [
+      { header: '甲', question: 'q1', options: ['a1'] },
+    ], 200);
+    assert.equal(
+      claimPendingMultiQuestionIfKeyedAnswer(qid, '1: 我自己写的'),
+      false,
+      '非 isOther 题不收自由文本（框架拒收重问，卡片必须仍活）',
+    );
+  }
+  // 已终态 / 未知 id ⇒ 不认领
+  {
+    const qid = `ask_shape_${Math.random().toString(36).slice(2, 10)}`;
+    registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_SHAPE', [
+      { header: '甲', question: 'q1', options: ['a1'] },
+    ], 200);
+    assert.equal(claimPendingMultiQuestionIfKeyedAnswer(qid, '1: 1'), true, '前置：首次认领成功');
+    assert.equal(claimPendingMultiQuestionIfKeyedAnswer(qid, '1: 1'), false, '已终态不再认领');
+  }
+});
+
+await test('源码守卫：认领必须在放行判定处接线（不得只定义不调用 / 只在 dispatch 起点）', () => {
+  const debounceSrc = readFileSync(new URL('../src/features/inbound-debounce.ts', import.meta.url), 'utf-8');
   assert.ok(
-    src.includes('markMultiQuestionResolved(pendingMulti.questionId)'),
-    'dispatch 必须在 c2c 入站受理时把多题 pending 置终态'
-      + '（issue #99 主因：函数定义了但全包零调用）',
+    debounceSrc.includes('claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId, text)'),
+    '旁路放行判定处必须同步认领——旁路资格是入队时逐条判定的，等到 dispatch'
+      + '起点再做，同批到达的重复投递已各自拿到资格（评审二轮）',
+  );
+  const dispatchSrc = readFileSync(new URL('../src/dispatch/dispatch.ts', import.meta.url), 'utf-8');
+  assert.ok(
+    dispatchSrc.includes('claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId'),
+    'dispatch 起点必须保留兜底认领（防抖关闭配置不经 shouldDebounce）',
   );
 });
 

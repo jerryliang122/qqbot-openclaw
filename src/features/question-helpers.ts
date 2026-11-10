@@ -579,6 +579,74 @@ export function markMultiQuestionResolved(questionId: string): void {
   }
 }
 
+// ============ keyed 答案认领（issue #99 评审一轮）============
+
+/** keyed 答案行：`<题号>: <非空值>`（ASCII 冒号——插件卡片/模板只产这种形态） */
+const KEYED_ANSWER_LINE = /^\s*(\d+)\s*:\s*(\S.*)$/;
+
+/**
+ * 判断文本是否是该 pending 的**可认领 keyed 答案**形态。
+ *
+ * 与框架的认领口径对齐（`gateway-question-*.mjs`：`parseKeyedAnswers` 按
+ * `<key>: <value>` 逐行解析，key 依次尝试 questionId/header/question/题号；
+ * 题号 key 命中后 `validateAnswers` 要求每题非空、纯数字须落在选项数内、
+ * 非 isOther 题不收自由文本）。插件卡片与手打模板只产生**题号 key + ASCII
+ * 冒号**形态，这里就只认这种——宁可漏认领（pending 保持武装、卡片仍可点，
+ * 与改造前行为一致），不可误认领（框架拒收重问时卡片已被打死）。
+ *
+ * 框架还接受 `=` / `-` 分隔与 header/题干 key，但卡片从不指引这些写法：
+ * 用户真用它们手打时框架侧照样认领，插件只是不置终态（卡片多活到 TTL，
+ * 无害）。全角冒号「：」框架解析不了（落 fallbackLines 按行兜底、多题时
+ * 必被 validateAnswers 拒收），同样不认。
+ */
+function isClaimableKeyedAnswerText(questions: MultiQuestionDef[], text: string): boolean {
+  const lines = String(text ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length !== questions.length) return false;
+  return questions.every((question, index) => {
+    const match = KEYED_ANSWER_LINE.exec(lines[index]!);
+    if (!match) return false;
+    if (Number(match[1]) !== index + 1) return false;
+    const value = match[2]!.trim();
+    // 纯数字 = 选项序号（1-based），越界会被框架拒收并重问——此时卡片
+    // 必须仍然活着，不能置终态。逗号/分号分隔的多选（multiSelect）同口径
+    // 逐段校验（插件卡片不产这种形态，手打时框架认领、插件不置终态）。
+    if (/^[\d,;\s]+$/.test(value)) {
+      return value.split(/[,;\s]+/).filter(Boolean).every((part) => {
+        const optionIndex = Number(part);
+        return optionIndex >= 1 && optionIndex <= question.options.length;
+      });
+    }
+    // 自由文本：框架只对声明了 Other 的题收（!isOther 的门会拦）
+    return question.isOther === true;
+  });
+}
+
+/**
+ * 若文本是该 pending 的可认领 keyed 答案，**同步置终态**（认领）并返回
+ * true；否则不动 pending、返回 false。
+ *
+ * 认领点必须尽量早（issue #99 评审二轮）：在放行判定处同步调用——等到
+ * dispatch 起点再做，同批到达的重复投递已各自拿到 keyed 旁路资格（旁路
+ * 判定在入队时做），每个副本都会独立成轮次。放行处同步认领后，窗口内的
+ * 后续副本立刻失去旁路资格 ⇒ 落入防抖合并收敛成单轮次。
+ */
+export function claimPendingMultiQuestionIfKeyedAnswer(
+  questionId: string,
+  text: string,
+): boolean {
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry || entry.terminal || entry.resolving || entry.expiresAtMs <= Date.now()) {
+    return false;
+  }
+  if (!isClaimableKeyedAnswerText(entry.questions, text)) return false;
+  entry.terminal = true;
+  entry.resolving = false;
+  return true;
+}
+
 /**
  * 复位 complete 时置上的 resolving 锁（确认卡已发出或发送失败后调用），
  * 允许用户继续点选修改答案并重新拿到确认卡。

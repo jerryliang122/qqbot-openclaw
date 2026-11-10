@@ -472,6 +472,73 @@ await test('多问题 keyed 答案旁路：原样直发不被合并（认领文�
   assert.equal(scenario.captured[0]!.ingest.textForCommands, '1: 3\n2: 1');
 });
 
+await test('keyed 答案在放行处同步认领：窗口内重复投递失去旁路资格、合并成单轮（issue #99 评审二轮）', async () => {
+  const scenario = setupScenario({ debounceMs: W });
+  const mkAnswer = () => makeC2CMsgAndCtx({
+    senderId: 'USER_QM_CLAIM',
+    content: '1: 2\n2: 1',
+    assembledBody: { webBody: '1: 2\n2: 1', agentBody: '1: 2\n2: 1', rawBody: '1: 2\n2: 1' },
+  });
+  registerPendingMultiQuestion(
+    'test-account',
+    'q-claim-test',
+    'c2c',
+    'USER_QM_CLAIM',
+    [
+      { header: '题1', question: '选一个', options: ['a', 'b'] },
+      { header: '题2', question: '选一个', options: ['a', 'b', 'c'] },
+    ],
+    1000, // 覆盖用例时长即可（认领后即终态，TTL 只是兜底）
+  );
+  // 首份：旁路立即直发——放行判定处同步认领（置终态）
+  await keepAlive(fire(scenario, mkAnswer()));
+  assert.equal(scenario.captured.length, 1, '首份 keyed 答案旁路立即直发');
+  assert.equal(scenario.captured[0]!.ingest.textForCommands, '1: 2\n2: 1', '首份原文不被改写');
+  // 窗口内两份重复投递（不同 messageId，模拟客户端连点/平台重推）：认领已
+  // 生效 ⇒ 失去旁路资格 ⇒ 进防抖缓冲合并——而非各自旁路成独立轮次
+  const dup1 = fire(scenario, mkAnswer());
+  await sleep(30);
+  const dup2 = fire(scenario, mkAnswer());
+  await keepAlive(Promise.all([dup1, dup2]));
+  assert.equal(
+    scenario.captured.length,
+    2,
+    `重复投递必须合并成单次 dispatch（1 直发 + 1 合并 = 2 轮上限），实际 ${scenario.captured.length}`,
+  );
+  assert.ok(
+    (scenario.captured[1]!.ingest.textForAgent as string).includes('[消息 1/2]'),
+    '第二组捕获应是合并体（分节头），证明副本走的是防抖缓冲而非旁路',
+  );
+});
+
+await test('无关文本不认领 pending：答题中途的普通消息旁路直发、卡片流程存活（issue #99 评审一轮）', async () => {
+  const scenario = setupScenario({ debounceMs: W });
+  const ask = makeC2CMsgAndCtx({
+    senderId: 'USER_QM_KEEP',
+    content: '这题什么意思？',
+    assembledBody: { webBody: '这题什么意思？', agentBody: '这题什么意思？', rawBody: '这题什么意思？' },
+  });
+  registerPendingMultiQuestion(
+    'test-account',
+    'q-keepalive-test',
+    'c2c',
+    'USER_QM_KEEP',
+    [
+      { header: '题1', question: '选一个', options: ['a', 'b'] },
+      { header: '题2', question: '选一个', options: ['a', 'b'] },
+    ],
+    500,
+  );
+  await keepAlive(fire(scenario, ask));
+  assert.equal(scenario.captured.length, 1, 'pending 武装期间文本仍旁路直发（不被合并改写）');
+  assert.equal(scenario.captured[0]!.ingest.textForCommands, '这题什么意思？');
+  const { findPendingMultiQuestionByConversation } = await import('../src/features/question-helpers.ts');
+  assert.ok(
+    findPendingMultiQuestionByConversation('test-account', 'c2c', 'USER_QM_KEEP'),
+    '无关文本不得置终态——顺序发题卡片要继续可用（框架侧会拒收并重问）',
+  );
+});
+
 await test('单问题作答旁路（PR1）：原样直发不被合并（答案文本不被改写）', async () => {
   const scenario = setupScenario({ debounceMs: W });
   // 独立 sender：pending 记录 TTL（200ms）内仍在注册表里，同 sender 会

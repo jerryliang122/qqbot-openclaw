@@ -100,7 +100,7 @@ import { assembleBody } from '../dispatch/body-assembler.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { runWithRequestContext } from '../request-context.js';
 import { dispatchToOpenClaw, type DispatchToOpenClawOptions } from '../dispatch/index.js';
-import { findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation } from './question-helpers.js';
+import { claimPendingMultiQuestionIfKeyedAnswer, findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation } from './question-helpers.js';
 
 /** 默认防抖窗口：3 秒（QQ 客户端连发"文件 + 说明"的典型间隔内） */
 export const DEFAULT_C2C_INBOUND_DEBOUNCE_MS = 3000;
@@ -187,8 +187,14 @@ function shouldDebounceC2CItem(item: C2CInboundDebounceItem): boolean {
 
   // 多问题 ask_user 的 keyed 答案文本：合并会改写答案、认领失败。
   // 会话键含 accountId（openid 是 per-account 的，跨账号同 targetId
-  // 不共享 pending 记录）
-  if (findPendingMultiQuestionByConversation(item.account.accountId, 'c2c', item.msg.replyTarget.targetId)) {
+  // 不共享 pending 记录）。
+  const pendingMulti = findPendingMultiQuestionByConversation(item.account.accountId, 'c2c', item.msg.replyTarget.targetId);
+  if (pendingMulti) {
+    // 首份 keyed 答案在**放行判定处同步认领**（置终态）：旁路资格是入队时
+    // 逐条判定的，若等到 dispatch 起点才置终态，同批到达的重复投递已各自
+    // 拿到旁路资格、各自独立成轮次（issue #99 评审二轮）。认领带形态匹配
+    // ——无关文本不认领，pending 保持武装、顺序发题卡片继续可用。
+    claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId, text);
     return false;
   }
 
