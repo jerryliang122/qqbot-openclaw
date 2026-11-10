@@ -66,6 +66,7 @@ const {
   recordSequentialAnswer,
   findPendingMultiQuestionByConversation,
   claimPendingMultiQuestionIfKeyedAnswer,
+  isDuplicateClaimedKeyedAnswerDelivery,
 } = await import('../src/features/question-helpers.ts');
 
 // ── 测试基础设施（沿用 ask-user-passive-anchor.test.ts 的形态）──
@@ -676,6 +677,9 @@ await test('claimPendingMultiQuestionIfKeyedAnswer：认领形态逐项判定（
     { text: '1: 1\n2: 1', expected: false, why: '行数不足 3（框架 validateAnswers 逐题非空，认领必失败）' },
     { text: '1: 1\n2: 1\n3: 1\n4: 1', expected: false, why: '行数超题数' },
     { text: '1: 3\n2: 1\n3: 1', expected: false, why: '第 1 题只有 2 个选项，序号越界（框架拒收重问，卡片必须仍活）' },
+    { text: '1: 1,2\n2: 3\n3: 1', expected: false, why: '逗号多值不认领（评审三轮·发现 2）：框架只对 multiSelect 拆多值，插件反解不出 multiSelect——单选题的 "1,2" 框架必拒收，认领即打死卡片' },
+    { text: '1: 1 2\n2: 3\n3: 1', expected: false, why: '空格多值同上，不认领' },
+    { text: '1: 1;2\n2: 3\n3: 1', expected: false, why: '分号多值同上，不认领' },
     { text: '1: 1\n2: 1\n3: ', expected: false, why: '末题空值（validateAnswers 拒空）' },
     { text: '1：1\n2：1\n3：1', expected: false, why: '全角冒号框架解析不了（卡片也从不产出）' },
     { text: '第一题: 1\n第二题: 1\n第三题: 1', expected: false, why: '非题号 key——卡片不指引这种写法，宁可漏认领' },
@@ -714,12 +718,54 @@ await test('claimPendingMultiQuestionIfKeyedAnswer：认领形态逐项判定（
   }
 });
 
+await test('认领登记表：逐字副本判定 + 认领自身豁免 + 新一单清表（issue #99 评审三轮）', () => {
+  const qid = `ask_reg_${Math.random().toString(36).slice(2, 10)}`;
+  const twoQuestions = [
+    { header: '甲', question: 'q1', options: ['a1', 'a2'] },
+    { header: '乙', question: 'q2', options: ['b1', 'b2'] },
+  ];
+  registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_REG', twoQuestions, 1000);
+  assert.equal(claimPendingMultiQuestionIfKeyedAnswer(qid, '1: 1\n2: 2', 'MSG_CLAIM'), true, '前置：认领成功并登记');
+  assert.equal(
+    isDuplicateClaimedKeyedAnswerDelivery(ACCOUNT_ID, 'USER_REG', 'MSG_CLAIM', '1: 1\n2: 2'),
+    false,
+    '认领那次自身的投递不算重复（豁免）',
+  );
+  assert.equal(
+    isDuplicateClaimedKeyedAnswerDelivery(ACCOUNT_ID, 'USER_REG', 'MSG_DUP', '1: 1\n2: 2'),
+    true,
+    '逐字同文 + 不同 messageId = 副本（客户端代发多次 / 平台重推）',
+  );
+  assert.equal(
+    isDuplicateClaimedKeyedAnswerDelivery(ACCOUNT_ID, 'USER_REG', 'MSG_DUP', '1: 2\n2: 2'),
+    false,
+    '文本不同 = 新消息（可能是用户改答案重发），不得丢',
+  );
+  assert.equal(
+    isDuplicateClaimedKeyedAnswerDelivery(ACCOUNT_ID, 'OTHER_USER', 'MSG_DUP', '1: 1\n2: 2'),
+    false,
+    '会话隔离：他用户同文本不受影响',
+  );
+  // 新一单开始 ⇒ 清表：上一单答案的重复窗口关闭，第二轮同文本作答不被误吞
+  registerPendingMultiQuestion(ACCOUNT_ID, `ask_reg2_${Math.random().toString(36).slice(2, 10)}`, 'c2c', 'USER_REG', twoQuestions, 1000);
+  assert.equal(
+    isDuplicateClaimedKeyedAnswerDelivery(ACCOUNT_ID, 'USER_REG', 'MSG_DUP', '1: 1\n2: 2'),
+    false,
+    '新一单登记后，上一单答案的登记应被清除',
+  );
+});
+
 await test('源码守卫：认领必须在放行判定处接线（不得只定义不调用 / 只在 dispatch 起点）', () => {
   const debounceSrc = readFileSync(new URL('../src/features/inbound-debounce.ts', import.meta.url), 'utf-8');
   assert.ok(
-    debounceSrc.includes('claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId, text)'),
-    '旁路放行判定处必须同步认领——旁路资格是入队时逐条判定的，等到 dispatch'
+    debounceSrc.includes('claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId, text, String(item.msg.messageId'),
+    '旁路放行判定处必须同步认领并登记 messageId——旁路资格是入队时逐条判定的，等到 dispatch'
       + '起点再做，同批到达的重复投递已各自拿到资格（评审二轮）',
+  );
+  assert.ok(
+    debounceSrc.includes('isDuplicateClaimedKeyedAnswerDelivery('),
+    'enqueue 入口必须接重复投递丢弃——副本降级进防抖缓冲、单条 flush 仍是独立轮次'
+      + '（评审三轮·发现 1），且防抖关闭配置无缓冲可合并（发现 3）',
   );
   const dispatchSrc = readFileSync(new URL('../src/dispatch/dispatch.ts', import.meta.url), 'utf-8');
   assert.ok(

@@ -472,7 +472,7 @@ await test('多问题 keyed 答案旁路：原样直发不被合并（认领文�
   assert.equal(scenario.captured[0]!.ingest.textForCommands, '1: 3\n2: 1');
 });
 
-await test('keyed 答案在放行处同步认领：窗口内重复投递失去旁路资格、合并成单轮（issue #99 评审二轮）', async () => {
+await test('keyed 答案副本在入队口直接终止：重复投递不成轮（issue #99 评审三轮·发现 1）', async () => {
   const scenario = setupScenario({ debounceMs: W });
   const mkAnswer = () => makeC2CMsgAndCtx({
     senderId: 'USER_QM_CLAIM',
@@ -490,25 +490,68 @@ await test('keyed 答案在放行处同步认领：窗口内重复投递失去�
     ],
     1000, // 覆盖用例时长即可（认领后即终态，TTL 只是兜底）
   );
-  // 首份：旁路立即直发——放行判定处同步认领（置终态）
+  // 首份：旁路立即直发——放行判定处同步认领（置终态 + 登记答案文本）
   await keepAlive(fire(scenario, mkAnswer()));
   assert.equal(scenario.captured.length, 1, '首份 keyed 答案旁路立即直发');
   assert.equal(scenario.captured[0]!.ingest.textForCommands, '1: 2\n2: 1', '首份原文不被改写');
-  // 窗口内两份重复投递（不同 messageId，模拟客户端连点/平台重推）：认领已
-  // 生效 ⇒ 失去旁路资格 ⇒ 进防抖缓冲合并——而非各自旁路成独立轮次
-  const dup1 = fire(scenario, mkAnswer());
+  // 窗口内两份重复投递（不同 messageId，模拟客户端连点/平台重推）：在
+  // enqueue 入口按「逐字同文 + messageId 不同」判定为副本直接终止——
+  // 降级进防抖缓冲没用：单条 items 的 flush 照样 dispatch 成独立轮次，
+  // 助手仍会多回一条雷同消息（评审三轮实测）
+  assert.equal(await keepAlive(fire(scenario, mkAnswer())), true, '副本被接管（丢弃）');
   await sleep(30);
-  const dup2 = fire(scenario, mkAnswer());
-  await keepAlive(Promise.all([dup1, dup2]));
+  assert.equal(await keepAlive(fire(scenario, mkAnswer())), true, '第二份副本同样被接管');
+  await keepAlive(sleep(W + 60));
   assert.equal(
     scenario.captured.length,
-    2,
-    `重复投递必须合并成单次 dispatch（1 直发 + 1 合并 = 2 轮上限），实际 ${scenario.captured.length}`,
+    1,
+    `重复投递必须终止、不得成轮（issue 验收：USER 记录 1 条、助手只回 1 条），实际 ${scenario.captured.length}`,
   );
-  assert.ok(
-    (scenario.captured[1]!.ingest.textForAgent as string).includes('[消息 1/2]'),
-    '第二组捕获应是合并体（分节头），证明副本走的是防抖缓冲而非旁路',
+});
+
+await test('防抖关闭配置同样收敛：副本在 debounceMs 判定之前被丢弃（issue #99 评审三轮·发现 3）', async () => {
+  const { claimPendingMultiQuestionIfKeyedAnswer, isDuplicateClaimedKeyedAnswerDelivery } =
+    await import('../src/features/question-helpers.ts');
+  // 防抖关闭时 shouldDebounce 不执行，认领走 dispatch 起点兜底——这里
+  // 直接调认领函数模拟「首份作答已受理并登记」（dispatch 兜底的行为由
+  // ask-user-multi-sequential.test.ts 覆盖）
+  registerPendingMultiQuestion(
+    'test-account',
+    'q-claim-off-test',
+    'c2c',
+    'USER_QM_OFF',
+    [
+      { header: '题1', question: '选一个', options: ['a', 'b'] },
+      { header: '题2', question: '选一个', options: ['a', 'b'] },
+    ],
+    1000,
   );
+  assert.equal(
+    claimPendingMultiQuestionIfKeyedAnswer('q-claim-off-test', '1: 1\n2: 2', 'msg-original'),
+    true,
+    '前置：认领成功并登记',
+  );
+  assert.equal(
+    isDuplicateClaimedKeyedAnswerDelivery('test-account', 'USER_QM_OFF', 'msg-dup', '1: 1\n2: 2'),
+    true,
+    '逐字同文 + 不同 messageId = 副本',
+  );
+  const scenario = setupScenario({ debounceMs: 0 });
+  const dup = makeC2CMsgAndCtx({
+    senderId: 'USER_QM_OFF',
+    content: '1: 1\n2: 2',
+    assembledBody: { webBody: '1: 1\n2: 2', agentBody: '1: 1\n2: 2', rawBody: '1: 1\n2: 2' },
+  });
+  assert.equal(await keepAlive(fire(scenario, dup)), true, '防抖关闭下副本仍被接管（丢弃）');
+  assert.equal(scenario.captured.length, 0, '丢弃即不成轮');
+  // 对照：非副本消息不受影响——防抖关闭时正常返回 false（调用方直发）
+  const fresh = makeC2CMsgAndCtx({
+    senderId: 'USER_QM_OFF',
+    content: '换个问题',
+    assembledBody: { webBody: '换个问题', agentBody: '换个问题', rawBody: '换个问题' },
+  });
+  assert.equal(await keepAlive(fire(scenario, fresh)), false, '非副本照旧走直发路径');
+  assert.equal(scenario.captured.length, 0, '直发不经防抖器，captured 不增长（middleware 负责 dispatch）');
 });
 
 await test('无关文本不认领 pending：答题中途的普通消息旁路直发、卡片流程存活（issue #99 评审一轮）', async () => {

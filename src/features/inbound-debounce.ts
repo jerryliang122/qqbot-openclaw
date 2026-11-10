@@ -100,7 +100,7 @@ import { assembleBody } from '../dispatch/body-assembler.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { runWithRequestContext } from '../request-context.js';
 import { dispatchToOpenClaw, type DispatchToOpenClawOptions } from '../dispatch/index.js';
-import { claimPendingMultiQuestionIfKeyedAnswer, findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation } from './question-helpers.js';
+import { claimPendingMultiQuestionIfKeyedAnswer, findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation, isDuplicateClaimedKeyedAnswerDelivery } from './question-helpers.js';
 
 /** 默认防抖窗口：3 秒（QQ 客户端连发"文件 + 说明"的典型间隔内） */
 export const DEFAULT_C2C_INBOUND_DEBOUNCE_MS = 3000;
@@ -190,11 +190,13 @@ function shouldDebounceC2CItem(item: C2CInboundDebounceItem): boolean {
   // 不共享 pending 记录）。
   const pendingMulti = findPendingMultiQuestionByConversation(item.account.accountId, 'c2c', item.msg.replyTarget.targetId);
   if (pendingMulti) {
-    // 首份 keyed 答案在**放行判定处同步认领**（置终态）：旁路资格是入队时
-    // 逐条判定的，若等到 dispatch 起点才置终态，同批到达的重复投递已各自
-    // 拿到旁路资格、各自独立成轮次（issue #99 评审二轮）。认领带形态匹配
-    // ——无关文本不认领，pending 保持武装、顺序发题卡片继续可用。
-    claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId, text);
+    // 首份 keyed 答案在**放行判定处同步认领**（置终态 + 登记答案文本）：
+    // 旁路资格是入队时逐条判定的，若等到 dispatch 起点才置终态，同批到达
+    // 的重复投递已各自拿到旁路资格、各自独立成轮次（issue #99 评审二轮）。
+    // 认领带形态匹配——无关文本不认领，pending 保持武装、顺序发题卡片
+    // 继续可用（评审一轮）。窗口内的逐字副本由 enqueue 入口的重复投递
+    // 丢弃终止（降级进防抖缓冲再单条 flush 仍是一轮，评审三轮·发现 1）。
+    claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId, text, String(item.msg.messageId ?? ''));
     return false;
   }
 
@@ -448,6 +450,33 @@ export async function enqueueC2CInboundMessage(
   log?: PluginLogger,
 ): Promise<boolean> {
   if (msg.replyTarget?.scope !== 'c2c') return false;
+
+  // ── 重复投递丢弃（issue #99 评审三轮·发现 1/3）──
+  // 已认领 keyed 答案的**逐字副本**（文本相同、messageId 不同、10s 窗口
+  // 内）在此终止：既不成轮也不进缓冲——降级进防抖缓冲后单条 flush 仍是
+  // 一个独立轮次（onFlush 对单条 items 照走 dispatchItem），助手仍会多回
+  // 一条雷同消息。必须在 debounceMs 判定**之前**做：防抖关闭配置
+  // （debounceMs=0 / enabled=false）不走 shouldDebounce、无缓冲可合并，
+  // 这里是唯一收敛点。
+  //
+  // 红线「入站文本绝不拦截——真实消息必须原样到达框架」的边界：首份答案
+  // 已原文到达框架并被认领（认领形态与框架 validateAnswers 对齐），题目
+  // 已 resolve，副本不携带框架需要的任何信息。与入站守卫的同 messageId
+  // 重推丢弃（[guard] dropped duplicate-push）同一意图、更窄的键
+  // （会话 + 逐字文本 + 短 TTL）。
+  if (
+    isDuplicateClaimedKeyedAnswerDelivery(
+      account.accountId,
+      msg.replyTarget.targetId,
+      String(msg.messageId ?? ''),
+      String(msg.content ?? ''),
+    )
+  ) {
+    log
+      ?.child('inbound-debounce')
+      ?.info(`[guard] dropped duplicate keyed-answer delivery msgId=${msg.messageId} target=${msg.replyTarget.targetId}`);
+    return true; // 已接管（丢弃）：调用方不再直发
+  }
 
   const cfg = (getAdapters(runtime).getConfig?.() ?? {}) as Record<string, unknown>;
   const debounceMs = resolveC2CInboundDebounceMs(account, cfg);

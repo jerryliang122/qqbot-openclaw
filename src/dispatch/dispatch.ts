@@ -405,7 +405,7 @@ export async function dispatchToOpenClaw(
       'c2c',
       peerId,
     );
-    if (pendingMulti && claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId, String(msg.content ?? ''))) {
+    if (pendingMulti && claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId, String(msg.content ?? ''), envelope.messageId)) {
       dlog?.debug(
         `[question] multi pending claimed on inbound (restore debounce merge) questionId=${pendingMulti.questionId}`,
       );

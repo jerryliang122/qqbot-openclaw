@@ -383,6 +383,8 @@ export function parseMultiQuestionButtonData(buttonData: string): ParsedMultiQue
 // ============ 多问题答案暂存 Store ============
 
 interface PendingMultiQuestion {
+  /** 登记账号（claimed-answer 登记表的会话键需要；openid 是 per-account 的） */
+  accountId: string;
   scope: 'c2c' | 'group';
   targetId: string;
   questions: MultiQuestionDef[];
@@ -455,7 +457,14 @@ export function registerPendingMultiQuestion(
   const existing = pendingMultiQuestions.get(questionId);
   if (existing) clearTimeout(existing.cleanupTimer);
 
+  // 新一单开始：清掉该会话上一单的「已认领答案」登记（issue #99 评审三轮）。
+  // 否则 10s 内紧接着的第二轮 ask_user 若答案文本恰好与上一单逐字相同
+  // （全是 "1: 1\n2: 1" 这类短文本，并非不可能），首份作答会被误判成
+  // 重复投递丢弃。新卡发出 ⇒ 旧答案的重复投递窗口随之关闭。
+  clearClaimedKeyedAnswer(accountId, scope, targetId);
+
   const entry: PendingMultiQuestion = {
+    accountId,
     scope,
     targetId,
     questions,
@@ -579,10 +588,56 @@ export function markMultiQuestionResolved(questionId: string): void {
   }
 }
 
-// ============ keyed 答案认领（issue #99 评审一轮）============
+// ============ keyed 答案认领（issue #99 评审一轮/二轮/三轮）============
 
 /** keyed 答案行：`<题号>: <非空值>`（ASCII 冒号——插件卡片/模板只产这种形态） */
 const KEYED_ANSWER_LINE = /^\s*(\d+)\s*:\s*(\S.*)$/;
+
+/**
+ * 重复投递丢弃窗口：认领时记下本会话最近一次受理的 keyed 答案文本，
+ * 窗口内**逐字相同且 messageId 不同**的入站按重复投递终止（issue 实录：
+ * 1.2s 内 4 次投递；click_limit 只掐客户端连点，平台/客户端重推不受它
+ * 约束）。窗口取 10s：覆盖实录与重推量级；「框架拒收后用户原样重发」
+ * 若发生在窗口内会被误吞一次（自愈：再发一次即出窗），代价可接受。
+ */
+const CLAIMED_ANSWER_DEDUP_TTL_MS = 10 * 1000;
+
+interface ClaimedKeyedAnswer {
+  text: string;
+  /** 认领那次的 messageId——它自身的投递不算重复 */
+  messageId: string;
+  expiresAtMs: number;
+  cleanupTimer: ReturnType<typeof setTimeout>;
+}
+
+/** `${accountId}:c2c:${targetId}` -> 最近一次认领的 keyed 答案 */
+const claimedKeyedAnswers = new Map<string, ClaimedKeyedAnswer>();
+
+function clearClaimedKeyedAnswer(accountId: string, scope: 'c2c' | 'group', targetId: string): void {
+  const key = conversationKey(accountId, scope, targetId);
+  const entry = claimedKeyedAnswers.get(key);
+  if (entry) {
+    claimedKeyedAnswers.delete(key);
+    clearTimeout(entry.cleanupTimer);
+  }
+}
+
+/**
+ * 判断一条 c2c 入站是否是**已认领 keyed 答案的重复投递**（逐字相同、
+ * messageId 不同、仍在丢弃窗口内）。同 messageId 的重推由入站守卫
+ * （[guard] dropped duplicate-push，30min 窗口）更早拦下，此处兜的是
+ * 不同 messageId 的副本（客户端代发多次 / 平台按新消息重投）。
+ */
+export function isDuplicateClaimedKeyedAnswerDelivery(
+  accountId: string,
+  targetId: string,
+  messageId: string,
+  text: string,
+): boolean {
+  const entry = claimedKeyedAnswers.get(conversationKey(accountId, 'c2c', targetId));
+  if (!entry || entry.expiresAtMs <= Date.now()) return false;
+  return entry.messageId !== messageId && entry.text === String(text ?? '').trim();
+}
 
 /**
  * 判断文本是否是该 pending 的**可认领 keyed 答案**形态。
@@ -594,10 +649,18 @@ const KEYED_ANSWER_LINE = /^\s*(\d+)\s*:\s*(\S.*)$/;
  * 冒号**形态，这里就只认这种——宁可漏认领（pending 保持武装、卡片仍可点，
  * 与改造前行为一致），不可误认领（框架拒收重问时卡片已被打死）。
  *
+ * **多值（"1,2" / "1 2" / "1;2"）一律不认领**（评审三轮·发现 2）：框架
+ * 只对 `question.multiSelect === true` 的题按 `[,;\n]` 拆多值，单选非
+ * isOther 题的 "1,2" 既匹配不到选项、又被自由文本门拦掉 ⇒ 拒收重问；
+ * 而插件从框架文本反解不出 multiSelect（`parseMultiQuestionPrompt` 无此
+ * 信息）——把判断放宽到多值就会把框架必拒的答案判成可认领，恰好踩中
+ * 「误认领致命」的方向。真 multiSelect 题用户手打多值时：框架认领、插件
+ * 不置终态（pending 武装到 TTL，卡片多活一会儿，无害）。
+ *
  * 框架还接受 `=` / `-` 分隔与 header/题干 key，但卡片从不指引这些写法：
- * 用户真用它们手打时框架侧照样认领，插件只是不置终态（卡片多活到 TTL，
- * 无害）。全角冒号「：」框架解析不了（落 fallbackLines 按行兜底、多题时
- * 必被 validateAnswers 拒收），同样不认。
+ * 用户真用它们手打时框架侧照样认领，插件只是不置终态（同上，无害）。
+ * 全角冒号「：」框架解析不了（落 fallbackLines 按行兜底、多题时必被
+ * validateAnswers 拒收），同样不认。
  */
 function isClaimableKeyedAnswerText(questions: MultiQuestionDef[], text: string): boolean {
   const lines = String(text ?? '')
@@ -610,32 +673,37 @@ function isClaimableKeyedAnswerText(questions: MultiQuestionDef[], text: string)
     if (!match) return false;
     if (Number(match[1]) !== index + 1) return false;
     const value = match[2]!.trim();
-    // 纯数字 = 选项序号（1-based），越界会被框架拒收并重问——此时卡片
-    // 必须仍然活着，不能置终态。逗号/分号分隔的多选（multiSelect）同口径
-    // 逐段校验（插件卡片不产这种形态，手打时框架认领、插件不置终态）。
-    if (/^[\d,;\s]+$/.test(value)) {
-      return value.split(/[,;\s]+/).filter(Boolean).every((part) => {
-        const optionIndex = Number(part);
-        return optionIndex >= 1 && optionIndex <= question.options.length;
-      });
+    // 纯数字 = 单个选项序号（1-based），且须落在该题选项数内——越界会被
+    // 框架拒收并重问，此时卡片必须仍然活着，不能置终态。
+    if (/^\d+$/.test(value)) {
+      const optionIndex = Number(value);
+      return optionIndex >= 1 && optionIndex <= question.options.length;
     }
-    // 自由文本：框架只对声明了 Other 的题收（!isOther 的门会拦）
+    // 自由文本：框架只对声明了 Other 的题收（!isOther 的门会拦）。
+    // 多值形态（逗号/分号/空白分隔的数字串）落在这里返回 false——见上。
     return question.isOther === true;
   });
 }
 
 /**
- * 若文本是该 pending 的可认领 keyed 答案，**同步置终态**（认领）并返回
- * true；否则不动 pending、返回 false。
+ * 若文本是该 pending 的可认领 keyed 答案，**同步置终态**（认领）、登记
+ * 答案文本（供重复投递丢弃，10s 窗口）并返回 true；否则不动 pending、
+ * 返回 false。
  *
  * 认领点必须尽量早（issue #99 评审二轮）：在放行判定处同步调用——等到
  * dispatch 起点再做，同批到达的重复投递已各自拿到 keyed 旁路资格（旁路
- * 判定在入队时做），每个副本都会独立成轮次。放行处同步认领后，窗口内的
- * 后续副本立刻失去旁路资格 ⇒ 落入防抖合并收敛成单轮次。
+ * 判定在入队时做）。放行处同步认领后，窗口内的后续副本立刻失去旁路
+ * 资格 ⇒ 由 `isDuplicateClaimedKeyedAnswerDelivery` 判定为重复投递
+ * 直接终止（不成轮、不进缓冲——降级成防抖缓冲单条 flush 仍是一轮，
+ * 评审三轮·发现 1）。
+ *
+ * @param claimingMessageId 认领这次投递的 messageId（登记进丢弃判据，
+ *   它自身此后的直发不算重复）
  */
 export function claimPendingMultiQuestionIfKeyedAnswer(
   questionId: string,
   text: string,
+  claimingMessageId: string,
 ): boolean {
   const entry = pendingMultiQuestions.get(questionId);
   if (!entry || entry.terminal || entry.resolving || entry.expiresAtMs <= Date.now()) {
@@ -644,6 +712,21 @@ export function claimPendingMultiQuestionIfKeyedAnswer(
   if (!isClaimableKeyedAnswerText(entry.questions, text)) return false;
   entry.terminal = true;
   entry.resolving = false;
+  // 登记已认领答案：窗口内逐字相同的后续投递 = 重复副本，直接终止
+  clearClaimedKeyedAnswer(entry.accountId, entry.scope, entry.targetId);
+  const ttlMs = CLAIMED_ANSWER_DEDUP_TTL_MS;
+  const claimed: ClaimedKeyedAnswer = {
+    text: String(text ?? '').trim(),
+    messageId: claimingMessageId,
+    expiresAtMs: Date.now() + ttlMs,
+    cleanupTimer: setTimeout(() => {
+      if (claimedKeyedAnswers.get(conversationKey(entry.accountId, entry.scope, entry.targetId)) === claimed) {
+        claimedKeyedAnswers.delete(conversationKey(entry.accountId, entry.scope, entry.targetId));
+      }
+    }, ttlMs),
+  };
+  claimed.cleanupTimer.unref?.();
+  claimedKeyedAnswers.set(conversationKey(entry.accountId, entry.scope, entry.targetId), claimed);
   return true;
 }
 
