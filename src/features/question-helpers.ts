@@ -428,8 +428,13 @@ interface PendingMultiQuestion {
    * 的查表键（框架的 `pendingAgentQuestions` 全局表）。
    *
    * 取值来自 dispatch 当轮的 `route.sessionKey`（与框架 turn 同一个 session
-   * ⇒ 命中同一条挂起记录）。缺省时插件直提会失败（回执「提交失败」），
-   * 用户仍可走「整单文本原样转发框架」的兜底路径。
+   * ⇒ 命中同一条挂起记录）。
+   *
+   * ⚠️ 缺省 ⇒ 插件直提**恒失败**（框架按 session 查表，空 sessionKey 命中
+   * 不了任何挂起记录）⇒ 回执「提交失败」+ pending 保持武装，直到 TTL 到期。
+   * **没有任何「转发框架」的兜底路径**：sequential 形态下 pending 武装期间
+   * 的入站文本一律被拦截层消费（绝不转发框架）——旧注释里那句「转发兜底」
+   * 描述的是已退役的旧机制，别照着写。
    */
   sessionKey?: string;
   expiresAtMs: number;
@@ -524,27 +529,53 @@ export function registerPendingMultiQuestion(
 }
 
 /**
- * 按会话查找进行中的多问题单（终态/提交中/已过期不算）；会话键含账号维度。
+ * 按会话查找多问题单条目（**含正在提交中**的条目；终态 / 已过期仍排除）；
+ * 会话键含账号维度。
  *
  * **归属校验**：映射指向的条目必须确实属于该账号 / scope / target——
  * questionId 复用（框架在另一会话用同一个 id）时，映射可能指向别人的条目，
  * 不校验就会让旧会话的文本命中新条目（答案串会话）。
+ *
+ * 返回值里的 `resolving` 区分两种语义完全不同的窗口：
+ * - `false`：**可作答**——文本可被拦截层消费成答案、按钮点选可记答案；
+ * - `true`：**提交进行中**（`markMultiQuestionSubmitting` 已置锁，框架
+ *   认领 await 未返回）⇒ 这一单**不能再收答案**，但也**绝不能把文本放行
+ *   回框架**（框架侧挂起记录仍在，会拿这条文本去认领 ⇒ partial 拒收 +
+ *   重问循环，正是本机制要消灭的场景）。
+ */
+export function findMultiQuestionEntryByConversation(
+  accountId: string,
+  scope: 'c2c' | 'group',
+  targetId: string,
+): { questionId: string; resolving: boolean } | undefined {
+  const questionId = pendingByConversation.get(conversationKey(accountId, scope, targetId));
+  if (!questionId) return undefined;
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry || entry.terminal || entry.expiresAtMs <= Date.now()) {
+    return undefined;
+  }
+  if (entry.accountId !== accountId || entry.scope !== scope || entry.targetId !== targetId) {
+    return undefined;
+  }
+  return { questionId, resolving: entry.resolving };
+}
+
+/**
+ * 按会话查找进行中的多问题单（终态/提交中/已过期不算）；会话键含账号维度。
+ *
+ * ⚠️ **排除 resolving**（提交进行中）——用于「现在能不能收答案」的判定。
+ * 需要「提交进行中也算数」的场景（让行判定、拦截层防泄漏）必须改用
+ * `findMultiQuestionEntryByConversation`（含 resolving）或
+ * `hasPendingMultiQuestionForConversation`。
  */
 export function findPendingMultiQuestionByConversation(
   accountId: string,
   scope: 'c2c' | 'group',
   targetId: string,
 ): { questionId: string } | undefined {
-  const questionId = pendingByConversation.get(conversationKey(accountId, scope, targetId));
-  if (!questionId) return undefined;
-  const entry = pendingMultiQuestions.get(questionId);
-  if (!entry || entry.terminal || entry.resolving || entry.expiresAtMs <= Date.now()) {
-    return undefined;
-  }
-  if (entry.accountId !== accountId || entry.scope !== scope || entry.targetId !== targetId) {
-    return undefined;
-  }
-  return { questionId };
+  const entry = findMultiQuestionEntryByConversation(accountId, scope, targetId);
+  if (!entry || entry.resolving) return undefined;
+  return { questionId: entry.questionId };
 }
 
 /**
@@ -555,17 +586,17 @@ export function findPendingMultiQuestionByConversation(
  * 为什么需要：secret-capture 中间件靠「该会话有多题待答」来**让行**
  * （答案文本绝不能被当成密钥值吞掉）。若提交进行中（resolving）时该
  * pending 被隐藏 ⇒ 让行判定失效 ⇒ 用户的普通消息会被写进密钥库。
+ *
+ * 拦截层（`planSequentialTextCapture`）同理：resolving 窗口内的文本
+ * 既不能当答案收（这一单正在提交），也**不能放行回框架**（框架会拿它去
+ * 认领 ⇒ 重问循环）⇒ 必须查含 resolving 的表。
  */
 export function hasPendingMultiQuestionForConversation(
   accountId: string,
   scope: 'c2c' | 'group',
   targetId: string,
 ): boolean {
-  const questionId = pendingByConversation.get(conversationKey(accountId, scope, targetId));
-  if (!questionId) return false;
-  const entry = pendingMultiQuestions.get(questionId);
-  if (!entry || entry.terminal || entry.expiresAtMs <= Date.now()) return false;
-  return entry.accountId === accountId && entry.scope === scope && entry.targetId === targetId;
+  return findMultiQuestionEntryByConversation(accountId, scope, targetId) !== undefined;
 }
 
 /**
@@ -832,7 +863,9 @@ export function getPendingMultiQuestionState(
 export type SequentialAnswerResult =
   | { status: 'ok'; nextIndex: number }
   | { status: 'unknown' }
-  | { status: 'terminal' };
+  | { status: 'terminal' }
+  /** 提交进行中（resolving）⇒ 这一单正在提交，不再收答案 */
+  | { status: 'resolving' };
 
 export function recordSequentialAnswer(
   questionId: string,
@@ -847,6 +880,10 @@ export function recordSequentialAnswer(
     return { status: 'unknown' };
   }
   if (entry.terminal) return { status: 'terminal' };
+  // 提交进行中 ⇒ **不记答案**（会覆盖正在提交的那份答案）、不回退 cursor。
+  // 此前无此判定 ⇒ 提交窗口内的点选被静默吞掉（用户看不到任何回执），
+  // 且答案表被改写（提交失败重试时用的是被改过的答案）。
+  if (entry.resolving) return { status: 'resolving' };
 
   const question = entry.questions[questionIndex];
   if (!question) return { status: 'unknown' };
@@ -890,7 +927,9 @@ export type SequentialTextAnswerResult =
   /** 末题收齐（全部答案齐备）⇒ 调用方负责组合 + 提交 */
   | { status: 'complete' }
   | { status: 'unknown' }
-  | { status: 'terminal' };
+  | { status: 'terminal' }
+  /** 提交进行中（resolving）⇒ 这一单正在提交，不再收答案 */
+  | { status: 'resolving' };
 
 export function recordSequentialTextAnswer(
   questionId: string,
@@ -911,6 +950,8 @@ export function recordSequentialTextAnswer(
     return { status: 'unknown' };
   }
   if (entry.terminal) return { status: 'terminal' };
+  // 提交进行中 ⇒ 不记答案（会覆盖正在提交的那份答案）
+  if (entry.resolving) return { status: 'resolving' };
 
   const total = entry.questions.length;
   const cursor = Math.min(Math.max(entry.cursor, 0), total - 1);

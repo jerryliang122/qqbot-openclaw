@@ -71,6 +71,7 @@ const {
   containsKeyedAnswerLine,
   applyFullKeyedAnswer,
   markMultiQuestionResolved,
+  markMultiQuestionSubmitting,
 } = await import('../src/features/question-helpers.ts');
 const { submitSequentialAnswers } = await import('../src/features/question-flow.ts');
 const { setMultiQuestionSubmitterForTest, setClaimTimeoutForTest } = await import('../src/features/question-submit.ts');
@@ -253,6 +254,19 @@ const fakeLog = {
   debug: () => {},
   child: () => fakeLog,
 } as any;
+
+/** 捕获日志行（用于断言「日志里不得出现完整 openid」） */
+function makeCapturingLog(): { log: any; lines: string[] } {
+  const lines: string[] = [];
+  const log: any = {
+    info: (m: unknown) => { lines.push(String(m)); },
+    warn: (m: unknown) => { lines.push(String(m)); },
+    error: (m: unknown) => { lines.push(String(m)); },
+    debug: (m: unknown) => { lines.push(String(m)); },
+    child: () => log,
+  };
+  return { log, lines };
+}
 
 function makeInteractionEvent(buttonData: string): any {
   return {
@@ -1359,6 +1373,125 @@ await test('带附件的消息不被拦截层吞（附件照旧进框架）', as
     const after = getPendingMultiQuestionState(QID)!;
     assert.equal(after.answers.size, 0, '带附件的消息不得被记成答案（附件会凭空消失）');
     assert.equal(submitCalls.length, 0, '不得提交');
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+// ── 11. 第二轮评审修复：日志脱敏 / resolving 窗口防泄漏 ──
+
+group('11. 第二轮评审修复：日志脱敏 / resolving 窗口防泄漏');
+
+await test('归属校验的拒绝日志不含完整 openid（INFO 可被 /bot-logs 导出）', async () => {
+  const qid = `ask_${'3'.repeat(32)}`;
+  const OWNER = 'OWNER_OPENID_0123456789abcdef0123456789abcdef';
+  const TAPPER = 'TAPPER_OPENID_0123456789abcdef0123456789abcdef';
+  registerPendingMultiQuestion(
+    ACCOUNT_ID,
+    qid,
+    'c2c',
+    OWNER,
+    [{ header: '甲', question: 'q1', options: ['a1', 'a2'] }],
+    5000,
+    undefined,
+    'sequential',
+  );
+  const { log: capLog, lines } = makeCapturingLog();
+  await handleInteraction(
+    { ...makeInteractionEvent(`qqbot:qm:${qid}:0:0`), user_openid: TAPPER },
+    makeAccount(),
+    makeFakeRuntime(),
+    capLog,
+    async () => {},
+  );
+  const joined = lines.join('\n');
+  assert.ok(joined.includes('owner mismatch'), '前置：确实走了归属校验拒绝分支');
+  assert.ok(!joined.includes(OWNER), '日志不得含卡片主人的完整 openid');
+  assert.ok(!joined.includes(TAPPER), '日志不得含点击者的完整 openid');
+  assert.ok(joined.includes('OWNER_O'), '应保留可定位的前 8 位（shortId）');
+});
+
+await test('提交进行中（resolving）窗口内的入站文本 ⇒ 被消费、不转发框架、回执「正在提交」', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  const qid = `ask_${'4'.repeat(32)}`;
+  const USER = 'USER_RESOLVING';
+  registerPendingMultiQuestion(
+    ACCOUNT_ID,
+    qid,
+    'c2c',
+    USER,
+    [{ header: '甲', question: 'q1', options: ['a1', 'a2'] }],
+    5000,
+    undefined,
+    'sequential',
+    `qqbot:test:${USER}`,
+  );
+  assert.equal(markMultiQuestionSubmitting(qid), true, '前置：取得提交锁（resolving）');
+  const { sent, gw } = installFakeGateway();
+  try {
+    const { msg, ctx } = makeMsgAndCtx({ messageId: 'M_RS_1', targetId: USER });
+    msg.content = '怎么还没回我';
+    ctx.message = { content: msg.content };
+    let inboundRuns = 0;
+    const runtime2 = makeFakeRuntime({
+      onInboundRun: async () => { inboundRuns++; return { dispatched: true }; },
+      dispatchReply: async () => ({ queuedFinal: true, counts: { final: 0 } }),
+    });
+    const handled = await enqueueC2CInboundMessage(ctx, msg, makeAccount(), runtime2, fakeLog);
+    assert.equal(handled, true, '文本必须被拦截层接管');
+    assert.equal(
+      inboundRuns,
+      0,
+      '⚠️ 提交进行中窗口的文本绝不能转发框架（框架会拿它去认领 ⇒ partial 拒收 + 重问循环）',
+    );
+    const receipt = sent.find((s) => String(s.text).includes('正在提交'));
+    assert.ok(receipt, '必须回执「正在提交，请稍候」');
+    const state = getPendingMultiQuestionState(qid)!;
+    assert.equal(state.answers.size, 0, '这一单正在提交，不得再收答案');
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('提交进行中（resolving）窗口内的按钮点选 ⇒ 不覆盖在途答案 + 回执「正在提交」', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  const qid = `ask_${'5'.repeat(32)}`;
+  const USER = 'USER_RESOLVING_TAP';
+  registerPendingMultiQuestion(
+    ACCOUNT_ID,
+    qid,
+    'c2c',
+    USER,
+    [
+      { header: '甲', question: 'q1', options: ['a1', 'a2'] },
+      { header: '乙', question: 'q2', options: ['b1', 'b2'] },
+    ],
+    5000,
+    undefined,
+    'sequential',
+    `qqbot:test:${USER}`,
+  );
+  recordSequentialAnswer(qid, 0, 0); // 先答第 1 题
+  assert.equal(markMultiQuestionSubmitting(qid), true, '前置：取得提交锁（resolving）');
+  const { sent, gw } = installFakeGateway();
+  try {
+    await handleInteraction(
+      { ...makeInteractionEvent(`qqbot:qm:${qid}:1:0`), user_openid: USER },
+      makeAccount(),
+      makeFakeRuntime(),
+      fakeLog,
+      async () => {},
+    );
+    const state = getPendingMultiQuestionState(qid)!;
+    assert.equal(state.answers.size, 1, '提交窗口内的点选不得记成答案（会覆盖在途的那份）');
+    assert.equal(state.cursor, 1, '提交窗口内的点选不得推进流程位置');
+    const receipt = sent.find((s) => String(s.text).includes('正在提交'));
+    assert.ok(receipt, '必须回执「正在提交」（不能静默吞掉用户的点选）');
+    assert.equal(submitCalls.length, 0, '提交窗口内的点选不得触发提交');
   } finally {
     uninstallFakeSubmitter();
     unregisterGateway(ACCOUNT_ID, gw);

@@ -444,7 +444,9 @@ async function handleQuestion(
     if (result.status === 'answered' || result.status === 'already-terminal') {
       markSingleQuestionResolved(parsed.questionId);
     }
-    log.info(`[question] resolved questionId=${parsed.questionId} optionIndex=${parsed.optionIndex} status=${result.status} operator=${operatorId ?? 'unknown'}`);
+    log.info(
+      `[question] resolved questionId=${parsed.questionId} optionIndex=${parsed.optionIndex} status=${result.status} operator=${shortId(operatorId)}`,
+    );
   } catch (err) {
     log.error(`[question] resolve error: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -479,7 +481,7 @@ async function handleMultiQuestionTap(
   if (!peerId) return; // 缺少会话定位信息，无法回执或发确认卡
 
   log.info(
-    `[question] multi tap id=${parsed.questionId} q=${parsed.questionIndex + 1} opt=${parsed.optionIndex + 1} operator=${operatorId ?? 'unknown'}`,
+    `[question] multi tap id=${parsed.questionId} q=${parsed.questionIndex + 1} opt=${parsed.optionIndex + 1} operator=${shortId(operatorId)}`,
   );
 
   // ── 归属校验（红线）────────────────────────────────────────────────
@@ -494,10 +496,13 @@ async function handleMultiQuestionTap(
     || owner.scope !== scope
     || owner.targetId !== peerId
   ) {
+    // ⚠️ 日志脱敏：targetId / peerId 在 c2c 下就是**完整对端 openid**，
+    // 而 INFO 日志可被 `/bot-logs` 导出给 c2c 用户 ⇒ 一律走 shortId()
+    // （本文件顶部的约定：不落完整他人标识符）。
     log.info(
       `[question] multi tap rejected (owner mismatch) id=${parsed.questionId}`
-      + ` owner=${owner ? `${owner.accountId}/${owner.scope}/${owner.targetId}` : 'unknown'}`
-      + ` tapper=${account.accountId}/${scope}/${peerId}`,
+      + ` owner=${owner ? `${owner.accountId}/${owner.scope}/${shortId(owner.targetId)}` : 'unknown'}`
+      + ` tapper=${account.accountId}/${scope}/${shortId(peerId)}`,
     );
     // 不回执「已提交或已过期」——那会向点击者暴露该问题存在。静默忽略。
     return;
@@ -519,6 +524,14 @@ async function handleMultiQuestionTap(
       // pending 已终态（已提交 / 已被框架结束）⇒ **静默忽略**。
       // 平台会重推 interaction 事件，回执会造成对用户刷屏。
       log.info(`[question] sequential tap ignored (terminal) id=${parsed.questionId}`);
+      return;
+    }
+    if (result.status === 'resolving') {
+      // 正在提交（框架认领 await 未返回）⇒ 这一单**不再收答案**
+      // （否则会覆盖正在提交的那份答案）。回执告知用户在途，
+      // 别让他对着「没反应的卡片」反复点。
+      log.info(`[question] sequential tap ignored (resolving) id=${parsed.questionId}`);
+      await sendMultiQuestionFeedback(event, account, '正在提交答案，请稍候', log, parsed.questionId);
       return;
     }
     if (result.status !== 'ok') {

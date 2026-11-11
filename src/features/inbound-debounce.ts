@@ -28,8 +28,9 @@
  *   命令标记（rawBody 拼接后可能不以 '/' 开头），必须原样直发；
  * - 多问题 ask_user 武装期间的文本（"1: 3\n2: 1" 或任意一句话）：合并会
  *   改写答案文本（`[消息 i/N]` 分节体）⇒ 提交必然失败；按
- *   findPendingMultiQuestionByConversation(accountId, 'c2c', peer) 识别
- *   （会话键含账号维度——openid 是 per-account 的，跨账号不共享 pending）。
+ *   findMultiQuestionEntryByConversation(accountId, 'c2c', peer) 识别
+ *   （**含提交进行中**的条目；会话键含账号维度——openid 是 per-account 的，
+ *   跨账号不共享 pending）。
  *
  * 入队口的一道**消费**（在 debounceMs 判定之前，防抖开/关行为一致）：
  * - 文本作答拦截（`planSequentialTextCapture`）：多题 pending 武装期间
@@ -109,7 +110,7 @@ import { assembleBody } from '../dispatch/body-assembler.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { runWithRequestContext } from '../request-context.js';
 import { dispatchToOpenClaw, type DispatchToOpenClawOptions } from '../dispatch/index.js';
-import { findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation, getPendingMultiQuestionState, buildSequentialFullAnswerDraft, containsKeyedAnswerLine, matchFullKeyedAnswer, applyFullKeyedAnswer, recordSequentialTextAnswer } from './question-helpers.js';
+import { findMultiQuestionEntryByConversation, findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation, getPendingMultiQuestionState, buildSequentialFullAnswerDraft, containsKeyedAnswerLine, matchFullKeyedAnswer, applyFullKeyedAnswer, recordSequentialTextAnswer } from './question-helpers.js';
 import { sendSequentialQuestionCard, submitSequentialAnswers } from './question-flow.js';
 import { sendText } from '../outbound/outbound-service.js';
 
@@ -205,7 +206,16 @@ function shouldDebounceC2CItem(item: C2CInboundDebounceItem): boolean {
   // `planSequentialTextCapture`（入队口）统一完成——插件直提整单答案，
   // 不再依赖框架的入站 keyed 认领。保留本旁路的意义：万一文本未被拦截层
   // 识别而原样转发框架（兜底第 3 层），它**不能被防抖合并**。
-  const pendingMulti = findPendingMultiQuestionByConversation(item.account.accountId, 'c2c', item.msg.replyTarget.targetId);
+  //
+  // ⚠️ 查表必须**含 resolving**（提交进行中）：那一单正在提交，文本既不能
+  // 当答案收、也绝不能放行回框架（框架会拿它去认领 ⇒ 重问循环）。
+  // 拦截层会先消费掉这类文本 ⇒ 正常不会走到这里；这里只是**第二道防线**
+  // （附件消息等拦截层放行的形态仍可能落到防抖器）。
+  const pendingMulti = findMultiQuestionEntryByConversation(
+    item.account.accountId,
+    'c2c',
+    item.msg.replyTarget.targetId,
+  );
   if (pendingMulti) {
     return false;
   }
@@ -466,7 +476,10 @@ function getOrCreateDebouncer(item: C2CInboundDebounceItem, initialDebounceMs: n
  * 分支（返回 null = 不接管，走原路径）：
  * - 纯附件 / 斜杠命令 / 无 pending → null
  *   （附件走原路径；斜杠是逃生通道）；
- * - pending 已终态（已提交 / 已被框架结束）→ null（文本照旧转发框架）。
+ * - pending 已终态（已提交 / 已被框架结束）→ null（文本照旧转发框架）；
+ * - pending **提交进行中**（resolving）→ **消费** + 回执「正在提交，请稍候」
+ *   （这一单正在提交：既不能当答案收，也**绝不转发框架**——框架会拿它去
+ *   认领 ⇒ partial 拒收 + 重问循环）。
  *
  * 提交红线：提交走框架官方认领通道（`claimPendingAgentQuestionAnswer`），
  * 插件只**搬运**用户真实作答，不代替用户作答、不合成入站消息。
@@ -488,7 +501,7 @@ function planSequentialTextCapture(params: {
   const attachments = (msg as { attachments?: unknown[] }).attachments;
   if (Array.isArray(attachments) && attachments.length > 0) return null;
 
-  const pending = findPendingMultiQuestionByConversation(
+  const pending = findMultiQuestionEntryByConversation(
     account.accountId,
     'c2c',
     msg.replyTarget.targetId,
@@ -511,6 +524,24 @@ function planSequentialTextCapture(params: {
   // 只处理**顺序发题**形态（c2c）：群聊 legacy 路径的文本不走「当前题
   // 答案」语义（它靠确认卡的客户端代发提交）。
   if (stateBefore.mode !== 'sequential') return null;
+
+  // ── 提交进行中（resolving）──
+  // 这一单正在提交（框架认领 await 未返回）⇒
+  // - **不能当答案收**：这一单的答案已经定稿，用户的补充会覆盖它；
+  // - **更不能放行回框架**：框架侧挂起记录还在，会拿这条文本去认领 ⇒
+  //   partial 拒收 + 重问循环（正是本机制要消灭的场景）。
+  // ⇒ 消费掉 + 回执「正在提交，请稍候」（用户稍后重发即可）。
+  //
+  // 窗口不是毫秒级：认领挂死时长达 20s（`question-submit.ts` 的超时），
+  // 而那正是用户最可能发「怎么没反应？」的时候 ⇒ 必须拦住。
+  if (pending.resolving) {
+    return async () => {
+      await bestEffortText('正在提交答案，请稍候——提交完成后可以再发一次。');
+      dlog?.info(
+        `[question] text consumed while resolving id=${pending.questionId} msgId=${msg.messageId}`,
+      );
+    };
+  }
 
   const questions = stateBefore.questions;
 
@@ -579,6 +610,16 @@ function planSequentialTextCapture(params: {
   if (result.status === 'terminal') {
     return async () => {
       await bestEffortText('该问题已提交或已过期');
+    };
+  }
+  if (result.status === 'resolving') {
+    // 防御：上面已按 `pending.resolving` 拦过一次，这里是并发兜底
+    // （提交窗口内这一单不再收答案）。
+    return async () => {
+      await bestEffortText('正在提交答案，请稍候——提交完成后可以再发一次。');
+      dlog?.info(
+        `[question] text consumed while resolving (late) id=${pending.questionId} msgId=${msg.messageId}`,
+      );
     };
   }
   dlog?.info(
