@@ -789,6 +789,10 @@ export async function dispatchToOpenClaw(
             undefined,
             envelope.messageId,
             sequential ? 'sequential' : 'legacy',
+            // 框架挂起 ask_user 记录的 sessionKey——插件直提整单答案的查表键
+            // （`claimPendingAgentQuestionAnswer`）。框架的 turn 就跑在这个
+            // session（`routeSessionKey: route.sessionKey`）⇒ 命中同一条记录。
+            route.sessionKey,
           );
           // ask_user 前先固化已累积的流式内容（同单问题分支，评审意见 6）
           // static 的 flush 走 tolerant：前置文本发送失败不终态化 controller

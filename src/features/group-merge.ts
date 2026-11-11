@@ -27,8 +27,9 @@
  * buffer 再执行旁路项，顺序保持）：
  * - 控制命令（stop/esc/abort/exit 等）：合并会吞掉取消语义；
  * - 斜杠命令（'/' 开头）：合并会破坏 buildCtxPayload 的命令标记；
- * - 多问题 ask_user 的 keyed 答案文本（"1: 3\n2: 1"）：合并会改写答案
- *   文本，框架 keyed 认领失败 → 挂起的 ask_user 永远等不到答案；
+ * - 多问题 ask_user 的 keyed 答案文本（"1: 3\n2: 1"，**群聊 legacy 路径**
+ *   的确认卡代发文本）：合并会改写答案文本，框架 keyed 认领失败 → 挂起的
+ *   ask_user 永远等不到答案；
  * - stt / fallback 来源语音（真实音频语义：本地文件 / 待理解媒体）。
  *   平台转写语音（source:'asr'）= 纯文本，**参与合批**——见
  *   needsStandaloneVoiceTurn。
@@ -168,8 +169,8 @@ function isBypassItem(item: GroupMergeItem): boolean {
   const text = rawText || sanitizedText;
   if (text && !shouldDebounceTextInbound({ text, cfg: item.cfg as never, hasMedia: false })) return true;
 
-  // 多问题 ask_user 的 keyed 答案文本：合并会改写答案、认领失败。
-  // 会话键含 accountId（openid 是 per-account 的）
+  // 多问题 ask_user 的 keyed 答案文本（群聊 legacy 路径）：合并会改写答案、
+  // 认领失败。会话键含 accountId（openid 是 per-account 的）
   if (findPendingMultiQuestionByConversation(item.account.accountId, 'group', groupOpenidOf(item))) {
     return true;
   }
