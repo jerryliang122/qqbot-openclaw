@@ -22,6 +22,7 @@ import {
   recordMultiQuestionTap,
   recordSequentialAnswer,
   getPendingMultiQuestionState,
+  findPendingMultiQuestionByConversation,
   buildSequentialFullAnswerDraft,
   markMultiQuestionResolveFailed,
   markSingleQuestionResolved,
@@ -481,6 +482,27 @@ async function handleMultiQuestionTap(
     `[question] multi tap id=${parsed.questionId} q=${parsed.questionIndex + 1} opt=${parsed.optionIndex + 1} operator=${operatorId ?? 'unknown'}`,
   );
 
+  // ── 归属校验（红线）────────────────────────────────────────────────
+  // 卡片被复制/转发到别的会话时，**点击者是别人**（event.user_openid 是
+  // 点击者，不是卡片的主人）。若只按 questionId 找 pending，别人的点选会
+  // 记进**原用户**的答案表，甚至把原用户的问题 resolve 掉。
+  // ⇒ 记录/提交答案前必须核对：账号、会话类型、对端三者与 pending 一致。
+  const owner = getPendingMultiQuestionState(parsed.questionId);
+  if (
+    !owner
+    || owner.accountId !== account.accountId
+    || owner.scope !== scope
+    || owner.targetId !== peerId
+  ) {
+    log.info(
+      `[question] multi tap rejected (owner mismatch) id=${parsed.questionId}`
+      + ` owner=${owner ? `${owner.accountId}/${owner.scope}/${owner.targetId}` : 'unknown'}`
+      + ` tapper=${account.accountId}/${scope}/${peerId}`,
+    );
+    // 不回执「已提交或已过期」——那会向点击者暴露该问题存在。静默忽略。
+    return;
+  }
+
   // ── c2c 顺序发题（PR2）──
   // 点选只**收集**答案（框架要求整单齐备，见 issue #93 根因 2），下一张
   // 题卡由这里续发；**全部答齐时直接提交**——插件组合整单文本并调框架
@@ -515,6 +537,16 @@ async function handleMultiQuestionTap(
         to: formatQuestionTarget(scope, peerId),
         log,
       });
+      return;
+    }
+
+    // 发卡前二次复查：期间可能已被另一条入站（或并发点选）提交掉了 ⇒
+    // 续卡会成为「已作废的卡片」（按钮点不动、看着莫名其妙）⇒ 不发。
+    // `findPendingMultiQuestionByConversation` 对终态 / 提交中 / 已过期都返回
+    // undefined ⇒ 一并覆盖「已被提交」与「正在提交」两种情况。
+    const armed = findPendingMultiQuestionByConversation(account.accountId, scope, peerId);
+    if (!armed || armed.questionId !== parsed.questionId) {
+      log.info(`[question] sequential card skipped (no longer armed) id=${parsed.questionId}`);
       return;
     }
 

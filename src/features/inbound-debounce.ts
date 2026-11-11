@@ -481,6 +481,13 @@ function planSequentialTextCapture(params: {
   if (!text) return null; // 纯附件：不做答案（已知边界：图片走框架 image-steer 取消问题）
   if (text.startsWith('/')) return null; // 斜杠命令：逃生通道，照旧放行
 
+  // 带附件的消息**不捕获为答案**（2026-11-11 评审修复）：捕获会让整条
+  // 消息（含附件）不进框架 ⇒ 用户的图片/文件凭空消失。附件的价值高于
+  // 「把它当答案」——让整条消息照旧走框架（框架侧的 image-steer 会取消
+  // 本次问卷，符合既有语义）。
+  const attachments = (msg as { attachments?: unknown[] }).attachments;
+  if (Array.isArray(attachments) && attachments.length > 0) return null;
+
   const pending = findPendingMultiQuestionByConversation(
     account.accountId,
     'c2c',
@@ -591,6 +598,13 @@ function planSequentialTextCapture(params: {
 
   // status === 'ok'：续发下一题卡（失败按 F1 口径回执手打草稿）
   return async () => {
+    // 发卡前复查：期间可能已被并发的那条入站提交掉了 ⇒ 续卡会变成
+    // 「已作废的卡片」（按钮点不动）⇒ 不发。
+    const armed = findPendingMultiQuestionByConversation(account.accountId, 'c2c', msg.replyTarget.targetId);
+    if (!armed || armed.questionId !== pending.questionId) {
+      dlog?.info(`[question] sequential card skipped (no longer armed) id=${pending.questionId}`);
+      return;
+    }
     const sent = await sendSequentialQuestionCard({
       state,
       index: result.nextIndex,

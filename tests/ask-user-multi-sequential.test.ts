@@ -73,7 +73,7 @@ const {
   markMultiQuestionResolved,
 } = await import('../src/features/question-helpers.ts');
 const { submitSequentialAnswers } = await import('../src/features/question-flow.ts');
-const { setMultiQuestionSubmitterForTest } = await import('../src/features/question-submit.ts');
+const { setMultiQuestionSubmitterForTest, setClaimTimeoutForTest } = await import('../src/features/question-submit.ts');
 const { enqueueC2CInboundMessage } = await import('../src/features/inbound-debounce.ts');
 
 // ── 假提交器（插件直提整单答案的替身）──
@@ -90,9 +90,14 @@ let submitBehavior: 'ok' | 'resolved' | 'throw' | 'invalid' = 'ok';
  * 注入假提交器：记录 `{sessionKey, text}`，按 `submitBehavior` 决定返回值。
  * 真实实现走框架的 `claimPendingAgentQuestionAnswer`（同进程、需真框架
  * 状态），测试里用替身断言「插件交出去的整单文本 + sessionKey」。
+ *
+ * ⚠️ 必须**重置 `submitBehavior`**：否则上一个用例留下的 'resolved' /
+ * 'throw' 会让后续用例悄悄走进失败分支，成功路径根本没被覆盖
+ * （评审发现：成功路径测试实际走了失败分支）。
  */
 function installFakeSubmitter(): void {
   submitCalls = [];
+  submitBehavior = 'ok';
   setMultiQuestionSubmitterForTest(async (params) => {
     submitCalls.push({ sessionKey: params.sessionKey, text: params.text });
     if (submitBehavior === 'throw') throw new Error('simulated submit failure');
@@ -919,8 +924,8 @@ await test('提交器返回 already-resolved ⇒ 回执「已过期」+ pending 
     await tap(`qqbot:qm:${QID}:1:0`, account, runtime);
     const before = sent.length;
     await tap(`qqbot:qm:${QID}:2:0`, account, runtime);
-    const receipt = sent.find((s) => String(s.text).includes('已提交或已过期'));
-    assert.ok(receipt, '必须回执已提交或已过期');
+    const receipt = sent.find((s) => String(s.text).includes('已过期'));
+    assert.ok(receipt, '必须回执已提交 / 已过期 / 已由框架处理');
     assert.equal(sent.length, before + 1, '只多一条回执，不再发卡');
     assert.equal(
       findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
@@ -1167,6 +1172,8 @@ await test('末题文本作答 ⇒ 直接提交：不再出现「✅ 提交」�
     });
     await enqueueC2CInboundMessage(ctx, msg, account, runtime2, fakeLog);
     assert.equal(submitCalls.length, 1, '末题答完必须提交');
+    // 成功路径必须真的走 submitted 分支（假提交器的行为在 install 时已重置）
+    assert.equal(submitBehavior, 'ok', '前置：提交器处于成功态');
     const labels = sent.flatMap((s) => buttonsOf(s).map((b: any) => String(b.render_data?.label ?? '')));
     assert.ok(!labels.some((l) => l.includes('提交')), `不应再有「✅ 提交」按钮，实际：${labels.join('、')}`);
     assert.ok(!sent.some((s) => String(s.text).includes('答案确认')), '不应再有确认卡正文');
@@ -1194,6 +1201,164 @@ await test('submitSequentialAnswers：缺答不提交（incomplete）', async ()
     });
     assert.equal(outcome.status, 'incomplete', '缺答 ⇒ 不提交');
     assert.equal(submitCalls.length, 0, '缺答不得调提交器');
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+// ── 10. 评审修复（2026-11-11，Sourcery 15 条）──
+
+group('10. 评审修复：归属校验 / 旧单退役 / 超时释放 / 附件不吞');
+
+await test('跨用户点选被拒：卡片被转发后，别人点不动原用户的题', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEC_1' });
+  try {
+    assert.equal(sent.length, 1, '前置：首卡已发');
+    const before = sent.length;
+    // 卡片被转发到**另一个用户**的会话：点击者的 openid 不是卡片主人
+    const otherAccount = { ...makeAccount(), accountId: 'other-account' };
+    await handleInteraction(
+      {
+        ...makeInteractionEvent(`qqbot:qm:${QID}:0:0`),
+        user_openid: 'OTHER_USER',
+      },
+      otherAccount,
+      runtime,
+      fakeLog,
+      async () => {},
+    );
+    assert.equal(submitCalls.length, 0, '别人的点选不得触发提交');
+    assert.equal(sent.length, before, '别人的点选不得续发卡片');
+    // 原用户自己点仍然正常
+    await tap(`qqbot:qm:${QID}:0:0`, account, runtime);
+    assert.equal(sent.length, before + 1, '原用户点选照常续发下一题卡');
+    assert.equal(submitCalls.length, 0, '还没答完不提交');
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('同一会话注册新一单 ⇒ 上一单退役（旧卡片点不动、不会被用来答新问题）', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  const { gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEC_2' });
+  try {
+    // 同一会话来了新的一单（新的 questionId）
+    const NEW_QID = `ask_${'d'.repeat(32)}`;
+    registerPendingMultiQuestion(
+      ACCOUNT_ID,
+      NEW_QID,
+      'c2c',
+      'USER_123',
+      [
+        { header: '甲', question: 'q1', options: ['a1', 'a2'] },
+        { header: '乙', question: 'q2', options: ['b1', 'b2'] },
+        { header: '丙', question: 'q3', options: ['c1', 'c2'] },
+      ],
+      5000,
+      undefined,
+      'sequential',
+      'qqbot:test:USER_123',
+    );
+    // 旧一单已退役
+    assert.equal(
+      recordSequentialAnswer(QID, 0, 0).status,
+      'terminal',
+      '上一单必须退役——否则旧卡片的点选会用旧答案把新问题 resolve 掉',
+    );
+    // 新一单可用
+    assert.equal(recordSequentialAnswer(NEW_QID, 0, 0).status, 'ok', '新一单照常推进');
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('questionId 被复用到另一个会话 ⇒ 旧会话的映射被清（答案不串会话）', async () => {
+  const qid = `ask_${'e'.repeat(32)}`;
+  const questions = [
+    { header: '甲', question: 'q1', options: ['a1', 'a2'] },
+    { header: '乙', question: 'q2', options: ['b1', 'b2'] },
+  ];
+  registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_A', questions, 5000, undefined, 'sequential');
+  // 同一个 questionId 被复用到了**另一个会话**
+  registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_B', questions, 5000, undefined, 'sequential');
+  assert.equal(
+    findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_A'),
+    undefined,
+    '旧会话的映射必须被清掉——否则 A 的文本会命中 B 的 pending（答案串会话）',
+  );
+  assert.ok(
+    findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_B'),
+    '新会话照常可查',
+  );
+});
+
+await test('认领挂死 ⇒ 超时后释放提交锁，pending 保持武装（可重试）', async () => {
+  clearQuotaCache();
+  const qid = `ask_${'f'.repeat(32)}`;
+  registerPendingMultiQuestion(
+    ACCOUNT_ID,
+    qid,
+    'c2c',
+    'USER_TIMEOUT',
+    [
+      { header: '甲', question: 'q1', options: ['a1', 'a2'] },
+      { header: '乙', question: 'q2', options: ['b1', 'b2'] },
+    ],
+    5000,
+    undefined,
+    'sequential',
+    'qqbot:test:USER_TIMEOUT',
+  );
+  // 先把两题答完（否则提交器压根不会被调用）
+  recordSequentialAnswer(qid, 0, 0);
+  recordSequentialAnswer(qid, 1, 0);
+  // 注入一个**永不返回**的提交器 + 调小超时（别让用例等 20s）
+  setMultiQuestionSubmitterForTest(() => new Promise<boolean>(() => {}));
+  setClaimTimeoutForTest(150);
+  const { gw } = installFakeGateway();
+  try {
+    const state = getPendingMultiQuestionState(qid)!;
+    const outcome = await submitSequentialAnswers({
+      state,
+      account: makeAccount(),
+      to: 'qqbot:c2c:USER_TIMEOUT',
+    });
+    assert.equal(outcome.status, 'failed', '挂死必须判失败（不得无限等待）');
+    assert.ok(
+      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_TIMEOUT'),
+      '超时后 pending 必须保持武装（用户可重试）——锁被释放了',
+    );
+  } finally {
+    setClaimTimeoutForTest(null);
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('带附件的消息不被拦截层吞（附件照旧进框架）', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  const { gw, account } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEC_3' });
+  try {
+    const { msg, ctx } = makeMsgAndCtx({ messageId: 'M_SEC_3_ATT', targetId: 'USER_123' });
+    msg.content = '这张图你看下';
+    ctx.message = { content: '这张图你看下' };
+    msg.attachments = [{ type: 'image', url: 'https://example.com/a.png' }];
+    let inboundRuns = 0;
+    const runtime2 = makeFakeRuntime({
+      onInboundRun: async () => { inboundRuns++; return { dispatched: true }; },
+      dispatchReply: async () => ({ queuedFinal: true, counts: { final: 0 } }),
+    });
+    await enqueueC2CInboundMessage(ctx, msg, account, runtime2, fakeLog);
+    const after = getPendingMultiQuestionState(QID)!;
+    assert.equal(after.answers.size, 0, '带附件的消息不得被记成答案（附件会凭空消失）');
+    assert.equal(submitCalls.length, 0, '不得提交');
   } finally {
     uninstallFakeSubmitter();
     unregisterGateway(ACCOUNT_ID, gw);

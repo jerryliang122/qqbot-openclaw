@@ -244,11 +244,14 @@ export async function submitSequentialAnswers(params: {
   if (result.status === 'already-resolved') {
     markMultiQuestionResolved(state.questionId);
     log?.info?.(`[question] answers not consumed (already resolved) id=${state.questionId}`);
+    // 措辞覆盖三种可能：框架侧已 resolve / 记录已取消或超时 / sessionKey
+    // 与框架当前挂起记录不匹配（插件无法区分，见 docs/agents/interaction.md
+    // 的「已知后果」段）。
     await sendSubmitReceipt({
       state,
       account,
       to,
-      text: '该问题已提交或已过期',
+      text: '该问题已提交、已过期或已由框架处理',
       log,
     });
     return { status: 'already-resolved' };

@@ -23,6 +23,24 @@
  */
 
 import type { PluginLogger } from '../utils/plugin-logger.js';
+import { createHash } from 'node:crypto';
+
+/**
+ * 认领调用的超时（毫秒）。
+ *
+ * 框架的 `question.resolve` RPC 自带 10s 宽限（`QUESTION_RPC_GRACE_MS`），
+ * 但插件这侧不能无限等：认领挂住 ⇒ pending 的 `resolving` 锁一直不释放 ⇒
+ * 该会话的文本既进不了拦截层、也重试不了 ⇒ 问卷彻底卡死（直到 TTL）。
+ * 取 20s（宽于框架宽限期，给一次重试留窗口）。
+ */
+const CLAIM_TIMEOUT_MS = 20_000;
+
+/** 测试用：覆盖认领超时（默认 20s；测试里调小以免拖慢用例） */
+let claimTimeoutMs = CLAIM_TIMEOUT_MS;
+
+export function setClaimTimeoutForTest(ms: number | null): void {
+  claimTimeoutMs = ms ?? CLAIM_TIMEOUT_MS;
+}
 
 // ============ 结果类型 ============
 
@@ -130,6 +148,18 @@ function describeError(error: unknown): string {
 // ============ 主入口 ============
 
 /**
+ * 日志里的会话键**脱敏**。
+ *
+ * c2c 的 sessionKey 含对端标识（openid），而 `/bot-logs` 会把本地日志文件
+ * 原样导出（`checkCommandAuth` 在 allowFrom 为空 / 开放模式下放行任何调用
+ * 者）⇒ 日志里出现完整 sessionKey = 别人的标识符被导出。
+ * 只留一个不可逆的短摘要，够用来把同一次提交的多条日志串起来。
+ */
+function redactSessionKey(sessionKey: string): string {
+  return createHash('sha256').update(sessionKey).digest('hex').slice(0, 8);
+}
+
+/**
  * 把组合好的整单答案文本交给框架的官方认领通道。
  *
  * @param params.sessionKey 框架挂起 ask_user 记录的 sessionKey
@@ -153,22 +183,49 @@ export async function submitMultiQuestionAnswer(params: {
   const claim = injectedSubmitter ?? (await loadClaimFnSafe(log));
   if (!claim) return { status: 'unsupported' };
 
+  const keyRef = redactSessionKey(sessionKey);
   try {
-    const consumed = await claim({ sessionKey, text });
+    const consumed = await withTimeout(claim({ sessionKey, text }), claimTimeoutMs);
     if (consumed) {
-      log?.info?.(`[question] answer submitted sessionKey=${sessionKey} chars=${text.length}`);
+      log?.info?.(`[question] answer submitted session=${keyRef} chars=${text.length}`);
       return { status: 'submitted' };
     }
-    log?.info?.(`[question] answer not consumed (already resolved) sessionKey=${sessionKey}`);
+    log?.info?.(`[question] answer not consumed (already resolved) session=${keyRef}`);
     return { status: 'already-resolved' };
   } catch (err) {
     if (isInvalidAnswerError(err)) {
-      log?.warn?.(`[question] answer rejected as invalid sessionKey=${sessionKey}: ${describeError(err)}`);
+      log?.warn?.(`[question] answer rejected as invalid session=${keyRef}: ${describeError(err)}`);
       return { status: 'invalid', reason: describeError(err) };
     }
-    log?.error?.(`[question] submit failed sessionKey=${sessionKey}: ${describeError(err)}`);
+    log?.error?.(`[question] submit failed session=${keyRef}: ${describeError(err)}`);
     return { status: 'error', error: err };
   }
+}
+
+/**
+ * 给 promise 加超时。超时抛 `Error`（带 `timeout` 标记）⇒ 调用方按失败处理
+ * （释放提交锁、pending 保持武装 ⇒ 用户可重试）。
+ */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    // ⚠️ 定时器**不能 unref**：unref 后事件循环空转时它压根不会触发 ⇒
+    // 「认领挂死」会变成「永久挂起」，锁永远不释放（这正是要防的故障）。
+    const timer = setTimeout(() => {
+      const err = new Error(`claim timed out after ${timeoutMs}ms`);
+      (err as Error & { timeout?: boolean }).timeout = true;
+      reject(err);
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 /**

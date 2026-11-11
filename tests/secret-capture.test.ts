@@ -33,6 +33,7 @@ import {
 import { isSecretInputCancelKeyword, secretCapture } from '../src/middleware/secret-capture.js';
 import {
   markMultiQuestionResolved,
+  markMultiQuestionSubmitting,
   registerPendingMultiQuestion,
   registerPendingSingleQuestion,
   markSingleQuestionResolved,
@@ -565,6 +566,37 @@ await test('红线：多问题 ask_user pending 中的会话 → 消息放行', 
   assert.equal(setCalls, 0);
   assert.ok(findPendingSecretInput(ACCT, USER), 'pending 保留（未被消费）');
   markMultiQuestionResolved('ask_0123456789abcdef0123456789abcdef'); // 清理，勿泄漏给后续用例
+  clearPendingSecretInputs();
+});
+
+await test('红线：多题 pending **正在提交中** → 消息仍放行（不得被当成密钥吞掉）', async () => {
+  clearPendingSecretInputs();
+  registerPendingSecretInput(makePending());
+  const qid = 'ask_22222222222222222222222222222222';
+  registerPendingMultiQuestion(
+    'default',
+    qid,
+    'c2c',
+    USER,
+    [{ header: 'Q1', question: 'pick', options: ['A', 'B'] }],
+    5 * 60 * 1000,
+  );
+  // 模拟「提交进行中」：resolving 锁已置上（findPending… 会排除它）
+  assert.equal(markMultiQuestionSubmitting(qid), true, '前置：取得提交锁');
+  const h = makeCtx({ content: 'ghs_abc', msgId: 'm-mq-resolving' });
+  let setCalls = 0;
+  const mw = secretCapture({
+    accountId: ACCT,
+    runSet: async () => {
+      setCalls += 1;
+      return okResult();
+    },
+    runReload: async () => true,
+  });
+  await mw(h.ctx as never, h.next);
+  assert.equal(h.nextCalled(), true, '提交进行中的那几十毫秒里，让行红线也不能失效');
+  assert.equal(setCalls, 0, '绝不能把消息写进密钥库');
+  markMultiQuestionResolved(qid);
   clearPendingSecretInputs();
 });
 

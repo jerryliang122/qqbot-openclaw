@@ -472,7 +472,29 @@ export function registerPendingMultiQuestion(
   sessionKey?: string,
 ): void {
   const existing = pendingMultiQuestions.get(questionId);
-  if (existing) clearTimeout(existing.cleanupTimer);
+  if (existing) {
+    clearTimeout(existing.cleanupTimer);
+    // 同一 questionId 被复用到**另一个会话** ⇒ 旧会话的映射必须一并清掉，
+    // 否则旧会话的文本会命中新条目（答案串到别人的会话）。
+    const oldKey = conversationKey(existing.accountId, existing.scope, existing.targetId);
+    if (pendingByConversation.get(oldKey) === questionId) pendingByConversation.delete(oldKey);
+  }
+
+  // 同一会话的**上一单**（不同 questionId）⇒ 退役。
+  //
+  // 为什么必须退役：提交通道只带 `sessionKey`（框架按 session 查挂起记录），
+  // **不带 questionId** ⇒ 旧卡片若仍可用，点它会用旧答案把**框架当前那个
+  // 问题**（新的那一单）resolve 掉——用户看到新问题被旧答案回答。
+  // 退役后旧卡片点选按 terminal 静默忽略。
+  const convKey = conversationKey(accountId, scope, targetId);
+  const previousId = pendingByConversation.get(convKey);
+  if (previousId && previousId !== questionId) {
+    const previous = pendingMultiQuestions.get(previousId);
+    if (previous) {
+      previous.terminal = true;
+      previous.resolving = false;
+    }
+  }
 
   const entry: PendingMultiQuestion = {
     accountId,
@@ -491,18 +513,23 @@ export function registerPendingMultiQuestion(
       if (pendingMultiQuestions.get(questionId) === entry) {
         pendingMultiQuestions.delete(questionId);
       }
-      if (pendingByConversation.get(conversationKey(accountId, scope, targetId)) === questionId) {
-        pendingByConversation.delete(conversationKey(accountId, scope, targetId));
+      if (pendingByConversation.get(convKey) === questionId) {
+        pendingByConversation.delete(convKey);
       }
     }, ttlMs),
   };
   entry.cleanupTimer.unref?.();
   pendingMultiQuestions.set(questionId, entry);
-  pendingByConversation.set(conversationKey(accountId, scope, targetId), questionId);
+  pendingByConversation.set(convKey, questionId);
 }
 
 /**
- * 按会话查找进行中的多问题单（终态/提交中/已过期不算）；会话键含账号维度 */
+ * 按会话查找进行中的多问题单（终态/提交中/已过期不算）；会话键含账号维度。
+ *
+ * **归属校验**：映射指向的条目必须确实属于该账号 / scope / target——
+ * questionId 复用（框架在另一会话用同一个 id）时，映射可能指向别人的条目，
+ * 不校验就会让旧会话的文本命中新条目（答案串会话）。
+ */
 export function findPendingMultiQuestionByConversation(
   accountId: string,
   scope: 'c2c' | 'group',
@@ -514,7 +541,47 @@ export function findPendingMultiQuestionByConversation(
   if (!entry || entry.terminal || entry.resolving || entry.expiresAtMs <= Date.now()) {
     return undefined;
   }
+  if (entry.accountId !== accountId || entry.scope !== scope || entry.targetId !== targetId) {
+    return undefined;
+  }
   return { questionId };
+}
+
+/**
+ * 该会话是否有多题 pending（**含正在提交中**的条目）。
+ *
+ * 与 `findPendingMultiQuestionByConversation` 的差别：**不排除 resolving**。
+ *
+ * 为什么需要：secret-capture 中间件靠「该会话有多题待答」来**让行**
+ * （答案文本绝不能被当成密钥值吞掉）。若提交进行中（resolving）时该
+ * pending 被隐藏 ⇒ 让行判定失效 ⇒ 用户的普通消息会被写进密钥库。
+ */
+export function hasPendingMultiQuestionForConversation(
+  accountId: string,
+  scope: 'c2c' | 'group',
+  targetId: string,
+): boolean {
+  const questionId = pendingByConversation.get(conversationKey(accountId, scope, targetId));
+  if (!questionId) return false;
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry || entry.terminal || entry.expiresAtMs <= Date.now()) return false;
+  return entry.accountId === accountId && entry.scope === scope && entry.targetId === targetId;
+}
+
+/**
+ * 退役一单多题 pending（置终态 + 清掉会话映射）。
+ *
+ * 用在「用户根本没看到卡片」的场景：ask_user turn 在登记 pending 之后、
+ * 发出首卡之前被取消，或首卡发送失败 ⇒ 留着 pending 会让用户后续的普通
+ * 消息被拦截层吞成「他没见过的那个问题」的答案。
+ */
+export function retirePendingMultiQuestion(questionId: string): void {
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry) return;
+  entry.terminal = true;
+  entry.resolving = false;
+  const key = conversationKey(entry.accountId, entry.scope, entry.targetId);
+  if (pendingByConversation.get(key) === questionId) pendingByConversation.delete(key);
 }
 
 export type MultiQuestionTapResult =
@@ -613,6 +680,16 @@ export function markMultiQuestionResolved(questionId: string): void {
 const KEYED_ANSWER_LINE = /^\s*(\d+)\s*:\s*(.*)$/;
 
 /**
+ * 整单解析用的宽松行式：**与框架的 keyed 正则同款分隔符**
+ * （框架 `parseKeyedAnswers`：`^\s*([^:=-]+?)\s*[:=-]\s*(.+?)\s*$` ⇒ 冒号 /
+ * 等号 / 短横都算分隔符）。
+ *
+ * 只用于**整单**判定（要求每行都匹配 + 行数 = 题数）⇒ 单行自由文本里的
+ * "3 - 5"、"a=b" 不会误伤（它们凑不满整单 ⇒ 落到「本题答案」形态）。
+ */
+const KEYED_ANSWER_LINE_LOOSE = /^\s*(\d+)\s*[:=-]\s*(.*)$/;
+
+/**
  * 文本里是否含「题号: 值」形态的行。
  *
  * 用于区分两种意图：
@@ -653,7 +730,7 @@ export function matchFullKeyedAnswer(
   if (lines.length !== questions.length) return null;
   const answers = new Map<number, string>();
   for (let index = 0; index < lines.length; index++) {
-    const match = KEYED_ANSWER_LINE.exec(lines[index]!);
+    const match = KEYED_ANSWER_LINE_LOOSE.exec(lines[index]!);
     if (!match) return null;
     if (Number(match[1]) !== index + 1) return null;
     answers.set(index, match[2]!.trim());
@@ -707,6 +784,8 @@ export interface PendingMultiQuestionState {
   /** 流程位置：当前发出去的那张卡对应的题号 */
   cursor: number;
   mode: 'sequential' | 'legacy';
+  /** 登记账号（归属校验用——见 findPendingMultiQuestionByConversation） */
+  accountId: string;
   scope: 'c2c' | 'group';
   targetId: string;
   anchorMsgId?: string;
@@ -726,6 +805,7 @@ export function getPendingMultiQuestionState(
     answers: new Map(entry.answers),
     cursor: entry.cursor,
     mode: entry.mode,
+    accountId: entry.accountId,
     scope: entry.scope,
     targetId: entry.targetId,
     ...(entry.anchorMsgId ? { anchorMsgId: entry.anchorMsgId } : {}),
