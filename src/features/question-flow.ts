@@ -257,11 +257,7 @@ export async function submitSequentialAnswers(params: {
   // 失败：pending 保持武装 ⇒ 用户可再次点选 / 重新打字重试
   markMultiQuestionResolveFailed(state.questionId);
   const reason =
-    result.status === 'invalid'
-      ? '答案格式不对，请检查后重新提交'
-      : result.status === 'unsupported'
-        ? '提交失败，请重新作答'
-        : '提交失败，请重新作答';
+    result.status === 'invalid' ? '答案格式不对，请检查后重新提交' : '提交失败，请重新作答';
   log?.warn?.(`[question] submit failed id=${state.questionId} status=${result.status}`);
   await sendSubmitReceipt({ state, account, to, text: `⚠️ ${reason}`, log });
   return { status: 'failed', reason };
