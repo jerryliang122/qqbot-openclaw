@@ -185,7 +185,7 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 ### 交互面（[详情](docs/agents/interaction.md)）
 
 - **webhook 模式的 op:0 派发必须挂 detached 准入根**，且**光包 `runDetachedWebhookWork` 不够**——回调内还要等「本次委托派生的在途派发」全部落地才 settle，否则 detached 根随 ACK 释放、bug 原样复现。报错文案是四分支兜底句「temporarily unavailable」，**网关并没有 drain**。
-- **多问题 ask_user 绝不能程序化提交**——官方无多问题提交 API，合成入站用户消息会因框架 steer 进 ask_user-suspended run 而不被认领。**入站文本绝不拦截**——真实消息必须原样到达框架。
+- **多问题 ask_user 绝不能程序化提交**——官方无多问题提交 API，合成入站用户消息会因框架 steer 进 ask_user-suspended run 而不被认领。**多题问答进行中（c2c、多题 pending 武装期间）的入站文本一律本地暂存为当前题答案、不转发框架**（2026-11-11 红线再界定，issue #99 / PR #100）：平台无法区分「用户手打的普通消息」与「指令按钮代发的回调内容」——两者都是普通入站消息；中间态文本转发给框架只会撞上 `validateAnswers` 的 partial 拒收 + 重问循环（白烧一轮、两侧状态分裂），且靠中间态词汇猜意图必然失效。**全部答完后**才由插件把全量 keyed 答案作为**客户端代发的真实用户消息**（`type=2` + `enter=true`）送出，框架据此认领。**边界**：仅多题 pending 武装期间 + 仅 c2c；单题 pending / 无 pending 时文本照旧原样转发框架；斜杠命令（`/` 开头）照旧放行（逃生通道）。**分类只认形态**（回调载荷恒为插件生成的 keyed 形态 `"N: v"` × N 行，非 keyed 即用户手打），**不靠内容语义猜**。
 - **ask_user 卡片由插件自渲染（单题 / 多题同构）**——渲染层在 `src/features/question-card.ts`：正文走插件自己的中文版式（去掉框架 3 行英文脚手架），按钮统一 `① ②` 前缀 + 截断。**单题文本反解失败 ⇒ 回退到「框架原文 + 旧键盘」**（不得产出半解析的卡片）。单题自由作答靠正文引导，**不加**「✍️ 其他」按钮（预填前缀会污染答案）。
 - **单题作答不得被防抖合并污染**——单题卡发出后登记单问题 pending（**仅 c2c**），c2c 防抖与 secret-capture 在 pending 期间放行该会话文本；pending 清理：按钮 resolve 成功 / 卡片发送失败 / 该会话下一条入站消息 / TTL 兜底。
 - **多题必须「整单提交」——「点一题解一题」在框架层不成立**——框架 `validateAnswers` 逐题要求非空（ask_user 归一化从不设 `allowEmpty`）⇒ 任何一次提交都要带齐全部题。**红线**：禁止程序化提交、禁止合成入站消息 ⇒ 提交只能靠**客户端代发的真实用户消息**（指令按钮 `type=2` + `enter=true`，data 写全量 keyed 文本）。
