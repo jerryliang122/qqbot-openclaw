@@ -374,14 +374,15 @@ export interface SequentialCardOpts {
  * 顺序发题的卡片正文。
  *
  * 与 `formatQuestionCard(variant:'multi')` 的差异（**刻意不复用**）：
- * - 中间题**不给**「✍️ 其他」按钮（框架要求整单齐备，中间题的自由文本
+ * - 中间题**不给**预填按钮（框架要求整单齐备，中间题的自由文本
  *   单独提交会被判「requires an answer」整单拒绝 ⇒ 中间题的自由作答
  *   统一留到最后一题）；
  * - 最后一题多一段「已记录」展示 + 「选完即提交」提示；
  * - **每一张卡都写清「想自己写答案怎么办」**——直接回复一句话即作答
  *   （sequential-text-answer 改造：pending 武装期间入站文本在入队口被
- *   捕获为当前题答案，不转发框架）；「✍️ 其他」按钮（仅 isOther 题）
- *   的角色改为「编辑全部已答」的快捷入口。
+ *   捕获为当前题答案，不转发框架）；末题**预填按钮**（恒存在）的角色
+ *   是「编辑全部已答」的快捷入口（isOther 题显示为「✍️ 其他」，否则
+ *   显示为「📝 填写模板」）。
  *
  * `formatMultiQuestionCard`（群聊旧路径）**逐字不动**。
  */
@@ -424,13 +425,21 @@ export function formatSequentialQuestionCard(
         '```',
       );
     }
-    // 「✍️ 其他」按钮存在时（def.isOther）才提它——不得指引不存在的按钮。
-    // 角色（sequential-text-answer 改造后）：直接回文本已是每题的作答
-    // 入口，「✍️ 其他」的独有价值 = 把**全部已答**预填进输入框一次改齐。
+    // 末题的**预填按钮恒存在**（2026-11-11 起不再以 isOther 为条件）：
+    // 指令型（type=2 + enter=false）⇒ 客户端把「全部已答 + 本题空位」填进
+    // 输入框但**不自动发送**——用户改完手动提交。
+    // 角色（sequential-text-answer 改造后）：直接回文本已是每题的作答入口，
+    // 预填按钮的独有价值 = 一次把**全部已答**装进输入框顺带改齐。
+    // 文案按按钮实际标签写——不得指引不存在的按钮。
     if (def.isOther) {
       lines.push(
         '',
         '想改前面任何一题？点「✍️ 其他」——输入框会带上全部已答内容，改哪行都行。',
+      );
+    } else {
+      lines.push(
+        '',
+        '想改前面任何一题？点「📝 填写模板」——输入框会带上全部已答内容（本题留空），改完手动发送。',
       );
     }
   }
@@ -443,7 +452,7 @@ export function formatSequentialQuestionCard(
  * - 选项：回调型（type=1），data = `qqbot:qm:<qid>:<题号>:<选项号>`
  *   ——与旧路径的按钮契约**逐字一致**（`parseMultiQuestionButtonData`
  *   不用改），点选只记答案、不提交；
- * - **只有选项按钮**：自由作答入口统一在最后一题的「✍️ 其他」（见
+ * - **只有选项按钮**：自由作答入口统一在最后一题的预填按钮（见
  *   `formatSequentialQuestionCard` 的说明文案），中间题不再挂额外按钮
  *   （按钮越少，用户越不会点到走不通的路）。
  */
@@ -488,10 +497,13 @@ export function buildSequentialCollectKeyboard(
  *   发出 ⇒ 框架认领并 resolve（**不程序化提交、不合成入站消息**）；
  *   `click_limit: 1` 防连点——每次点击都会把整份答案文本再发一遍，
  *   重复投递在 pending 置终态前各自成为独立轮次（issue #99）；
- * - 「✍️ 其他」：指令型（type=2, enter=false），预填
- *   `"<前 N-1 题>\n<N>: "` ——用户可在输入框里改任意一行（含最后一题
- *   的自由文本）后手动发送。不设 click_limit：只预填不发消息，重复点
- *   无害，且「清空输入框后想再要一次模板」是真实用法。
+ * - 预填按钮：**恒存在**（2026-11-11 起不再以 isOther 为条件）——
+ *   指令型（type=2, enter=false），data = `"<前 N-1 题>\n<N>: "`
+ *   ——客户端把「全部已答 + 本题空位」填进输入框但**不自动发送**，用户可在
+ *   输入框里改任意一行（含最后一题的自由文本）后手动发送。不设 click_limit：
+ *   只预填不发消息，重复点无害，且「清空输入框后想再要一次模板」是真实用法。
+ *   标签随题面走：isOther 题「✍️ 其他」（该题确有「其他」选项）、非 isOther
+ *   题「📝 填写模板」（不得挂「其他」——题面没有那个选项）。
  *
  * @param answerPrefix 前 N-1 题的 keyed 答案文本（`"1: 3\n2: 1"`）；
  *   空串表示前序还没答（此时退化为只带本题号）。
@@ -527,27 +539,35 @@ export function buildSequentialSubmitKeyboard(
     };
   });
 
+  // 预填按钮**恒存在**（2026-11-11 起不再以 isOther 为条件）：
+  // 指令型（type=2, enter=false）⇒ 客户端把 data 填进输入框但**不自动
+  // 发送**，用户改完手动提交。data = 「全部已答 + 本题空位」
+  // （`"<前 N-1 题>\n<N>: "`）——与卡片正文里那份可复制模板同源。
+  // 标签随题面走：isOther 题用「✍️ 其他」（该题真有「其他」选项）；
+  // 非 isOther 题用「📝 填写模板」（不得挂「其他」——题面没有那个选项）。
+  // 不设 click_limit：只预填不发消息，重复点无害，且「清空输入框后想再要
+  // 一次模板」是真实用法。
   const buttons = [...optionButtons];
-  if (question.isOther) {
-    buttons.push({
-      id: `${idPrefix}other`,
-      render_data: {
-        label: '✍️ 其他',
-        visited_label: '✍️ 其他',
-        style: 0 as const,
-      },
-      action: {
-        type: 2 as const,
-        data: line(''),
-        enter: false,
-        permission: { type: KEYBOARD_PERMISSION_EVERYONE },
-        unsupport_tips: '当前客户端版本不支持，请直接回复「题号: 答案」',
-      },
-    });
-  }
+  buttons.push({
+    id: `${idPrefix}${question.isOther ? 'other' : 'fill'}`,
+    render_data: {
+      label: question.isOther ? '✍️ 其他' : '📝 填写模板',
+      visited_label: question.isOther ? '✍️ 其他' : '📝 填写模板',
+      style: 0 as const,
+    },
+    action: {
+      type: 2 as const,
+      data: line(''),
+      enter: false,
+      permission: { type: KEYBOARD_PERMISSION_EVERYONE },
+      unsupport_tips: question.isOther
+        ? '当前客户端版本不支持，请直接回复「题号: 答案」'
+        : '当前客户端版本不支持，请直接回复下方给出的答案文本',
+    },
+  });
 
-  // **只有选项 + 「✍️ 其他」**：不再挂「✏️ 改一改」——想改前面的题，在最后一题
-  // 点「✍️ 其他」，输入框会带上全部已答内容，用户改哪一行都行（按钮越少，
+  // **只有选项 + 预填按钮**：不再挂「✏️ 改一改」——想改前面的题，在最后一题
+  // 点预填按钮，输入框会带上全部已答内容，用户改哪一行都行（按钮越少，
   // 用户越不会点到走不通的路）。
   return { content: { rows: layoutButtonRows(buttons) } };
 }

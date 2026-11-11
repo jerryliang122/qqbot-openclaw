@@ -405,6 +405,28 @@ await test('最后一题带「✍️ 其他」，data 预填「1: x\\n2: 」供�
   }
 });
 
+await test('末题**无 isOther** 时也有预填按钮（「📝 填写模板」）：填进输入框、不自动发送', async () => {
+  clearQuotaCache();
+  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_FILL_1' });
+  try {
+    await tap(`qqbot:qm:${QID}:0:0`, account, runtime); // 第 1 题选第 1 项
+    await tap(`qqbot:qm:${QID}:1:0`, account, runtime); // 第 2 题选第 1 项
+    const last = sent[2]!;
+    const fill = buttonByLabel(last, '📝 填写模板');
+    assert.ok(fill, '末题必须带预填按钮——预填能力不依赖题面有没有「其他」选项');
+    assert.equal(fill.action.type, 2, '预填按钮是指令型（type=2）');
+    assert.equal(fill.action.enter, false, '必须 enter=false（填入输入框、由用户手动发送）');
+    assert.equal(fill.action.click_limit, undefined, '只预填不发消息，不设 click_limit');
+    assert.equal(fill.action.data, '1: 1\n2: 1\n3: ', '预填内容 = 全部已答 + 本题空位（与正文模板同源）');
+    // 正文必须写清怎么用，且不得指引不存在的「✍️ 其他」
+    const body = String(last.text);
+    assert.ok(body.includes('📝 填写模板'), '正文要写明预填按钮怎么用');
+    assert.ok(!body.includes('✍️ 其他'), '非 isOther 题不得指引不存在的「✍️ 其他」按钮');
+  } finally {
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
 await test('整组都没有「其他」选项时，中间题正文不得提「✍️ 其他」（按钮根本不存在）', async () => {
   clearQuotaCache();
   const { sent, gw } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEQ_6B' });
