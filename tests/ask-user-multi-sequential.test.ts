@@ -64,10 +64,13 @@ const {
   registerPendingMultiQuestion,
   getPendingMultiQuestionState,
   recordSequentialAnswer,
+  recordSequentialTextAnswer,
   findPendingMultiQuestionByConversation,
   claimPendingMultiQuestionIfKeyedAnswer,
   isDuplicateClaimedKeyedAnswerDelivery,
 } = await import('../src/features/question-helpers.ts');
+const { renderSequentialTextConfirmCard, sendSequentialTextConfirmCard } =
+  await import('../src/features/question-flow.ts');
 
 // ── 测试基础设施（沿用 ask-user-passive-anchor.test.ts 的形态）──
 
@@ -413,7 +416,7 @@ await test('整组都没有「其他」选项时，中间题正文不得提「�
   }
 });
 
-await test('最后一题带「✍️ 其他」时，中间题正文要指路过去（说明怎么自由作答）', async () => {
+await test('中间题正文指引「直接回复一句话作答」，不指引只在末题存在的「✍️ 其他」', async () => {
   clearQuotaCache();
   const payload = {
     text: TWO_QUESTION_WITH_OTHER_TEXT,
@@ -422,10 +425,11 @@ await test('最后一题带「✍️ 其他」时，中间题正文要指路过�
   const { sent, gw } = await deliverAskUserKeepingGateway(payload, { messageId: 'M_SEQ_6D' });
   try {
     const body = String(sent[0]!.text);
-    assert.ok(body.includes('想自己写答案'), '中间题正文要说明「想自己写答案怎么办」');
-    assert.ok(body.includes('最后一道题'), '指路必须说清入口在最后一题');
-    assert.ok(body.includes('✍️ 其他'), '指路要写明按钮名');
-    // 该题自己没有这个按钮——正文不得让人以为它就在这张卡上
+    // sequential-text-answer 改造：文本作答是**每张卡**的入口（pending 武装
+    // 期间入站文本被消费为当前题答案），不再指路到最后一题的「✍️ 其他」
+    assert.ok(body.includes('直接回复一句话作为本题答案'), '中间题正文要写明文本作答入口');
+    assert.ok(!body.includes('✍️ 其他'), '中间题不得指引只在末题存在的「✍️ 其他」');
+    assert.ok(!body.includes('改一改'), '不得再指引已移除的「✏️ 改一改」');
     assert.ok(!buttonsOf(sent[0]!).some((b: any) => b.render_data.label.includes('其他')), '中间题本身不得有「✍️ 其他」按钮');
   } finally {
     unregisterGateway(ACCOUNT_ID, gw);
@@ -676,14 +680,15 @@ await test('claimPendingMultiQuestionIfKeyedAnswer：认领形态逐项判定（
     { text: '1: 2\n2: 1\n3: 1', expected: true, why: 'isOther 题用序号作答也合法' },
     { text: '1: 1\n2: 1', expected: false, why: '行数不足 3（框架 validateAnswers 逐题非空，认领必失败）' },
     { text: '1: 1\n2: 1\n3: 1\n4: 1', expected: false, why: '行数超题数' },
-    { text: '1: 3\n2: 1\n3: 1', expected: false, why: '第 1 题只有 2 个选项，序号越界（框架拒收重问，卡片必须仍活）' },
-    { text: '1: 1,2\n2: 3\n3: 1', expected: false, why: '逗号多值不认领（评审三轮·发现 2）：框架只对 multiSelect 拆多值，插件反解不出 multiSelect——单选题的 "1,2" 框架必拒收，认领即打死卡片' },
-    { text: '1: 1 2\n2: 3\n3: 1', expected: false, why: '空格多值同上，不认领' },
-    { text: '1: 1;2\n2: 3\n3: 1', expected: false, why: '分号多值同上，不认领' },
+    { text: '1: 3\n2: 1\n3: 1', expected: true, why: '越界数字也认领——框架 isOther 强制下按自由文本收（2026-11-11 修正：此前「越界必拒收」判断源于未归一化 question 的对拍，生产路径不存在该分支）' },
+    { text: '1: 1,2\n2: 3\n3: 1', expected: true, why: '多值同上——单选按自由文本、multiSelect 按拆段，框架都收' },
+    { text: '1: 1 2\n2: 3\n3: 1', expected: true, why: '空格多值同上' },
+    { text: '1: 1;2\n2: 3\n3: 1', expected: true, why: '分号多值同上' },
     { text: '1: 1\n2: 1\n3: ', expected: false, why: '末题空值（validateAnswers 拒空）' },
     { text: '1：1\n2：1\n3：1', expected: false, why: '全角冒号框架解析不了（卡片也从不产出）' },
     { text: '第一题: 1\n第二题: 1\n第三题: 1', expected: false, why: '非题号 key——卡片不指引这种写法，宁可漏认领' },
     { text: '1: 1\n2: 2\n3: 随便写', expected: true, why: '自由文本落在 isOther 题上' },
+    { text: '1: 自由文本\n2: 1\n3: 1', expected: true, why: '自由文本在非 isOther 声明题上也认领——框架 ask_user 归一化对每题强制 isOther: true（dist 实锤），!isOther 门永不触发' },
   ];
   for (const { text, expected, why } of cases) {
     // 每例独立 pending（认领会置终态，复用会串味）
@@ -695,7 +700,9 @@ await test('claimPendingMultiQuestionIfKeyedAnswer：认领形态逐项判定（
       `「${text.replace(/\n/g, '⏎')} }」应${expected ? '认领' : '不认领'}：${why}`,
     );
   }
-  // 非 isOther 题收自由文本 ⇒ 不认领（框架 !isOther 的门会拦）
+  // 非 isOther 声明题的自由文本：**认领**（sequential-text-answer 改造）
+  // ——框架 ask_user 归一化对每题强制 isOther: true，认领侧 !isOther 门
+  // 永不触发；插件反解出的 per-question isOther 只作展示参考
   {
     const qid = `ask_shape_${Math.random().toString(36).slice(2, 10)}`;
     registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_SHAPE', [
@@ -703,8 +710,8 @@ await test('claimPendingMultiQuestionIfKeyedAnswer：认领形态逐项判定（
     ], 200);
     assert.equal(
       claimPendingMultiQuestionIfKeyedAnswer(qid, '1: 我自己写的'),
-      false,
-      '非 isOther 题不收自由文本（框架拒收重问，卡片必须仍活）',
+      true,
+      '自由文本对任何题都可认领（框架强制 isOther）',
     );
   }
   // 已终态 / 未知 id ⇒ 不认领
@@ -819,6 +826,100 @@ await test('群确认卡键盘：「✅ 提交」click_limit=1；「✏️ 改�
   assert.ok(submit && edit, '确认卡应有「✅ 提交」与「✏️ 改一改」两个按钮');
   assert.equal(submit.action.click_limit, 1, '「✅ 提交」每次点击代发答案文本，必须限一次');
   assert.equal(edit.action.click_limit, undefined, '「✏️ 改一改」只预填输入框，可重复点');
+});
+
+// ── 9. 文本作答（sequential-text-answer 改造）──
+
+group('9. 文本作答：直接回复一句话即作答，末题收齐发确认卡');
+
+await test('recordSequentialTextAnswer：压平单行 / 推进 cursor / 末题收齐返回 complete-text', () => {
+  const qid = `ask_text_${Math.random().toString(36).slice(2, 10)}`;
+  registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_TEXT', [
+    { header: '甲', question: 'q1', options: ['a1', 'a2'] },
+    { header: '乙', question: 'q2', options: ['b1', 'b2'] },
+    { header: '丙', question: 'q3', options: ['c1', 'c2'] },
+  ], 5000);
+  // 多行压平为单行（keyed 终稿一行一题，多行自由文本会打乱行数）
+  let r = recordSequentialTextAnswer(qid, '就选\na 吧  ');
+  assert.equal(r.status, 'ok');
+  assert.equal((r as any).nextIndex, 1, '答完第 1 题 cursor 前进');
+  assert.equal(
+    (getPendingMultiQuestionState(qid)!.answers.get(0) as { text: string }).text,
+    '就选 a 吧',
+    '多行压平为单行',
+  );
+  r = recordSequentialTextAnswer(qid, '第二个答案');
+  assert.equal((r as any).nextIndex, 2, '答完第 2 题推进到第 3 题');
+  // 末题文本作答 → 全部收齐
+  r = recordSequentialTextAnswer(qid, '3');
+  assert.equal(r.status, 'complete-text', '末题收齐返回 complete-text');
+  const st = getPendingMultiQuestionState(qid);
+  assert.ok(st, 'pending 保持武装（终态化由最终 keyed 认领负责，不在此处置）');
+  assert.equal((st!.answers.get(2) as { text: string }).text, '3');
+  // 空文本 / 未登记 / 已终态
+  assert.equal(recordSequentialTextAnswer(qid, '   ').status, 'unknown', '空文本不作答');
+  assert.equal(recordSequentialTextAnswer(`ask_x_${'9'.repeat(30)}`, 'x').status, 'unknown', '未登记 unknown');
+  claimPendingMultiQuestionIfKeyedAnswer(qid, '1: 就选 a 吧\n2: 第二个答案\n3: 3', 'msg-x');
+  assert.equal(recordSequentialTextAnswer(qid, '再来一句').status, 'terminal', '已认领置终态后按 terminal 处理');
+});
+
+await test('文本作答收齐 → 确认卡：单「✅ 提交」按钮携带全量 keyed（含自由文本行）', async () => {
+  clearQuotaCache();
+  const qid = `ask_confirm_${Math.random().toString(36).slice(2, 10)}`;
+  registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_CONFIRM', [
+    { header: '甲', question: 'q1', options: ['a1', 'a2'] },
+    { header: '乙', question: 'q2', options: ['b1', 'b2'] },
+    { header: '丙', question: 'q3', options: ['c1', 'c2'] },
+  ], 5000, 'M_TEXT_CONFIRM_ANCHOR');
+  recordSequentialTextAnswer(qid, '就选 a 吧');
+  recordSequentialTextAnswer(qid, '第二个答案');
+  recordSequentialTextAnswer(qid, '3');
+
+  const { sent, gw } = installFakeGateway();
+  try {
+    const r = await sendSequentialTextConfirmCard({
+      state: getPendingMultiQuestionState(qid)!,
+      account: makeAccount(),
+      to: 'qqbot:c2c:USER_CONFIRM',
+    });
+    assert.ok(!r.error, `确认卡发送应成功：${r.error}`);
+    assert.equal(sent.length, 1, '只发一张确认卡');
+    const card = sent[0]!;
+    assert.equal(card.opts?.msgId, 'M_TEXT_CONFIRM_ANCHOR', '确认卡复用 pending 锚点走被动回复');
+    const body = String(card.text);
+    assert.ok(body.includes('已收齐 3 题答案'), '正文标题写明收齐');
+    assert.ok(body.includes('就选 a 吧'), '已记录展示自由文本答案');
+    assert.ok(body.includes('第二个答案'), '已记录逐题展示');
+    assert.ok(body.includes('点「✅ 提交」发送'), '指引写明提交入口');
+    const buttons = buttonsOf(card);
+    assert.equal(buttons.length, 1, '确认卡只有一个按钮');
+    const btn = buttons[0];
+    assert.equal(btn.action.type, 2, '指令型（type=2）');
+    assert.equal(btn.action.enter, true, 'enter=true（点击即代发）');
+    assert.equal(btn.action.click_limit, 1, 'click_limit=1 防连点');
+    assert.equal(
+      btn.action.data,
+      '1: 就选 a 吧\n2: 第二个答案\n3: 3',
+      'data = 全量 keyed（自由文本行 + 选项序号行），与手打模板同源',
+    );
+  } finally {
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('确认卡超长护栏：keyed > 300 字符时不挂按钮、只剩手打模板', () => {
+  const qid = `ask_long_${Math.random().toString(36).slice(2, 10)}`;
+  registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_LONG', [
+    { header: '甲', question: 'q1', options: ['a1'] },
+    { header: '乙', question: 'q2', options: ['b1'] },
+  ], 5000);
+  recordSequentialTextAnswer(qid, '长'.repeat(320));
+  recordSequentialTextAnswer(qid, '1');
+  const card = renderSequentialTextConfirmCard(getPendingMultiQuestionState(qid)!);
+  assert.ok(card, '渲染成功');
+  assert.equal(card!.keyboard, undefined, '超长时不得挂按钮（平台 data 限额未知的风险护栏）');
+  assert.ok(card!.text.includes('请直接回复下面这段提交'), '只剩手打模板指引');
+  assert.ok(card!.text.includes('长'.repeat(320)), '模板保留完整答案（可复制）');
 });
 
 // ── 结果 ──

@@ -30,6 +30,7 @@
 
 import type { InlineKeyboard, KeyboardButton } from '../types.js';
 import { KEYBOARD_PERMISSION_EVERYONE } from '../types.js';
+import { resolveFindGraphemeChunkEnd } from '../outbound/grapheme.js';
 
 // ============ Types ============
 
@@ -367,14 +368,6 @@ export interface SequentialCardOpts {
    * 框架当合法自由文本收单，原样复制会静默提交占位文案（评审 F2）。
    */
   submitTemplate?: string;
-  /**
-   * **最后一题是否带「✍️ 其他」按钮**。
-   *
-   * 中间题正文要说清「想自己写答案怎么办」，但那个入口在**最后一题**上
-   * —— 若最后一题没有「✍️ 其他」（`isOther` 为 false），正文**不得**指引
-   * 用户去点一个不存在的按钮（同「兜底正文不得指引点不存在的按钮」）。
-   */
-  canFreeText?: boolean;
 }
 
 /**
@@ -385,9 +378,10 @@ export interface SequentialCardOpts {
  *   单独提交会被判「requires an answer」整单拒绝 ⇒ 中间题的自由作答
  *   统一留到最后一题）；
  * - 最后一题多一段「已记录」展示 + 「选完即提交」提示；
- * - **每一张卡都写清「想自己写答案怎么办」**——自由作答的入口在最后一题
- *   的「✍️ 其他」（点击后把整单答案预填进输入框，用户改哪行都行），
- *   中间题要指路过去，否则用户会以为「只能点按钮」。
+ * - **每一张卡都写清「想自己写答案怎么办」**——直接回复一句话即作答
+ *   （sequential-text-answer 改造：pending 武装期间入站文本在入队口被
+ *   捕获为当前题答案，不转发框架）；「✍️ 其他」按钮（仅 isOther 题）
+ *   的角色改为「编辑全部已答」的快捷入口。
  *
  * `formatMultiQuestionCard`（群聊旧路径）**逐字不动**。
  */
@@ -408,8 +402,8 @@ export function formatSequentialQuestionCard(
   lines.push(
     '',
     opts.mode === 'submit'
-      ? '👇 点下方按钮作答（选完即提交全部答案）'
-      : '👇 点下方按钮作答',
+      ? '👇 点下方按钮作答（选完即提交全部答案）；不想点就直接回复一句话作为本题答案'
+      : '👇 点下方按钮，或直接回复一句话作为本题答案',
   );
   if (opts.mode === 'submit') {
     if (opts.collected?.length) {
@@ -430,22 +424,15 @@ export function formatSequentialQuestionCard(
         '```',
       );
     }
-    // 「✍️ 其他」按钮存在时（def.isOther）才提它——不得指引不存在的按钮
+    // 「✍️ 其他」按钮存在时（def.isOther）才提它——不得指引不存在的按钮。
+    // 角色（sequential-text-answer 改造后）：直接回文本已是每题的作答
+    // 入口，「✍️ 其他」的独有价值 = 把**全部已答**预填进输入框一次改齐。
     if (def.isOther) {
       lines.push(
         '',
-        '想自己写某一题？点「✍️ 其他」——输入框会带上前面几题的答案，'
-        + '把要改的那一行换成你自己的文字，最后一行的空白处补上你这题的答案。',
+        '想改前面任何一题？点「✍️ 其他」——输入框会带上全部已答内容，改哪行都行。',
       );
     }
-  } else if (opts.canFreeText) {
-    // 中间题不给「✍️ 其他」（框架要求整单齐备，中间题的自由文本单独提交
-    // 会被整单拒收）⇒ 自由作答的入口在**最后一题**，这里指路过去。
-    lines.push(
-      '',
-      '想自己写答案？答到最后一道题时，点那里的「✍️ 其他」，'
-      + '输入框会带上已答的题目，可以换成你自己的文字（也能回头改前面任何一题）。',
-    );
   }
   return lines.join('\n');
 }
@@ -563,6 +550,91 @@ export function buildSequentialSubmitKeyboard(
   // 点「✍️ 其他」，输入框会带上全部已答内容，用户改哪一行都行（按钮越少，
   // 用户越不会点到走不通的路）。
   return { content: { rows: layoutButtonRows(buttons) } };
+}
+
+// ============ 文本作答确认卡（sequential-text-answer 改造）============
+
+/** 「已记录」展示用截断上限（字形簇数）——自由文本答案可能很长 */
+export const ANSWER_DISPLAY_MAX_GRAPHEMES = 20;
+
+/**
+ * 展示用截断（**字形簇安全**，复用 `outbound/grapheme.ts`——红线：
+ * 不得按码元硬切切碎代理对 / ZWJ / 组合符号）。
+ */
+export function truncateGraphemeSafe(text: string, maxGraphemes: number): string {
+  const source = String(text ?? '');
+  if (maxGraphemes <= 0) return '';
+  const find = resolveFindGraphemeChunkEnd();
+  let end = 0;
+  let count = 0;
+  while (count < maxGraphemes && end < source.length) {
+    const next = find(source, end, source.length, source.length, false);
+    if (next <= end) break; // 防御：零进展（官方契约下不应发生）
+    end = next;
+    count++;
+  }
+  return end < source.length ? `${source.slice(0, end)}…` : source.slice(0, end);
+}
+
+/** 文本作答确认卡的正文参数 */
+export interface SequentialTextConfirmOpts {
+  /** 总题数 */
+  total: number;
+  /** 全部题的已记录展示（人话版，逐题） */
+  collected: ReadonlyArray<{ header: string; display: string }>;
+  /** 全量 keyed 答案文本（按钮 data / 手打模板同源） */
+  keyedText: string;
+  /** 是否带「✅ 提交」按钮（keyed 超长退化时为 false，只剩手打模板） */
+  buttonAttached: boolean;
+}
+
+/**
+ * 文本作答收齐后的**轻量确认卡**正文：已记录 + 全量 keyed 模板 + 提交指引。
+ *
+ * 只在「末题用文本作答」时出现（末题点选项按钮 = 一键直提，无此卡）。
+ */
+export function formatSequentialTextConfirmCard(opts: SequentialTextConfirmOpts): string {
+  const lines: string[] = [];
+  lines.push(`**已收齐 ${opts.total} 题答案**`);
+  lines.push('', '**已记录**');
+  for (const item of opts.collected) {
+    lines.push(`**·** ${item.header}：${item.display}`);
+  }
+  lines.push(
+    '',
+    opts.buttonAttached ? '点「✅ 提交」发送；或直接回复下面这段提交' : '请直接回复下面这段提交',
+    '',
+    '```',
+    opts.keyedText,
+    '```',
+  );
+  return lines.join('\n');
+}
+
+/**
+ * 文本作答确认卡键盘：单「✅ 提交」按钮（指令型 type=2 + enter=true +
+ * click_limit:1），data = 全量 keyed 答案文本——点击由客户端以真实用户
+ * 身份代发，框架 keyed 认领（与末题选项按钮同款提交机制，程序化提交/
+ * 合成入站是红线，2026-08-24 事故）。
+ */
+export function buildSequentialTextConfirmKeyboard(keyedText: string): InlineKeyboard {
+  const button: KeyboardButton = {
+    id: 'text_confirm_submit',
+    render_data: {
+      label: '✅ 提交',
+      visited_label: '已提交',
+      style: 1 as const,
+    },
+    action: {
+      type: 2 as const,
+      data: keyedText,
+      enter: true,
+      permission: { type: KEYBOARD_PERMISSION_EVERYONE },
+      click_limit: 1,
+      unsupport_tips: '当前客户端版本不支持，请直接回复上方给出的答案文本',
+    },
+  };
+  return { content: { rows: [{ buttons: [button] }] } };
 }
 
 // ============ 单题文本反解 ============

@@ -33,12 +33,17 @@ import type { InlineKeyboard, ResolvedQQBotAccount } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
 import type { SendResult } from '../outbound/outbound-service.js';
 import {
+  ANSWER_DISPLAY_MAX_GRAPHEMES,
   buildSequentialCollectKeyboard,
   buildSequentialSubmitKeyboard,
+  buildSequentialTextConfirmKeyboard,
   formatSequentialQuestionCard,
+  formatSequentialTextConfirmCard,
+  truncateGraphemeSafe,
 } from './question-card.js';
 import {
   buildSequentialAnswerPrefix,
+  buildSequentialFullAnswerDraft,
   formatMultiQuestionAnswerDisplay,
   type PendingMultiQuestionState,
 } from './question-helpers.js';
@@ -69,15 +74,6 @@ export function renderSequentialCard(
 
   const total = state.questions.length;
   const isLast = index === total - 1;
-  /**
-   * 自由作答入口（最后一题的「✍️ 其他」）是否存在。
-   *
-   * - 中间题：**指路**到最后一题 ⇒ 最后一题带 `isOther` 才有那个按钮；
-   * - 最后一题：提交态时按钮就在这张卡上（由 `formatSequentialQuestionCard`
-   *   按 `def.isOther` 判断）；收集态（降级）时这张卡**没有**该按钮 ⇒
-   *   不得在正文里指引用户去点它。
-   */
-  const freeTextOnLast = Boolean(state.questions[total - 1]?.isOther);
 
   if (!isLast) {
     return {
@@ -85,7 +81,6 @@ export function renderSequentialCard(
         index,
         total,
         mode: 'collect',
-        canFreeText: freeTextOnLast,
       }),
       keyboard: buildSequentialCollectKeyboard(state.questionId, index, question),
     };
@@ -105,7 +100,6 @@ export function renderSequentialCard(
         index,
         total,
         mode: 'collect',
-        canFreeText: false,
       }),
       keyboard: buildSequentialCollectKeyboard(state.questionId, index, question),
     };
@@ -116,7 +110,9 @@ export function renderSequentialCard(
     const answer = state.answers.get(i);
     return {
       header: q.header,
-      display: answer ? formatMultiQuestionAnswerDisplay(q, answer) : '（未作答）',
+      display: answer
+        ? truncateGraphemeSafe(formatMultiQuestionAnswerDisplay(q, answer), ANSWER_DISPLAY_MAX_GRAPHEMES)
+        : '（未作答）',
     };
   });
   // 手打兜底模板：前 N-1 题的答案 + 最后一题**留空**占位（客户端不支持
@@ -175,6 +171,83 @@ export async function sendSequentialQuestionCard(params: {
   } else {
     log?.info?.(
       `[question] sequential card sent id=${state.questionId} index=${index + 1}/${state.questions.length}`,
+    );
+  }
+  return result;
+}
+
+// ============ 文本作答确认卡（sequential-text-answer 改造）============
+
+/**
+ * 按钮 data（keyed 全文）的长度护栏：平台对 button data 的隐性限额未知，
+ * 自由文本答案可能很长——超限时不挂按钮、只给可复制模板 + 手打指引，
+ * 保证「答不了」退化为「手打也能答」（与指令按钮老客户端兜底同思路）。
+ */
+const TEXT_CONFIRM_BUTTON_MAX_CHARS = 300;
+
+/**
+ * 渲染**文本作答收齐后**的轻量确认卡：已记录 + 全量 keyed 模板 + 单
+ * 「✅ 提交」按钮（keyed 超长时退化无按钮，只剩手打模板）。
+ *
+ * 只在末题用文本作答时出现（末题点选项 = type=2 data 全量 keyed 一键
+ * 直提，无此卡）。提交仍靠客户端代发的真实用户消息——程序化提交 /
+ * 合成入站是红线（2026-08-24 事故），「全自动提交」在平台约束下不存在。
+ */
+export function renderSequentialTextConfirmCard(state: PendingMultiQuestionState): {
+  text: string;
+  keyboard?: InlineKeyboard;
+} | null {
+  const total = state.questions.length;
+  if (total === 0) return null;
+  const keyedText = buildSequentialFullAnswerDraft(state.answers, total);
+  const collected = state.questions.map((q, i) => {
+    const answer = state.answers.get(i);
+    return {
+      header: q.header,
+      display: answer
+        ? truncateGraphemeSafe(formatMultiQuestionAnswerDisplay(q, answer), ANSWER_DISPLAY_MAX_GRAPHEMES)
+        : '（未作答）',
+    };
+  });
+  const buttonAttached = keyedText.length <= TEXT_CONFIRM_BUTTON_MAX_CHARS;
+  return {
+    text: formatSequentialTextConfirmCard({ total, collected, keyedText, buttonAttached }),
+    ...(buttonAttached ? { keyboard: buildSequentialTextConfirmKeyboard(keyedText) } : {}),
+  };
+}
+
+/**
+ * 渲染并发送文本作答确认卡。出站口径与续卡一致（被动锚点优先、锚点
+ * 不可用降级主动——见 sendQuestionMessage）。
+ */
+export async function sendSequentialTextConfirmCard(params: {
+  state: PendingMultiQuestionState;
+  account: ResolvedQQBotAccount;
+  /** 出站目标（`qqbot:c2c:<openid>`） */
+  to: string;
+  log?: PluginLogger;
+}): Promise<SendResult> {
+  const { state, account, to, log } = params;
+  const card = renderSequentialTextConfirmCard(state);
+  if (!card) {
+    return { error: 'text confirm card render failed' };
+  }
+  const keyedText = buildSequentialFullAnswerDraft(state.answers, state.questions.length);
+  const result = await sendQuestionMessage({
+    account,
+    accountId: account.accountId,
+    to,
+    text: card.text,
+    ...(card.keyboard ? { keyboard: card.keyboard as never } : {}),
+    ...(state.anchorMsgId ? { anchorMsgId: state.anchorMsgId } : {}),
+    log,
+  });
+  if (result.error) {
+    log?.error?.(`[question] text confirm card send failed: ${result.error}`);
+  } else {
+    log?.info?.(
+      `[question] text confirm card sent id=${state.questionId} keyedChars=${keyedText.length}`
+      + ` button=${card.keyboard ? 'yes' : 'no(too-long)'}`,
     );
   }
   return result;

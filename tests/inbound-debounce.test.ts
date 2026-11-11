@@ -452,19 +452,24 @@ await test('斜杠命令旁路：不被合并，原样直发（pending buffer �
 
 await test('多问题 keyed 答案旁路：原样直发不被合并（认领文本不被改写）', async () => {
   const scenario = setupScenario({ debounceMs: W });
-  // 独立 sender：pending 记录 TTL（200ms）内仍在注册表里，同 sender 会
-  // 让后续用例的消息误命中 keyed 旁路（跨测试污染）
+  // 独立 sender：pending 记录 TTL 内仍在注册表里，同 sender 会让后续用例
+  // 的消息误命中 keyed 旁路 / 文本作答拦截（跨测试污染）
   const answer = makeC2CMsgAndCtx({
     senderId: 'USER_QM',
     content: '1: 3\n2: 1',
     assembledBody: { webBody: '1: 3\n2: 1', agentBody: '1: 3\n2: 1', rawBody: '1: 3\n2: 1' },
   });
+  // 两题都给 3 个选项 ⇒ '1: 3\n2: 1' 是可认领 keyed 全量形态（sequential-
+  // text-answer 改造后：可认领 keyed 走既有认领旁路；其余文本被拦截消费）
   registerPendingMultiQuestion(
     'test-account',
     'q-bypass-test',
     'c2c',
     answer.msg.replyTarget.targetId,
-    [{ header: '题1', question: '选一个', options: ['a', 'b', 'c'] }],
+    [
+      { header: '题1', question: '选一个', options: ['a', 'b', 'c'] },
+      { header: '题2', question: '选一个', options: ['a', 'b', 'c'] },
+    ],
     200, // 短 TTL：cleanup timer 不悬挂测试进程
   );
   assert.equal(await keepAlive(fire(scenario, answer)), true);
@@ -554,32 +559,69 @@ await test('防抖关闭配置同样收敛：副本在 debounceMs 判定之前�
   assert.equal(scenario.captured.length, 0, '直发不经防抖器，captured 不增长（middleware 负责 dispatch）');
 });
 
-await test('无关文本不认领 pending：答题中途的普通消息旁路直发、卡片流程存活（issue #99 评审一轮）', async () => {
+await test('文本作答拦截：pending 武装时单行文本被消费为当前题答案（不转发框架）', async () => {
   const scenario = setupScenario({ debounceMs: W });
-  const ask = makeC2CMsgAndCtx({
+  const answer = makeC2CMsgAndCtx({
     senderId: 'USER_QM_KEEP',
-    content: '这题什么意思？',
-    assembledBody: { webBody: '这题什么意思？', agentBody: '这题什么意思？', rawBody: '这题什么意思？' },
+    content: '就选 a 吧',
+    assembledBody: { webBody: '就选 a 吧', agentBody: '就选 a 吧', rawBody: '就选 a 吧' },
   });
   registerPendingMultiQuestion(
     'test-account',
-    'q-keepalive-test',
+    'q-text-capture',
     'c2c',
     'USER_QM_KEEP',
     [
       { header: '题1', question: '选一个', options: ['a', 'b'] },
       { header: '题2', question: '选一个', options: ['a', 'b'] },
     ],
-    500,
+    1000,
   );
-  await keepAlive(fire(scenario, ask));
-  assert.equal(scenario.captured.length, 1, 'pending 武装期间文本仍旁路直发（不被合并改写）');
-  assert.equal(scenario.captured[0]!.ingest.textForCommands, '这题什么意思？');
-  const { findPendingMultiQuestionByConversation } = await import('../src/features/question-helpers.ts');
-  assert.ok(
-    findPendingMultiQuestionByConversation('test-account', 'c2c', 'USER_QM_KEEP'),
-    '无关文本不得置终态——顺序发题卡片要继续可用（框架侧会拒收并重问）',
+  // sequential-text-answer 改造：窗口内文本即作答意图——被插件消费为
+  // 当前题答案（不再旁路直发框架，框架对 partial 答案只会拒收重问）
+  assert.equal(await keepAlive(fire(scenario, answer)), true, '已接管（消费为当前题答案）');
+  assert.equal(scenario.captured.length, 0, '不得转发框架成轮');
+  const { getPendingMultiQuestionState } = await import('../src/features/question-helpers.ts');
+  const st = getPendingMultiQuestionState('q-text-capture');
+  assert.ok(st, 'pending 保持武装（终态化仍由最终 keyed 认领负责）');
+  assert.equal(st!.cursor, 1, 'cursor 推进到下一题');
+  assert.equal(
+    (st!.answers.get(0) as { text?: string }).text,
+    '就选 a 吧',
+    '文本被记为第 1 题答案',
   );
+});
+
+await test('文本作答拦截：多行非 keyed 消费 + 引导；斜杠命令照旧放行', async () => {
+  const scenario = setupScenario({ debounceMs: W });
+  registerPendingMultiQuestion(
+    'test-account',
+    'q-multiline-guide',
+    'c2c',
+    'USER_QM_ML',
+    [
+      { header: '题1', question: '选一个', options: ['a', 'b'] },
+      { header: '题2', question: '选一个', options: ['a', 'b'] },
+    ],
+    1000,
+  );
+  // 多行但不可认领（典型：粘贴手打模板没填完）→ 消费 + 引导，不成轮
+  const partial = makeC2CMsgAndCtx({
+    senderId: 'USER_QM_ML',
+    content: '1: 1\n2: ',
+    assembledBody: { webBody: '1: 1\n2: ', agentBody: '1: 1\n2: ', rawBody: '1: 1\n2: ' },
+  });
+  assert.equal(await keepAlive(fire(scenario, partial)), true, '多行非 keyed 被接管（引导）');
+  assert.equal(scenario.captured.length, 0, '半成品不得到框架（只会被拒收重问）');
+  // 斜杠命令 = 逃生通道：pending 武装期间照旧旁路直发
+  const slash = makeC2CMsgAndCtx({
+    senderId: 'USER_QM_ML',
+    content: '/status',
+    assembledBody: { webBody: '/status', agentBody: '/status', rawBody: '/status' },
+  });
+  assert.equal(await keepAlive(fire(scenario, slash)), true);
+  assert.equal(scenario.captured.length, 1, '斜杠命令旁路立即 dispatch');
+  assert.equal(scenario.captured[0]!.ingest.textForCommands, '/status');
 });
 
 await test('单问题作答旁路（PR1）：原样直发不被合并（答案文本不被改写）', async () => {

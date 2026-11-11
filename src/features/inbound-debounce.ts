@@ -31,6 +31,13 @@
  *   按 findPendingMultiQuestionByConversation(accountId, 'c2c', peer) 识别
  *   （会话键含账号维度——openid 是 per-account 的，跨账号不共享 pending）。
  *
+ * 入队口的两道**消费**（在 debounceMs 判定之前，防抖开/关行为一致）：
+ * - 已认领 keyed 答案的逐字副本 → 直接终止（issue #99）；
+ * - 文本作答拦截（sequential-text-answer）：多题 pending 武装期间的非
+ *   keyed 文本 → 记为当前题答案并续卡/发确认卡，**不转发框架**（窗口
+ *   内文本即作答意图，仓库主人拍板的红线再界定）——见
+ *   tryCaptureSequentialTextAnswer。
+ *
  * admission 放行（2026-10-16 修复，红线）：onFlush 返回的 admission 与
  * completion 必须解耦——框架 debouncer 的同 key 任务链持有到 admission
  * settle，enqueue 对旁路项在同 key 有 in-flight 任务时会排队等它。若
@@ -100,7 +107,9 @@ import { assembleBody } from '../dispatch/body-assembler.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { runWithRequestContext } from '../request-context.js';
 import { dispatchToOpenClaw, type DispatchToOpenClawOptions } from '../dispatch/index.js';
-import { claimPendingMultiQuestionIfKeyedAnswer, findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation, isDuplicateClaimedKeyedAnswerDelivery } from './question-helpers.js';
+import { claimPendingMultiQuestionIfKeyedAnswer, findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation, getPendingMultiQuestionState, buildSequentialFullAnswerDraft, isClaimableKeyedAnswerForConversation, isDuplicateClaimedKeyedAnswerDelivery, recordSequentialTextAnswer } from './question-helpers.js';
+import { sendSequentialQuestionCard, sendSequentialTextConfirmCard } from './question-flow.js';
+import { sendText } from '../outbound/outbound-service.js';
 
 /** 默认防抖窗口：3 秒（QQ 客户端连发"文件 + 说明"的典型间隔内） */
 export const DEFAULT_C2C_INBOUND_DEBOUNCE_MS = 3000;
@@ -434,6 +443,119 @@ function getOrCreateDebouncer(item: C2CInboundDebounceItem, initialDebounceMs: n
 }
 
 /**
+ * 文本作答拦截（sequential-text-answer 改造）。
+ *
+ * 多题 pending 武装期间，用户**直接回复的文本**被消费为「当前题的答案」，
+ * 不再转发框架（仓库主人拍板的红线再界定：窗口内文本即作答意图——
+ * 框架侧对单条 partial 答案只会拒收重问，转发没有意义）。
+ *
+ * **同步规划、异步执行**：本函数必须完全同步返回（决策 + 状态推进），
+ * 出站（续卡/确认卡/回执）封装成 thunk 交给调用方 await——enqueue 的
+ * 「防抖器同步注册」时序不能被任何 await 打断（调用方在同一宏任务里
+ * 就可能 flushAll，注册被推迟到微任务后 = 冲刷扑空、消息滞留缓冲）。
+ *
+ * 分支（返回 null = 不接管，走原路径）：
+ * - 纯附件 / 斜杠命令 / 无 pending / 全量 keyed 可认领形态 → null
+ *   （附件走原路径；斜杠是逃生通道；keyed 全量交给既有认领路径）；
+ * - 多行但不可认领（典型：粘贴手打模板没填完）→ 消费 + 引导回执；
+ * - 单行文本 → `recordSequentialTextAnswer` 记为当前题答案（同步推进）：
+ *   - 中间题 → 续发下一题卡（失败按 F1 口径回执手打草稿）；
+ *   - 末题收齐 → 发文本作答确认卡（单「✅ 提交」按钮；失败回执草稿）；
+ *   - pending 已终态 → 消费 + 「该问题已提交或已过期」回执；
+ *   - 竞态（pending 消失）→ null 走原路径。
+ *
+ * 提交红线不变：确认卡/末题按钮都是 type=2 客户端代发真实消息，插件
+ * 不程序化提交、不合成入站（2026-08-24 事故）。
+ */
+function planSequentialTextCapture(params: {
+  msg: QQBotInboundMessage;
+  account: ResolvedQQBotAccount;
+  log?: PluginLogger;
+}): (() => Promise<void>) | null {
+  const { msg, account, log } = params;
+  const text = String(msg.content ?? '').trim();
+  if (!text) return null; // 纯附件：不做答案（已知边界：图片走框架 image-steer 取消问题）
+  if (text.startsWith('/')) return null; // 斜杠命令：逃生通道，照旧放行
+
+  const pending = findPendingMultiQuestionByConversation(
+    account.accountId,
+    'c2c',
+    msg.replyTarget.targetId,
+  );
+  if (!pending) return null;
+  // 全量 keyed 提交形态（可认领）：交给既有认领路径（含 #99 副本丢弃）
+  if (isClaimableKeyedAnswerForConversation(account.accountId, msg.replyTarget.targetId, text)) {
+    return null;
+  }
+
+  const dlog = log?.child('inbound-debounce');
+  const to = `qqbot:c2c:${msg.replyTarget.targetId}`;
+  const replyToId = String(msg.messageId ?? '');
+  const bestEffortText = async (body: string): Promise<void> => {
+    try {
+      await sendText({ to, text: body, account, ...(replyToId ? { replyToId } : {}) });
+    } catch {
+      // 尽力而为的通知：失败不阻断消费语义
+    }
+  };
+
+  const stateBefore = getPendingMultiQuestionState(pending.questionId);
+  if (!stateBefore) return null; // 竞态：pending 刚失效 → 走原路径
+
+  // 多行但不可认领——消费 + 引导（半成品到框架只会被拒收重问）
+  if (/\r?\n/.test(text)) {
+    return async () => {
+      await bestEffortText(
+        '这段看起来还没填完——请把最后一行冒号后补上答案后**整段**发送，或只回复一句话作为本题答案。',
+      );
+      dlog?.info(`[question] multi-line non-keyed text consumed with guidance msgId=${msg.messageId}`);
+    };
+  }
+
+  const result = recordSequentialTextAnswer(pending.questionId, text);
+  if (result.status === 'unknown') return null; // 竞态：走原路径
+  if (result.status === 'terminal') {
+    return async () => {
+      await bestEffortText('该问题已提交或已过期');
+    };
+  }
+  dlog?.info(
+    `[question] text answer captured id=${pending.questionId}`
+    + ` q=${stateBefore.cursor + 1}/${stateBefore.questions.length} msgId=${msg.messageId}`,
+  );
+
+  const state = getPendingMultiQuestionState(pending.questionId);
+  if (!state) return null;
+
+  if (result.status === 'complete-text') {
+    return async () => {
+      const sent = await sendSequentialTextConfirmCard({ state, account, to, log });
+      if (sent.error) {
+        const draft = buildSequentialFullAnswerDraft(state.answers, state.questions.length);
+        await bestEffortText(`确认卡发送失败——请直接回复下面这段提交：\n\n${draft}`);
+      }
+    };
+  }
+
+  // status === 'ok'：续发下一题卡（失败按 F1 口径回执手打草稿）
+  return async () => {
+    const sent = await sendSequentialQuestionCard({
+      state,
+      index: result.nextIndex,
+      account,
+      to,
+      log,
+    });
+    if (sent.error) {
+      const draft = buildSequentialFullAnswerDraft(state.answers, state.questions.length);
+      await bestEffortText(
+        `下一题发送失败——请直接回复下面这段提交（空白处补上答案）：\n\n${draft}`,
+      );
+    }
+  };
+}
+
+/**
  * c2c 入站消息入防抖队列。
  *
  * 返回 true = 已接管（进缓冲区，或旁路的立即 dispatch 已在内部完成）；
@@ -476,6 +598,18 @@ export async function enqueueC2CInboundMessage(
       ?.child('inbound-debounce')
       ?.info(`[guard] dropped duplicate keyed-answer delivery msgId=${msg.messageId} target=${msg.replyTarget.targetId}`);
     return true; // 已接管（丢弃）：调用方不再直发
+  }
+
+  // ── 文本作答拦截（sequential-text-answer 改造）──
+  // 多题 pending 武装期间，用户的直接文本回复被消费为「当前题的答案」，
+  // 不再转发框架（仓库主人拍板的红线再界定：窗口内文本即作答意图）。
+  // 同样必须在 debounceMs 判定之前——防抖开/关配置行为一致。决策与状态
+  // 推进同步完成（planSequentialTextCapture 不得含 await——防抖器的同步
+  // 注册时序不能被打断），出站在 thunk 里异步执行。
+  const textCapture = planSequentialTextCapture({ msg, account, log });
+  if (textCapture) {
+    await textCapture();
+    return true; // 已接管（记答案 + 续卡 / 确认卡 / 引导 / 回执）
   }
 
   const cfg = (getAdapters(runtime).getConfig?.() ?? {}) as Record<string, unknown>;

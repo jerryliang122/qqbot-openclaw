@@ -489,7 +489,8 @@ export function registerPendingMultiQuestion(
   pendingByConversation.set(conversationKey(accountId, scope, targetId), questionId);
 }
 
-/** 按会话查找进行中的多问题单（终态/提交中/已过期不算）；会话键含账号维度 */
+/**
+ * 按会话查找进行中的多问题单（终态/提交中/已过期不算）；会话键含账号维度 */
 export function findPendingMultiQuestionByConversation(
   accountId: string,
   scope: 'c2c' | 'group',
@@ -502,6 +503,28 @@ export function findPendingMultiQuestionByConversation(
     return undefined;
   }
   return { questionId };
+}
+
+/**
+ * 判断文本是否是「该 c2c 会话武装中多题 pending 的**可认领 keyed 全量
+ * 答案**」（只读判定、不置终态）。
+ *
+ * 入队口的文本作答拦截用它区分两种意图：全量 keyed 形态 = 提交（交给
+ * 既有认领路径，含 #99 副本丢弃）；其余文本 = 当前题的自由文本答案
+ * （被插件消费，不转发框架）。
+ */
+export function isClaimableKeyedAnswerForConversation(
+  accountId: string,
+  targetId: string,
+  text: string,
+): boolean {
+  const questionId = pendingByConversation.get(conversationKey(accountId, 'c2c', targetId));
+  if (!questionId) return false;
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry || entry.terminal || entry.resolving || entry.expiresAtMs <= Date.now()) {
+    return false;
+  }
+  return isClaimableKeyedAnswerText(entry.questions, text);
 }
 
 export type MultiQuestionTapResult =
@@ -642,25 +665,24 @@ export function isDuplicateClaimedKeyedAnswerDelivery(
 /**
  * 判断文本是否是该 pending 的**可认领 keyed 答案**形态。
  *
- * 与框架的认领口径对齐（`gateway-question-*.mjs`：`parseKeyedAnswers` 按
+ * 与框架的认领口径对齐（`gateway-question-*.mjs`）：`parseKeyedAnswers` 按
  * `<key>: <value>` 逐行解析，key 依次尝试 questionId/header/question/题号；
- * 题号 key 命中后 `validateAnswers` 要求每题非空、纯数字须落在选项数内、
- * 非 isOther 题不收自由文本）。插件卡片与手打模板只产生**题号 key + ASCII
- * 冒号**形态，这里就只认这种——宁可漏认领（pending 保持武装、卡片仍可点，
- * 与改造前行为一致），不可误认领（框架拒收重问时卡片已被打死）。
+ * 题号 key 命中后 `validateAnswers` 要求每题非空。**值只要非空即可**——
+ * `ask_user` 归一化对每题强制 `isOther: true`（dist ask-user-tool-
+ * normalization 实锤），认领侧 `!question.isOther` 的自由文本门永不触发：
+ * 越界数字（"1: 3" 两选项题）、多值（"1,2"）、任意文本都按自由文本收。
+ * （2026-11-11 修正：此前「多值/越界必拒收」的判断源自评审三轮的 dist
+ * 对拍，但那次对拍用的是**未归一化**的原始 question——生产路径的 ask_user
+ * 恒带 isOther，不存在该拒收分支。）
  *
- * **多值（"1,2" / "1 2" / "1;2"）一律不认领**（评审三轮·发现 2）：框架
- * 只对 `question.multiSelect === true` 的题按 `[,;\n]` 拆多值，单选非
- * isOther 题的 "1,2" 既匹配不到选项、又被自由文本门拦掉 ⇒ 拒收重问；
- * 而插件从框架文本反解不出 multiSelect（`parseMultiQuestionPrompt` 无此
- * 信息）——把判断放宽到多值就会把框架必拒的答案判成可认领，恰好踩中
- * 「误认领致命」的方向。真 multiSelect 题用户手打多值时：框架认领、插件
- * 不置终态（pending 武装到 TTL，卡片多活一会儿，无害）。
- *
- * 框架还接受 `=` / `-` 分隔与 header/题干 key，但卡片从不指引这些写法：
- * 用户真用它们手打时框架侧照样认领，插件只是不置终态（同上，无害）。
- * 全角冒号「：」框架解析不了（落 fallbackLines 按行兜底、多题时必被
- * validateAnswers 拒收），同样不认。
+ * 仍保守保留的门槛（宁可漏认领——pending 保持武装、卡片仍可点，与改造
+ * 前行为一致；误认领方向致命——框架拒收重问时卡片已被打死）：
+ * - 只认**题号 key + ASCII 冒号**（插件卡片/模板唯一产出的形态）；
+ *   框架还接受 `=` / `-` 分隔与 header/题干 key，但卡片从不指引这些
+ *   写法：用户真用它们手打时框架侧照样认领，插件只是不置终态（无害）；
+ * - 全角冒号「：」框架解析不了（落 fallbackLines 按行兜底、多题时必被
+ *   validateAnswers 拒收），不认；
+ * - 行数必须恰等于题数、题号 1..N 顺序（fallbackLines 按行配位的前提）。
  */
 function isClaimableKeyedAnswerText(questions: MultiQuestionDef[], text: string): boolean {
   const lines = String(text ?? '')
@@ -668,20 +690,13 @@ function isClaimableKeyedAnswerText(questions: MultiQuestionDef[], text: string)
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
   if (lines.length !== questions.length) return false;
-  return questions.every((question, index) => {
+  return questions.every((_question, index) => {
     const match = KEYED_ANSWER_LINE.exec(lines[index]!);
     if (!match) return false;
     if (Number(match[1]) !== index + 1) return false;
-    const value = match[2]!.trim();
-    // 纯数字 = 单个选项序号（1-based），且须落在该题选项数内——越界会被
-    // 框架拒收并重问，此时卡片必须仍然活着，不能置终态。
-    if (/^\d+$/.test(value)) {
-      const optionIndex = Number(value);
-      return optionIndex >= 1 && optionIndex <= question.options.length;
-    }
-    // 自由文本：框架只对声明了 Other 的题收（!isOther 的门会拦）。
-    // 多值形态（逗号/分号/空白分隔的数字串）落在这里返回 false——见上。
-    return question.isOther === true;
+    // 值非空即可：数字（在界内=选项序号，越界=自由文本）、多值、任意
+    // 文本——框架 isOther 强制下全部可收
+    return match[2]!.trim().length > 0;
   });
 }
 
@@ -852,6 +867,61 @@ export function recordSequentialAnswer(
   if (nextIndex < 0) nextIndex = 0;
   entry.cursor = nextIndex;
   return { status: 'ok', nextIndex };
+}
+
+/**
+ * 顺序发题（文本作答，sequential-text-answer 改造）：把用户**直接回复
+ * 的一条文本消息**记为**当前题**（cursor 指向的那张卡）的答案。
+ *
+ * - 多行压平为单行（`\n` → 空格）：keyed 终稿是「一行一题」格式，多行
+ *   自由文本会把行数打乱、框架认领必失败；
+ * - 中间题 ⇒ cursor 前进，返回 `{status:'ok', nextIndex}`（调用方续发
+ *   下一题卡）；
+ * - 末题 ⇒ 全部收齐，返回 `{status:'complete-text'}`（调用方组装全量
+ *   keyed 文本发确认卡）；**pending 保持武装**——终态化仍由最终 keyed
+ *   消息的认领路径负责（type=2 按钮代发 / 手打，框架认领后才置终态）；
+ * - 文本作答永远作用于**当前题**：想改更早的题，点那张卡的选项按钮
+ *   （既有语义）。
+ *
+ * 框架侧合法性：ask_user 归一化对每题强制 `isOther: true` ⇒ 自由文本
+ * 值（`k: <text>`）必可被认领，无需按题开关。
+ */
+export type SequentialTextAnswerResult =
+  | { status: 'ok'; nextIndex: number }
+  | { status: 'complete-text' }
+  | { status: 'unknown' }
+  | { status: 'terminal' };
+
+export function recordSequentialTextAnswer(
+  questionId: string,
+  rawText: string,
+): SequentialTextAnswerResult {
+  const flattened = String(rawText ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .join(' ');
+  if (!flattened) return { status: 'unknown' };
+
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry) return { status: 'unknown' };
+  if (entry.expiresAtMs <= Date.now()) {
+    pendingMultiQuestions.delete(questionId);
+    clearTimeout(entry.cleanupTimer);
+    return { status: 'unknown' };
+  }
+  if (entry.terminal) return { status: 'terminal' };
+
+  const total = entry.questions.length;
+  const cursor = Math.min(Math.max(entry.cursor, 0), total - 1);
+  entry.answers.set(cursor, { text: flattened });
+
+  if (cursor >= total - 1) {
+    // 末题收齐：不置终态（等最终 keyed 消息认领），由调用方发确认卡
+    return { status: 'complete-text' };
+  }
+  entry.cursor = cursor + 1;
+  return { status: 'ok', nextIndex: cursor + 1 };
 }
 
 /**
