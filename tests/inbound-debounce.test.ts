@@ -10,11 +10,12 @@
  *    - 窗口内两条消息 → 单次 dispatch，textForAgent 含分节头与两段内容，
  *      锚点 messageId = 最后一条；media facts 合并；
  *    - 单条消息 → 原样直发，无分节头；
- *    - 三类旁路（控制命令 stop / 斜杠命令 / 多问题 keyed 答案）：
+ *    - 三类旁路（控制命令 stop / 斜杠命令 / 多问题 pending 期间的文本）：
  *      不被合并且原样直发；有 pending buffer 时先冲刷再执行（保序）；
  *      运行中的 turn 不阻塞旁路（admission 在 lane 决策时放行，
  *      /stop 挡在 keyChains 后排队是 2026-10-16 修复的回归缺陷）；
- *      挂起 ask_user 的 keyed 答案同机制立即 dispatch（死锁类钉子）；
+ *      挂起 ask_user 的 keyed 答案在入队口被拦截层消费并提交
+ *      （插件直提整单答案；死锁类钉子：不被运行中的 turn 排队）；
  *      跨窗口消息在运行中的 turn 期间即 dispatch（插嘴语义显式拍板）；
  *      放行时点取 lane 决策而非 inboundRun 调用（入队前不抢先，
  *      Sourcery 意见 2）；dispatch 失败（run 抛错）不悬挂 enqueue、
@@ -34,6 +35,7 @@
  * 运行方式: npx tsx tests/inbound-debounce.test.ts
  */
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 let passed = 0;
 let failed = 0;
@@ -87,6 +89,29 @@ const {
 const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
 const { registerGateway } = await import('../src/outbound/outbound-service.ts');
 const { registerPendingMultiQuestion, registerPendingSingleQuestion } = await import('../src/features/question-helpers.ts');
+const { setMultiQuestionSubmitterForTest } = await import('../src/features/question-submit.ts');
+
+// ── 假提交器（插件直提整单答案的替身）──
+
+interface SubmitCall {
+  sessionKey?: string;
+  text: string;
+}
+
+let submitCalls: SubmitCall[] = [];
+
+function installFakeSubmitter(): void {
+  submitCalls = [];
+  setMultiQuestionSubmitterForTest(async (params) => {
+    submitCalls.push({ sessionKey: params.sessionKey, text: params.text });
+    return true;
+  });
+}
+
+function uninstallFakeSubmitter(): void {
+  setMultiQuestionSubmitterForTest(null);
+  submitCalls = [];
+}
 
 // ── 测试基础设施（对齐 room-event.test.ts）──
 
@@ -450,17 +475,18 @@ await test('斜杠命令旁路：不被合并，原样直发（pending buffer �
   assert.equal(scenario.captured[1]!.ingest.textForCommands, '/status', 'command text must stay unmerged');
 });
 
-await test('多问题 keyed 答案旁路：原样直发不被合并（认领文本不被改写）', async () => {
+await test('多问题 sequential pending：整单形态文本被拦截层消费（不进框架）', async () => {
+  installFakeSubmitter();
   const scenario = setupScenario({ debounceMs: W });
   // 独立 sender：pending 记录 TTL 内仍在注册表里，同 sender 会让后续用例
-  // 的消息误命中 keyed 旁路 / 文本作答拦截（跨测试污染）
+  // 的消息误命中旁路 / 文本作答拦截（跨测试污染）
   const answer = makeC2CMsgAndCtx({
     senderId: 'USER_QM',
     content: '1: 3\n2: 1',
     assembledBody: { webBody: '1: 3\n2: 1', agentBody: '1: 3\n2: 1', rawBody: '1: 3\n2: 1' },
   });
-  // 两题都给 3 个选项 ⇒ '1: 3\n2: 1' 是可认领 keyed 全量形态（sequential-
-  // text-answer 改造后：可认领 keyed 走既有认领旁路；其余文本被拦截消费）
+  // 两题都给 3 个选项 ⇒ '1: 3\n2: 1' 是整单形态（行数=题数、题号 1..2）
+  // ⇒ 拦截层「覆盖全部答案 + 提交」，**不转发框架**
   registerPendingMultiQuestion(
     'test-account',
     'q-bypass-test',
@@ -471,92 +497,49 @@ await test('多问题 keyed 答案旁路：原样直发不被合并（认领文�
       { header: '题2', question: '选一个', options: ['a', 'b', 'c'] },
     ],
     200, // 短 TTL：cleanup timer 不悬挂测试进程
+    undefined,
+    'sequential',
+  );
+  assert.equal(await keepAlive(fire(scenario, answer)), true, '整单形态被接管');
+  assert.equal(scenario.captured.length, 0, '整单形态不得转发框架（插件直提整单答案）');
+  uninstallFakeSubmitter();
+});
+
+await test('非 sequential 形态的 pending 不参与文本拦截：文本照旧旁路直发不被合并', async () => {
+  const scenario = setupScenario({ debounceMs: W });
+  const answer = makeC2CMsgAndCtx({
+    senderId: 'USER_QM_LEGACY',
+    content: '1: 3\n2: 1',
+    assembledBody: { webBody: '1: 3\n2: 1', agentBody: '1: 3\n2: 1', rawBody: '1: 3\n2: 1' },
+  });
+  // legacy 形态（群聊旧路径）：文本不走「当前题答案」拦截，原样直发
+  // ——这是拦截层未识别时「转发框架」的第 3 层兜底路径（原文不被改写）
+  registerPendingMultiQuestion(
+    'test-account',
+    'q-legacy-bypass',
+    'c2c',
+    answer.msg.replyTarget.targetId,
+    [
+      { header: '题1', question: '选一个', options: ['a', 'b', 'c'] },
+      { header: '题2', question: '选一个', options: ['a', 'b', 'c'] },
+    ],
+    200,
   );
   assert.equal(await keepAlive(fire(scenario, answer)), true);
-  assert.equal(scenario.captured.length, 1, 'keyed answer must bypass debounce immediately');
+  assert.equal(scenario.captured.length, 1, 'legacy 形态的文本照旧直发');
   assert.equal(scenario.captured[0]!.ingest.textForCommands, '1: 3\n2: 1');
 });
 
-await test('keyed 答案副本在入队口直接终止：重复投递不成轮（issue #99 评审三轮·发现 1）', async () => {
-  const scenario = setupScenario({ debounceMs: W });
-  const mkAnswer = () => makeC2CMsgAndCtx({
-    senderId: 'USER_QM_CLAIM',
-    content: '1: 2\n2: 1',
-    assembledBody: { webBody: '1: 2\n2: 1', agentBody: '1: 2\n2: 1', rawBody: '1: 2\n2: 1' },
-  });
-  registerPendingMultiQuestion(
-    'test-account',
-    'q-claim-test',
-    'c2c',
-    'USER_QM_CLAIM',
-    [
-      { header: '题1', question: '选一个', options: ['a', 'b'] },
-      { header: '题2', question: '选一个', options: ['a', 'b', 'c'] },
-    ],
-    1000, // 覆盖用例时长即可（认领后即终态，TTL 只是兜底）
+await test('旧的 keyed 副本丢弃窗口已退役：客户端不再代发 ⇒ 无副本可丢', async () => {
+  // 退役原因：末题选项改成回调型（type=1）、提交由插件直提 ⇒ 客户端不再
+  // 代发机器文本 ⇒ 不存在「同一份 keyed 答案的重复投递」。
+  // 重复提交由框架 claim 的幂等覆盖（第二次 claim 返回 false）。
+  const src2 = readFileSync(new URL('../src/features/question-helpers.ts', import.meta.url), 'utf-8');
+  assert.ok(
+    !src2.includes('isDuplicateClaimedKeyedAnswerDelivery'),
+    '副本丢弃窗口必须退役（否则会误吞用户改答案重发的文本）',
   );
-  // 首份：旁路立即直发——放行判定处同步认领（置终态 + 登记答案文本）
-  await keepAlive(fire(scenario, mkAnswer()));
-  assert.equal(scenario.captured.length, 1, '首份 keyed 答案旁路立即直发');
-  assert.equal(scenario.captured[0]!.ingest.textForCommands, '1: 2\n2: 1', '首份原文不被改写');
-  // 窗口内两份重复投递（不同 messageId，模拟客户端连点/平台重推）：在
-  // enqueue 入口按「逐字同文 + messageId 不同」判定为副本直接终止——
-  // 降级进防抖缓冲没用：单条 items 的 flush 照样 dispatch 成独立轮次，
-  // 助手仍会多回一条雷同消息（评审三轮实测）
-  assert.equal(await keepAlive(fire(scenario, mkAnswer())), true, '副本被接管（丢弃）');
-  await sleep(30);
-  assert.equal(await keepAlive(fire(scenario, mkAnswer())), true, '第二份副本同样被接管');
-  await keepAlive(sleep(W + 60));
-  assert.equal(
-    scenario.captured.length,
-    1,
-    `重复投递必须终止、不得成轮（issue 验收：USER 记录 1 条、助手只回 1 条），实际 ${scenario.captured.length}`,
-  );
-});
-
-await test('防抖关闭配置同样收敛：副本在 debounceMs 判定之前被丢弃（issue #99 评审三轮·发现 3）', async () => {
-  const { claimPendingMultiQuestionIfKeyedAnswer, isDuplicateClaimedKeyedAnswerDelivery } =
-    await import('../src/features/question-helpers.ts');
-  // 防抖关闭时 shouldDebounce 不执行，认领走 dispatch 起点兜底——这里
-  // 直接调认领函数模拟「首份作答已受理并登记」（dispatch 兜底的行为由
-  // ask-user-multi-sequential.test.ts 覆盖）
-  registerPendingMultiQuestion(
-    'test-account',
-    'q-claim-off-test',
-    'c2c',
-    'USER_QM_OFF',
-    [
-      { header: '题1', question: '选一个', options: ['a', 'b'] },
-      { header: '题2', question: '选一个', options: ['a', 'b'] },
-    ],
-    1000,
-  );
-  assert.equal(
-    claimPendingMultiQuestionIfKeyedAnswer('q-claim-off-test', '1: 1\n2: 2', 'msg-original'),
-    true,
-    '前置：认领成功并登记',
-  );
-  assert.equal(
-    isDuplicateClaimedKeyedAnswerDelivery('test-account', 'USER_QM_OFF', 'msg-dup', '1: 1\n2: 2'),
-    true,
-    '逐字同文 + 不同 messageId = 副本',
-  );
-  const scenario = setupScenario({ debounceMs: 0 });
-  const dup = makeC2CMsgAndCtx({
-    senderId: 'USER_QM_OFF',
-    content: '1: 1\n2: 2',
-    assembledBody: { webBody: '1: 1\n2: 2', agentBody: '1: 1\n2: 2', rawBody: '1: 1\n2: 2' },
-  });
-  assert.equal(await keepAlive(fire(scenario, dup)), true, '防抖关闭下副本仍被接管（丢弃）');
-  assert.equal(scenario.captured.length, 0, '丢弃即不成轮');
-  // 对照：非副本消息不受影响——防抖关闭时正常返回 false（调用方直发）
-  const fresh = makeC2CMsgAndCtx({
-    senderId: 'USER_QM_OFF',
-    content: '换个问题',
-    assembledBody: { webBody: '换个问题', agentBody: '换个问题', rawBody: '换个问题' },
-  });
-  assert.equal(await keepAlive(fire(scenario, fresh)), false, '非副本照旧走直发路径');
-  assert.equal(scenario.captured.length, 0, '直发不经防抖器，captured 不增长（middleware 负责 dispatch）');
+  assert.ok(!src2.includes('claimedKeyedAnswers'), '副本登记表必须退役');
 });
 
 await test('文本作答拦截：pending 武装时单行文本被消费为当前题答案（不转发框架）', async () => {
@@ -576,6 +559,8 @@ await test('文本作答拦截：pending 武装时单行文本被消费为当前
       { header: '题2', question: '选一个', options: ['a', 'b'] },
     ],
     1000,
+    undefined,
+    'sequential',
   );
   // sequential-text-answer 改造：窗口内文本即作答意图——被插件消费为
   // 当前题答案（不再旁路直发框架，框架对 partial 答案只会拒收重问）
@@ -604,15 +589,18 @@ await test('文本作答拦截：多行非 keyed 消费 + 引导；斜杠命令�
       { header: '题2', question: '选一个', options: ['a', 'b'] },
     ],
     1000,
+    undefined,
+    'sequential',
   );
-  // 多行但不可认领（典型：粘贴手打模板没填完）→ 消费 + 引导，不成轮
+  // 整单形态但某题留空（典型：粘贴手打模板没填完）→ 消费 + 回执要求补全，
+  // 不成轮（空值行会被框架的行序兜底捡成字面量「N:」静默收下）
   const partial = makeC2CMsgAndCtx({
     senderId: 'USER_QM_ML',
     content: '1: 1\n2: ',
     assembledBody: { webBody: '1: 1\n2: ', agentBody: '1: 1\n2: ', rawBody: '1: 1\n2: ' },
   });
-  assert.equal(await keepAlive(fire(scenario, partial)), true, '多行非 keyed 被接管（引导）');
-  assert.equal(scenario.captured.length, 0, '半成品不得到框架（只会被拒收重问）');
+  assert.equal(await keepAlive(fire(scenario, partial)), true, '留空的整单被接管（回执要求补全）');
+  assert.equal(scenario.captured.length, 0, '半成品不得到框架（空值会被静默收下）');
   // 斜杠命令 = 逃生通道：pending 武装期间照旧旁路直发
   const slash = makeC2CMsgAndCtx({
     senderId: 'USER_QM_ML',
@@ -915,17 +903,18 @@ await test('跨窗口第二文件在 turn A 运行中即 dispatch——插嘴语
   await keepAlive(Promise.all([p1, p2]));
 });
 
-await test('挂起 ask_user 的 keyed 答案在 turn 运行中立即 dispatch（死锁类钉子）', async () => {
-  // 与 /stop 同一旁路机制、但后果更重：ask_user turn 运行中（等待答案），
-  // keyed 答案若被同 key 链排队即死锁——答案等 turn 完成、turn 等答案。
-  // 修复前（admission === completion）正是如此；放行在 lane 决策处后
-  // 答案立即 dispatch、turn 得以续跑。
+await test('挂起 ask_user 的整单答案在 turn 运行中立即被消费并提交（死锁类钉子）', async () => {
+  installFakeSubmitter();
+  // 与 /stop 同一诉求、但后果更重：ask_user turn 运行中（等待答案），
+  // 答案若被同 key 链排队即死锁——答案等 turn 完成、turn 等答案。
+  // 现在的机制：多题文本在**入队口**（debouncer 之外）被拦截层消费并
+  // 直提整单答案 ⇒ 既不排队、也不成轮（成轮 = 白烧一轮 + 重问循环）。
   let releaseTurn!: () => void;
   const turnHanging = new Promise<void>((r) => {
     releaseTurn = r;
   });
   const scenario = setupScenario({ debounceMs: 120 }, turnHanging);
-  const senderId = 'USER_ASK'; // 独立 sender 防 keyed pending 跨测试污染
+  const senderId = 'USER_ASK'; // 独立 sender 防 pending 跨测试污染
   const ask = makeC2CMsgAndCtx({
     senderId,
     content: '帮我选一下',
@@ -942,23 +931,29 @@ await test('挂起 ask_user 的 keyed 答案在 turn 运行中立即 dispatch（
     senderId,
     [{ header: '题1', question: '选一个', options: ['a', 'b'] }],
     200, // 短 TTL：cleanup timer 不悬挂测试进程
+    undefined,
+    'sequential',
+    'qqbot:test:USER_ASK',
   );
   const answer = makeC2CMsgAndCtx({
     senderId,
     content: '1: a',
     assembledBody: { webBody: '1: a', agentBody: '1: a', rawBody: '1: a' },
   });
-  const p2 = fire(scenario, answer); // keyed 旁路：不得被运行中的 turn 排队
+  const p2 = fire(scenario, answer); // 入队口消费：不得被运行中的 turn 排队
   await keepAlive(sleep(80));
   assert.equal(
     scenario.captured.length,
-    2,
-    'keyed answer must dispatch while the awaiting turn still runs (deadlock before fix)',
+    1,
+    '整单答案不得成轮（拦截层消费 + 插件直提；成轮 = 白烧一轮 + 重问循环）',
   );
-  assert.equal(scenario.captured[1]!.ingest.textForCommands, '1: a');
+  assert.equal(submitCalls.length, 1, '答案必须被直提一次');
+  assert.equal(submitCalls[0]!.text, '1: a', '直提的整单文本');
+  assert.equal(submitCalls[0]!.sessionKey, 'qqbot:test:USER_ASK', '直提必须带框架 sessionKey');
 
   releaseTurn();
   await keepAlive(Promise.all([p1, p2]));
+  uninstallFakeSubmitter();
 });
 
 await test('到达顺序排序：入队顺序颠倒时按平台 timestamp 排序，载体 = 最新到达', async () => {

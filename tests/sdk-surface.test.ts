@@ -390,6 +390,8 @@ await test('扫描器覆盖非常规引用形态（动态 import / 字面量 req
     'openclaw/plugin-sdk/setup-tools',
     // 本次盯版的回归锁
     'openclaw/plugin-sdk/channel-outbound',
+    // await import(...)：多题 ask_user 整单直提（claimPendingAgentQuestionAnswer）
+    'openclaw/plugin-sdk/agent-harness-runtime',
   ];
   const missing = mustCover.filter((s) => !subpaths.has(s));
   assert.deepEqual(

@@ -32,7 +32,7 @@ import {
   buildMultiQuestionConfirmKeyboard,
   type MultiQuestionAnswer,
 } from '../features/question-helpers.js';
-import { sendSequentialQuestionCard } from '../features/question-flow.js';
+import { sendSequentialQuestionCard, submitSequentialAnswers } from '../features/question-flow.js';
 import { recordKnownUser } from '../features/proactive.js';
 import { cacheMsgId } from '../features/msgid-cache.js';
 import { enqueueC2CInboundMessage } from '../features/inbound-debounce.js';
@@ -448,15 +448,19 @@ async function handleQuestion(
 
 // ── 多问题按钮处理（ask_user questions >= 2）──
 // 框架对多问题记录没有单题按钮解析通道（resolveOption 仅支持单问题），
-// 这里按题缓冲点选，集齐后发一张"确认卡"：指令按钮（action.type=2,
-// enter=true）携带完整答案文本 "1: 3\n2: 1"，由 QQ 客户端以真实用户
-// 消息发出，走框架原生的 keyed 文本认领通道 resolve 挂起的 ask_user。
+// 这里按题缓冲点选。两条路径：
+// - **c2c 顺序发题**（`mode === 'sequential'`）：逐题发卡、逐题收集，
+//   全部答齐后由插件**组合整单文本**并调框架官方认领通道
+//   （`claimPendingAgentQuestionAnswer`）整单 resolve——用户聊天里不再
+//   出现 `1: 3\n2: 1` 的机器气泡；
+// - **群聊 legacy**：所有题卡一次发出 + 集齐后确认卡（指令按钮代发真实
+//   用户消息，走框架原生的 keyed 文本认领通道）。
+//
 // 注意两条红线（都出过生产事故，勿回退）：
-// 1. 不要程序化提交：官方 openclaw 无多问题提交 API，改官方代码要背
-//    fork 维护成本；
+// 1. 不要程序化提交**答案内容**（插件没有 `operator.questions` scope，
+//    且**禁止代替用户作答**）——插件只搬运用户真实作答的组合文本；
 // 2. 不要合成入站消息"假装用户回答"：合成消息会被框架当成 steering
 //    注入挂起的 run，claim 不触发，模型等答案直到超时（2026-08-24 事故）。
-// 只有真实用户消息（客户端代发或手打）能被框架认领。
 
 async function handleMultiQuestionTap(
   parsed: ParsedMultiQuestionAction,
@@ -476,8 +480,9 @@ async function handleMultiQuestionTap(
 
   // ── c2c 顺序发题（PR2）──
   // 点选只**收集**答案（框架要求整单齐备，见 issue #93 根因 2），下一张
-  // 题卡由这里续发；最后一题的卡本身就是提交点（选项是指令按钮，data
-  // 带全量答案文本，客户端代发真实用户消息）。
+  // 题卡由这里续发；**全部答齐时直接提交**——插件组合整单文本并调框架
+  // 官方认领通道（`claimPendingAgentQuestionAnswer`），不再依赖客户端
+  // 代发机器文本。
   const state = getPendingMultiQuestionState(parsed.questionId);
   if (state?.mode === 'sequential') {
     const result = recordSequentialAnswer(
@@ -485,6 +490,12 @@ async function handleMultiQuestionTap(
       parsed.questionIndex,
       parsed.optionIndex,
     );
+    if (result.status === 'terminal') {
+      // pending 已终态（已提交 / 已被框架结束）⇒ **静默忽略**。
+      // 平台会重推 interaction 事件，回执会造成对用户刷屏。
+      log.info(`[question] sequential tap ignored (terminal) id=${parsed.questionId}`);
+      return;
+    }
     if (result.status !== 'ok') {
       log.info(`[question] sequential tap ignored id=${parsed.questionId} status=${result.status}`);
       await sendMultiQuestionFeedback(event, account, '该问题已提交或已过期', log, parsed.questionId);
@@ -492,6 +503,18 @@ async function handleMultiQuestionTap(
     }
     const nextState = getPendingMultiQuestionState(parsed.questionId);
     if (!nextState) return;
+
+    // 全部答齐 ⇒ 组合 + 提交（不再发卡）
+    if (nextState.answers.size === nextState.questions.length) {
+      await submitSequentialAnswers({
+        state: nextState,
+        account,
+        to: formatQuestionTarget(scope, peerId),
+        log,
+      });
+      return;
+    }
+
     const cardResult = await sendSequentialQuestionCard({
       state: nextState,
       index: result.nextIndex,

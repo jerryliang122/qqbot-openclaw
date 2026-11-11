@@ -492,11 +492,13 @@ export function buildSequentialCollectKeyboard(
 /**
  * 顺序发题：**最后一题**键盘（提交态）。
  *
- * - 选项：**指令型**（type=2, enter=true），data = 全量 keyed 答案文本
- *   （前 N-1 题已答 + 本题该选项），点击即由客户端以**真实用户身份**
- *   发出 ⇒ 框架认领并 resolve（**不程序化提交、不合成入站消息**）；
- *   `click_limit: 1` 防连点——每次点击都会把整份答案文本再发一遍，
- *   重复投递在 pending 置终态前各自成为独立轮次（issue #99）；
+ * - 选项：**回调型**（type=1），data = `qqbot:qm:<qid>:<题号>:<选项号>`
+ *   ——与 `buildSequentialCollectKeyboard` **逐字同构**（`parseMultiQuestionButtonData`
+ *   不用改）。点选只记答案；**全部答齐时由插件组合整单文本并调框架官方
+ *   认领通道提交**（`question-submit.ts`）——不再让客户端代发机器文本，
+ *   用户聊天里不再出现 `1: 1\n2: …` 的气泡。**不设 click_limit**：
+ *   没有客户端代发 ⇒ 不存在连点重复投递；同一题的重复点选由 pending 的
+ *   「后一次为准」语义吸收；
  * - 预填按钮：**恒存在**（2026-11-11 起不再以 isOther 为条件）——
  *   指令型（type=2, enter=false），data = `"<前 N-1 题>\n<N>: "`
  *   ——客户端把「全部已答 + 本题空位」填进输入框但**不自动发送**，用户可在
@@ -509,6 +511,7 @@ export function buildSequentialCollectKeyboard(
  *   空串表示前序还没答（此时退化为只带本题号）。
  */
 export function buildSequentialSubmitKeyboard(
+  questionId: string,
   questionIndex: number,
   question: QuestionDef,
   answerPrefix: string,
@@ -524,16 +527,13 @@ export function buildSequentialSubmitKeyboard(
       id: `${idPrefix}${optionIndex}`,
       render_data: {
         label: `${prefix} ${buildButtonLabel(optionLine, reserve)}`,
-        visited_label: '已提交',
+        visited_label: '已选',
         style: 1 as const,
       },
       action: {
-        type: 2 as const,
-        data: line(String(optionIndex + 1)),
-        enter: true,
+        type: 1 as const,
+        data: `qqbot:qm:${questionId}:${questionIndex}:${optionIndex}`,
         permission: { type: KEYBOARD_PERMISSION_EVERYONE },
-        click_limit: 1,
-        unsupport_tips: '当前客户端版本不支持，请直接回复下方给出的答案文本',
       },
       group_id: `question-${questionIndex}`,
     };
@@ -572,7 +572,14 @@ export function buildSequentialSubmitKeyboard(
   return { content: { rows: layoutButtonRows(buttons) } };
 }
 
-// ============ 文本作答确认卡（sequential-text-answer 改造）============
+// ============ 文本作答确认卡（已退役）============
+//
+// 原「末题用文本作答 ⇒ 发一张带「✅ 提交」按钮的确认卡」机制**已退役**：
+// 答案齐备后由 `question-flow.ts` 的 `submitSequentialAnswers` 直接调框架
+// 官方认领通道（`claimPendingAgentQuestionAnswer`）整单 resolve——
+// 确认卡 + 「✅ 提交」按钮（指令型代发机器文本）整条链路都不再需要。
+// 群聊 legacy 路径的确认卡（`buildMultiQuestionConfirmKeyboard`，
+// 在 `question-helpers.ts`）**不受影响**。
 
 /** 「已记录」展示用截断上限（字形簇数）——自由文本答案可能很长 */
 export const ANSWER_DISPLAY_MAX_GRAPHEMES = 20;
@@ -594,67 +601,6 @@ export function truncateGraphemeSafe(text: string, maxGraphemes: number): string
     count++;
   }
   return end < source.length ? `${source.slice(0, end)}…` : source.slice(0, end);
-}
-
-/** 文本作答确认卡的正文参数 */
-export interface SequentialTextConfirmOpts {
-  /** 总题数 */
-  total: number;
-  /** 全部题的已记录展示（人话版，逐题） */
-  collected: ReadonlyArray<{ header: string; display: string }>;
-  /** 全量 keyed 答案文本（按钮 data / 手打模板同源） */
-  keyedText: string;
-  /** 是否带「✅ 提交」按钮（keyed 超长退化时为 false，只剩手打模板） */
-  buttonAttached: boolean;
-}
-
-/**
- * 文本作答收齐后的**轻量确认卡**正文：已记录 + 全量 keyed 模板 + 提交指引。
- *
- * 只在「末题用文本作答」时出现（末题点选项按钮 = 一键直提，无此卡）。
- */
-export function formatSequentialTextConfirmCard(opts: SequentialTextConfirmOpts): string {
-  const lines: string[] = [];
-  lines.push(`**已收齐 ${opts.total} 题答案**`);
-  lines.push('', '**已记录**');
-  for (const item of opts.collected) {
-    lines.push(`**·** ${item.header}：${item.display}`);
-  }
-  lines.push(
-    '',
-    opts.buttonAttached ? '点「✅ 提交」发送；或直接回复下面这段提交' : '请直接回复下面这段提交',
-    '',
-    '```',
-    opts.keyedText,
-    '```',
-  );
-  return lines.join('\n');
-}
-
-/**
- * 文本作答确认卡键盘：单「✅ 提交」按钮（指令型 type=2 + enter=true +
- * click_limit:1），data = 全量 keyed 答案文本——点击由客户端以真实用户
- * 身份代发，框架 keyed 认领（与末题选项按钮同款提交机制，程序化提交/
- * 合成入站是红线，2026-08-24 事故）。
- */
-export function buildSequentialTextConfirmKeyboard(keyedText: string): InlineKeyboard {
-  const button: KeyboardButton = {
-    id: 'text_confirm_submit',
-    render_data: {
-      label: '✅ 提交',
-      visited_label: '已提交',
-      style: 1 as const,
-    },
-    action: {
-      type: 2 as const,
-      data: keyedText,
-      enter: true,
-      permission: { type: KEYBOARD_PERMISSION_EVERYONE },
-      click_limit: 1,
-      unsupport_tips: '当前客户端版本不支持，请直接回复上方给出的答案文本',
-    },
-  };
-  return { content: { rows: [{ buttons: [button] }] } };
 }
 
 // ============ 单题文本反解 ============

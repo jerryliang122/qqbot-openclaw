@@ -1,27 +1,27 @@
 /**
- * 多题顺序发题守卫（PR2 / issue #93）
+ * 多题顺序发题守卫（PR2 / issue #93 + 整单直提改造）
  *
  * 背景：改造前多题 ask_user 一次性把 2–3 张卡全发出去，答完还要再点一次
  * 「✅ 提交」（确认卡）。PR2 改成 **c2c 单聊顺序发题**：
  *
  * 1. 只发第 1 题，答完第 k 题才发第 k+1 题；
  * 2. 每题卡**只有选项按钮**（没有「✏️ 改一改」）——想改前面的题，在最后
- *    一题点「✍️ 其他」，输入框会带上全部已答内容，用户改哪行都行；
- * 3. 最后一题卡**本身就是提交点**——选项按钮是指令型（type=2,
- *    enter=true），data 写全量 keyed 答案文本（`"1: 3\n2: 1"`），
- *    客户端以真实用户身份发出 ⇒ 框架 keyed 认领 ⇒ 确认卡整个消失。
+ *    一题点预填按钮（「✍️ 其他」/「📝 填写模板」），输入框会带上全部已答
+ *    内容，用户改哪行都行；
+ * 3. **全部答齐即提交**：插件把已收集的答案组合成整单文本（`"1: 3\n2: 1"`），
+ *    交给框架官方认领通道（`claimPendingAgentQuestionAnswer`）整单 resolve
+ *    ——用户聊天里不再出现机器代发的 keyed 文本气泡，也没有确认卡。
  *
  * 本文件锁定：
  * - 首卡形态（收集态：type=1 选项，**无**「✍️ 其他」、**无**「✏️ 改一改」）
  * - 逐题推进（点选 → 续发下一题）
- * - 最后一题提交态（type=2 + enter=true，data 带全量答案）
- * - 自由作答指引（正文写清「想自己写答案怎么办」，且只在按钮真实存在时提）
- * - 「✏️ 改一改」已移除（按钮、回调前缀、状态机全部不存在）
- * - keyed 答案文本口径（数字=选项序号 1-based / 非数字=自由文本）
- * - 红线守卫：**不程序化提交**、**不合成入站消息**
- * - issue #99：多题 pending 在同会话下一条入站时置终态（keyed 旁路失效、
- *   恢复防抖合并）；提交型按钮（末题选项 / 群确认卡「✅ 提交」）带
- *   click_limit=1 防连点重复发送
+ * - 末题按钮形态（type=1 回调、**无** enter / **无** click_limit；预填按钮
+ *   仍是指令型 type=2 + enter=false）
+ * - **插件直提**：末题点选 / 末题打字 ⇒ 提交器收到组合好的整单文本 + 框架
+ *   sessionKey；pending 终态；不再发卡
+ * - 拦截层三形态（整单覆盖 / 形态错误 / 本题答案）
+ * - 失败矩阵（提交失败保持武装可重试；already-resolved 终态）
+ * - 红线守卫：**不代替用户作答**、**不合成入站消息**、提交只走官方认领通道
  *
  * 运行方式: npx tsx tests/ask-user-multi-sequential.test.ts
  */
@@ -60,18 +60,57 @@ const { handleInteraction } = await import('../src/gateway/event-handlers.ts');
 const {
   buildSequentialAnswerPrefix,
   buildSequentialFullAnswerDraft,
+  buildSequentialFullAnswerText,
   buildMultiQuestionConfirmKeyboard,
   registerPendingMultiQuestion,
   getPendingMultiQuestionState,
   recordSequentialAnswer,
   recordSequentialTextAnswer,
   findPendingMultiQuestionByConversation,
-  claimPendingMultiQuestionIfKeyedAnswer,
-  isDuplicateClaimedKeyedAnswerDelivery,
+  matchFullKeyedAnswer,
+  containsKeyedAnswerLine,
+  applyFullKeyedAnswer,
+  markMultiQuestionResolved,
 } = await import('../src/features/question-helpers.ts');
-const { renderSequentialTextConfirmCard, sendSequentialTextConfirmCard } =
-  await import('../src/features/question-flow.ts');
+const { submitSequentialAnswers } = await import('../src/features/question-flow.ts');
+const { setMultiQuestionSubmitterForTest } = await import('../src/features/question-submit.ts');
 const { enqueueC2CInboundMessage } = await import('../src/features/inbound-debounce.ts');
+
+// ── 假提交器（插件直提整单答案的替身）──
+
+interface SubmitCall {
+  sessionKey?: string;
+  text: string;
+}
+
+let submitCalls: SubmitCall[] = [];
+let submitBehavior: 'ok' | 'resolved' | 'throw' | 'invalid' = 'ok';
+
+/**
+ * 注入假提交器：记录 `{sessionKey, text}`，按 `submitBehavior` 决定返回值。
+ * 真实实现走框架的 `claimPendingAgentQuestionAnswer`（同进程、需真框架
+ * 状态），测试里用替身断言「插件交出去的整单文本 + sessionKey」。
+ */
+function installFakeSubmitter(): void {
+  submitCalls = [];
+  setMultiQuestionSubmitterForTest(async (params) => {
+    submitCalls.push({ sessionKey: params.sessionKey, text: params.text });
+    if (submitBehavior === 'throw') throw new Error('simulated submit failure');
+    if (submitBehavior === 'invalid') {
+      const err: any = new Error('invalid answer');
+      err.code = 'INVALID_REQUEST';
+      err.details = { reason: 'QUESTION_INVALID_ANSWER' };
+      throw err;
+    }
+    if (submitBehavior === 'resolved') return false;
+    return true;
+  });
+}
+
+function uninstallFakeSubmitter(): void {
+  setMultiQuestionSubmitterForTest(null);
+  submitCalls = [];
+}
 
 // ── 测试基础设施（沿用 ask-user-passive-anchor.test.ts 的形态）──
 
@@ -340,8 +379,9 @@ await test('续卡发送失败 ⇒ 回执含全量手打草稿，不静默（评
   }
 });
 
-await test('点第 2 题选项 → 续发最后一题卡（提交态：type=2 + enter=true + 全量答案）', async () => {
+await test('点第 2 题选项 → 续发最后一题卡（提交态：type=1 回调 + 预填按钮）', async () => {
   clearQuotaCache();
+  installFakeSubmitter();
   const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEQ_4' });
   try {
     await tap(`qqbot:qm:${QID}:0:1`, account, runtime); // 第 1 题选第 2 项（a2）
@@ -355,12 +395,15 @@ await test('点第 2 题选项 → 续发最后一题卡（提交态：type=2 + 
 
     const options = buttonsOf(last).filter((b: any) => b.render_data.label.startsWith('①') || b.render_data.label.startsWith('②'));
     assert.equal(options.length, 2, '最后一题应有 2 个选项按钮');
-    assert.equal(options[0].action.type, 2, '最后一题选项必须是指令型（type=2）');
-    assert.equal(options[0].action.enter, true, '最后一题选项必须 enter=true（点击即代发）');
-    // 第 1 题选了第 2 项（序号 2）、第 2 题选了第 1 项（序号 1）、本题选第 1 项（序号 1）
-    assert.equal(options[0].action.data, '1: 2\n2: 1\n3: 1', 'data 必须是全量 keyed 答案文本');
-    assert.equal(options[1].action.data, '1: 2\n2: 1\n3: 2', '每个选项按钮携带自己那一档的全量答案');
+    // 末题选项 = 回调型（与中间题同构）：点选只记答案，提交由插件直提
+    assert.equal(options[0].action.type, 1, '最后一题选项必须是回调型（type=1）');
+    assert.equal(options[0].action.data, `qqbot:qm:${QID}:2:0`, '选项回调 data 沿用旧契约');
+    assert.equal(options[1].action.data, `qqbot:qm:${QID}:2:1`);
+    assert.equal(options[0].action.enter, undefined, '回调型按钮不得带 enter');
+    assert.equal(options[0].action.click_limit, undefined, '回调型按钮不设 click_limit（没有客户端代发）');
+    assert.equal(submitCalls.length, 0, '还没答完不得提交');
   } finally {
+    uninstallFakeSubmitter();
     unregisterGateway(ACCOUNT_ID, gw);
   }
 });
@@ -514,23 +557,25 @@ await test('源码里不再有「qqbot:qme:」回调前缀与回改状态机', (
   }
 });
 
-await test('点更早那张卡的选项 ⇒ 记答案并重发当前卡（刷新全量提交文本）', async () => {
+await test('点更早那张卡的选项 ⇒ 记答案并重发当前卡（刷新已记录展示）', async () => {
   clearQuotaCache();
+  installFakeSubmitter();
   const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SEQ_9' });
   try {
     await tap(`qqbot:qm:${QID}:0:0`, account, runtime); // 第 1 题选第 1 项
     await tap(`qqbot:qm:${QID}:1:0`, account, runtime); // 第 2 题选第 1 项
     const lastBefore = sent[2]!;
-    const optionBefore = buttonsOf(lastBefore).find((b: any) => b.render_data.label.startsWith('①'));
-    assert.equal(optionBefore.action.data, '1: 1\n2: 1\n3: 1');
+    assert.ok(String(lastBefore.text).includes('第 3/3 题'));
     // 回头改第 1 题（点更早那张卡上的选项）
     await tap(`qqbot:qm:${QID}:0:1`, account, runtime); // 改成第 2 项
-    assert.equal(sent.length, 4, '应重发当前卡刷新全量文本');
+    assert.equal(sent.length, 4, '应重发当前卡刷新已记录展示');
     const lastAfter = sent[3]!;
     assert.ok(String(lastAfter.text).includes('第 3/3 题'), '重发的应是当前（最后一题）卡');
-    const optionAfter = buttonsOf(lastAfter).find((b: any) => b.render_data.label.startsWith('①'));
-    assert.equal(optionAfter.action.data, '1: 2\n2: 1\n3: 1', '提交文本必须用改后的答案');
+    const st = getPendingMultiQuestionState(QID)!;
+    assert.deepEqual(st.answers.get(0), { optionIndex: 1 }, '第 1 题的答案必须被改后的覆盖');
+    assert.equal(submitCalls.length, 0, '还有一题没答，不得提交');
   } finally {
+    uninstallFakeSubmitter();
     unregisterGateway(ACCOUNT_ID, gw);
   }
 });
@@ -597,26 +642,60 @@ await test('getPendingMultiQuestionState：暴露 cursor，且没有回改态字
 
 group('6. 红线守卫');
 
-await test('不得程序化提交多题答案（无 resolveAnswers 一类 API）', () => {
+await test('不得调用不存在的多题提交 API（resolveAnswers 一类）', () => {
   for (const file of [
     'src/features/question-flow.ts',
     'src/features/question-helpers.ts',
     'src/gateway/event-handlers.ts',
     'src/dispatch/dispatch.ts',
+    'src/features/question-submit.ts',
   ]) {
     const src = readFileSync(new URL(`../${file}`, import.meta.url), 'utf-8');
     assert.ok(
       !/resolveAnswers\s*\(/.test(src),
-      `${file} 不得程序化提交多题答案（2026-08-24 事故红线）`,
+      `${file} 不得调用不存在的多题提交 API（2026-08-24 事故红线）`,
     );
   }
 });
 
-await test('顺序发题不得合成入站消息（不得出现 inbound 注入入口）', () => {
-  const src = readFileSync(new URL('../src/features/question-flow.ts', import.meta.url), 'utf-8');
+await test('提交必须走框架官方认领通道（不得自造提交入口）', () => {
+  const submitSrc = readFileSync(new URL('../src/features/question-submit.ts', import.meta.url), 'utf-8');
   assert.ok(
-    !/enqueueC2CInboundMessage|enqueueGroupInboundMessage/.test(src),
-    'question-flow 不得合成入站消息（会被 steer 进 ask_user-suspended run）',
+    submitSrc.includes("import('openclaw/plugin-sdk/agent-harness-runtime')"),
+    '提交器必须走 openclaw/plugin-sdk/agent-harness-runtime 的 claimPendingAgentQuestionAnswer',
+  );
+  assert.ok(
+    submitSrc.includes('claimPendingAgentQuestionAnswer'),
+    '提交器必须调用 claimPendingAgentQuestionAnswer',
+  );
+  const flowSrc = readFileSync(new URL('../src/features/question-flow.ts', import.meta.url), 'utf-8');
+  assert.ok(
+    flowSrc.includes('submitMultiQuestionAnswer('),
+    '提交动作必须收敛到 submitMultiQuestionAnswer（单一入口）',
+  );
+});
+
+await test('顺序发题不得合成入站消息（不得出现 inbound 注入入口）', () => {
+  for (const file of ['src/features/question-flow.ts', 'src/features/question-submit.ts']) {
+    const src = readFileSync(new URL(`../${file}`, import.meta.url), 'utf-8');
+    assert.ok(
+      !/enqueueC2CInboundMessage|enqueueGroupInboundMessage/.test(src),
+      `${file} 不得合成入站消息（会被 steer 进 ask_user-suspended run）`,
+    );
+  }
+});
+
+await test('提交文本只能来自用户真实作答（答案值不得由插件编造）', () => {
+  // 提交器的入参只有「sessionKey + text」，text 必须由已记录的答案组合而成
+  const flowSrc = readFileSync(new URL('../src/features/question-flow.ts', import.meta.url), 'utf-8');
+  assert.ok(
+    flowSrc.includes('buildSequentialFullAnswerText(state.answers, total)'),
+    '提交文本必须由已记录的答案组合（buildSequentialFullAnswerText）',
+  );
+  const helpersSrc = readFileSync(new URL('../src/features/question-helpers.ts', import.meta.url), 'utf-8');
+  assert.ok(
+    helpersSrc.includes('export function buildSequentialFullAnswerText('),
+    '组合函数必须存在（每题必有值，缺答即 null）',
   );
 });
 
@@ -628,12 +707,13 @@ await test('顺序发题只在 c2c 生效（群聊仍旧路径）', () => {
   );
 });
 
-// ── 7. issue #99 守卫：多题 pending 认领 ──
+// ── 7. 插件直提整单答案（c2c 顺序发题）──
 
-group('7. issue #99：多题 pending 认领（keyed 旁路在作答受理后失效）');
+group('7. 插件直提：整单答案交给框架官方认领通道');
 
-await test('发卡那一轮不自清：ask_user 投递后 pending 仍武装（keyed 旁路可用）', async () => {
+await test('发卡那一轮不自清：ask_user 投递后 pending 仍武装', async () => {
   clearQuotaCache();
+  installFakeSubmitter();
   const { sent, gw } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_I99_1' });
   try {
     assert.equal(sent.length, 1, '顺序发题首轮只发 1 张卡');
@@ -641,224 +721,356 @@ await test('发卡那一轮不自清：ask_user 投递后 pending 仍武装（ke
     assert.ok(pending, '发卡那一轮的 dispatch 起点不得清掉自己（deliver 回调里）刚登记的 pending');
     assert.equal(pending!.questionId, QID);
   } finally {
+    uninstallFakeSubmitter();
     unregisterGateway(ACCOUNT_ID, gw);
   }
 });
 
-await test('keyed 形态作答入站 dispatch ⇒ pending 置终态（旁路失效，恢复防抖合并）', async () => {
+await test('pending 登记必须带上 route.sessionKey（提交器的查表键）', async () => {
   clearQuotaCache();
-  const { gw } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_I99_2' });
+  installFakeSubmitter();
+  const { gw } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SK_1' });
   try {
-    assert.ok(
-      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
-      '前置：作答到达前 keyed 旁路处于武装态',
-    );
-    // 末题指令按钮代发的 keyed 答案 = 该会话的下一条入站消息（3 题 × 2 选项）
-    await dispatchPlainInbound({ messageId: 'M_I99_2_ANSWER', content: '1: 1\n2: 1\n3: 1' });
+    const state = getPendingMultiQuestionState(QID);
+    assert.ok(state, 'pending 可读');
+    // 假 runtime 的 resolveAgentRoute 返回 `qqbot:test:<peerId>`
+    assert.equal(state!.sessionKey, 'qqbot:test:USER_123', 'pending 必须带上框架 sessionKey');
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('末题点选 ⇒ 提交器收到组合好的整单文本 + sessionKey；pending 终态；不再发卡', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SUB_1' });
+  try {
+    await tap(`qqbot:qm:${QID}:0:0`, account, runtime); // 第 1 题选第 1 项
+    await tap(`qqbot:qm:${QID}:1:0`, account, runtime); // 第 2 题选第 1 项
+    assert.equal(sent.length, 3, '应发到最后一题卡');
+    const before = sent.length;
+    await tap(`qqbot:qm:${QID}:2:0`, account, runtime); // 第 3 题选第 1 项 ⇒ 全部答齐
+    assert.equal(submitCalls.length, 1, '全部答齐必须提交一次');
+    assert.equal(submitCalls[0]!.text, '1: 1\n2: 1\n3: 1', '提交器收到组合好的整单文本');
+    assert.equal(submitCalls[0]!.sessionKey, 'qqbot:test:USER_123', '提交必须带框架 sessionKey');
+    assert.equal(sent.length, before, '提交后不得再发卡（末题不再有确认卡）');
     assert.equal(
       findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
       undefined,
-      '可认领作答受理后 keyed 旁路必须失效——否则 25 分钟 TTL 内同一份作答的'
-        + '重复投递（连点 / 平台重推）各自独立成轮次（issue #99 实录 3 条 USER）',
+      '提交成功后 pending 终态（旁路失效，恢复防抖合并）',
     );
     assert.equal(
       recordSequentialAnswer(QID, 0, 0).status,
       'terminal',
-      '终态后继续点旧卡应按 terminal 处理，不再重复发卡',
+      '终态后继续点旧卡应按 terminal 处理',
     );
   } finally {
+    uninstallFakeSubmitter();
     unregisterGateway(ACCOUNT_ID, gw);
   }
 });
 
-await test('无关文本不认领（dispatch 起点兜底路径）：pending 不置终态，卡片流程继续存活', async () => {
+await test('末题打字 ⇒ 拦截层消费（不进框架）⇒ 提交器收到整单文本 ⇒ pending 终态', async () => {
   clearQuotaCache();
-  const { gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_I99_2B' });
+  installFakeSubmitter();
+  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SUB_2' });
   try {
-    // 用户没点按钮，先发了条无关文本（"这题什么意思？"）——**dispatch 起点
-    // 兜底路径**（防抖关闭配置的直发路径）：该处只认领「可认领 keyed 答案」，
-    // 无关文本不认领 ⇒ pending 保持武装（无条件置终态会打死顺序发题状态机，
-    // 两侧状态分裂）。
-    // ⚠ 多题问答进行中的**真实路径是入队口**（enqueueC2CInboundMessage）——
-    // 那里无关文本被本地暂存为当前题答案、不转发框架，见下一条用例。
-    await dispatchPlainInbound({ messageId: 'M_I99_2B_ASK', content: '这题什么意思？' });
-    assert.ok(
-      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
-      '无关文本不得认领 pending（评审一轮：无条件置终态会打死顺序发题状态机）',
-    );
-    // 卡片流程确实还活着：点选仍被受理（不是 terminal）
-    const r = recordSequentialAnswer(QID, 0, 0);
-    assert.equal(r.status, 'ok', '无关文本后点选第 1 题仍应正常推进');
-    void account; void runtime;
-  } finally {
-    unregisterGateway(ACCOUNT_ID, gw);
-  }
-});
-
-await test('无关文本在入队口被本地暂存为当前题答案（真实路径）：不进框架 + pending 不终态 + cursor 前进 + 续发下一题卡', async () => {
-  clearQuotaCache();
-  const { sent, gw, account } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_I99_2C' });
-  try {
-    assert.equal(sent.length, 1, '前置：首轮只发第 1 题卡');
-    assert.equal(getPendingMultiQuestionState(QID)!.cursor, 0, '前置：cursor 指向第 1 题');
-
-    // 多题问答进行中：平台无法区分「用户手打的普通消息」与「指令按钮代发的
-    // 回调内容」——两者都是普通入站消息。故入队口把窗口内文本**本地暂存**
-    // 为当前题答案、**不转发框架**（转发只会撞上 validateAnswers 的 partial
-    // 拒收 + 重问循环：白烧一轮、两侧状态分裂）。分类只认形态（keyed vs
-    // 非 keyed），不靠内容语义猜——用户在答题中途问别的也会被当答案。
-    const { msg, ctx } = makeMsgAndCtx({ messageId: 'M_I99_2C_ASK', targetId: 'USER_123' });
-    msg.content = '这题什么意思？';
-    ctx.message = { content: '这题什么意思？' };
+    await tap(`qqbot:qm:${QID}:0:0`, account, runtime); // 第 1 题选第 1 项
+    await tap(`qqbot:qm:${QID}:1:0`, account, runtime); // 第 2 题选第 1 项
+    const { msg, ctx } = makeMsgAndCtx({ messageId: 'M_SUB_2_ANSWER', targetId: 'USER_123' });
+    msg.content = '第三个答案';
+    ctx.message = { content: '第三个答案' };
     let inboundRuns = 0;
     const runtime2 = makeFakeRuntime({
       onInboundRun: async () => { inboundRuns++; return { dispatched: true }; },
       dispatchReply: async () => ({ queuedFinal: true, counts: { final: 0 } }),
     });
     const handled = await enqueueC2CInboundMessage(ctx, msg, account, runtime2, fakeLog);
-    assert.equal(handled, true, '文本已被接管（暂存为当前题答案）');
-    assert.equal(inboundRuns, 0, '不得转发框架成轮（中间态文本转发 = 白烧一轮 + 重问循环）');
-
-    // pending 不置终态：终态化只由最终 keyed 认领负责（全部答齐后）
-    assert.ok(
-      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
-      'pending 保持武装（终态化只由最终 keyed 认领负责）',
-    );
-    const after = getPendingMultiQuestionState(QID)!;
-    assert.equal(after.cursor, 1, 'cursor 前进到第 2 题');
+    assert.equal(handled, true, '末题文本作答必须被接管');
+    assert.equal(inboundRuns, 0, '不得转发框架成轮');
+    assert.equal(submitCalls.length, 1, '末题答完必须提交');
+    assert.equal(submitCalls[0]!.text, '1: 1\n2: 1\n3: 第三个答案', '整单文本 = 前序答案 + 本题自由文本');
     assert.equal(
-      (after.answers.get(0) as { text?: string }).text,
-      '这题什么意思？',
-      '无关文本被记为当前题（第 1 题）的答案',
-    );
-    assert.equal(sent.length, 2, '续发第 2 题卡');
-    assert.ok(
-      String(sent[1]!.text).includes('第 2/3 题'),
-      `续发的应是第 2 题卡，实际：${String(sent[1]!.text).slice(0, 40)}`,
+      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      undefined,
+      '提交成功后 pending 终态',
     );
   } finally {
+    uninstallFakeSubmitter();
     unregisterGateway(ACCOUNT_ID, gw);
   }
 });
 
-await test('claimPendingMultiQuestionIfKeyedAnswer：认领形态逐项判定（与框架 validateAnswers 对齐）', () => {
+await test('「改一改」预填后发送整单形态文本 ⇒ 前面题的答案被替换 ⇒ 提交器收到替换后的文本', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SUB_3' });
+  try {
+    await tap(`qqbot:qm:${QID}:0:0`, account, runtime); // 第 1 题选第 1 项
+    await tap(`qqbot:qm:${QID}:1:0`, account, runtime); // 第 2 题选第 1 项
+    assert.equal(sent.length, 3);
+    const before = sent.length;
+    // 用户改完「1: 1\n2: 1\n3: 」后整段发出（改了第 1 题、补了第 3 题）
+    const { msg, ctx } = makeMsgAndCtx({ messageId: 'M_SUB_3_EDIT', targetId: 'USER_123' });
+    msg.content = '1: 2\n2: 1\n3: 我改的答案';
+    ctx.message = { content: msg.content };
+    let inboundRuns = 0;
+    const runtime2 = makeFakeRuntime({
+      onInboundRun: async () => { inboundRuns++; return { dispatched: true }; },
+      dispatchReply: async () => ({ queuedFinal: true, counts: { final: 0 } }),
+    });
+    const handled = await enqueueC2CInboundMessage(ctx, msg, account, runtime2, fakeLog);
+    assert.equal(handled, true, '整单形态文本必须被接管');
+    assert.equal(inboundRuns, 0, '整单形态文本不得转发框架');
+    assert.equal(submitCalls.length, 1, '整单覆盖后全部答齐 ⇒ 提交');
+    assert.equal(submitCalls[0]!.text, '1: 2\n2: 1\n3: 我改的答案', '提交文本必须是改后的答案');
+    assert.equal(sent.length, before, '提交后不得再发卡');
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('「改一改」文本形态错误（含题号行但行数不对）⇒ 回执格式错误、不提交、pending 保持武装', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  const { sent, gw, account } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SUB_4' });
+  try {
+    const { msg, ctx } = makeMsgAndCtx({ messageId: 'M_SUB_4_BAD', targetId: 'USER_123' });
+    msg.content = '1: 1\n2: 2';
+    ctx.message = { content: msg.content };
+    let inboundRuns = 0;
+    const runtime2 = makeFakeRuntime({
+      onInboundRun: async () => { inboundRuns++; return { dispatched: true }; },
+      dispatchReply: async () => ({ queuedFinal: true, counts: { final: 0 } }),
+    });
+    const handled = await enqueueC2CInboundMessage(ctx, msg, account, runtime2, fakeLog);
+    assert.equal(handled, true, '形态错误的文本仍被接管（不得转发框架）');
+    assert.equal(inboundRuns, 0, '不得转发框架');
+    assert.equal(submitCalls.length, 0, '形态错误不得提交');
+    const receipt = sent.find((s) => String(s.text).includes('格式不对'));
+    assert.ok(receipt, '必须回执格式错误');
+    assert.ok(
+      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      'pending 保持武装（用户可改完重发）',
+    );
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('「改一改」文本某题留空 ⇒ 回执要求补全、不提交（不得把「N: 」当答案）', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  const { sent, gw, account } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SUB_5' });
+  try {
+    const { msg, ctx } = makeMsgAndCtx({ messageId: 'M_SUB_5_EMPTY', targetId: 'USER_123' });
+    msg.content = '1: 1\n2: 2\n3: ';
+    ctx.message = { content: msg.content };
+    const runtime2 = makeFakeRuntime({
+      onInboundRun: async () => ({ dispatched: true }),
+      dispatchReply: async () => ({ queuedFinal: true, counts: { final: 0 } }),
+    });
+    await enqueueC2CInboundMessage(ctx, msg, account, runtime2, fakeLog);
+    assert.equal(submitCalls.length, 0, '空值行不得提交（框架会把它当字面量「3:」静默收下）');
+    const receipt = sent.find((s) => String(s.text).includes('每道题都要填上答案'));
+    assert.ok(receipt, '必须回执要求补全');
+    assert.ok(
+      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      'pending 保持武装',
+    );
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('提交失败（提交器抛错）⇒ 回执「提交失败」+ pending 保持武装（可重试）', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  submitBehavior = 'throw';
+  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SUB_6' });
+  try {
+    await tap(`qqbot:qm:${QID}:0:0`, account, runtime);
+    await tap(`qqbot:qm:${QID}:1:0`, account, runtime);
+    await tap(`qqbot:qm:${QID}:2:0`, account, runtime);
+    assert.equal(submitCalls.length, 1, '前置：确实提交过一次');
+    const receipt = sent.find((s) => String(s.text).includes('提交失败'));
+    assert.ok(receipt, '必须回执提交失败');
+    assert.ok(
+      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      'pending 保持武装（用户可再次点选重试）',
+    );
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('提交器返回 already-resolved ⇒ 回执「已过期」+ pending 终态 + 不再发卡', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  submitBehavior = 'resolved';
+  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_SUB_7' });
+  try {
+    await tap(`qqbot:qm:${QID}:0:0`, account, runtime);
+    await tap(`qqbot:qm:${QID}:1:0`, account, runtime);
+    const before = sent.length;
+    await tap(`qqbot:qm:${QID}:2:0`, account, runtime);
+    const receipt = sent.find((s) => String(s.text).includes('已提交或已过期'));
+    assert.ok(receipt, '必须回执已提交或已过期');
+    assert.equal(sent.length, before + 1, '只多一条回执，不再发卡');
+    assert.equal(
+      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      undefined,
+      'pending 终态（问卷已结束）',
+    );
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('无关文本不认领：pending 不终态，卡片流程继续存活', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  const { gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_I99_2B' });
+  try {
+    // 用户没点按钮，先发了条无关文本（"这题什么意思？"）——**入队口**路径：
+    // 文本被本地暂存为当前题答案、不转发框架。
+    const { msg, ctx } = makeMsgAndCtx({ messageId: 'M_I99_2B_ASK', targetId: 'USER_123' });
+    msg.content = '这题什么意思？';
+    ctx.message = { content: msg.content };
+    const runtime2 = makeFakeRuntime({
+      onInboundRun: async () => ({ dispatched: true }),
+      dispatchReply: async () => ({ queuedFinal: true, counts: { final: 0 } }),
+    });
+    await enqueueC2CInboundMessage(ctx, msg, account, runtime2, fakeLog);
+    assert.ok(
+      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      '无关文本不得认领 pending（无条件置终态会打死顺序发题状态机）',
+    );
+    assert.equal(submitCalls.length, 0, '无关文本不得触发提交');
+    // 卡片流程确实还活着：点选仍被受理（不是 terminal）
+    const r = recordSequentialAnswer(QID, 0, 0);
+    assert.equal(r.status, 'ok', '无关文本后点选第 1 题仍应正常推进');
+    void runtime;
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('matchFullKeyedAnswer：整单形态逐项判定（行数 + 题号顺序，值可空）', () => {
   const questions = [
     { header: '甲', question: 'q1', options: ['a1', 'a2'] },
     { header: '乙', question: 'q2', options: ['b1', 'b2', 'b3'] },
     { header: '丙', question: 'q3', options: ['c1'], isOther: true },
   ];
   const cases: Array<{ text: string; expected: boolean; why: string }> = [
-    { text: '1: 1\n2: 3\n3: 自由文本', expected: true, why: '标准形态：序号在选项范围内，isOther 题收自由文本' },
+    { text: '1: 1\n2: 3\n3: 自由文本', expected: true, why: '标准形态' },
     { text: '1: 2\n2: 1\n3: 1', expected: true, why: 'isOther 题用序号作答也合法' },
-    { text: '1: 1\n2: 1', expected: false, why: '行数不足 3（框架 validateAnswers 逐题非空，认领必失败）' },
+    { text: '1: 1\n2: 1', expected: false, why: '行数不足 3' },
     { text: '1: 1\n2: 1\n3: 1\n4: 1', expected: false, why: '行数超题数' },
-    { text: '1: 3\n2: 1\n3: 1', expected: true, why: '越界数字也认领——框架 isOther 强制下按自由文本收（2026-11-11 修正：此前「越界必拒收」判断源于未归一化 question 的对拍，生产路径不存在该分支）' },
-    { text: '1: 1,2\n2: 3\n3: 1', expected: true, why: '多值同上——单选按自由文本、multiSelect 按拆段，框架都收' },
-    { text: '1: 1 2\n2: 3\n3: 1', expected: true, why: '空格多值同上' },
-    { text: '1: 1;2\n2: 3\n3: 1', expected: true, why: '分号多值同上' },
-    { text: '1: 1\n2: 1\n3: ', expected: false, why: '末题空值（validateAnswers 拒空）' },
-    { text: '1：1\n2：1\n3：1', expected: false, why: '全角冒号框架解析不了（卡片也从不产出）' },
-    { text: '第一题: 1\n第二题: 1\n第三题: 1', expected: false, why: '非题号 key——卡片不指引这种写法，宁可漏认领' },
-    { text: '1: 1\n2: 2\n3: 随便写', expected: true, why: '自由文本落在 isOther 题上' },
-    { text: '1: 自由文本\n2: 1\n3: 1', expected: true, why: '自由文本在非 isOther 声明题上也认领——框架 ask_user 归一化对每题强制 isOther: true（dist 实锤），!isOther 门永不触发' },
+    { text: '1: 3\n2: 1\n3: 1', expected: true, why: '越界数字按自由文本收' },
+    { text: '1: 1\n2: 1\n3: ', expected: true, why: '末题空值——形态合法（值为空由提交前自检拦下）' },
+    { text: '1：1\n2：1\n3：1', expected: false, why: '全角冒号不算 keyed 行' },
+    { text: '第一题: 1\n第二题: 1\n第三题: 1', expected: false, why: '非题号 key' },
+    { text: '2: 1\n1: 1\n3: 1', expected: false, why: '题号乱序' },
   ];
   for (const { text, expected, why } of cases) {
-    // 每例独立 pending（认领会置终态，复用会串味）
-    const qid = `ask_shape_${Math.random().toString(36).slice(2, 10)}`;
-    registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_SHAPE', questions, 200);
-    assert.equal(
-      claimPendingMultiQuestionIfKeyedAnswer(qid, text),
-      expected,
-      `「${text.replace(/\n/g, '⏎')} }」应${expected ? '认领' : '不认领'}：${why}`,
-    );
+    const got = matchFullKeyedAnswer(questions, text);
+    assert.equal(got !== null, expected, `「${text.replace(/\n/g, '⏎')}」应${expected ? '命中整单' : '不命中'}：${why}`);
   }
-  // 非 isOther 声明题的自由文本：**认领**（sequential-text-answer 改造）
-  // ——框架 ask_user 归一化对每题强制 isOther: true，认领侧 !isOther 门
-  // 永不触发；插件反解出的 per-question isOther 只作展示参考
-  {
-    const qid = `ask_shape_${Math.random().toString(36).slice(2, 10)}`;
-    registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_SHAPE', [
-      { header: '甲', question: 'q1', options: ['a1'] },
-    ], 200);
-    assert.equal(
-      claimPendingMultiQuestionIfKeyedAnswer(qid, '1: 我自己写的'),
-      true,
-      '自由文本对任何题都可认领（框架强制 isOther）',
-    );
-  }
-  // 已终态 / 未知 id ⇒ 不认领
-  {
-    const qid = `ask_shape_${Math.random().toString(36).slice(2, 10)}`;
-    registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_SHAPE', [
-      { header: '甲', question: 'q1', options: ['a1'] },
-    ], 200);
-    assert.equal(claimPendingMultiQuestionIfKeyedAnswer(qid, '1: 1'), true, '前置：首次认领成功');
-    assert.equal(claimPendingMultiQuestionIfKeyedAnswer(qid, '1: 1'), false, '已终态不再认领');
-  }
+  // 命中时返回「题号 → 值」映射（值 trim，空值是空串）
+  const full = matchFullKeyedAnswer(questions, '1: 1\n2: 3\n3: ')!;
+  assert.equal(full.get(0), '1');
+  assert.equal(full.get(1), '3');
+  assert.equal(full.get(2), '', '空值是空串（不是 undefined）');
 });
 
-await test('认领登记表：逐字副本判定 + 认领自身豁免 + 新一单清表（issue #99 评审三轮）', () => {
-  const qid = `ask_reg_${Math.random().toString(36).slice(2, 10)}`;
-  const twoQuestions = [
+await test('containsKeyedAnswerLine：形态错误判定（含题号行但非整单）', () => {
+  assert.equal(containsKeyedAnswerLine('1: 1\n2: 2'), true);
+  assert.equal(containsKeyedAnswerLine('这题什么意思？'), false);
+  assert.equal(containsKeyedAnswerLine('随便写点东西'), false);
+  assert.equal(containsKeyedAnswerLine('1：全角冒号'), false);
+});
+
+await test('applyFullKeyedAnswer：空值视为未答 ⇒ 拒绝覆盖（保持武装）', () => {
+  const qid = `ask_apply_${Math.random().toString(36).slice(2, 10)}`;
+  registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_APPLY', [
     { header: '甲', question: 'q1', options: ['a1', 'a2'] },
     { header: '乙', question: 'q2', options: ['b1', 'b2'] },
-  ];
-  registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_REG', twoQuestions, 1000);
-  assert.equal(claimPendingMultiQuestionIfKeyedAnswer(qid, '1: 1\n2: 2', 'MSG_CLAIM'), true, '前置：认领成功并登记');
+  ], 5000);
   assert.equal(
-    isDuplicateClaimedKeyedAnswerDelivery(ACCOUNT_ID, 'USER_REG', 'MSG_CLAIM', '1: 1\n2: 2'),
+    applyFullKeyedAnswer(qid, new Map([[0, '1'], [1, '  ']])),
     false,
-    '认领那次自身的投递不算重复（豁免）',
+    '任一题空值 ⇒ 拒绝覆盖',
   );
   assert.equal(
-    isDuplicateClaimedKeyedAnswerDelivery(ACCOUNT_ID, 'USER_REG', 'MSG_DUP', '1: 1\n2: 2'),
+    applyFullKeyedAnswer(qid, new Map([[0, '1'], [1, '随便写']])),
     true,
-    '逐字同文 + 不同 messageId = 副本（客户端代发多次 / 平台重推）',
+    '全部有值 ⇒ 覆盖成功',
   );
-  assert.equal(
-    isDuplicateClaimedKeyedAnswerDelivery(ACCOUNT_ID, 'USER_REG', 'MSG_DUP', '1: 2\n2: 2'),
-    false,
-    '文本不同 = 新消息（可能是用户改答案重发），不得丢',
-  );
-  assert.equal(
-    isDuplicateClaimedKeyedAnswerDelivery(ACCOUNT_ID, 'OTHER_USER', 'MSG_DUP', '1: 1\n2: 2'),
-    false,
-    '会话隔离：他用户同文本不受影响',
-  );
-  // 新一单开始 ⇒ 清表：上一单答案的重复窗口关闭，第二轮同文本作答不被误吞
-  registerPendingMultiQuestion(ACCOUNT_ID, `ask_reg2_${Math.random().toString(36).slice(2, 10)}`, 'c2c', 'USER_REG', twoQuestions, 1000);
-  assert.equal(
-    isDuplicateClaimedKeyedAnswerDelivery(ACCOUNT_ID, 'USER_REG', 'MSG_DUP', '1: 1\n2: 2'),
-    false,
-    '新一单登记后，上一单答案的登记应被清除',
-  );
+  const st = getPendingMultiQuestionState(qid)!;
+  assert.deepEqual(st.answers.get(0), { optionIndex: 0 }, '数字落在选项范围内 ⇒ 选项序号');
+  assert.deepEqual(st.answers.get(1), { text: '随便写' }, '非数字 ⇒ 自由文本');
 });
 
-await test('源码守卫：认领必须在放行判定处接线（不得只定义不调用 / 只在 dispatch 起点）', () => {
+await test('buildSequentialFullAnswerText：每题必有值，缺答即 null', () => {
+  const answers = new Map<number, MultiQuestionAnswer>([
+    [0, { optionIndex: 1 }],
+    [1, { text: '我自己写的' }],
+  ]);
+  assert.equal(buildSequentialFullAnswerText(answers, 3), null, '缺题 ⇒ null（不得提交缺题的整单）');
+  const full = new Map<number, MultiQuestionAnswer>([
+    [0, { optionIndex: 1 }],
+    [1, { text: '我自己写的' }],
+    [2, { optionIndex: 0 }],
+  ]);
+  assert.equal(buildSequentialFullAnswerText(full, 3), '1: 2\n2: 我自己写的\n3: 1');
+});
+
+await test('源码守卫：旧认领机制已退役（客户端不再代发 keyed 副本）', () => {
+  for (const file of [
+    'src/features/question-helpers.ts',
+    'src/features/inbound-debounce.ts',
+    'src/dispatch/dispatch.ts',
+  ]) {
+    const src = readFileSync(new URL(`../${file}`, import.meta.url), 'utf-8');
+    assert.ok(
+      !src.includes('claimPendingMultiQuestionIfKeyedAnswer'),
+      `${file} 不得再调用已退役的认领入口`,
+    );
+    assert.ok(
+      !src.includes('isDuplicateClaimedKeyedAnswerDelivery'),
+      `${file} 不得再有 keyed 副本丢弃窗口（客户端不再代发 ⇒ 无副本；重复提交由框架 claim 幂等覆盖）`,
+    );
+  }
+});
+
+await test('源码守卫：拦截层三形态齐备 + 放行判定只做旁路不认领', () => {
   const debounceSrc = readFileSync(new URL('../src/features/inbound-debounce.ts', import.meta.url), 'utf-8');
-  assert.ok(
-    debounceSrc.includes('claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId, text, String(item.msg.messageId'),
-    '旁路放行判定处必须同步认领并登记 messageId——旁路资格是入队时逐条判定的，等到 dispatch'
-      + '起点再做，同批到达的重复投递已各自拿到资格（评审二轮）',
-  );
-  assert.ok(
-    debounceSrc.includes('isDuplicateClaimedKeyedAnswerDelivery('),
-    'enqueue 入口必须接重复投递丢弃——副本降级进防抖缓冲、单条 flush 仍是独立轮次'
-      + '（评审三轮·发现 1），且防抖关闭配置无缓冲可合并（发现 3）',
-  );
+  assert.ok(debounceSrc.includes('matchFullKeyedAnswer('), '拦截层必须识别整单形态');
+  assert.ok(debounceSrc.includes('containsKeyedAnswerLine('), '拦截层必须识别形态错误');
+  assert.ok(debounceSrc.includes('recordSequentialTextAnswer('), '拦截层必须识别本题答案形态');
+  assert.ok(debounceSrc.includes('submitSequentialAnswers('), '拦截层的末题分支必须提交');
   const dispatchSrc = readFileSync(new URL('../src/dispatch/dispatch.ts', import.meta.url), 'utf-8');
   assert.ok(
-    dispatchSrc.includes('claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId'),
-    'dispatch 起点必须保留兜底认领（防抖关闭配置不经 shouldDebounce）',
+    !/claimPendingMultiQuestionIfKeyedAnswer/.test(dispatchSrc),
+    'dispatch 起点不得再有兜底认领（提交由插件完成）',
   );
 });
 
-// ── 8. issue #99 守卫：提交型按钮防连点 ──
+// ── 8. 按钮形态（末题不再有客户端代发）──
 
-group('8. issue #99：提交型按钮 click_limit（防连点重复发送）');
+group('8. 按钮形态：末题选项 = 回调型，预填按钮仍是指令型');
 
-await test('末题提交键盘：选项按钮 click_limit=1；「✍️ 其他」不设（可重复预填）', async () => {
+await test('末题选项：type=1 回调、无 enter、无 click_limit；预填按钮 type=2 + enter=false', async () => {
   clearQuotaCache();
+  installFakeSubmitter();
   const payload = {
     text: TWO_QUESTION_WITH_OTHER_TEXT,
     channelData: { askUser: { questionId: QID } },
@@ -870,27 +1082,30 @@ await test('末题提交键盘：选项按钮 click_limit=1；「✍️ 其他�
     const options = buttonsOf(last).filter((b: any) => b.render_data.label.startsWith('①') || b.render_data.label.startsWith('②'));
     assert.equal(options.length, 2, '末题应有 2 个选项按钮');
     for (const b of options) {
-      assert.equal(b.action.type, 2, '末题选项是指令型（type=2）');
+      assert.equal(b.action.type, 1, '末题选项是回调型（type=1）——不再让客户端代发机器文本');
+      assert.equal(b.action.enter, undefined, '回调型按钮不得带 enter');
       assert.equal(
         b.action.click_limit,
-        1,
-        '末题选项必须 click_limit=1——每次点击都让客户端代发整份答案文本，'
-          + '连点 = 同一份作答重复投递（issue #99 缺陷 2）',
+        undefined,
+        '回调型按钮不设 click_limit——没有客户端代发 ⇒ 不存在连点重复投递',
       );
     }
     const other = buttonByLabel(last, '✍️ 其他');
     assert.ok(other, '末题带「✍️ 其他」');
+    assert.equal(other.action.type, 2, '预填按钮是指令型（type=2）');
+    assert.equal(other.action.enter, false, '预填按钮 enter=false（只填输入框）');
     assert.equal(
       other.action.click_limit,
       undefined,
       '「✍️ 其他」只预填不发消息，不设 click_limit（清空输入框后再要一次模板是真实用法）',
     );
   } finally {
+    uninstallFakeSubmitter();
     unregisterGateway(ACCOUNT_ID, gw);
   }
 });
 
-await test('群确认卡键盘：「✅ 提交」click_limit=1；「✏️ 改一改」不设', () => {
+await test('群确认卡键盘：「✅ 提交」click_limit=1；「✏️ 改一改」不设（legacy 路径不动）', () => {
   const kb: any = buildMultiQuestionConfirmKeyboard('1: 3\n2: 1');
   const buttons = (kb.content.rows ?? []).flatMap((r: any) => r.buttons ?? []);
   const submit = buttons.find((b: any) => b.id === 'confirm_submit');
@@ -900,18 +1115,18 @@ await test('群确认卡键盘：「✅ 提交」click_limit=1；「✏️ 改�
   assert.equal(edit.action.click_limit, undefined, '「✏️ 改一改」只预填输入框，可重复点');
 });
 
-// ── 9. 文本作答（sequential-text-answer 改造）──
+// ── 9. 文本作答 ──
 
-group('9. 文本作答：直接回复一句话即作答，末题收齐发确认卡');
+group('9. 文本作答：直接回复一句话即作答，末题收齐即提交');
 
-await test('recordSequentialTextAnswer：压平单行 / 推进 cursor / 末题收齐返回 complete-text', () => {
+await test('recordSequentialTextAnswer：压平单行 / 推进 cursor / 末题收齐返回 complete', () => {
   const qid = `ask_text_${Math.random().toString(36).slice(2, 10)}`;
   registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_TEXT', [
     { header: '甲', question: 'q1', options: ['a1', 'a2'] },
     { header: '乙', question: 'q2', options: ['b1', 'b2'] },
     { header: '丙', question: 'q3', options: ['c1', 'c2'] },
   ], 5000);
-  // 多行压平为单行（keyed 终稿一行一题，多行自由文本会打乱行数）
+  // 多行压平为单行（整单文本一行一题，多行自由文本会打乱行数）
   let r = recordSequentialTextAnswer(qid, '就选\na 吧  ');
   assert.equal(r.status, 'ok');
   assert.equal((r as any).nextIndex, 1, '答完第 1 题 cursor 前进');
@@ -924,74 +1139,65 @@ await test('recordSequentialTextAnswer：压平单行 / 推进 cursor / 末题�
   assert.equal((r as any).nextIndex, 2, '答完第 2 题推进到第 3 题');
   // 末题文本作答 → 全部收齐
   r = recordSequentialTextAnswer(qid, '3');
-  assert.equal(r.status, 'complete-text', '末题收齐返回 complete-text');
+  assert.equal(r.status, 'complete', '末题收齐返回 complete');
   const st = getPendingMultiQuestionState(qid);
-  assert.ok(st, 'pending 保持武装（终态化由最终 keyed 认领负责，不在此处置）');
+  assert.ok(st, 'pending 保持武装（终态由提交结果决定）');
   assert.equal((st!.answers.get(2) as { text: string }).text, '3');
-  // 空文本 / 未登记 / 已终态
+  // 空文本 / 未登记
   assert.equal(recordSequentialTextAnswer(qid, '   ').status, 'unknown', '空文本不作答');
   assert.equal(recordSequentialTextAnswer(`ask_x_${'9'.repeat(30)}`, 'x').status, 'unknown', '未登记 unknown');
-  claimPendingMultiQuestionIfKeyedAnswer(qid, '1: 就选 a 吧\n2: 第二个答案\n3: 3', 'msg-x');
-  assert.equal(recordSequentialTextAnswer(qid, '再来一句').status, 'terminal', '已认领置终态后按 terminal 处理');
+  // 终态后按 terminal 处理
+  markMultiQuestionResolved(qid);
+  assert.equal(recordSequentialTextAnswer(qid, '再来一句').status, 'terminal', '已终态后按 terminal 处理');
 });
 
-await test('文本作答收齐 → 确认卡：单「✅ 提交」按钮携带全量 keyed（含自由文本行）', async () => {
+await test('末题文本作答 ⇒ 直接提交：不再出现「✅ 提交」确认卡', async () => {
   clearQuotaCache();
-  const qid = `ask_confirm_${Math.random().toString(36).slice(2, 10)}`;
-  registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_CONFIRM', [
-    { header: '甲', question: 'q1', options: ['a1', 'a2'] },
-    { header: '乙', question: 'q2', options: ['b1', 'b2'] },
-    { header: '丙', question: 'q3', options: ['c1', 'c2'] },
-  ], 5000, 'M_TEXT_CONFIRM_ANCHOR');
-  recordSequentialTextAnswer(qid, '就选 a 吧');
-  recordSequentialTextAnswer(qid, '第二个答案');
-  recordSequentialTextAnswer(qid, '3');
-
-  const { sent, gw } = installFakeGateway();
+  installFakeSubmitter();
+  const { sent, gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_TEXT_1' });
   try {
-    const r = await sendSequentialTextConfirmCard({
-      state: getPendingMultiQuestionState(qid)!,
-      account: makeAccount(),
-      to: 'qqbot:c2c:USER_CONFIRM',
+    await tap(`qqbot:qm:${QID}:0:0`, account, runtime); // 第 1 题
+    await tap(`qqbot:qm:${QID}:1:0`, account, runtime); // 第 2 题
+    const { msg, ctx } = makeMsgAndCtx({ messageId: 'M_TEXT_1_ANSWER', targetId: 'USER_123' });
+    msg.content = '第三个答案';
+    ctx.message = { content: msg.content };
+    const runtime2 = makeFakeRuntime({
+      onInboundRun: async () => ({ dispatched: true }),
+      dispatchReply: async () => ({ queuedFinal: true, counts: { final: 0 } }),
     });
-    assert.ok(!r.error, `确认卡发送应成功：${r.error}`);
-    assert.equal(sent.length, 1, '只发一张确认卡');
-    const card = sent[0]!;
-    assert.equal(card.opts?.msgId, 'M_TEXT_CONFIRM_ANCHOR', '确认卡复用 pending 锚点走被动回复');
-    const body = String(card.text);
-    assert.ok(body.includes('已收齐 3 题答案'), '正文标题写明收齐');
-    assert.ok(body.includes('就选 a 吧'), '已记录展示自由文本答案');
-    assert.ok(body.includes('第二个答案'), '已记录逐题展示');
-    assert.ok(body.includes('点「✅ 提交」发送'), '指引写明提交入口');
-    const buttons = buttonsOf(card);
-    assert.equal(buttons.length, 1, '确认卡只有一个按钮');
-    const btn = buttons[0];
-    assert.equal(btn.action.type, 2, '指令型（type=2）');
-    assert.equal(btn.action.enter, true, 'enter=true（点击即代发）');
-    assert.equal(btn.action.click_limit, 1, 'click_limit=1 防连点');
-    assert.equal(
-      btn.action.data,
-      '1: 就选 a 吧\n2: 第二个答案\n3: 3',
-      'data = 全量 keyed（自由文本行 + 选项序号行），与手打模板同源',
-    );
+    await enqueueC2CInboundMessage(ctx, msg, account, runtime2, fakeLog);
+    assert.equal(submitCalls.length, 1, '末题答完必须提交');
+    const labels = sent.flatMap((s) => buttonsOf(s).map((b: any) => String(b.render_data?.label ?? '')));
+    assert.ok(!labels.some((l) => l.includes('提交')), `不应再有「✅ 提交」按钮，实际：${labels.join('、')}`);
+    assert.ok(!sent.some((s) => String(s.text).includes('答案确认')), '不应再有确认卡正文');
   } finally {
+    uninstallFakeSubmitter();
     unregisterGateway(ACCOUNT_ID, gw);
   }
 });
 
-await test('确认卡超长护栏：keyed > 300 字符时不挂按钮、只剩手打模板', () => {
-  const qid = `ask_long_${Math.random().toString(36).slice(2, 10)}`;
-  registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_LONG', [
-    { header: '甲', question: 'q1', options: ['a1'] },
-    { header: '乙', question: 'q2', options: ['b1'] },
-  ], 5000);
-  recordSequentialTextAnswer(qid, '长'.repeat(320));
-  recordSequentialTextAnswer(qid, '1');
-  const card = renderSequentialTextConfirmCard(getPendingMultiQuestionState(qid)!);
-  assert.ok(card, '渲染成功');
-  assert.equal(card!.keyboard, undefined, '超长时不得挂按钮（平台 data 限额未知的风险护栏）');
-  assert.ok(card!.text.includes('请直接回复下面这段提交'), '只剩手打模板指引');
-  assert.ok(card!.text.includes('长'.repeat(320)), '模板保留完整答案（可复制）');
+await test('submitSequentialAnswers：缺答不提交（incomplete）', async () => {
+  clearQuotaCache();
+  installFakeSubmitter();
+  const qid = `ask_inc_${Math.random().toString(36).slice(2, 10)}`;
+  registerPendingMultiQuestion(ACCOUNT_ID, qid, 'c2c', 'USER_INC', [
+    { header: '甲', question: 'q1', options: ['a1', 'a2'] },
+    { header: '乙', question: 'q2', options: ['b1', 'b2'] },
+  ], 5000, 'M_INC_ANCHOR', 'sequential', 'qqbot:test:USER_INC');
+  const { gw } = installFakeGateway();
+  try {
+    const state = getPendingMultiQuestionState(qid)!;
+    const outcome = await submitSequentialAnswers({
+      state,
+      account: makeAccount(),
+      to: 'qqbot:c2c:USER_INC',
+    });
+    assert.equal(outcome.status, 'incomplete', '缺答 ⇒ 不提交');
+    assert.equal(submitCalls.length, 0, '缺答不得调提交器');
+  } finally {
+    uninstallFakeSubmitter();
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
 });
 
 // ── 结果 ──

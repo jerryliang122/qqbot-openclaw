@@ -36,9 +36,7 @@ import {
   registerPendingMultiQuestion,
   registerPendingSingleQuestion,
   markSingleQuestionResolved,
-  claimPendingMultiQuestionIfKeyedAnswer,
   findPendingSingleQuestionByConversation,
-  findPendingMultiQuestionByConversation,
   getPendingMultiQuestionState,
 } from '../features/question-helpers.js';
 import {
@@ -382,33 +380,6 @@ export async function dispatchToOpenClaw(
     );
     if (pendingSingle) {
       markSingleQuestionResolved(pendingSingle.questionId);
-    }
-  }
-
-  // 多问题 pending 认领（issue #99，评审一轮改形态匹配）：文本是**可认领
-  // 的 keyed 答案**（N 行题号 1..N、值合法，见 question-helpers 的
-  // isClaimableKeyedAnswerText）才置终态。无条件置终态会把顺序发题状态机
-  // 打死——用户答题中途发无关文本（"这题什么意思？"）时，框架侧只会拒收
-  // 该文本并重问、问卷继续存活，插件侧却已 terminal、不再续发题卡，两侧
-  // 状态分裂。漏认领的方向无害：pending 保持武装（与改造前一致），卡片
-  // 仍可点。
-  //
-  // 主认领点在防抖的放行判定处（inbound-debounce.ts，入队时同步做——
-  // 旁路资格是逐条判定的，等 dispatch 起点再做，同批到达的重复投递已各
-  // 自拿到资格）；本行是**防抖关闭配置**（debounceMs=0 → 直发不经
-  // shouldDebounce）与直发路径的兜底。同样不会误清「发卡那一轮」：多题
-  // pending 在该轮 deliver 回调里登记（registerPendingMultiQuestion 晚于
-  // 本行）。
-  if (envelope.chatScope !== 'group') {
-    const pendingMulti = findPendingMultiQuestionByConversation(
-      account.accountId,
-      'c2c',
-      peerId,
-    );
-    if (pendingMulti && claimPendingMultiQuestionIfKeyedAnswer(pendingMulti.questionId, String(msg.content ?? ''), envelope.messageId)) {
-      dlog?.debug(
-        `[question] multi pending claimed on inbound (restore debounce merge) questionId=${pendingMulti.questionId}`,
-      );
     }
   }
 
@@ -818,6 +789,10 @@ export async function dispatchToOpenClaw(
             undefined,
             envelope.messageId,
             sequential ? 'sequential' : 'legacy',
+            // 框架挂起 ask_user 记录的 sessionKey——插件直提整单答案的查表键
+            // （`claimPendingAgentQuestionAnswer`）。框架的 turn 就跑在这个
+            // session（`routeSessionKey: route.sessionKey`）⇒ 命中同一条记录。
+            route.sessionKey,
           );
           // ask_user 前先固化已累积的流式内容（同单问题分支，评审意见 6）
           // static 的 flush 走 tolerant：前置文本发送失败不终态化 controller

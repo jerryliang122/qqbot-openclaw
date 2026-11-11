@@ -7,19 +7,20 @@
  *
  * 1. 只发第 1 题；用户答完第 k 题才发第 k+1 题；
  * 2. 每一题卡只有选项按钮（**没有**「✏️ 改一改」）；想改前面的题，在
- *    最后一题点「✍️ 其他」——输入框会带上全部已答内容，用户改哪行都行；
- * 3. **最后一题卡本身就是提交点**——选项按钮是指令型（type=2,
- *    enter=true），data 里写全量 keyed 答案文本（`"1: 3\n2: 1"`），
- *    客户端以真实用户身份发出 ⇒ 框架 keyed 认领通道 resolve 掉挂起的
- *    ask_user ⇒ **确认卡整个消失**。
+ *    最后一题点预填按钮（「✍️ 其他」/「📝 填写模板」）——输入框会带上全部
+ *    已答内容，用户改哪行都行；
+ * 3. **最后一题答完即提交**：选项按钮是回调型（type=1），点选只记答案；
+ *    全部答齐后由本模块的 `submitSequentialAnswers` **组合整单文本**并交给
+ *    框架官方认领通道（`claimPendingAgentQuestionAnswer`）整单 resolve。
  *
  * 交互流程的出站在两处发生（首卡在 dispatch、续卡在 interaction 回调），
  * 但「这张卡长什么样」只有一份口径 ⇒ 渲染 + 发送收敛到本模块。
  *
  * ── 红线 ───────────────────────────────────────────────────────────
- * - **不程序化提交**（插件没有 `operator.questions` scope）；
- * - **不合成入站消息**（会被框架 steer 进 ask_user-suspended run，
- *   2026-08-24 事故）——提交只靠客户端代发的**真实**用户消息；
+ * - **禁止代替用户作答**：提交出去的每个答案值都来自用户的真实输入
+ *   （按钮点选 / 手打文本），插件只负责**搬运**与**组合**；
+ * - **禁止合成入站消息**（会被框架 steer 进 ask_user-suspended run，
+ *   2026-08-24 事故）——提交只走框架的官方认领通道，不构造入站事件；
  * - 被动锚点只认 pending 登记时记下的**本轮 inbound msg_id**（禁止从
  *   msgid-cache 池化选取）。
  *
@@ -36,17 +37,19 @@ import {
   ANSWER_DISPLAY_MAX_GRAPHEMES,
   buildSequentialCollectKeyboard,
   buildSequentialSubmitKeyboard,
-  buildSequentialTextConfirmKeyboard,
   formatSequentialQuestionCard,
-  formatSequentialTextConfirmCard,
   truncateGraphemeSafe,
 } from './question-card.js';
 import {
   buildSequentialAnswerPrefix,
-  buildSequentialFullAnswerDraft,
+  buildSequentialFullAnswerText,
   formatMultiQuestionAnswerDisplay,
+  markMultiQuestionResolveFailed,
+  markMultiQuestionResolved,
+  markMultiQuestionSubmitting,
   type PendingMultiQuestionState,
 } from './question-helpers.js';
+import { submitMultiQuestionAnswer } from './question-submit.js';
 import { sendQuestionMessage } from '../outbound/question-send.js';
 
 /** 渲染出来的一张顺序发题卡 */
@@ -58,7 +61,7 @@ export interface SequentialCard {
 /**
  * 渲染顺序发题的第 `index` 题卡。
  *
- * - 最后一题 ⇒ **提交态**（选项是指令型按钮，data 带全量答案文本）；
+ * - 最后一题 ⇒ **提交态**（选项是回调型按钮 + 预填按钮）；
  * - 中间题 ⇒ **收集态**（选项是回调型按钮，点选只记答案）。
  *
  * 最后一题的前序答案**不齐**时（理论上不会发生：流程只在 0..N-2 都
@@ -119,8 +122,8 @@ export function renderSequentialCard(
   // 指令按钮时用）。末题占位必须是空值、不得填「你的答案」之类文案：
   // ask_user 恒 isOther（框架 normalizeAskUserParams 强制），任何非数字
   // 文本都会被当合法自由文本收单——原样复制模板会把占位文案静默提交成
-  // 末题答案；留空则被 validateAnswers 拒绝并重问，用户还有机会补全
-  // （评审 F2，与「✍️ 其他」预填 `"<N>: "` 同口径）。
+  // 末题答案；留空则被插件判为「未答」并回执格式错误（评审 F2，与
+  // 「✍️ 其他」预填 `"<N>: "` 同口径）。
   const submitTemplate = prefix
     ? `${prefix}\n${total}: `
     : '1: ';
@@ -133,7 +136,7 @@ export function renderSequentialCard(
       collected,
       submitTemplate,
     }),
-    keyboard: buildSequentialSubmitKeyboard(index, question, prefix),
+    keyboard: buildSequentialSubmitKeyboard(state.questionId, index, question, prefix),
   };
 }
 
@@ -176,79 +179,122 @@ export async function sendSequentialQuestionCard(params: {
   return result;
 }
 
-// ============ 文本作答确认卡（sequential-text-answer 改造）============
+// ============ 整单提交（插件直提）============
+
+/** 整单提交的结果 */
+export type SequentialSubmitOutcome =
+  /** 框架已受理答案（挂起的 ask_user 被 resolve） */
+  | { status: 'submitted' }
+  /** 框架侧已终态（无挂起记录 / 已取消 / 已超时） */
+  | { status: 'already-resolved' }
+  /** 提交失败（答案非法 / SDK 不可用 / 传输异常）——pending 保持武装 */
+  | { status: 'failed'; reason: string }
+  /** 答案不齐（缺题）——不提交 */
+  | { status: 'incomplete' }
+  /** 未取得提交锁（已在提交中 / 已终态）——静默忽略 */
+  | { status: 'skipped' };
 
 /**
- * 按钮 data（keyed 全文）的长度护栏：平台对 button data 的隐性限额未知，
- * 自由文本答案可能很长——超限时不挂按钮、只给可复制模板 + 手打指引，
- * 保证「答不了」退化为「手打也能答」（与指令按钮老客户端兜底同思路）。
- */
-const TEXT_CONFIRM_BUTTON_MAX_CHARS = 300;
-
-/**
- * 渲染**文本作答收齐后**的轻量确认卡：已记录 + 全量 keyed 模板 + 单
- * 「✅ 提交」按钮（keyed 超长时退化无按钮，只剩手打模板）。
+ * 把已收集的答案**组合成整单文本**并交给框架官方认领通道提交。
  *
- * 只在末题用文本作答时出现（末题点选项 = type=2 data 全量 keyed 一键
- * 直提，无此卡）。提交仍靠客户端代发的真实用户消息——程序化提交 /
- * 合成入站是红线（2026-08-24 事故），「全自动提交」在平台约束下不存在。
+ * 流程：
+ * 1. `buildSequentialFullAnswerText` 组合（任一题缺答 ⇒ `incomplete`）；
+ * 2. `markMultiQuestionSubmitting` 取提交锁（防并发重复提交）；
+ * 3. `submitMultiQuestionAnswer` 调框架 `claimPendingAgentQuestionAnswer`
+ *    —— 与框架自己的入站认领**同一套解析与校验**；
+ * 4. 结果映射：
+ *    - `submitted` ⇒ pending 终态（不回执：助手续跑后会自己回话）；
+ *    - `already-resolved` ⇒ pending 终态 + 回执「该问题已提交或已过期」；
+ *    - `invalid` / `error` / `unsupported` ⇒ **pending 保持武装**（用户可
+ *      再次点选或重新打字重试）+ 回执失败原因。
  */
-export function renderSequentialTextConfirmCard(state: PendingMultiQuestionState): {
-  text: string;
-  keyboard?: InlineKeyboard;
-} | null {
-  const total = state.questions.length;
-  if (total === 0) return null;
-  const keyedText = buildSequentialFullAnswerDraft(state.answers, total);
-  const collected = state.questions.map((q, i) => {
-    const answer = state.answers.get(i);
-    return {
-      header: q.header,
-      display: answer
-        ? truncateGraphemeSafe(formatMultiQuestionAnswerDisplay(q, answer), ANSWER_DISPLAY_MAX_GRAPHEMES)
-        : '（未作答）',
-    };
-  });
-  const buttonAttached = keyedText.length <= TEXT_CONFIRM_BUTTON_MAX_CHARS;
-  return {
-    text: formatSequentialTextConfirmCard({ total, collected, keyedText, buttonAttached }),
-    ...(buttonAttached ? { keyboard: buildSequentialTextConfirmKeyboard(keyedText) } : {}),
-  };
-}
-
-/**
- * 渲染并发送文本作答确认卡。出站口径与续卡一致（被动锚点优先、锚点
- * 不可用降级主动——见 sendQuestionMessage）。
- */
-export async function sendSequentialTextConfirmCard(params: {
+export async function submitSequentialAnswers(params: {
   state: PendingMultiQuestionState;
   account: ResolvedQQBotAccount;
   /** 出站目标（`qqbot:c2c:<openid>`） */
   to: string;
   log?: PluginLogger;
-}): Promise<SendResult> {
+}): Promise<SequentialSubmitOutcome> {
   const { state, account, to, log } = params;
-  const card = renderSequentialTextConfirmCard(state);
-  if (!card) {
-    return { error: 'text confirm card render failed' };
+  const total = state.questions.length;
+
+  const text = buildSequentialFullAnswerText(state.answers, total);
+  if (!text) {
+    log?.warn?.(`[question] submit skipped: answers incomplete id=${state.questionId}`);
+    return { status: 'incomplete' };
   }
-  const keyedText = buildSequentialFullAnswerDraft(state.answers, state.questions.length);
-  const result = await sendQuestionMessage({
-    account,
-    accountId: account.accountId,
-    to,
-    text: card.text,
-    ...(card.keyboard ? { keyboard: card.keyboard as never } : {}),
-    ...(state.anchorMsgId ? { anchorMsgId: state.anchorMsgId } : {}),
+
+  if (!markMultiQuestionSubmitting(state.questionId)) {
+    log?.info?.(`[question] submit skipped: not armed id=${state.questionId}`);
+    return { status: 'skipped' };
+  }
+
+  const result = await submitMultiQuestionAnswer({
+    sessionKey: state.sessionKey,
+    text,
     log,
   });
-  if (result.error) {
-    log?.error?.(`[question] text confirm card send failed: ${result.error}`);
-  } else {
-    log?.info?.(
-      `[question] text confirm card sent id=${state.questionId} keyedChars=${keyedText.length}`
-      + ` button=${card.keyboard ? 'yes' : 'no(too-long)'}`,
+
+  if (result.status === 'submitted') {
+    markMultiQuestionResolved(state.questionId);
+    log?.info?.(`[question] answers submitted id=${state.questionId} chars=${text.length}`);
+    return { status: 'submitted' };
+  }
+
+  if (result.status === 'already-resolved') {
+    markMultiQuestionResolved(state.questionId);
+    log?.info?.(`[question] answers not consumed (already resolved) id=${state.questionId}`);
+    await sendSubmitReceipt({
+      state,
+      account,
+      to,
+      text: '该问题已提交或已过期',
+      log,
+    });
+    return { status: 'already-resolved' };
+  }
+
+  // 失败：pending 保持武装 ⇒ 用户可再次点选 / 重新打字重试
+  markMultiQuestionResolveFailed(state.questionId);
+  const reason =
+    result.status === 'invalid'
+      ? '答案格式不对，请检查后重新提交'
+      : result.status === 'unsupported'
+        ? '提交失败，请重新作答'
+        : '提交失败，请重新作答';
+  log?.warn?.(`[question] submit failed id=${state.questionId} status=${result.status}`);
+  await sendSubmitReceipt({ state, account, to, text: `⚠️ ${reason}`, log });
+  return { status: 'failed', reason };
+}
+
+/**
+ * 提交结果的回执（尽力而为：失败不阻断流程）。
+ *
+ * 出站口径与续卡一致（被动锚点优先、锚点不可用降级主动）。
+ */
+async function sendSubmitReceipt(params: {
+  state: PendingMultiQuestionState;
+  account: ResolvedQQBotAccount;
+  to: string;
+  text: string;
+  log?: PluginLogger;
+}): Promise<void> {
+  const { state, account, to, text, log } = params;
+  try {
+    const result = await sendQuestionMessage({
+      account,
+      accountId: account.accountId,
+      to,
+      text,
+      ...(state.anchorMsgId ? { anchorMsgId: state.anchorMsgId } : {}),
+      log,
+    });
+    if (result.error) {
+      log?.error?.(`[question] submit receipt send failed: ${result.error}`);
+    }
+  } catch (err) {
+    log?.error?.(
+      `[question] submit receipt send threw: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  return result;
 }

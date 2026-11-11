@@ -8,9 +8,14 @@
  * - parseMultiQuestionPrompt: 从多问题投递文本反解题目结构
  * - registerPendingMultiQuestion 等: 多问题答案暂存 store
  * - registerPendingSingleQuestion 等: 单问题 pending 登记（c2c 旁路用）
- * - buildMultiQuestionConfirmKeyboard 等: 集齐后发"确认卡"——指令按钮
- *   (type=2, enter=true) 携带完整答案文本，由客户端以真实用户消息发出，
- *   走框架原生的 keyed 文本认领通道（不程序化提交，不合成入站消息）
+ * - buildMultiQuestionConfirmKeyboard 等: 群聊 legacy 路径的「确认卡」——
+ *   指令按钮 (type=2, enter=true) 携带完整答案文本，由客户端以真实用户
+ *   消息发出，走框架原生的 keyed 文本认领通道。
+ *
+ * **c2c 顺序发题路径（sequential）不走确认卡**：答案齐备后由
+ * `question-submit.ts` 直接调框架官方认领通道
+ * （`claimPendingAgentQuestionAnswer`）整单 resolve——插件只**搬运**用户
+ * 真实作答，不代替用户作答、不合成入站消息。
  *
  * **卡片渲染已迁到 `question-card.ts`**（单题 / 多题共用渲染层，PR1）：
  * 本文件保留 `buildQuestionKeyboard` 作为**单题文本反解失败时的回退形态**
@@ -418,6 +423,15 @@ interface PendingMultiQuestion {
    * 锚点过期（群聊 5min / c2c 60min）或被平台判死时，发送侧降级为主动。
    */
   anchorMsgId?: string;
+  /**
+   * 框架挂起 ask_user 记录的 sessionKey——`claimPendingAgentQuestionAnswer`
+   * 的查表键（框架的 `pendingAgentQuestions` 全局表）。
+   *
+   * 取值来自 dispatch 当轮的 `route.sessionKey`（与框架 turn 同一个 session
+   * ⇒ 命中同一条挂起记录）。缺省时插件直提会失败（回执「提交失败」），
+   * 用户仍可走「整单文本原样转发框架」的兜底路径。
+   */
+  sessionKey?: string;
   expiresAtMs: number;
   cleanupTimer: ReturnType<typeof setTimeout>;
 }
@@ -443,6 +457,8 @@ function conversationKey(accountId: string, scope: 'c2c' | 'group', targetId: st
  *   状态回执据此走被动回复；缺省则后续消息一律主动发送。
  * @param mode 多题流程形态（PR2）：`sequential` = c2c 顺序发题（逐题收集、
  *   最后一题直接提交）；`legacy` = 群聊旧形态（全部发出 + 确认卡）。
+ * @param sessionKey 框架挂起 ask_user 记录的 sessionKey——插件直提整单答案的
+ *   查表键（`claimPendingAgentQuestionAnswer`）。只用于 `sequential` 形态。
  */
 export function registerPendingMultiQuestion(
   accountId: string,
@@ -453,15 +469,10 @@ export function registerPendingMultiQuestion(
   ttlMs: number = DEFAULT_MULTI_QUESTION_TTL_MS,
   anchorMsgId?: string,
   mode: 'sequential' | 'legacy' = 'legacy',
+  sessionKey?: string,
 ): void {
   const existing = pendingMultiQuestions.get(questionId);
   if (existing) clearTimeout(existing.cleanupTimer);
-
-  // 新一单开始：清掉该会话上一单的「已认领答案」登记（issue #99 评审三轮）。
-  // 否则 10s 内紧接着的第二轮 ask_user 若答案文本恰好与上一单逐字相同
-  // （全是 "1: 1\n2: 1" 这类短文本，并非不可能），首份作答会被误判成
-  // 重复投递丢弃。新卡发出 ⇒ 旧答案的重复投递窗口随之关闭。
-  clearClaimedKeyedAnswer(accountId, scope, targetId);
 
   const entry: PendingMultiQuestion = {
     accountId,
@@ -474,6 +485,7 @@ export function registerPendingMultiQuestion(
     mode,
     cursor: 0,
     ...(anchorMsgId ? { anchorMsgId } : {}),
+    ...(sessionKey ? { sessionKey } : {}),
     expiresAtMs: Date.now() + ttlMs,
     cleanupTimer: setTimeout(() => {
       if (pendingMultiQuestions.get(questionId) === entry) {
@@ -503,28 +515,6 @@ export function findPendingMultiQuestionByConversation(
     return undefined;
   }
   return { questionId };
-}
-
-/**
- * 判断文本是否是「该 c2c 会话武装中多题 pending 的**可认领 keyed 全量
- * 答案**」（只读判定、不置终态）。
- *
- * 入队口的文本作答拦截用它区分两种意图：全量 keyed 形态 = 提交（交给
- * 既有认领路径，含 #99 副本丢弃）；其余文本 = 当前题的自由文本答案
- * （被插件消费，不转发框架）。
- */
-export function isClaimableKeyedAnswerForConversation(
-  accountId: string,
-  targetId: string,
-  text: string,
-): boolean {
-  const questionId = pendingByConversation.get(conversationKey(accountId, 'c2c', targetId));
-  if (!questionId) return false;
-  const entry = pendingMultiQuestions.get(questionId);
-  if (!entry || entry.terminal || entry.resolving || entry.expiresAtMs <= Date.now()) {
-    return false;
-  }
-  return isClaimableKeyedAnswerText(entry.questions, text);
 }
 
 export type MultiQuestionTapResult =
@@ -611,138 +601,64 @@ export function markMultiQuestionResolved(questionId: string): void {
   }
 }
 
-// ============ keyed 答案认领（issue #99 评审一轮/二轮/三轮）============
-
-/** keyed 答案行：`<题号>: <非空值>`（ASCII 冒号——插件卡片/模板只产这种形态） */
-const KEYED_ANSWER_LINE = /^\s*(\d+)\s*:\s*(\S.*)$/;
+// ============ keyed 答案形态判定（整单提交改造）============
 
 /**
- * 重复投递丢弃窗口：认领时记下本会话最近一次受理的 keyed 答案文本，
- * 窗口内**逐字相同且 messageId 不同**的入站按重复投递终止（issue 实录：
- * 1.2s 内 4 次投递；click_limit 只掐客户端连点，平台/客户端重推不受它
- * 约束）。窗口取 10s：覆盖实录与重推量级；「框架拒收后用户原样重发」
- * 若发生在窗口内会被误吞一次（自愈：再发一次即出窗），代价可接受。
+ * keyed 答案行：`<题号>: <值>`（ASCII 冒号——插件卡片/模板只产这种形态）。
+ *
+ * **值可空**：整单形态判定只看「行数 + 题号顺序 + 有题号行」，值是否为空
+ * 交给提交前的自检（框架 `validateAnswers` 要求每题非空，空值会被拒收
+ * 并重问——与其让框架拒收，不如插件先拦下并回执格式错误）。
  */
-const CLAIMED_ANSWER_DEDUP_TTL_MS = 10 * 1000;
+const KEYED_ANSWER_LINE = /^\s*(\d+)\s*:\s*(.*)$/;
 
-interface ClaimedKeyedAnswer {
-  text: string;
-  /** 认领那次的 messageId——它自身的投递不算重复 */
-  messageId: string;
-  expiresAtMs: number;
-  cleanupTimer: ReturnType<typeof setTimeout>;
-}
-
-/** `${accountId}:c2c:${targetId}` -> 最近一次认领的 keyed 答案 */
-const claimedKeyedAnswers = new Map<string, ClaimedKeyedAnswer>();
-
-function clearClaimedKeyedAnswer(accountId: string, scope: 'c2c' | 'group', targetId: string): void {
-  const key = conversationKey(accountId, scope, targetId);
-  const entry = claimedKeyedAnswers.get(key);
-  if (entry) {
-    claimedKeyedAnswers.delete(key);
-    clearTimeout(entry.cleanupTimer);
-  }
+/**
+ * 文本里是否含「题号: 值」形态的行。
+ *
+ * 用于区分两种意图：
+ * - 含题号行但**不是**整单形态 ⇒ **形态错误**（行数/题号不对）⇒ 回执格式
+ *   错误、保持 pending 武装；
+ * - 完全不含题号行 ⇒ **本题答案**（用户为当前题写的自由文本）。
+ *
+ * 只认题号 + ASCII 冒号：全角冒号「：」框架解析不了（落 fallbackLines
+ * 按行兜底，多题时必被 `validateAnswers` 拒收），不当作 keyed 行。
+ */
+export function containsKeyedAnswerLine(text: string): boolean {
+  return String(text ?? '')
+    .split(/\r?\n/)
+    .some((line) => KEYED_ANSWER_LINE.test(line.trim()));
 }
 
 /**
- * 判断一条 c2c 入站是否是**已认领 keyed 答案的重复投递**（逐字相同、
- * messageId 不同、仍在丢弃窗口内）。同 messageId 的重推由入站守卫
- * （[guard] dropped duplicate-push，30min 窗口）更早拦下，此处兜的是
- * 不同 messageId 的副本（客户端代发多次 / 平台按新消息重投）。
+ * 把文本解析成**整单** keyed 答案（题号 → 值）。
+ *
+ * 判据（与框架认领口径对齐）：
+ * - 非空行数 = 题数；
+ * - 每行匹配 `^\s*(\d+)\s*:\s*(.*)$`；
+ * - 题号必须是 1..N **顺序**（框架 `fallbackLines` 按行配位的前提）。
+ *
+ * 值可为空串（用户用「📝 填写模板」预填后没填完）——调用方负责补答或
+ * 回执格式错误，**不要**把空值直接提交（框架会拒收重问）。
+ *
+ * 不满足整单形态 ⇒ 返回 null（调用方再按「含题号行」判形态错误）。
  */
-export function isDuplicateClaimedKeyedAnswerDelivery(
-  accountId: string,
-  targetId: string,
-  messageId: string,
+export function matchFullKeyedAnswer(
+  questions: MultiQuestionDef[],
   text: string,
-): boolean {
-  const entry = claimedKeyedAnswers.get(conversationKey(accountId, 'c2c', targetId));
-  if (!entry || entry.expiresAtMs <= Date.now()) return false;
-  return entry.messageId !== messageId && entry.text === String(text ?? '').trim();
-}
-
-/**
- * 判断文本是否是该 pending 的**可认领 keyed 答案**形态。
- *
- * 与框架的认领口径对齐（`gateway-question-*.mjs`）：`parseKeyedAnswers` 按
- * `<key>: <value>` 逐行解析，key 依次尝试 questionId/header/question/题号；
- * 题号 key 命中后 `validateAnswers` 要求每题非空。**值只要非空即可**——
- * `ask_user` 归一化对每题强制 `isOther: true`（dist ask-user-tool-
- * normalization 实锤），认领侧 `!question.isOther` 的自由文本门永不触发：
- * 越界数字（"1: 3" 两选项题）、多值（"1,2"）、任意文本都按自由文本收。
- * （2026-11-11 修正：此前「多值/越界必拒收」的判断源自评审三轮的 dist
- * 对拍，但那次对拍用的是**未归一化**的原始 question——生产路径的 ask_user
- * 恒带 isOther，不存在该拒收分支。）
- *
- * 仍保守保留的门槛（宁可漏认领——pending 保持武装、卡片仍可点，与改造
- * 前行为一致；误认领方向致命——框架拒收重问时卡片已被打死）：
- * - 只认**题号 key + ASCII 冒号**（插件卡片/模板唯一产出的形态）；
- *   框架还接受 `=` / `-` 分隔与 header/题干 key，但卡片从不指引这些
- *   写法：用户真用它们手打时框架侧照样认领，插件只是不置终态（无害）；
- * - 全角冒号「：」框架解析不了（落 fallbackLines 按行兜底、多题时必被
- *   validateAnswers 拒收），不认；
- * - 行数必须恰等于题数、题号 1..N 顺序（fallbackLines 按行配位的前提）。
- */
-function isClaimableKeyedAnswerText(questions: MultiQuestionDef[], text: string): boolean {
+): Map<number, string> | null {
   const lines = String(text ?? '')
-    .split('\n')
+    .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
-  if (lines.length !== questions.length) return false;
-  return questions.every((_question, index) => {
+  if (lines.length !== questions.length) return null;
+  const answers = new Map<number, string>();
+  for (let index = 0; index < lines.length; index++) {
     const match = KEYED_ANSWER_LINE.exec(lines[index]!);
-    if (!match) return false;
-    if (Number(match[1]) !== index + 1) return false;
-    // 值非空即可：数字（在界内=选项序号，越界=自由文本）、多值、任意
-    // 文本——框架 isOther 强制下全部可收
-    return match[2]!.trim().length > 0;
-  });
-}
-
-/**
- * 若文本是该 pending 的可认领 keyed 答案，**同步置终态**（认领）、登记
- * 答案文本（供重复投递丢弃，10s 窗口）并返回 true；否则不动 pending、
- * 返回 false。
- *
- * 认领点必须尽量早（issue #99 评审二轮）：在放行判定处同步调用——等到
- * dispatch 起点再做，同批到达的重复投递已各自拿到 keyed 旁路资格（旁路
- * 判定在入队时做）。放行处同步认领后，窗口内的后续副本立刻失去旁路
- * 资格 ⇒ 由 `isDuplicateClaimedKeyedAnswerDelivery` 判定为重复投递
- * 直接终止（不成轮、不进缓冲——降级成防抖缓冲单条 flush 仍是一轮，
- * 评审三轮·发现 1）。
- *
- * @param claimingMessageId 认领这次投递的 messageId（登记进丢弃判据，
- *   它自身此后的直发不算重复）
- */
-export function claimPendingMultiQuestionIfKeyedAnswer(
-  questionId: string,
-  text: string,
-  claimingMessageId: string,
-): boolean {
-  const entry = pendingMultiQuestions.get(questionId);
-  if (!entry || entry.terminal || entry.resolving || entry.expiresAtMs <= Date.now()) {
-    return false;
+    if (!match) return null;
+    if (Number(match[1]) !== index + 1) return null;
+    answers.set(index, match[2]!.trim());
   }
-  if (!isClaimableKeyedAnswerText(entry.questions, text)) return false;
-  entry.terminal = true;
-  entry.resolving = false;
-  // 登记已认领答案：窗口内逐字相同的后续投递 = 重复副本，直接终止
-  clearClaimedKeyedAnswer(entry.accountId, entry.scope, entry.targetId);
-  const ttlMs = CLAIMED_ANSWER_DEDUP_TTL_MS;
-  const claimed: ClaimedKeyedAnswer = {
-    text: String(text ?? '').trim(),
-    messageId: claimingMessageId,
-    expiresAtMs: Date.now() + ttlMs,
-    cleanupTimer: setTimeout(() => {
-      if (claimedKeyedAnswers.get(conversationKey(entry.accountId, entry.scope, entry.targetId)) === claimed) {
-        claimedKeyedAnswers.delete(conversationKey(entry.accountId, entry.scope, entry.targetId));
-      }
-    }, ttlMs),
-  };
-  claimed.cleanupTimer.unref?.();
-  claimedKeyedAnswers.set(conversationKey(entry.accountId, entry.scope, entry.targetId), claimed);
-  return true;
+  return answers;
 }
 
 /**
@@ -794,6 +710,8 @@ export interface PendingMultiQuestionState {
   scope: 'c2c' | 'group';
   targetId: string;
   anchorMsgId?: string;
+  /** 框架挂起 ask_user 记录的 sessionKey（插件直提整单答案的查表键） */
+  sessionKey?: string;
 }
 
 /** 读取多题 pending 的快照；不存在 / 已过期 ⇒ null */
@@ -811,6 +729,7 @@ export function getPendingMultiQuestionState(
     scope: entry.scope,
     targetId: entry.targetId,
     ...(entry.anchorMsgId ? { anchorMsgId: entry.anchorMsgId } : {}),
+    ...(entry.sessionKey ? { sessionKey: entry.sessionKey } : {}),
   };
 }
 
@@ -870,16 +789,16 @@ export function recordSequentialAnswer(
 }
 
 /**
- * 顺序发题（文本作答，sequential-text-answer 改造）：把用户**直接回复
- * 的一条文本消息**记为**当前题**（cursor 指向的那张卡）的答案。
+ * 顺序发题（文本作答）：把用户**直接回复的一条文本消息**记为**当前题**
+ * （cursor 指向的那张卡）的答案。
  *
- * - 多行压平为单行（`\n` → 空格）：keyed 终稿是「一行一题」格式，多行
+ * - 多行压平为单行（`\n` → 空格）：整单文本是「一行一题」格式，多行
  *   自由文本会把行数打乱、框架认领必失败；
  * - 中间题 ⇒ cursor 前进，返回 `{status:'ok', nextIndex}`（调用方续发
  *   下一题卡）；
- * - 末题 ⇒ 全部收齐，返回 `{status:'complete-text'}`（调用方组装全量
- *   keyed 文本发确认卡）；**pending 保持武装**——终态化仍由最终 keyed
- *   消息的认领路径负责（type=2 按钮代发 / 手打，框架认领后才置终态）；
+ * - 末题 ⇒ 全部收齐，返回 `{status:'complete'}`（调用方组合整单文本并
+ *   交给框架官方认领通道提交）；**pending 不在此置终态**——终态由提交
+ *   结果决定（成功 ⇒ 终态；失败 ⇒ 保持武装，用户可重试）；
  * - 文本作答永远作用于**当前题**：想改更早的题，点那张卡的选项按钮
  *   （既有语义）。
  *
@@ -888,7 +807,8 @@ export function recordSequentialAnswer(
  */
 export type SequentialTextAnswerResult =
   | { status: 'ok'; nextIndex: number }
-  | { status: 'complete-text' }
+  /** 末题收齐（全部答案齐备）⇒ 调用方负责组合 + 提交 */
+  | { status: 'complete' }
   | { status: 'unknown' }
   | { status: 'terminal' };
 
@@ -917,11 +837,77 @@ export function recordSequentialTextAnswer(
   entry.answers.set(cursor, { text: flattened });
 
   if (cursor >= total - 1) {
-    // 末题收齐：不置终态（等最终 keyed 消息认领），由调用方发确认卡
-    return { status: 'complete-text' };
+    // 末题收齐：不置终态（等提交器认领），由调用方组合整单文本后提交
+    return { status: 'complete' };
   }
   entry.cursor = cursor + 1;
   return { status: 'ok', nextIndex: cursor + 1 };
+}
+
+/**
+ * 把**整单 keyed 文本**解析出的值覆盖进 pending 的答案表（「改一改」路径）。
+ *
+ * 值的形态归一与框架一致（`normalizeAgentHarnessUserInputOption`）：
+ * - 纯数字且落在选项范围内 ⇒ 选项序号（1-based）；
+ * - 其余（含越界数字）⇒ 自由文本。
+ *
+ * ⚠️ **空值不算作答**：框架的 `validateAnswers` 要求每题非空，且框架的
+ * keyed 解析正则要求值至少一个字符——空值行会被行序兜底捡成字面量
+ * `"N:"` 并**静默当成答案收下**（实测）。这里显式把空值当作「未答」，
+ * 由调用方回执格式错误、要求补全。
+ *
+ * @returns 是否覆盖成功（pending 不存在 / 已终态 ⇒ false）
+ */
+export function applyFullKeyedAnswer(
+  questionId: string,
+  values: ReadonlyMap<number, string>,
+): boolean {
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry || entry.terminal || entry.resolving || entry.expiresAtMs <= Date.now()) {
+    return false;
+  }
+  for (const [index, value] of values) {
+    const question = entry.questions[index];
+    if (!question) return false;
+    const trimmed = value.trim();
+    if (!trimmed) return false; // 空值 = 未答 ⇒ 拒绝覆盖（避免静默收下 `"N:"`）
+    entry.answers.set(index, toMultiQuestionAnswer(question, trimmed));
+  }
+  return true;
+}
+
+/**
+ * 把文本值归一成答案（选项序号 or 自由文本）。
+ *
+ * 与框架 `normalizeAgentHarnessUserInputOption` 同口径：纯数字且在选项
+ * 范围内 ⇒ 选项序号；其余 ⇒ 自由文本。
+ */
+function toMultiQuestionAnswer(question: MultiQuestionDef, value: string): MultiQuestionAnswer {
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const optionIndex = Number(trimmed) - 1;
+    if (optionIndex >= 0 && optionIndex < question.options.length) {
+      return { optionIndex };
+    }
+  }
+  return { text: trimmed };
+}
+
+/**
+ * 置「正在提交」锁（防并发重复提交）。
+ *
+ * 顺序发题的末题点选 / 末题打字都可能撞上同一次提交（用户连点、平台重推
+ * interaction 事件）——提交是 await 边界，锁必须**在 await 前**置上。
+ *
+ * @returns 是否成功取得锁（已终态 / 已在提交中 ⇒ false）
+ */
+export function markMultiQuestionSubmitting(questionId: string): boolean {
+  const entry = pendingMultiQuestions.get(questionId);
+  if (!entry || entry.terminal || entry.resolving || entry.expiresAtMs <= Date.now()) {
+    return false;
+  }
+  entry.resolving = true;
+  return true;
 }
 
 /**
@@ -941,6 +927,32 @@ export function buildSequentialAnswerPrefix(
     const answer = answers.get(i);
     if (!answer) continue;
     lines.push(`${i + 1}: ${'optionIndex' in answer ? answer.optionIndex + 1 : answer.text}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * 顺序发题的**整单答案文本**（每题一行「题号: 答案」，**每题必有值**）。
+ *
+ * 与 `buildSequentialFullAnswerDraft` 的区别：草稿版未答**留空**（给用户
+ * 手打补全用），本版**缺答即 null**——提交路径绝不能带空值（框架的
+ * `validateAnswers` 要求每题非空；空值行还会被框架的行序兜底捡成字面量
+ * `"N:"` 静默收下）。
+ *
+ * @returns 整单文本；任一题缺答 ⇒ null（调用方不得提交）
+ */
+export function buildSequentialFullAnswerText(
+  answers: ReadonlyMap<number, MultiQuestionAnswer>,
+  total: number,
+): string | null {
+  if (total <= 0) return null;
+  const lines: string[] = [];
+  for (let i = 0; i < total; i++) {
+    const answer = answers.get(i);
+    if (!answer) return null;
+    const value = 'optionIndex' in answer ? String(answer.optionIndex + 1) : answer.text.trim();
+    if (!value) return null;
+    lines.push(`${i + 1}: ${value}`);
   }
   return lines.join('\n');
 }
