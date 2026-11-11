@@ -71,6 +71,7 @@ const {
 } = await import('../src/features/question-helpers.ts');
 const { renderSequentialTextConfirmCard, sendSequentialTextConfirmCard } =
   await import('../src/features/question-flow.ts');
+const { enqueueC2CInboundMessage } = await import('../src/features/inbound-debounce.ts');
 
 // ── 测试基础设施（沿用 ask-user-passive-anchor.test.ts 的形态）──
 
@@ -648,13 +649,16 @@ await test('keyed 形态作答入站 dispatch ⇒ pending 置终态（旁路失�
   }
 });
 
-await test('无关文本不认领（评审一轮）：答题中途发普通消息，卡片流程继续存活', async () => {
+await test('无关文本不认领（dispatch 起点兜底路径）：pending 不置终态，卡片流程继续存活', async () => {
   clearQuotaCache();
   const { gw, account, runtime } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_I99_2B' });
   try {
-    // 用户没点按钮，先发了条无关文本（"这题什么意思？"）——框架侧只会把它
-    // 当第 1 题答案拒收并重问，问卷继续存活；插件侧若也置终态，顺序发题
-    // 状态机就死了（不再续发题卡），两侧状态分裂
+    // 用户没点按钮，先发了条无关文本（"这题什么意思？"）——**dispatch 起点
+    // 兜底路径**（防抖关闭配置的直发路径）：该处只认领「可认领 keyed 答案」，
+    // 无关文本不认领 ⇒ pending 保持武装（无条件置终态会打死顺序发题状态机，
+    // 两侧状态分裂）。
+    // ⚠ 多题问答进行中的**真实路径是入队口**（enqueueC2CInboundMessage）——
+    // 那里无关文本被本地暂存为当前题答案、不转发框架，见下一条用例。
     await dispatchPlainInbound({ messageId: 'M_I99_2B_ASK', content: '这题什么意思？' });
     assert.ok(
       findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
@@ -664,6 +668,52 @@ await test('无关文本不认领（评审一轮）：答题中途发普通消�
     const r = recordSequentialAnswer(QID, 0, 0);
     assert.equal(r.status, 'ok', '无关文本后点选第 1 题仍应正常推进');
     void account; void runtime;
+  } finally {
+    unregisterGateway(ACCOUNT_ID, gw);
+  }
+});
+
+await test('无关文本在入队口被本地暂存为当前题答案（真实路径）：不进框架 + pending 不终态 + cursor 前进 + 续发下一题卡', async () => {
+  clearQuotaCache();
+  const { sent, gw, account } = await deliverAskUserKeepingGateway(THREE_QUESTION_PAYLOAD, { messageId: 'M_I99_2C' });
+  try {
+    assert.equal(sent.length, 1, '前置：首轮只发第 1 题卡');
+    assert.equal(getPendingMultiQuestionState(QID)!.cursor, 0, '前置：cursor 指向第 1 题');
+
+    // 多题问答进行中：平台无法区分「用户手打的普通消息」与「指令按钮代发的
+    // 回调内容」——两者都是普通入站消息。故入队口把窗口内文本**本地暂存**
+    // 为当前题答案、**不转发框架**（转发只会撞上 validateAnswers 的 partial
+    // 拒收 + 重问循环：白烧一轮、两侧状态分裂）。分类只认形态（keyed vs
+    // 非 keyed），不靠内容语义猜——用户在答题中途问别的也会被当答案。
+    const { msg, ctx } = makeMsgAndCtx({ messageId: 'M_I99_2C_ASK', targetId: 'USER_123' });
+    msg.content = '这题什么意思？';
+    ctx.message = { content: '这题什么意思？' };
+    let inboundRuns = 0;
+    const runtime2 = makeFakeRuntime({
+      onInboundRun: async () => { inboundRuns++; return { dispatched: true }; },
+      dispatchReply: async () => ({ queuedFinal: true, counts: { final: 0 } }),
+    });
+    const handled = await enqueueC2CInboundMessage(ctx, msg, account, runtime2, fakeLog);
+    assert.equal(handled, true, '文本已被接管（暂存为当前题答案）');
+    assert.equal(inboundRuns, 0, '不得转发框架成轮（中间态文本转发 = 白烧一轮 + 重问循环）');
+
+    // pending 不置终态：终态化只由最终 keyed 认领负责（全部答齐后）
+    assert.ok(
+      findPendingMultiQuestionByConversation(ACCOUNT_ID, 'c2c', 'USER_123'),
+      'pending 保持武装（终态化只由最终 keyed 认领负责）',
+    );
+    const after = getPendingMultiQuestionState(QID)!;
+    assert.equal(after.cursor, 1, 'cursor 前进到第 2 题');
+    assert.equal(
+      (after.answers.get(0) as { text?: string }).text,
+      '这题什么意思？',
+      '无关文本被记为当前题（第 1 题）的答案',
+    );
+    assert.equal(sent.length, 2, '续发第 2 题卡');
+    assert.ok(
+      String(sent[1]!.text).includes('第 2/3 题'),
+      `续发的应是第 2 题卡，实际：${String(sent[1]!.text).slice(0, 40)}`,
+    );
   } finally {
     unregisterGateway(ACCOUNT_ID, gw);
   }
