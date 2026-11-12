@@ -375,12 +375,15 @@ async function handleApproval(
     senderId: operatorId,
   });
   if (!authorization.authorized) {
-    log.warn(`[approval] unauthorized operator=${operatorId ?? 'unknown'} account=${account.accountId}${authorization.reason ? ` reason=${authorization.reason}` : ''}`);
+    // ⚠️ 日志脱敏：operatorId 就是点击者的完整 openid，而 `/bot-logs` 会把
+    // 本地日志文件原样导出给 c2c 用户 ⇒ 一律走 shortId()（本文件顶部约定：
+    // 不落完整他人标识符）。
+    log.warn(`[approval] unauthorized operator=${shortId(operatorId)} account=${account.accountId}${authorization.reason ? ` reason=${authorization.reason}` : ''}`);
     return;
   }
 
   log.info(
-    `[approval] tap operator=${operatorId ?? 'unknown'} approvalId=${parsed.approvalId} kind=${parsed.approvalKind} decision=${parsed.decision} account=${account.accountId}`,
+    `[approval] tap operator=${shortId(operatorId)} approvalId=${parsed.approvalId} kind=${parsed.approvalKind} decision=${parsed.decision} account=${account.accountId}`,
   );
 
   try {
@@ -394,7 +397,7 @@ async function handleApproval(
       clientDisplayName: 'QQBot Approval Handler',
     });
     log.info(
-      `[approval] resolved approvalId=${parsed.approvalId} decision=${parsed.decision} operator=${operatorId ?? 'unknown'}`,
+      `[approval] resolved approvalId=${parsed.approvalId} decision=${parsed.decision} operator=${shortId(operatorId)}`,
     );
   } catch (err) {
     log.error(`interaction approve error: ${err instanceof Error ? err.message : String(err)}`);
