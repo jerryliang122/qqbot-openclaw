@@ -8,6 +8,36 @@
 
 ---
 
+## [4.2.0] - 2026-11-12
+
+ask_user 多题投递机制改造（issue #99，PR #101，取代 #100）：末题提交从「客户端代发机器文本」重构为「插件直提整单答案」，多题 pending 期间入站文本改插件本地暂存；另含审批路径日志脱敏（PR #102）。
+
+### 变更
+
+- **多题 c2c 改「插件直提整单答案」——末题不再由客户端代发**（PR #101）。提交走框架官方认领通道 `claimPendingAgentQuestionAnswer({ sessionKey, text })`（`openclaw/plugin-sdk/agent-harness-runtime`）——与框架自己的入站认领走**同一套解析与校验**（`buildAgentHarnessUserInputAnswers` / `validateAnswers`）⇒ 插件组合的文本与用户手打文本在框架侧等价；`sessionKey` 取 dispatch 当轮的 `route.sessionKey`（框架 turn 就跑在这个 session ⇒ 命中同一条 pendingAgentQuestions 记录）。新增提交器 `src/features/question-submit.ts`（结果归一化 + 测试注入点）。**末题选项按钮改回调型**（`type=1`，与中间题同构）：无 `enter`、无 `click_limit` ⇒ 用户聊天里**不再出现** `1: 1\n2: …` 的机器气泡；**预填按钮保留**（`type=2` + `enter=false`，只把「全部已答 + 本题空位」装进输入框、不自动发送，用户改完手动发出即命中整单形态提交）。**删除**：文本作答确认卡（及「✅ 提交」按钮）、10s keyed 副本丢弃窗口、dispatch 起点的兜底认领。**红线口径改写**：旧「多问题 ask_user 绝不能程序化提交」→ 新「**禁止代替用户作答**（答案值必须来自用户真实输入）；允许插件**搬运**用户已作答的组合文本走框架官方认领通道」；「禁止合成入站消息」保留。
+- **多题 pending 期间的文本处置（issue #99 原始诉求）**。多题 pending 武装期间（**仅 c2c + 仅 `sequential` 形态**）入站文本一律由插件本地暂存、**不转发框架**——QQ 平台无法区分「用户手打的普通消息」与「指令按钮代发的回调内容」（两者都是普通入站消息），中间态文本转发框架只会撞 `validateAnswers` 的 partial 拒收 + 重问循环（白烧一轮、两侧状态分裂）；分类只认形态、不靠内容语义猜。拦截层三形态（`planSequentialTextCapture`）：**整单**（行数=题数、题号 1..N 顺序、每行 `N: 值` ⇒ 用文本值覆盖全部答案，答齐即提交）/ **形态错误**（含「题号:」行但不合整单 ⇒ 回执「格式不对」+ 保持 pending 武装，可改完重发）/ **本题答案**（不含题号行，多行压平 ⇒ 记当前题答案，末题则提交、否则续发下一题卡）。**空值行插件先拦**：框架 keyed 正则要求值至少一个字符，空值行会被 `fallbackLines` 按行序捡成字面量 `"3:"` **静默当答案收下**（实测）——插件把空值视为该题未答，回执要求补全、不提交。斜杠命令（`/` 开头）照旧放行（逃生通道）、纯附件照旧走原路径、单题 pending / 无 pending ⇒ 文本照旧原样转发框架。
+- **评审修复（两轮 14 条真缺陷，PR #101）**：**归属校验**——按钮回调记录/提交答案前核对账号 + scope + 对端（卡片被转发出去后别人点不动原用户的题）；**旧单退役**——同会话注册新一单时上一单必须退役（提交通道只带 sessionKey 不带 questionId，否则旧卡片会把新问题答掉）；**questionId 复用**清旧会话映射 + 查询时校验归属（防答案串会话）；**认领超时** 20s 且释放提交锁（超时定时器不能 unref，否则事件循环空转时不触发 ⇒ 永久挂起）；**resolving 窗口防泄漏**——拦截层入口与防抖旁路改用**含 resolving** 的查表（claim await 期间文本不再漏回常规路径撞 partial 拒收循环），secret-capture 的让行判定同步含 resolving（否则该窗口内用户消息会被写进密钥库）；用户没看到卡片时退役 pending（turn 在登记后、发首卡前被取消 / 首卡发送失败）；带附件的消息整条照旧进框架（不吞）；日志脱敏——sessionKey 一律记 sha256 前 8 位摘要、operator 的 targetId/peerId/openid 走既有 `shortId()`（`/bot-logs` 会导出本地日志文件）。
+
+### 修复
+
+- **审批路径日志脱敏（PR #102）**：`[approval] unauthorized`（WARN）/ `[approval] tap`（INFO）/ `[approval] resolved`（INFO）三处日志把 `operator`（= 点击者 openid）原样落盘，而 `/bot-logs` 导出的是本地日志文件**原样**（不限级别）⇒ 完整 openid 等于公开给其他 c2c 用户。三处一律改走同文件既有 `shortId()`（保留前 8 位，排障仍可定位），不改任何行为。
+
+### 升级注意
+
+- **transcript 不再含用户原始消息**：插件直提不经入站路径 ⇒ 用户答题那条消息不作为 user turn 落进会话历史（模型仍通过 ask_user 的 tool result 拿到全部答案；框架把解答者标记为 `resolvedBy: "plain-text"`）。
+- **新增 SDK 依赖面**：`openclaw/plugin-sdk/agent-harness-runtime`（agent-harness 大桶，导出数百个内部符号，稳定性**低于** `question-gateway-runtime` 等专用子路径）——已在 `tests/sdk-surface.test.ts` 的 `mustCover` 锁定；该子路径被删 = 插件整体加载失败（AGENTS.md 红线）。
+- **末题点选后立即提交**的语义变化：点更早题目的选项改答案时，若已答齐会**立即提交**（与改造前「改早先题重发当前卡」不同）。
+- **群聊 legacy 路径完全未动**（全部题卡 + 确认卡 + 客户端代发 + `click_limit: 1`，两套机制并存）、单题路径完全不动。无配置格式变更，升级无需改配置。
+
+### 守卫
+
+- `tests/ask-user-multi-sequential.test.ts`（重写，44 例）：末题点选 ⇒ 提交器收到组合好的整单文本 + 正确 sessionKey、pending 终态、不再发卡；末题打字 ⇒ 拦截层消费（不进框架）⇒ 提交；「改一改」整单覆盖 ⇒ 前面题的答案被替换；形态错误 / 空值 ⇒ 回执 + 不提交 + 保持武装；失败矩阵（`claim` 返回 false ⇒ 终态 / 答案非法 INVALID_REQUEST ⇒ 保持武装 / 传输·运行时异常 ⇒ 保持武装 / SDK 子路径不可用 ⇒ 保持武装）；末题按钮形态断言（`type=1` / 无 `enter` / 无 `click_limit`，预填按钮仍 `type=2` + `enter=false`）；红线守卫（提交只走官方认领通道、不合成入站消息、答案值只来自用户真实作答）；旧认领机制退役守卫；归属校验的拒绝日志不含完整 openid。
+- `tests/inbound-debounce.test.ts`（39 例）：拦截层三形态 + 斜杠放行 + 纯附件放行 + 非 sequential 形态不参与拦截 + **死锁钉子**（挂起 ask_user 的整单答案在 turn 运行中立即被消费并提交，不成轮、不排队）。
+- `tests/sdk-surface.test.ts`：`mustCover` 增 `openclaw/plugin-sdk/agent-harness-runtime`。
+- `tests/approval-log-redaction.test.ts`（新增，2 例）：审批日志（未授权 WARN / 已授权 tap INFO）不含完整 openid、保留前 8 位。
+
+---
+
 ## [4.1.0] - 2026-11-06
 
 ask_user 交互形态整体改造（issue #93，三个 PR：#94 / #95 / #96）：问题卡被动化 + 单题卡自渲染 + 多题顺序发题。
