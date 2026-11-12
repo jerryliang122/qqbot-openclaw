@@ -22,6 +22,7 @@ import {
   recordMultiQuestionTap,
   recordSequentialAnswer,
   getPendingMultiQuestionState,
+  findPendingMultiQuestionByConversation,
   buildSequentialFullAnswerDraft,
   markMultiQuestionResolveFailed,
   markSingleQuestionResolved,
@@ -32,7 +33,7 @@ import {
   buildMultiQuestionConfirmKeyboard,
   type MultiQuestionAnswer,
 } from '../features/question-helpers.js';
-import { sendSequentialQuestionCard } from '../features/question-flow.js';
+import { sendSequentialQuestionCard, submitSequentialAnswers } from '../features/question-flow.js';
 import { recordKnownUser } from '../features/proactive.js';
 import { cacheMsgId } from '../features/msgid-cache.js';
 import { enqueueC2CInboundMessage } from '../features/inbound-debounce.js';
@@ -98,8 +99,11 @@ export async function handleMessage(
     });
 
     // ── 多问题 ask_user 的最终答案不在此拦截 ──
-    // 确认卡的指令按钮代发（或用户手打）的 "1: 3\n2: 1" 是真实用户消息，
-    // 必须原样放行走框架原生 keyed 文本认领；任何拦截都会破坏认领链路。
+    // c2c 顺序发题：答案由入队口的拦截层消费并直提（见 inbound-debounce.ts
+    // 的 planSequentialTextCapture），本层不碰。
+    // 群聊 legacy：确认卡的指令按钮代发（或用户手打）的 "1: 3\n2: 1" 是
+    // 真实用户消息，必须原样放行走框架原生 keyed 文本认领；任何拦截都会
+    // 破坏认领链路。
 
     // ── 入站防抖/合批 ──
     // 私聊：同一发送者在防抖窗口内的连续消息合并为一次 dispatch（文件 +
@@ -440,7 +444,9 @@ async function handleQuestion(
     if (result.status === 'answered' || result.status === 'already-terminal') {
       markSingleQuestionResolved(parsed.questionId);
     }
-    log.info(`[question] resolved questionId=${parsed.questionId} optionIndex=${parsed.optionIndex} status=${result.status} operator=${operatorId ?? 'unknown'}`);
+    log.info(
+      `[question] resolved questionId=${parsed.questionId} optionIndex=${parsed.optionIndex} status=${result.status} operator=${shortId(operatorId)}`,
+    );
   } catch (err) {
     log.error(`[question] resolve error: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -448,15 +454,19 @@ async function handleQuestion(
 
 // ── 多问题按钮处理（ask_user questions >= 2）──
 // 框架对多问题记录没有单题按钮解析通道（resolveOption 仅支持单问题），
-// 这里按题缓冲点选，集齐后发一张"确认卡"：指令按钮（action.type=2,
-// enter=true）携带完整答案文本 "1: 3\n2: 1"，由 QQ 客户端以真实用户
-// 消息发出，走框架原生的 keyed 文本认领通道 resolve 挂起的 ask_user。
+// 这里按题缓冲点选。两条路径：
+// - **c2c 顺序发题**（`mode === 'sequential'`）：逐题发卡、逐题收集，
+//   全部答齐后由插件**组合整单文本**并调框架官方认领通道
+//   （`claimPendingAgentQuestionAnswer`）整单 resolve——用户聊天里不再
+//   出现 `1: 3\n2: 1` 的机器气泡；
+// - **群聊 legacy**：所有题卡一次发出 + 集齐后确认卡（指令按钮代发真实
+//   用户消息，走框架原生的 keyed 文本认领通道）。
+//
 // 注意两条红线（都出过生产事故，勿回退）：
-// 1. 不要程序化提交：官方 openclaw 无多问题提交 API，改官方代码要背
-//    fork 维护成本；
+// 1. 不要程序化提交**答案内容**（插件没有 `operator.questions` scope，
+//    且**禁止代替用户作答**）——插件只搬运用户真实作答的组合文本；
 // 2. 不要合成入站消息"假装用户回答"：合成消息会被框架当成 steering
 //    注入挂起的 run，claim 不触发，模型等答案直到超时（2026-08-24 事故）。
-// 只有真实用户消息（客户端代发或手打）能被框架认领。
 
 async function handleMultiQuestionTap(
   parsed: ParsedMultiQuestionAction,
@@ -471,13 +481,38 @@ async function handleMultiQuestionTap(
   if (!peerId) return; // 缺少会话定位信息，无法回执或发确认卡
 
   log.info(
-    `[question] multi tap id=${parsed.questionId} q=${parsed.questionIndex + 1} opt=${parsed.optionIndex + 1} operator=${operatorId ?? 'unknown'}`,
+    `[question] multi tap id=${parsed.questionId} q=${parsed.questionIndex + 1} opt=${parsed.optionIndex + 1} operator=${shortId(operatorId)}`,
   );
+
+  // ── 归属校验（红线）────────────────────────────────────────────────
+  // 卡片被复制/转发到别的会话时，**点击者是别人**（event.user_openid 是
+  // 点击者，不是卡片的主人）。若只按 questionId 找 pending，别人的点选会
+  // 记进**原用户**的答案表，甚至把原用户的问题 resolve 掉。
+  // ⇒ 记录/提交答案前必须核对：账号、会话类型、对端三者与 pending 一致。
+  const owner = getPendingMultiQuestionState(parsed.questionId);
+  if (
+    !owner
+    || owner.accountId !== account.accountId
+    || owner.scope !== scope
+    || owner.targetId !== peerId
+  ) {
+    // ⚠️ 日志脱敏：targetId / peerId 在 c2c 下就是**完整对端 openid**，
+    // 而 INFO 日志可被 `/bot-logs` 导出给 c2c 用户 ⇒ 一律走 shortId()
+    // （本文件顶部的约定：不落完整他人标识符）。
+    log.info(
+      `[question] multi tap rejected (owner mismatch) id=${parsed.questionId}`
+      + ` owner=${owner ? `${owner.accountId}/${owner.scope}/${shortId(owner.targetId)}` : 'unknown'}`
+      + ` tapper=${account.accountId}/${scope}/${shortId(peerId)}`,
+    );
+    // 不回执「已提交或已过期」——那会向点击者暴露该问题存在。静默忽略。
+    return;
+  }
 
   // ── c2c 顺序发题（PR2）──
   // 点选只**收集**答案（框架要求整单齐备，见 issue #93 根因 2），下一张
-  // 题卡由这里续发；最后一题的卡本身就是提交点（选项是指令按钮，data
-  // 带全量答案文本，客户端代发真实用户消息）。
+  // 题卡由这里续发；**全部答齐时直接提交**——插件组合整单文本并调框架
+  // 官方认领通道（`claimPendingAgentQuestionAnswer`），不再依赖客户端
+  // 代发机器文本。
   const state = getPendingMultiQuestionState(parsed.questionId);
   if (state?.mode === 'sequential') {
     const result = recordSequentialAnswer(
@@ -485,6 +520,20 @@ async function handleMultiQuestionTap(
       parsed.questionIndex,
       parsed.optionIndex,
     );
+    if (result.status === 'terminal') {
+      // pending 已终态（已提交 / 已被框架结束）⇒ **静默忽略**。
+      // 平台会重推 interaction 事件，回执会造成对用户刷屏。
+      log.info(`[question] sequential tap ignored (terminal) id=${parsed.questionId}`);
+      return;
+    }
+    if (result.status === 'resolving') {
+      // 正在提交（框架认领 await 未返回）⇒ 这一单**不再收答案**
+      // （否则会覆盖正在提交的那份答案）。回执告知用户在途，
+      // 别让他对着「没反应的卡片」反复点。
+      log.info(`[question] sequential tap ignored (resolving) id=${parsed.questionId}`);
+      await sendMultiQuestionFeedback(event, account, '正在提交答案，请稍候', log, parsed.questionId);
+      return;
+    }
     if (result.status !== 'ok') {
       log.info(`[question] sequential tap ignored id=${parsed.questionId} status=${result.status}`);
       await sendMultiQuestionFeedback(event, account, '该问题已提交或已过期', log, parsed.questionId);
@@ -492,6 +541,28 @@ async function handleMultiQuestionTap(
     }
     const nextState = getPendingMultiQuestionState(parsed.questionId);
     if (!nextState) return;
+
+    // 全部答齐 ⇒ 组合 + 提交（不再发卡）
+    if (nextState.answers.size === nextState.questions.length) {
+      await submitSequentialAnswers({
+        state: nextState,
+        account,
+        to: formatQuestionTarget(scope, peerId),
+        log,
+      });
+      return;
+    }
+
+    // 发卡前二次复查：期间可能已被另一条入站（或并发点选）提交掉了 ⇒
+    // 续卡会成为「已作废的卡片」（按钮点不动、看着莫名其妙）⇒ 不发。
+    // `findPendingMultiQuestionByConversation` 对终态 / 提交中 / 已过期都返回
+    // undefined ⇒ 一并覆盖「已被提交」与「正在提交」两种情况。
+    const armed = findPendingMultiQuestionByConversation(account.accountId, scope, peerId);
+    if (!armed || armed.questionId !== parsed.questionId) {
+      log.info(`[question] sequential card skipped (no longer armed) id=${parsed.questionId}`);
+      return;
+    }
+
     const cardResult = await sendSequentialQuestionCard({
       state: nextState,
       index: result.nextIndex,

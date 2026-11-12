@@ -12,7 +12,7 @@
  * 会导致挂起的 ask_user 永不成单（AGENTS.md 2026-08-24 事故）。
  */
 import type { Middleware } from '@tencent-connect/qqbot-nodejs';
-import { findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation } from '../features/question-helpers.js';
+import { hasPendingMultiQuestionForConversation, findPendingSingleQuestionByConversation } from '../features/question-helpers.js';
 import { checkAndConsumePassiveReplyQuota } from '../features/quota-manager.js';
 import {
   runSecretsReload,
@@ -106,7 +106,12 @@ export function secretCapture(params: SecretCaptureParams): Middleware {
     }
 
     // 红线：多问题 ask_user 进行中 → 其答案/确认卡消息优先，绝不拦截
-    if (findPendingMultiQuestionByConversation(accountId, 'c2c', senderId)) {
+    //
+    // 用 `hasPendingMultiQuestionForConversation`（**含正在提交中**的条目）
+    // 而不是 `findPendingMultiQuestionByConversation`：后者排除 resolving ⇒
+    // 提交进行中的那几十毫秒窗口里，本红线会失效 ⇒ 用户的普通消息被当成
+    // 密钥值写进密钥库（消息凭空消失）。
+    if (hasPendingMultiQuestionForConversation(accountId, 'c2c', senderId)) {
       await next();
       return;
     }

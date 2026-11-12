@@ -26,10 +26,20 @@
  *   shouldDebounceTextInbound / isControlCommandMessage）；
  * - 斜杠命令（rawBody 以 '/' 开头）：合并会破坏 buildCtxPayload 的
  *   命令标记（rawBody 拼接后可能不以 '/' 开头），必须原样直发；
- * - 多问题 ask_user 的 keyed 答案文本（"1: 3\n2: 1"）：合并会改写答案
- *   文本，框架 keyed 文本认领失败 → 挂起的 ask_user 永远等不到答案；
- *   按 findPendingMultiQuestionByConversation(accountId, 'c2c', peer) 识别
- *   （会话键含账号维度——openid 是 per-account 的，跨账号不共享 pending）。
+ * - 多问题 ask_user 武装期间的文本（"1: 3\n2: 1" 或任意一句话）：合并会
+ *   改写答案文本（`[消息 i/N]` 分节体）⇒ 提交必然失败；按
+ *   findMultiQuestionEntryByConversation(accountId, 'c2c', peer) 识别
+ *   （**含提交进行中**的条目；会话键含账号维度——openid 是 per-account 的，
+ *   跨账号不共享 pending）。
+ *
+ * 入队口的一道**消费**（在 debounceMs 判定之前，防抖开/关行为一致）：
+ * - 文本作答拦截（`planSequentialTextCapture`）：多题 pending 武装期间
+ *   （**仅 c2c + 仅 `sequential` 形态**）的文本按**形态**分三类处理——
+ *   整单（覆盖全部答案 ⇒ 全部答齐即提交）/ 形态错误（回执格式错误、保持
+ *   武装）/ 本题答案（记为当前题 ⇒ 末题则提交、否则续卡）——三种都
+ *   **不转发框架**（窗口内文本即作答意图，仓库主人拍板的红线再界定）。
+ *   提交走框架官方认领通道（`claimPendingAgentQuestionAnswer`），插件只
+ *   **搬运**用户真实作答、不代替用户作答、不合成入站消息。
  *
  * admission 放行（2026-10-16 修复，红线）：onFlush 返回的 admission 与
  * completion 必须解耦——框架 debouncer 的同 key 任务链持有到 admission
@@ -100,7 +110,9 @@ import { assembleBody } from '../dispatch/body-assembler.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { runWithRequestContext } from '../request-context.js';
 import { dispatchToOpenClaw, type DispatchToOpenClawOptions } from '../dispatch/index.js';
-import { findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation } from './question-helpers.js';
+import { findMultiQuestionEntryByConversation, findPendingMultiQuestionByConversation, findPendingSingleQuestionByConversation, getPendingMultiQuestionState, buildSequentialFullAnswerDraft, containsKeyedAnswerLine, matchFullKeyedAnswer, applyFullKeyedAnswer, recordSequentialTextAnswer } from './question-helpers.js';
+import { sendSequentialQuestionCard, submitSequentialAnswers } from './question-flow.js';
+import { sendText } from '../outbound/outbound-service.js';
 
 /** 默认防抖窗口：3 秒（QQ 客户端连发"文件 + 说明"的典型间隔内） */
 export const DEFAULT_C2C_INBOUND_DEBOUNCE_MS = 3000;
@@ -185,10 +197,26 @@ function shouldDebounceC2CItem(item: C2CInboundDebounceItem): boolean {
   // 斜杠命令：合并会破坏命令标记（rawBody 拼接后可能不以 '/' 开头）
   if (text.startsWith('/')) return false;
 
-  // 多问题 ask_user 的 keyed 答案文本：合并会改写答案、认领失败。
+  // 多问题 ask_user 武装期间的文本：合并会改写答案（`[消息 i/N]` 分节体）
+  // ⇒ 认领/提交必然失败。pending 期间该会话的文本**一律不合并**。
   // 会话键含 accountId（openid 是 per-account 的，跨账号同 targetId
-  // 不共享 pending 记录）
-  if (findPendingMultiQuestionByConversation(item.account.accountId, 'c2c', item.msg.replyTarget.targetId)) {
+  // 不共享 pending 记录）。
+  //
+  // ⚠️ 这里**只做旁路判定，不做认领/提交**：多题文本的处置在
+  // `planSequentialTextCapture`（入队口）统一完成——插件直提整单答案，
+  // 不再依赖框架的入站 keyed 认领。保留本旁路的意义：万一文本未被拦截层
+  // 识别而原样转发框架（兜底第 3 层），它**不能被防抖合并**。
+  //
+  // ⚠️ 查表必须**含 resolving**（提交进行中）：那一单正在提交，文本既不能
+  // 当答案收、也绝不能放行回框架（框架会拿它去认领 ⇒ 重问循环）。
+  // 拦截层会先消费掉这类文本 ⇒ 正常不会走到这里；这里只是**第二道防线**
+  // （附件消息等拦截层放行的形态仍可能落到防抖器）。
+  const pendingMulti = findMultiQuestionEntryByConversation(
+    item.account.accountId,
+    'c2c',
+    item.msg.replyTarget.targetId,
+  );
+  if (pendingMulti) {
     return false;
   }
 
@@ -426,6 +454,215 @@ function getOrCreateDebouncer(item: C2CInboundDebounceItem, initialDebounceMs: n
 }
 
 /**
+ * 文本作答拦截（多题顺序发题）。
+ *
+ * 多题 pending 武装期间，用户**直接回复的文本**被消费为答案，**不转发
+ * 框架**（仓库主人拍板的红线再界定：窗口内文本即作答意图——框架侧对
+ * 单条 partial 答案只会拒收重问，转发没有意义）。
+ *
+ * **三种文本形态**（判据只看形态，不猜内容语义）：
+ *
+ * | 形态 | 判据 | 动作 |
+ * |---|---|---|
+ * | **整单** | 行数 = 题数、题号 1..N 顺序、每行 `N: 值` | 用文本里的值**覆盖全部答案**；全部答齐 ⇒ 组合 + 提交；未答齐 ⇒ 更新答案 + 续发当前题卡 |
+ * | **形态错误** | 含「题号:」行但不满足整单形态 | 回执「格式不对」+ **保持 pending 武装**；不改答案、不提交 |
+ * | **本题答案** | 不含题号行（单行或多行，多行压平成一行） | 记为**当前题**答案；末题 ⇒ 组合 + 提交，否则续发下一题卡 |
+ *
+ * **同步规划、异步执行**：本函数必须完全同步返回（决策 + 状态推进），
+ * 出站（续卡/回执）封装成 thunk 交给调用方 await——enqueue 的
+ * 「防抖器同步注册」时序不能被任何 await 打断（调用方在同一宏任务里
+ * 就可能 flushAll，注册被推迟到微任务后 = 冲刷扑空、消息滞留缓冲）。
+ *
+ * 分支（返回 null = 不接管，走原路径）：
+ * - 纯附件 / 斜杠命令 / 无 pending → null
+ *   （附件走原路径；斜杠是逃生通道）；
+ * - pending 已终态（已提交 / 已被框架结束）→ null（文本照旧转发框架）；
+ * - pending **提交进行中**（resolving）→ **消费** + 回执「正在提交，请稍候」
+ *   （这一单正在提交：既不能当答案收，也**绝不转发框架**——框架会拿它去
+ *   认领 ⇒ partial 拒收 + 重问循环）。
+ *
+ * 提交红线：提交走框架官方认领通道（`claimPendingAgentQuestionAnswer`），
+ * 插件只**搬运**用户真实作答，不代替用户作答、不合成入站消息。
+ */
+function planSequentialTextCapture(params: {
+  msg: QQBotInboundMessage;
+  account: ResolvedQQBotAccount;
+  log?: PluginLogger;
+}): (() => Promise<void>) | null {
+  const { msg, account, log } = params;
+  const text = String(msg.content ?? '').trim();
+  if (!text) return null; // 纯附件：不做答案（已知边界：图片走框架 image-steer 取消问题）
+  if (text.startsWith('/')) return null; // 斜杠命令：逃生通道，照旧放行
+
+  // 带附件的消息**不捕获为答案**（2026-11-11 评审修复）：捕获会让整条
+  // 消息（含附件）不进框架 ⇒ 用户的图片/文件凭空消失。附件的价值高于
+  // 「把它当答案」——让整条消息照旧走框架（框架侧的 image-steer 会取消
+  // 本次问卷，符合既有语义）。
+  const attachments = (msg as { attachments?: unknown[] }).attachments;
+  if (Array.isArray(attachments) && attachments.length > 0) return null;
+
+  const pending = findMultiQuestionEntryByConversation(
+    account.accountId,
+    'c2c',
+    msg.replyTarget.targetId,
+  );
+  if (!pending) return null;
+
+  const dlog = log?.child('inbound-debounce');
+  const to = `qqbot:c2c:${msg.replyTarget.targetId}`;
+  const replyToId = String(msg.messageId ?? '');
+  const bestEffortText = async (body: string): Promise<void> => {
+    try {
+      await sendText({ to, text: body, account, ...(replyToId ? { replyToId } : {}) });
+    } catch {
+      // 尽力而为的通知：失败不阻断消费语义
+    }
+  };
+
+  const stateBefore = getPendingMultiQuestionState(pending.questionId);
+  if (!stateBefore) return null; // 竞态：pending 刚失效 → 走原路径
+  // 只处理**顺序发题**形态（c2c）：群聊 legacy 路径的文本不走「当前题
+  // 答案」语义（它靠确认卡的客户端代发提交）。
+  if (stateBefore.mode !== 'sequential') return null;
+
+  // ── 提交进行中（resolving）──
+  // 这一单正在提交（框架认领 await 未返回）⇒
+  // - **不能当答案收**：这一单的答案已经定稿，用户的补充会覆盖它；
+  // - **更不能放行回框架**：框架侧挂起记录还在，会拿这条文本去认领 ⇒
+  //   partial 拒收 + 重问循环（正是本机制要消灭的场景）。
+  // ⇒ 消费掉 + 回执「正在提交，请稍候」（用户稍后重发即可）。
+  //
+  // 窗口不是毫秒级：认领挂死时长达 20s（`question-submit.ts` 的超时），
+  // 而那正是用户最可能发「怎么没反应？」的时候 ⇒ 必须拦住。
+  if (pending.resolving) {
+    return async () => {
+      await bestEffortText('正在提交答案，请稍候——提交完成后可以再发一次。');
+      dlog?.info(
+        `[question] text consumed while resolving id=${pending.questionId} msgId=${msg.messageId}`,
+      );
+    };
+  }
+
+  const questions = stateBefore.questions;
+
+  // ── 形态 1：整单 ──
+  const full = matchFullKeyedAnswer(questions, text);
+  if (full) {
+    // 空值 = 该题未答（框架的 keyed 正则要求值至少一个字符，空值行会被
+    // 行序兜底捡成字面量 `"N:"` 静默收下——必须插件先拦下）
+    const empty = [...full.values()].some((value) => value.trim().length === 0);
+    if (empty) {
+      return async () => {
+        await bestEffortText(
+          '每道题都要填上答案——请把空的冒号后补上答案后**整段**发送。',
+        );
+        dlog?.info(`[question] full-keyed text has empty value (rejected) msgId=${msg.messageId}`);
+      };
+    }
+    // 覆盖全部答案（任一题空/非法 ⇒ applyFullKeyedAnswer 拒绝 ⇒ 保持武装）
+    if (!applyFullKeyedAnswer(pending.questionId, full)) {
+      return async () => {
+        await bestEffortText('这组答案没能解析成功，请每行一题重发一次。');
+        dlog?.info(`[question] full-keyed text rejected by state msgId=${msg.messageId}`);
+      };
+    }
+    const state = getPendingMultiQuestionState(pending.questionId);
+    if (!state) return null; // 竞态
+    dlog?.info(
+      `[question] full-keyed answer captured id=${pending.questionId} msgId=${msg.messageId}`,
+    );
+    if (state.answers.size < state.questions.length) {
+      // 理论不可达（整单形态要求行数 = 题数 ⇒ 每题都有值 ⇒ 全部答齐）；
+      // 保留作防御：万一判定口径放宽，这里不会静默提交一份缺题的答案
+      // （框架会整单拒绝，白白让用户多点一次）。
+      return async () => {
+        const sent = await sendSequentialQuestionCard({
+          state,
+          index: state.cursor,
+          account,
+          to,
+          log,
+        });
+        if (sent.error) {
+          await bestEffortText('题目卡片发送失败，请稍后重新点选或直接回复答案。');
+        }
+      };
+    }
+    // 全部答齐 ⇒ 组合 + 提交
+    return async () => {
+      await submitSequentialAnswers({ state, account, to, log });
+    };
+  }
+
+  // ── 形态 2：形态错误（含题号行但不合整单）──
+  if (containsKeyedAnswerLine(text)) {
+    return async () => {
+      await bestEffortText(
+        `格式不对——请每行一题、题号 ${questions.length} 道题按 1..${questions.length} 顺序写（例如「1: 3」），整段发送。`,
+      );
+      dlog?.info(`[question] malformed keyed text consumed with guidance msgId=${msg.messageId}`);
+    };
+  }
+
+  // ── 形态 3：本题答案（不含题号行）──
+  const result = recordSequentialTextAnswer(pending.questionId, text);
+  if (result.status === 'unknown') return null; // 竞态：走原路径
+  if (result.status === 'terminal') {
+    return async () => {
+      await bestEffortText('该问题已提交或已过期');
+    };
+  }
+  if (result.status === 'resolving') {
+    // 防御：上面已按 `pending.resolving` 拦过一次，这里是并发兜底
+    // （提交窗口内这一单不再收答案）。
+    return async () => {
+      await bestEffortText('正在提交答案，请稍候——提交完成后可以再发一次。');
+      dlog?.info(
+        `[question] text consumed while resolving (late) id=${pending.questionId} msgId=${msg.messageId}`,
+      );
+    };
+  }
+  dlog?.info(
+    `[question] text answer captured id=${pending.questionId}`
+    + ` q=${stateBefore.cursor + 1}/${stateBefore.questions.length} msgId=${msg.messageId}`,
+  );
+
+  const state = getPendingMultiQuestionState(pending.questionId);
+  if (!state) return null;
+
+  if (result.status === 'complete') {
+    // 末题收齐 ⇒ 组合 + 提交（不再发确认卡）
+    return async () => {
+      await submitSequentialAnswers({ state, account, to, log });
+    };
+  }
+
+  // status === 'ok'：续发下一题卡（失败按 F1 口径回执手打草稿）
+  return async () => {
+    // 发卡前复查：期间可能已被并发的那条入站提交掉了 ⇒ 续卡会变成
+    // 「已作废的卡片」（按钮点不动）⇒ 不发。
+    const armed = findPendingMultiQuestionByConversation(account.accountId, 'c2c', msg.replyTarget.targetId);
+    if (!armed || armed.questionId !== pending.questionId) {
+      dlog?.info(`[question] sequential card skipped (no longer armed) id=${pending.questionId}`);
+      return;
+    }
+    const sent = await sendSequentialQuestionCard({
+      state,
+      index: result.nextIndex,
+      account,
+      to,
+      log,
+    });
+    if (sent.error) {
+      const draft = buildSequentialFullAnswerDraft(state.answers, state.questions.length);
+      await bestEffortText(
+        `下一题发送失败——请直接回复下面这段提交（空白处补上答案）：\n\n${draft}`,
+      );
+    }
+  };
+}
+
+/**
  * c2c 入站消息入防抖队列。
  *
  * 返回 true = 已接管（进缓冲区，或旁路的立即 dispatch 已在内部完成）；
@@ -442,6 +679,18 @@ export async function enqueueC2CInboundMessage(
   log?: PluginLogger,
 ): Promise<boolean> {
   if (msg.replyTarget?.scope !== 'c2c') return false;
+
+  // ── 文本作答拦截（多题顺序发题）──
+  // 多题 pending 武装期间，用户的直接文本回复被消费为答案，**不转发框架**
+  // （仓库主人拍板的红线再界定：窗口内文本即作答意图）。必须在
+  // debounceMs 判定之前——防抖开/关配置行为一致。决策与状态推进同步完成
+  // （planSequentialTextCapture 不得含 await——防抖器的同步注册时序不能被
+  // 打断），出站在 thunk 里异步执行。
+  const textCapture = planSequentialTextCapture({ msg, account, log });
+  if (textCapture) {
+    await textCapture();
+    return true; // 已接管（记答案 + 续卡 / 提交 / 引导 / 回执）
+  }
 
   const cfg = (getAdapters(runtime).getConfig?.() ?? {}) as Record<string, unknown>;
   const debounceMs = resolveC2CInboundDebounceMs(account, cfg);

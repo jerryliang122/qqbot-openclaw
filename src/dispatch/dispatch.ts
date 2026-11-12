@@ -36,6 +36,7 @@ import {
   registerPendingMultiQuestion,
   registerPendingSingleQuestion,
   markSingleQuestionResolved,
+  retirePendingMultiQuestion,
   findPendingSingleQuestionByConversation,
   getPendingMultiQuestionState,
 } from '../features/question-helpers.js';
@@ -789,6 +790,10 @@ export async function dispatchToOpenClaw(
             undefined,
             envelope.messageId,
             sequential ? 'sequential' : 'legacy',
+            // 框架挂起 ask_user 记录的 sessionKey——插件直提整单答案的查表键
+            // （`claimPendingAgentQuestionAnswer`）。框架的 turn 就跑在这个
+            // session（`routeSessionKey: route.sessionKey`）⇒ 命中同一条记录。
+            route.sessionKey,
           );
           // ask_user 前先固化已累积的流式内容（同单问题分支，评审意见 6）
           // static 的 flush 走 tolerant：前置文本发送失败不终态化 controller
@@ -806,6 +811,9 @@ export async function dispatchToOpenClaw(
           // 卡片发送前二次复查取消信号（await 期间可能已取消）
           if (combinedAbortSignal.aborted) {
             dlog?.info('[question] skipped: turn cancelled before cards (multi)');
+            // 用户根本没看到卡片 ⇒ 退役 pending：否则他后续的普通消息会被
+            // 拦截层吞成「一个他没见过的问题」的答案（评审修复）。
+            retirePendingMultiQuestion(questionId);
             return;
           }
           try {
@@ -852,6 +860,11 @@ export async function dispatchToOpenClaw(
           } catch (err) {
             outboundSendFail++;
             dlog?.error(`[question] multi-question send failed: ${err instanceof Error ? err.message : String(err)}`);
+            // 首卡没送达 ⇒ 用户看不到任何题目 ⇒ 退役 pending（避免他后续的
+            // 普通消息被当成「没见过的那个问题」的答案）。
+            // 注意：**部分送达**（首卡成功、后续卡失败）时 pending 仍保留——
+            // 用户至少看得见第一题，可以作答。
+            if (outboundSendOk === 0) retirePendingMultiQuestion(questionId);
             // 已发出的卡片仍可点选；此处走纯文本兜底补全未送达部分
           }
         } else {
