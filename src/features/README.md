@@ -89,6 +89,8 @@
 - **drain 钩子抛错必须隔离**——框架 `await turnAdoptionLifecycle?.onAdopted()`，钩子抛错会冒泡成 turn 失败。
 - **旁路判定必须入队时冻结**（`payload.bypass`）——合批发生在 claim 之后，那时读不到活状态（pending question store 是进程内的、附件是活对象）；口径共用 `group-merge.ts` 的 `isBypassGroupItem`，**禁止另写一份**。
 - **批次指纹的命名空间跨版本必须稳定**——`qqbot-group-batch` 改了等于放过一次重复回复。
+- **单条批次必须走「不合并」特判**（`kept.length === 1 && dropped === 0`）——否则正文多出 `[消息 1/1]` 分节头、webBody 的 from 从发送者变成群 openid（内存路径 `group-merge.ts` 有同条件特判，durable 路径必须对齐）。
+- **日志里的群标识一律走 `shortId()`**（唯一事实源 `src/utils/redaction.ts`）——core 的 drain 内部日志还会内嵌 lane key（含群 openid）⇒ `onLog` 桥接处必须过 `redactIngressLog()`。
 - **群历史模式 `historyMode`**：默认 `clear`（回复后整清）；`rolling`——bot 出站也记入 historyBuffer，回复后裁剪到最后一条 bot 发言之后。
 
 ### 入站防抖与回告

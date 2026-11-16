@@ -23,6 +23,7 @@ import {
   type BatchMember,
 } from '../src/features/ingress-batcher.js';
 import { INGRESS_PAYLOAD_VERSION, type QQBotIngressPayload } from '../src/features/ingress-payload.js';
+import type { AssembledBody } from '../src/dispatch/body-assembler.js';
 
 /**
  * 每次运行的唯一后缀。
@@ -359,6 +360,151 @@ await test('窗口 > 0 ⇒ 窗口期内到达的消息并入本批', async () =>
   });
   assert.ok(body.includes('AAA'), '队首消息应在正文里');
   assert.ok(body.includes('BBB'), '窗口期内到达的消息应并入本批');
+});
+
+group('单条批次不合并（正文格式与改造前逐字一致）');
+
+/**
+ * 派发一批并抓取模型可见正文（bodyForAgent / rawBody / webBody）。
+ *
+ * bodyForAgent = 模型看到的正文；rawBody = 命令判定用的原文；
+ * webBody = Web UI 信封正文（from 标签在 renderWebBody 里决定）。
+ */
+async function dispatchAndCapture(params: {
+  cfg?: Record<string, unknown>;
+  head: QQBotIngressPayload;
+  backlog?: QQBotIngressPayload[];
+  frozenBody?: AssembledBody;
+}): Promise<{ agentBody: string; rawBody: string; webBody: string }> {
+  const { dispatchClaimedGroupEvent, resetIngressEffectGuardsForTest } = await import(
+    '../src/features/ingress-batcher.js'
+  );
+  resetIngressEffectGuardsForTest();
+
+  let captured: { agentBody: string; rawBody: string; webBody: string } = {
+    agentBody: '',
+    rawBody: '',
+    webBody: '',
+  };
+  const runtime = {
+    version: '2026.10.5',
+    channel: {
+      inbound: {
+        run: async (runParams: any) => {
+          const message = runParams.adapter.resolveTurn?.({}, {}, {}).ctxPayload?.message ?? {};
+          captured = {
+            agentBody: String(message.bodyForAgent ?? ''),
+            rawBody: String(message.rawBody ?? ''),
+            webBody: String(message.body ?? ''),
+          };
+          return { dispatched: true };
+        },
+        buildContext: (buildParams: any) => ({ ...buildParams }),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async () => ({ queuedFinal: true, counts: { final: 1 } }),
+      },
+      routing: {
+        resolveAgentRoute: () => ({ sessionKey: 's', accountId: 'acc1', agentId: 'default' }),
+      },
+      session: { resolveStorePath: () => '', recordInboundSession: async () => {} },
+    },
+    config: { current: () => params.cfg ?? {} },
+  } as unknown as PluginRuntime;
+
+  const handle = {
+    accountId: 'acc1',
+    ownerId: 'test-owner',
+    runtime,
+    queue: {
+      claim: async (id: string) => {
+        const row = (params.backlog ?? []).find((p) => `row-${p.messageId}` === id);
+        return row
+          ? { id, payload: row, receivedAt: row.receivedAtMs, laneKey: 'l' }
+          : null;
+      },
+      complete: async () => true,
+      release: async () => true,
+    },
+    log: undefined,
+  } as never;
+
+  const lifecycle = {
+    abortSignal: new AbortController().signal,
+    readLaneBacklog: async () =>
+      (params.backlog ?? []).map((p) => ({ id: `row-${p.messageId}`, payload: p })),
+    onAdopted: () => {},
+    onDeferred: () => {},
+    onAdoptionFinalizing: () => {},
+    onAbandoned: () => {},
+  } as never;
+
+  await dispatchClaimedGroupEvent(
+    {
+      id: `row-${params.head.messageId}`,
+      payload: params.head,
+      receivedAt: params.head.receivedAtMs,
+      laneKey: 'l',
+    } as never,
+    lifecycle,
+    handle,
+  );
+  return captured;
+}
+
+await test('单条消息：沿用中间件冻结的单条正文（无 [消息 1/1]、webBody 不变）', async () => {
+  const groupOpenid = `g-single-${RUN_ID}`;
+  const frozen: AssembledBody = {
+    agentBody: 'FROZEN-SINGLE-BODY',
+    rawBody: 'FROZEN-RAW',
+    webBody: 'FROZEN-WEB',
+  };
+  const head = makePayload({
+    groupOpenid,
+    messageId: 'single',
+    content: 'AAA',
+    rawContent: 'AAA',
+    assembledBody: frozen,
+  });
+
+  const out = await dispatchAndCapture({ head });
+  assert.equal(out.agentBody, 'FROZEN-SINGLE-BODY', '单条批次必须沿用中间件冻结的单条正文');
+  assert.ok(!out.agentBody.includes('[消息 1/1]'), '单条批次不得出现 [消息 1/1] 分节头');
+  assert.equal(out.rawBody, 'FROZEN-RAW', 'rawBody 必须沿用冻结值');
+  assert.equal(out.webBody, 'FROZEN-WEB', 'webBody 必须沿用冻结值（from 不得变成群 id）');
+});
+
+await test('多条消息：仍走合并装配（[消息 i/N] 分节 + 合并正文）', async () => {
+  const groupOpenid = `g-multi-${RUN_ID}`;
+  const head = makePayload({
+    groupOpenid,
+    messageId: 'm1',
+    content: 'AAA',
+    rawContent: 'AAA',
+    assembledBody: {
+      agentBody: 'FROZEN-1',
+      rawBody: 'FROZEN-1',
+      webBody: 'FROZEN-1',
+    },
+  });
+  const second = makePayload({
+    groupOpenid,
+    messageId: 'm2',
+    content: 'BBB',
+    rawContent: 'BBB',
+    receivedAtMs: head.receivedAtMs + 1,
+    assembledBody: {
+      agentBody: 'FROZEN-2',
+      rawBody: 'FROZEN-2',
+      webBody: 'FROZEN-2',
+    },
+  });
+
+  const out = await dispatchAndCapture({ head, backlog: [second] });
+  assert.ok(out.agentBody.includes('[消息 1/2]'), '多成员批次必须带分节头');
+  assert.ok(out.agentBody.includes('[消息 2/2]'), '多成员批次必须带分节头');
+  assert.ok(out.agentBody.includes('AAA') && out.agentBody.includes('BBB'), '两��成员都要进正文');
+  assert.ok(!out.agentBody.includes('FROZEN-1'), '多成员批次不得沿用单条冻结正文');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

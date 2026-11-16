@@ -38,6 +38,7 @@ import { recordKnownUser } from '../features/proactive.js';
 import { cacheMsgId } from '../features/msgid-cache.js';
 import { enqueueC2CInboundMessage } from '../features/inbound-debounce.js';
 import { enqueueDurableGroupInbound } from '../features/ingress-queue.js';
+import { shortId } from '../utils/redaction.js';
 import { enqueueGroupInboundMessage } from '../features/group-merge.js';
 import { recordGroupEvent, getGroupModeFacts } from '../features/group-mode-store.js';
 import { recordPushAuthorizeEvent } from '../features/push-authorization-store.js';
@@ -257,14 +258,10 @@ export async function handleInteraction(
  * 纯观测：留痕 + 授权事件入 store，不 ack（官方文档：仅 11/12 需要 ack），
  * 不产生任何出站动作。
  *
- * 日志中的标识符统一截断为前 8 字符（openid 32 位 hex，前缀已足够定位排障；
- * 对齐 /bot-group-info 的展示惯例）——INFO 日志可被 /bot-logs 导出给 c2c
- * 用户（默认 allowFrom 为空即开放），不落完整他人标识符。
+ * 日志中的标识符统一走 `shortId()`（utils/redaction.ts 的唯一事实源）——
+ * INFO 日志可被 /bot-logs 导出给 c2c 用户（默认 allowFrom 为空即开放），
+ * 不落完整他人标识符。
  */
-function shortId(id: string | undefined): string {
-  if (!id) return '?';
-  return id.length > 8 ? `${id.slice(0, 8)}…` : id;
-}
 
 function handlePlatformInteraction(
   event: InteractionEvent,

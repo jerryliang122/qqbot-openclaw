@@ -37,6 +37,7 @@ import { CHANNEL_INGRESS_RETENTION_DEFAULTS } from 'openclaw/plugin-sdk/channel-
 import type { PluginRuntime } from 'openclaw/plugin-sdk';
 import type { MiddlewareContext, QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import { createPluginLogger } from '../utils/plugin-logger.js';
+import { shortId } from '../utils/redaction.js';
 import type { ResolvedQQBotAccount } from '../types.js';
 import { getAdapters } from '../adapter/resolve.js';
 import { resolveGroupConfigFromAccount } from '../config.js';
@@ -159,6 +160,17 @@ export function buildIngressLaneKey(accountId: string, groupOpenid: string): str
   return `qqbot:${accountId}:group:${groupOpenid}`;
 }
 
+/**
+ * 脱敏 drain 的内部日志（core 的 onLog 原文里**内嵌 lane key**）。
+ *
+ * lane key 形如 `qqbot:{accountId}:group:{groupOpenid}` ⇒ core 的日志行
+ * （如「…on lane <laneKey> reached retry limit…」）会把**完整群 openid**带出来。
+ * `/bot-logs` 原样导出本地日志文件 ⇒ 桥接处必须脱敏（根 AGENTS.md § Security）。
+ */
+export function redactIngressLog(message: string): string {
+  return message.replace(/group:([A-Za-z0-9_-]{8,})/g, (_m, id: string) => `group:${shortId(id)}`);
+}
+
 /** 队列行 id */
 export function buildIngressQueueId(accountId: string, messageId: string): string {
   return `${QUEUE_ID_PREFIX}${accountId}:${messageId}`;
@@ -232,7 +244,7 @@ export function getIngressAccount(
       },
       resolveNonRetryableFailure: (err: unknown) =>
         handlers?.resolveNonRetryableFailure?.(err) ?? null,
-      onLog: (message: string) => log?.debug(`[ingress] ${message}`),
+      onLog: (message: string) => log?.debug(`[ingress] ${redactIngressLog(message)}`),
     });
   } catch (err) {
     unavailableAccounts.add(accountId);
