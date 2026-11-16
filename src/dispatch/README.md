@@ -19,8 +19,8 @@
 
 ## 相关红线
 
-- **canonical session key 文法是 10.x 硬门槛** → [`docs/agents/session-and-dispatch.md`](../../docs/agents/session-and-dispatch.md) §「canonical session key 文法」
-- **route 文法是 canonical 之外的第二道门** → [`docs/agents/session-and-dispatch.md`](../../docs/agents/session-and-dispatch.md) §「session key 的 route 文法」
+- **canonical session key 文法是 10.x 硬门槛**（根级）→ 根 [`AGENTS.md`](../../AGENTS.md) §「Session key 与投递」
+- **route 文法是 canonical 之外的第二道门** → [`docs/agents/session-and-dispatch.md`](../../docs/agents/session-and-dispatch.md)
 - **10.5 的 admission ticket 发生在 replyResolver 之前** → [`docs/agents/session-and-dispatch.md`](../../docs/agents/session-and-dispatch.md) §「10.5 指令/投递语义实测」
 - **c2c 入站防抖合并 + 三类旁路** → [`docs/agents/inbound.md`](../../docs/agents/inbound.md) §「c2c 入站防抖合并」
 - **群消息合并在插件侧做（框架 collect 对「同群不同人」无效）** → [`docs/agents/group-and-room-event.md`](../../docs/agents/group-and-room-event.md) §「群消息合并在插件侧做」
@@ -29,8 +29,10 @@
 ## 本目录特有的坑
 
 - **兜底路由必须用 `buildFallbackRouteSessionKey`**——不能用裸通道前缀 key 或含大写的 key，框架会抛 `SessionCanonicalKeyMigrationRequiredError`，该 session 一切读写瘫痪、dispatch 全部 outcome=error。
-- **canonical 过了 ≠ 框架能反解出投递目标**——框架反解用 `parseSessionDeliveryRoute`，peer 段之后所有冒号分段都会被并进 peerId。兜底优先用框架原语 `runtime.channel.routing.buildAgentSessionKey`。
+- **canonical 过了 ≠ 框架能反解出投递目标**——框架反解用 `parseSessionDeliveryRoute`，文法是 `<channel>[:<accountId>]:<peerKind>:<peerId>`，peer 段之后所有冒号分段都会被并进 peerId。兜底优先用框架原语 `runtime.channel.routing.buildAgentSessionKey`。
 - **群 key 不含 accountId**——框架自身就不按账号隔离群会话，插件兜底也不该塞。
+- **所有 c2c 用户默认共享 `agent:main:main` 一个 session**——要多用户隔离得让用户配 `session.dmScope: "per-peer"`。
+- **10.5 的 admission ticket 发生在 replyResolver 之前**——忙碌会话里非 abort 类指令要等活动 turn 结束才被解释，「群里任务跑着发指令没反应」是预期排队语义，不是丢消息。
 - **合并后的历史必须取「批前基线」**（最早成员的快照）——直接拼 N 条 agentBody 会让 history 块重复 N 份。
 - **合并载体 = 按平台 timestamp 排序后最后一条消息的 ctx**——中间件链并发执行，入队顺序 ≠ 到达顺序。
-- **所有 c2c 用户默认共享 `agent:main:main` 一个 session**——要多用户隔离得让用户配 `session.dmScope: "per-peer"`。
+- **`#ROBOT1.0_<id>! ` 前缀是框架 `formatRoomEventLine` 把消息 id 合并进正文**，不是平台塞进 content。修复方向是改写格式（传 `AmbientTranscriptBody`）而非剥离入站正文。**刻意不设 `AmbientTranscriptWatermarkKey`**——那是 telegram 专属路径。
