@@ -33,6 +33,7 @@ import type {
   ChannelIngressQueueClaim,
   ChannelIngressQueueRecord,
 } from 'openclaw/plugin-sdk/channel-outbound';
+import { CHANNEL_INGRESS_RETENTION_DEFAULTS } from 'openclaw/plugin-sdk/channel-outbound';
 import type { PluginRuntime } from 'openclaw/plugin-sdk';
 import type { MiddlewareContext, QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import { createPluginLogger } from '../utils/plugin-logger.js';
@@ -266,6 +267,7 @@ export function getIngressAccount(
   // ⚠️ drain 内部的 claim 是**并发**跑的（runClaimed 不 await），因此
   // 单个 lane 的长耗时不会阻塞其它 lane。
   void (async () => {
+    let lastPrunedAt = Date.now();
     while (!stopped) {
       try {
         await drain.drainOnce({ shouldStop: () => stopped });
@@ -275,6 +277,25 @@ export function getIngressAccount(
         );
       }
       if (stopped) break;
+      // 队列清理（保留策略取框架默认，与 core 的 ingress monitor 同款）：
+      // 只清 completed / failed 的墓碑行，**pending 行永不按 TTL 清理**
+      // ——pending 是「还没送达的消息」，按 TTL 清就是丢用户消息。
+      const now = Date.now();
+      if (now - lastPrunedAt >= CHANNEL_INGRESS_RETENTION_DEFAULTS.pruneIntervalMs) {
+        lastPrunedAt = now;
+        try {
+          await handle.queue.prune({
+            completedTtlMs: CHANNEL_INGRESS_RETENTION_DEFAULTS.completedTtlMs,
+            completedMaxEntries: CHANNEL_INGRESS_RETENTION_DEFAULTS.completedMaxEntries,
+            failedTtlMs: CHANNEL_INGRESS_RETENTION_DEFAULTS.failedTtlMs,
+            failedMaxEntries: CHANNEL_INGRESS_RETENTION_DEFAULTS.failedMaxEntries,
+          });
+        } catch (err) {
+          log?.warn(
+            `[ingress] 队列清理失败 account=${accountId}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
       await new Promise<void>((resolve) => {
         const timer = setTimeout(() => {
           wakeResolve = null;

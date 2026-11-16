@@ -97,7 +97,11 @@ enqueueDurableGroupInbound() → 'handled' | 'not_applicable' | 'unavailable'
 - **群聊 legacy `user_request` 语义不变**：被 @ 的那条在 room_event 群里仍然分类为 `user_request`（不被压成静默）——分类口径仍是 `classifyInboundEventKind`，输入是重建后的同一份 mention 状态。
 - **合批窗口时长来源是框架旋钮**（D-c）——不得改回插件内硬编码常量（会让用户已有的 `messages.inbound.byChannel.qqbot.debounceMs` 旋钮再次失效），也不得新增群专属配置键。
 
-## 8. 已知限制
+## 8. 队列清理（prune）
+
+drain 循环每小时调一次 `queue.prune`，保留策略**取框架默认** `CHANNEL_INGRESS_RETENTION_DEFAULTS`（与 core 的 ingress monitor 同款）：只清 `completed` / `failed` 的墓碑行（TTL 30 天 / 上限 20000 条），**pending 行永不按 TTL 清理**——pending 是「还没送达的消息」，按 TTL 清就是丢用户消息。
+
+## 9. 已知限制
 
 - **副作用仍可能重复一次**（见 §5，core 契约）。
 - **退出只保证「宽限内能跑完的 turn 把回复发完」**：`flushIngressQueues` 反复 `drainOnce` 后 `disposeIngressQueues` 停摆；deferred 的 turn 由框架队列在后台继续，无界等待会让 Ctrl+C 卡死（同 c2c 路径的取舍）。
