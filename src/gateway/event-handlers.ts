@@ -37,6 +37,7 @@ import { sendSequentialQuestionCard, submitSequentialAnswers } from '../features
 import { recordKnownUser } from '../features/proactive.js';
 import { cacheMsgId } from '../features/msgid-cache.js';
 import { enqueueC2CInboundMessage } from '../features/inbound-debounce.js';
+import { enqueueDurableGroupInbound } from '../features/ingress-queue.js';
 import { enqueueGroupInboundMessage } from '../features/group-merge.js';
 import { recordGroupEvent, getGroupModeFacts } from '../features/group-mode-store.js';
 import { recordPushAuthorizeEvent } from '../features/push-authorization-store.js';
@@ -128,8 +129,26 @@ export async function handleMessage(
       const handled = await enqueueC2CInboundMessage(ctx, msg, account, runtime, hlog);
       if (!handled) await dispatchNow();
     } else {
-      const handled = await enqueueGroupInboundMessage(ctx, msg, account, runtime, hlog);
-      if (!handled) await dispatchNow();
+      // 群聊：**持久化入站**（durable ingress）。消息先落盘再派发——
+      // 进程重启不丢、忙闲判定不再依赖 dispatch promise 的生命周期
+      // （框架把 turn defer 时 promise 就 resolve，会让 busy 提前归零）。
+      const outcome = await enqueueDurableGroupInbound({
+        ctx,
+        msg,
+        account,
+        runtime,
+        log: hlog,
+      });
+      if (outcome === 'handled') {
+        // 已持久化，后续由 drain 派发
+      } else if (outcome === 'unavailable') {
+        // 持久化入站不可用 ⇒ 回落内存合批路径（改造前的行为）
+        const handled = await enqueueGroupInboundMessage(ctx, msg, account, runtime, hlog);
+        if (!handled) await dispatchNow();
+      } else {
+        // not_applicable：交回框架队列（strategy:'framework'）⇒ 直发
+        await dispatchNow();
+      }
     }
   } catch (err) {
     hlog.error(`dispatch error: ${err}`);

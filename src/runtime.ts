@@ -42,6 +42,14 @@ function installExitHooksOnce(): void {
       const m = await import("./features/group-merge.js");
       await m.flushAllGroupMergeQueues();
     } catch {}
+    // 群聊持久化入站：先把队列里 pending 的行派发出去，再停 drain。
+    // （不冲刷的话，退出时已落盘但未派发的群消息会一直留在队列里，
+    //  下次启动才被 recoverStaleClaims 捞出来重投。）
+    try {
+      const m = await import("./features/ingress-queue.js");
+      await m.flushIngressQueues();
+      await m.disposeIngressQueues();
+    } catch {}
   };
 
   process.on('beforeExit', () => {

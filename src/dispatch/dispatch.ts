@@ -11,6 +11,7 @@
  */
 import type { MiddlewareContext, QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { PluginRuntime } from 'openclaw/plugin-sdk';
+import { bindIngressLifecycleToReplyOptions } from 'openclaw/plugin-sdk/channel-outbound';
 import type { ResolvedQQBotAccount } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
 import { buildEnvelope } from './envelope-builder.js';
@@ -161,6 +162,62 @@ function combineAbortSignals(
 }
 
 
+/**
+ * 把持久化入站的 claim lifecycle 映射到回复车道的 turnAdoptionLifecycle。
+ *
+ * 框架的采纳钩子是**唯一**让 drain 结算 claim 的时机：
+ * - onAdopted：turn 已被回复车道采纳 ⇒ drain tombstone claim（不再重投）
+ * - onDeferred：turn 排到了活动 turn 后面 ⇒ claim 继续持有
+ * - onAbandoned：turn 终局未拿到回复车道 ⇒ drain 释放 claim 供重试
+ *
+ * ⚠️ 钩子回调**不能抛**：框架 `await turnAdoptionLifecycle?.onAdopted()`
+ * 会把异常冒泡成 turn 失败。drain 的记账错误只记日志，不影响用户这一轮。
+ */
+export function buildIngressBoundAdoptionLifecycle(params: {
+  ingress: IngressLifecycleLike;
+  dlog?: PluginLogger;
+  isGroup: boolean;
+  sessionKey: string;
+  notifyTurnSubmitted: () => void;
+}) {
+  const { ingress, dlog, isGroup, sessionKey, notifyTurnSubmitted } = params;
+  const bound = bindIngressLifecycleToReplyOptions(ingress as never);
+  const source = bound.turnAdoptionLifecycle;
+
+  const guard = async (fn: (() => void | Promise<void>) | undefined, label: string) => {
+    try {
+      await fn?.();
+    } catch (err) {
+      dlog?.warn(
+        `ingress ${label} hook failed sessionKey=${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+
+  return {
+    admission: 'exclusive' as const,
+    abortSignal: source.abortSignal,
+    onAdopted: async () => {
+      dlog?.debug(`turn adopted (exclusive, ${isGroup ? 'group' : 'c2c'}) sessionKey=${sessionKey}`);
+      notifyTurnSubmitted();
+      await guard(source.onAdopted, 'onAdopted');
+    },
+    onDeferred: () => {
+      dlog?.debug(`turn deferred behind active turn sessionKey=${sessionKey}`);
+      notifyTurnSubmitted();
+      source.onDeferred?.();
+    },
+    onDeferredHeartbeat: source.onDeferredHeartbeat,
+    deferredHeartbeatIntervalMs: source.deferredHeartbeatIntervalMs,
+    onAbandoned: async () => {
+      dlog?.info(`group turn abandoned without owning reply lane sessionKey=${sessionKey}`);
+      notifyTurnSubmitted();
+      await guard(source.onAbandoned, 'onAbandoned');
+    },
+  };
+}
+
+
 /** dispatchToOpenClaw 可选行为开关（c2c 防抖 admission 信号等） */
 export interface DispatchToOpenClawOptions {
   /**
@@ -185,6 +242,32 @@ export interface DispatchToOpenClawOptions {
    * 链不会悬挂。
    */
   onTurnSubmitted?: () => void;
+  /**
+   * 持久化入站的 claim 生命周期（群聊 durable ingress 路径）。
+   *
+   * 传入时，`replyOptions.turnAdoptionLifecycle` 改由
+   * `bindIngressLifecycleToReplyOptions(lifecycle)` 映射而来：turn 被回复
+   * 车道采纳 ⇒ drain tombstone 该 claim（消息不再重投）；turn 被放弃 ⇒
+   * drain 释放该 claim 供重试。
+   *
+   * 不传时走本文件原有的 turnAdoptionLifecycle（c2c 插嘴语义）。
+   */
+  ingressLifecycle?: IngressLifecycleLike;
+}
+
+/**
+ * 持久化入站 lifecycle 的结构化子集（本仓不依赖 core 的内部类型导出）。
+ *
+ * 字段与 core 的 `ChannelIngressDispatchLifecycle` 对齐——
+ * `bindIngressLifecycleToReplyOptions` 按结构接收它。
+ */
+export interface IngressLifecycleLike {
+  abortSignal: AbortSignal;
+  onAdopted: () => void | Promise<void>;
+  onDeferred: () => void;
+  onDeferredHeartbeat?: () => void;
+  deferredHeartbeatIntervalMs?: number;
+  onAbandoned: () => void | Promise<void>;
 }
 
 /** 框架 canonical agent id（非法值回退 'main'）——与 openclaw normalizeAgentId 同形。 */
@@ -1038,28 +1121,36 @@ export async function dispatchToOpenClaw(
     opts?.onTurnSubmitted?.();
   };
 
-  const turnAdoptionLifecycle = {
-    admission,
-    abortSignal: interruptible ? turnAbort.signal : undefined,
-    onAdopted: () => {
-      dlog?.debug(`turn adopted (exclusive, ${isGroup ? 'group' : 'c2c'}) sessionKey=${route.sessionKey}`);
-      notifyTurnSubmitted();
-    },
-    onDeferred: () => {
-      dlog?.debug(`turn deferred behind active turn sessionKey=${route.sessionKey}`);
-      notifyTurnSubmitted();
-    },
-    onAbandoned: () => {
-      if (interruptible) {
-        dlog?.info(`turn abandoned (superseded) — aborting sessionKey=${route.sessionKey}`);
-        turnAbort.abort();
-      } else {
-        dlog?.info(`group turn abandoned without owning reply lane sessionKey=${route.sessionKey}`);
-      }
-      // 防御路径：未经采纳/排队即被弃的 turn，链同样该放行
-      notifyTurnSubmitted();
-    },
-  };
+  const turnAdoptionLifecycle = opts?.ingressLifecycle
+    ? buildIngressBoundAdoptionLifecycle({
+        ingress: opts.ingressLifecycle,
+        dlog,
+        isGroup,
+        sessionKey: route.sessionKey,
+        notifyTurnSubmitted,
+      })
+    : {
+        admission,
+        abortSignal: interruptible ? turnAbort.signal : undefined,
+        onAdopted: () => {
+          dlog?.debug(`turn adopted (exclusive, ${isGroup ? 'group' : 'c2c'}) sessionKey=${route.sessionKey}`);
+          notifyTurnSubmitted();
+        },
+        onDeferred: () => {
+          dlog?.debug(`turn deferred behind active turn sessionKey=${route.sessionKey}`);
+          notifyTurnSubmitted();
+        },
+        onAbandoned: () => {
+          if (interruptible) {
+            dlog?.info(`turn abandoned (superseded) — aborting sessionKey=${route.sessionKey}`);
+            turnAbort.abort();
+          } else {
+            dlog?.info(`group turn abandoned without owning reply lane sessionKey=${route.sessionKey}`);
+          }
+          // 防御路径：未经采纳/排队即被弃的 turn，链同样该放行
+          notifyTurnSubmitted();
+        },
+      };
   const combinedAbortSignal = interruptible
     ? combineAbortSignals(ctx.signal, turnAbort.signal)
     : ctx.signal;
