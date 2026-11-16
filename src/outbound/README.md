@@ -23,7 +23,7 @@
 | `local-file-router.ts` | `isLocalFilePath` / `validateLocalFile` / `getFileSize`——本地路径与 data URL 判定 |
 | `target.ts` | `isQQBotTarget` / OpenID 与 scope 前缀解析 |
 | `debounce.ts` | `DeliverDebouncer`——出站合并 |
-| `sanitize.ts` | `sanitizeQQBotText`——富媒体 token 剥离 |
+| `sanitize.ts` | `sanitizeQQBotText`——剥离框架内部脚手架标签（`system-reminder` / `thinking` / `reasoning` 等），保留 Markdown 渲染 |
 | `reply-limiter.ts` | `ReplyLimiter`——**独立的老工具类，与 quota-manager 无关** |
 
 ## 相关红线

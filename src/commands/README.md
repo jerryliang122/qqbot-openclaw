@@ -17,7 +17,7 @@
 | `bot-version.ts` | `/bot-version`——插件与 openclaw 版本 |
 | `bot-ping.ts` | `/bot-ping` 连通性自检 |
 | `bot-me.ts` | `/bot-me`——当前会话身份 |
-| `bot-group-info.ts` | `/bot-group-info`——群模式 / 配额 / 可见回复模式巡检 |
+| `bot-group-info.ts` | `/bot-group-info`——查看该群的**推送模式**与**生效配置**（群级 / 按 agent / 全局三层） |
 | `bot-group-always.ts` | `/bot-group-always`——群级 always 开关 |
 | `bot-approve.ts` | `/bot-approve`——审批相关命令 |
 | `bot-pairing.ts` | `/bot-pairing`——配对码 |
