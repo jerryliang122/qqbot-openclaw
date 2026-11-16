@@ -25,6 +25,7 @@ OpenClaw 通道插件：把 QQ Bot 官方 API 接入 OpenClaw framework（独立
 | [docs/agents/chunking.md](docs/agents/chunking.md) | 字形簇安全分块、结构上下文开销封顶 | 动 `src/outbound/chunker.ts` / `src/outbound/grapheme.ts` |
 | [docs/agents/streaming.md](docs/agents/streaming.md) | 流式生命周期、段模型、final 承接判定、park 语义 | 动 `src/outbound/streaming-controller.ts` 或 dispatch 流式分支 |
 | [docs/agents/group-and-room-event.md](docs/agents/group-and-room-event.md) | 群三模式、room_event、合批、群历史窗口 | 动群聊策略、合批、唤醒判定 |
+| [docs/agents/durable-group-ingress.md](docs/agents/durable-group-ingress.md) | 群聊持久化入站：队列/租约、到达序排序、lane 串行、幂等、降级 | 动群聊入站缓冲、合批、排序、幂等 |
 | [docs/agents/inbound.md](docs/agents/inbound.md) | 入站防抖、白名单回告、事件守卫、语音转录、限流 | 动中间件链、入站分类、附件处理 |
 | [docs/agents/interaction.md](docs/agents/interaction.md) | ask_user 按钮卡片、Secret 输入、webhook detached 派发 | 动按钮卡片、凭据输入、webhook 传输 |
 | [docs/agents/platform-capabilities.md](docs/agents/platform-capabilities.md) | QQ 平台语义：被动/主动/互动、流式通道、Markdown、OpenID、双传输、Telegram 对照 | 拿 Telegram 直觉套 QQ、设计平台交互时 |
@@ -181,7 +182,8 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 
 - **群聊三模式由平台决定，插件不可控**（AT 纯模式 / AT+最近N / 全量），**插件无需也不应按模式分流**——三事件共用 intent、SDK 映射同形态、走同一条中间件链。
 - **room_event 的三处裁决必须同源**——门控（`src/middleware/policy-injector.ts`）、入站分类（`src/dispatch/`）、历史缓冲跳过三处共用 `resolveGroupRoomEventPolicy` 的一份结论，**三处各算各的必然出事**（门控放行 + 分类成 user_request = 刷屏；门控拦掉 + 分类成 room_event = 永远收不到消息）。
-- **群消息合并在插件侧做**——框架 collect 合批对「同群不同人」无效（分组键含 `senderId`，遇第一个不同 key 就 break）。插件自建 busy 信号 + `createInboundDebouncer` 合批，**批次键按群不按人**。→ 实现见 [`src/features/README.md`](src/features/README.md)
+- **群消息合并在插件侧做**——框架 collect 合批对「同群不同人」无效（分组键含 `senderId`，遇第一个不同 key 就 break）。**批次键按群不按人**。→ 实现见 [`src/features/README.md`](src/features/README.md)
+- **群聊入站是持久化队列（2026-11-16）**——群消息**先落盘再派发**（SQLite 队列 + lane 串行 + 租约续期 + 失败重投 + 幂等守卫），对齐 openclaw 2026.11.4 的 Telegram L1–L5。**排序权威是本地到达时刻**（不是平台 timestamp——QQ timestamp 是客户端发送时间，群成员设备时钟不一致 ⇒ 按它排就是排错）；**忙闲判据是 durable lane claim**（不是 dispatch promise 生命周期——框架把 turn defer 时 promise 就 resolve，旧口径会提前归零导致合批散架）。**红线：不得改回按平台 timestamp 排序、不得把 busy 判据换回 promise 生命周期、不得让群路径出现「绕过队列直接 dispatch」的快路径**（空闲群单条消息也走队列）。**C2C 私聊零改动、配置面零变更、`strategy:'framework'` 保持 legacy**。→ 叙事见 [`docs/agents/durable-group-ingress.md`](docs/agents/durable-group-ingress.md)
 
 ### 交互面（[详情](docs/agents/interaction.md)）
 
@@ -204,6 +206,7 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 | 进度卡 / 问题卡 / 媒体投递 | [`src/outbound/README.md`](src/outbound/README.md) | [docs/agents/outbound-and-quota.md](docs/agents/outbound-and-quota.md) |
 | 入站（防抖 / 守卫 / 语音 / 回告 / 限流） | [`src/middleware/README.md`](src/middleware/README.md) [`src/features/README.md`](src/features/README.md) | [docs/agents/inbound.md](docs/agents/inbound.md) |
 | 群聊（合并 / 可见回复 / 工具策略 / 历史模式） | [`src/features/README.md`](src/features/README.md) | [docs/agents/group-and-room-event.md](docs/agents/group-and-room-event.md) |
+| 群聊持久化入站（到达序 / lane 串行 / 幂等 / 降级） | [`src/features/README.md`](src/features/README.md) | [docs/agents/durable-group-ingress.md](docs/agents/durable-group-ingress.md) |
 | 问答（多题 / 拦截层 / 归属 / 提交失败） | [`src/features/README.md`](src/features/README.md) | [docs/agents/interaction.md](docs/agents/interaction.md) |
 | 配置类型 / capabilities / 凭据 | [`src/README.md`](src/README.md) | [docs/agents/config-and-credentials.md](docs/agents/config-and-credentials.md) |
 | webhook detached 准入 | [`src/adapter/README.md`](src/adapter/README.md) | [docs/agents/interaction.md](docs/agents/interaction.md) |

@@ -24,7 +24,10 @@
 
 | 文件 | 作用 |
 |---|---|
-| `group-merge.ts` | 群消息合并（窗口 / 最大批量 / 最大持有时长 / 正文上限） |
+| `group-merge.ts` | 群消息合并（窗口 / 最大批量 / 最大持有时长 / 正文上限）——**现为持久化入站不可用时的回落路径**；`isBypassGroupItem` 是旁路判定的**单一事实源** |
+| `ingress-payload.ts` | 持久化入站载荷（schema v1）：活上下文 → 纯数据快照 / 反向重建 ctx·msg / `receivedAtMs` 排序键 |
+| `ingress-queue.ts` | 持久化入站队列：per-account queue+drain 单例、lane 键、三态入队入口（`handled`/`not_applicable`/`unavailable`）、退出冲刷 |
+| `ingress-batcher.ts` | 持久化入站组批：lane backlog 组批、容量裁剪、批次指纹、`createIngressEffectOnce` 幂等、派发 |
 | `group-session-busy.ts` | 群 turn 忙碌信号（`markGroupTurnStarted` / `onGroupIdle`） |
 | `group-mode-store.ts` | `recordGroupEvent` / `getGroupModeFacts`——群三模式推断 |
 | `room-event.ts` | room_event 策略结论：`resolveGroupRoomEventPolicy` 的那一份 |
@@ -67,6 +70,7 @@
 - **room_event 完整支持** → [`docs/agents/group-and-room-event.md`](../../docs/agents/group-and-room-event.md)
 - **群历史模式 historyMode** → [`docs/agents/group-and-room-event.md`](../../docs/agents/group-and-room-event.md) §「群历史模式 historyMode」
 - **c2c 入站防抖合并 + 三类旁路** → [`docs/agents/inbound.md`](../../docs/agents/inbound.md) §「c2c 入站防抖合并」
+- **群聊持久化入站（排序 / 忙闲 / 幂等 / 降级）** → [`docs/agents/durable-group-ingress.md`](../../docs/agents/durable-group-ingress.md)
 
 ## 本目录特有的坑
 
@@ -78,8 +82,12 @@
 - **可见回复模式按 turn 判定、且按会话类型隔离**——群/频道读 `messages.groupChat.visibleReplies`，非群只读 `messages.visibleReplies`。**群级 `message` 工具守卫的 allow 缺失/为空 + alsoAllow 非空 = 不限制**（core `unionAllow` 会合成 `["*", ...]` 隐式全放行，按排他白名单判会误降级）。确定不可用时该群降级回 user_request + 每群一条 WARN。
 - **agent profile 不是阻塞项**——core 在 `message_tool_only` / `room_event` turn 会把 `message` 强制并入 profile 允许集。
 - **群工具策略红线**：`resolveToolPolicy` 返回 `{allow: []}` = 什么都不允许（连 message 工具都被过滤）→ room_event 群彻底沉默。框架回调的 groupId 派生自 session key（**小写**），QQ openid 配置键原生**大写**——`lookupGroupEntry` 必须大小写不敏感查找，否则 adapter 路径永远落默认值。
-- **群消息合并在插件侧做**——框架 collect 合批对「同群不同人」无效（分组键含 `senderId`，遇第一个不同 key 就 break）。插件自建 busy 信号 + `createInboundDebouncer` 合批，**批次键按群不按人**。合并内容不能直接拼 N 条 agentBody（history 块会重复 N 份），历史必须取**批前基线**（最早成员的快照）。
-- **合并载体 = 按平台 timestamp 排序后最后一条消息的 ctx**——中间件链并发执行，入队顺序 ≠ 到达顺序。
+- **群消息合并在插件侧做**——框架 collect 合批对「同群不同人」无效（分组键含 `senderId`，遇第一个不同 key 就 break）。**当前实现是持久化入站队列**（`ingress-queue.ts` + `ingress-batcher.ts`），内存合批（`group-merge.ts`）降级为回落路径。合并内容不能直接拼 N 条 agentBody（history 块会重复 N 份），历史必须取**批前基线**（最早成员的快照）。
+- **排序权威 = 本地到达时刻 `receivedAtMs`，不是平台 timestamp**——QQ timestamp 是**客户端发送时间**，群成员设备时钟不一致 ⇒ 按它排序就是排错（旧实现的真缺陷）。
+- **忙闲判据 = durable lane claim，不是 dispatch promise 生命周期**——框架把 turn **defer**（仅入队）时 promise 就 resolve ⇒ 旧 busy 口径提前归零 ⇒ 合批散架。
+- **drain 钩子抛错必须隔离**——框架 `await turnAdoptionLifecycle?.onAdopted()`，钩子抛错会冒泡成 turn 失败。
+- **旁路判定必须入队时冻结**（`payload.bypass`）——合批发生在 claim 之后，那时读不到活状态（pending question store 是进程内的、附件是活对象）；口径共用 `group-merge.ts` 的 `isBypassGroupItem`，**禁止另写一份**。
+- **批次指纹的命名空间跨版本必须稳定**——`qqbot-group-batch` 改了等于放过一次重复回复。
 - **群历史模式 `historyMode`**：默认 `clear`（回复后整清）；`rolling`——bot 出站也记入 historyBuffer，回复后裁剪到最后一条 bot 发言之后。
 
 ### 入站防抖与回告

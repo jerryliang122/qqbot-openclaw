@@ -134,6 +134,56 @@ function isExplicitlyWoken(item: GroupMergeItem): boolean {
 }
 
 /**
+ * 旁路判定：返回 true 表示**不参与合批**（必须单独成轮）。
+ *
+ * **单一事实源**：内存合批路径（本模块）与持久化入站路径
+ * （features/ingress-payload.ts 的 buildIngressPayload）共用本函数——
+ * 两处各写一份必然漂移，漂移后"合批路径能吃、持久化路径不能吃"这类
+ * 差异会以命令失效/答案认领失败的形式暴露出来。
+ *
+ * ⚠️ 判定必须在**入队时**做（活状态：pending question store 是进程内的、
+ *  附件是活对象），结果冻结进载荷——合批发生在 claim 之后。
+ */
+export function isBypassGroupItem(params: {
+  ctx: MiddlewareContext;
+  msg: QQBotInboundMessage;
+  accountId: string;
+  groupOpenid: string;
+  cfg: Record<string, unknown> | undefined;
+}): boolean {
+  const { ctx, msg, accountId, groupOpenid, cfg } = params;
+
+  // 斜杠命令：合并会破坏命令标记（rawBody 拼接后可能不以 '/' 开头）。
+  // 判定同时看**原始**与**清洗后**两份文本：单条路径的 agentBody 直通
+  // 用的是清洗后的 userContent（body-assembler 的 buildAgentBody），
+  // 而 ctxPayload 的命令标记用原始 rawBody（ctx-builder）——任一份以
+  // '/' 开头都要旁路，否则「@bot /cmd」这类（原文以 @ 开头、清洗后以
+  // / 开头）在合并路径里会退化成普通文本、命令语义丢失。
+  const rawText = String(msg?.content ?? '').trim();
+  const sanitizedText = String((ctx.message as { content?: string } | undefined)?.content ?? '').trim();
+  if (rawText.startsWith('/') || sanitizedText.startsWith('/')) return true;
+
+  // 控制命令（stop/esc/abort/exit 等）：hasMedia 刻意传 false——框架默认策略
+  // 不防抖媒体，本插件场景相反，仅借它的控制命令判定
+  const text = rawText || sanitizedText;
+  if (text && !shouldDebounceTextInbound({ text, cfg: cfg as never, hasMedia: false })) return true;
+
+  // 多问题 ask_user 的 keyed 答案文本（群聊 legacy 路径）：合并会改写答案、
+  // 认领失败。会话键含 accountId（openid 是 per-account 的）
+  if (findPendingMultiQuestionByConversation(accountId, 'group', groupOpenid)) {
+    return true;
+  }
+
+  // stt/fallback 来源语音：真实音频语义，独立成轮；平台转写语音=纯文本可合批
+  // （2026-11-01 修复：任何语音都旁路会在忙时拆散批次——语音单独成 turn、
+  // 且 SDK 对旁路项先冲刷 pending buffer 再单独发，把已攒的文本批也拆了）
+  const processed = ctx.state.processedAttachments as ProcessedAttachments | undefined;
+  if (processed && needsStandaloneVoiceTurn({ ctx })) return true;
+
+  return false;
+}
+
+/**
  * 该条语音是否需要独立成轮：仅 stt / fallback 来源——stt 有真实本地音频
  * （时长、框架媒体理解在跑），fallback 是占位文本且媒体 fact `transcribed:false`
  * （框架可能自行尝试音频理解）。**平台转写（全部 transcript source==='asr'）
@@ -144,43 +194,10 @@ function isExplicitlyWoken(item: GroupMergeItem): boolean {
  * 框架队列**多个 pending item 之间**的 collect 合批；插件把一批消息合成一条
  * turn 只会减少队列 item 数，不触发该路径——按来源收窄旁路不与框架冲突。
  */
-function needsStandaloneVoiceTurn(item: GroupMergeItem): boolean {
+function needsStandaloneVoiceTurn(item: { ctx: MiddlewareContext }): boolean {
   const processed = item.ctx.state.processedAttachments as ProcessedAttachments | undefined;
   if (!processed) return false;
   return processed.transcripts.some((t) => t.source !== 'asr');
-}
-
-/**
- * 旁路判定：返回 true 表示**不参与合批**（立即直发）。
- */
-function isBypassItem(item: GroupMergeItem): boolean {
-  // 斜杠命令：合并会破坏命令标记（rawBody 拼接后可能不以 '/' 开头）。
-  // 判定同时看**原始**与**清洗后**两份文本：单条路径的 agentBody 直通
-  // 用的是清洗后的 userContent（body-assembler 的 buildAgentBody），
-  // 而 ctxPayload 的命令标记用原始 rawBody（ctx-builder）——任一份以
-  // '/' 开头都要旁路，否则「@bot /cmd」这类（原文以 @ 开头、清洗后以
-  // / 开头）在合并路径里会退化成普通文本、命令语义丢失。
-  const rawText = String(item.msg?.content ?? '').trim();
-  const sanitizedText = String((item.ctx.message as { content?: string } | undefined)?.content ?? '').trim();
-  if (rawText.startsWith('/') || sanitizedText.startsWith('/')) return true;
-
-  // 控制命令（stop/esc/abort/exit 等）：hasMedia 刻意传 false——框架默认策略
-  // 不防抖媒体，本插件场景相反，仅借它的控制命令判定
-  const text = rawText || sanitizedText;
-  if (text && !shouldDebounceTextInbound({ text, cfg: item.cfg as never, hasMedia: false })) return true;
-
-  // 多问题 ask_user 的 keyed 答案文本（群聊 legacy 路径）：合并会改写答案、
-  // 认领失败。会话键含 accountId（openid 是 per-account 的）
-  if (findPendingMultiQuestionByConversation(item.account.accountId, 'group', groupOpenidOf(item))) {
-    return true;
-  }
-
-  // stt/fallback 来源语音：真实音频语义，独立成轮；平台转写语音=纯文本可合批
-  // （2026-11-01 修复：任何语音都旁路会在忙时拆散批次——语音单独成 turn、
-  // 且 SDK 对旁路项先冲刷 pending buffer 再单独发，把已攒的文本批也拆了）
-  if (needsStandaloneVoiceTurn(item)) return true;
-
-  return false;
 }
 
 /**
@@ -200,7 +217,13 @@ function shouldDebounceGroupItem(item: GroupMergeItem): boolean {
   if (groupCfg.coalesce.strategy !== 'plugin') return false;
 
   // 旁路项立即直发
-  if (isBypassItem(item)) return false;
+  if (isBypassGroupItem({
+    ctx: item.ctx,
+    msg: item.msg,
+    accountId: item.account.accountId,
+    groupOpenid: groupOpenidOf(item),
+    cfg: item.cfg,
+  })) return false;
 
   // 只有"正在工作"才攒批；空闲时零延迟直发
   return isGroupBusy(item.account.accountId, groupOpenid);
