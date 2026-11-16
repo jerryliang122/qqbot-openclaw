@@ -24,7 +24,8 @@
     "preload.cjs",
     "tsconfig.json",
     "tsup.config.ts",
-    "openclaw.plugin.json"
+    "openclaw.plugin.json",
+    "!src/**/README.md"
   ],
   "openclaw": {
     "id": "openclaw-qqbot",

@@ -4,6 +4,8 @@ OpenClaw 通道插件：把 QQ Bot 官方 API 接入 OpenClaw framework（独立
 
 > **本文是「索引 + 红线」层**：只保留动手前必须知道的事（能踩的坑、必须守的约束、去哪查细节）。深度叙事在 `docs/agents/` 下按主题分文件，**改对应模块前先读该文件**——里面的「为什么」比本文的「是什么」更能防止你改出回归。
 >
+> 文档分两层：**主题层** = `docs/agents/`（跨模块概念的完整叙事，一概念一篇）；**模块层** = 各源码目录下的 `README.md`（就近速查：职责边界 / 关键文件 / 红线指针 / 本目录特有的坑）。模块层只做**指针**，不复制主题层正文——避免同一事实两处维护、迟早对不上。模块层索引见 [Project layout](#project-layout) § 模块文档层。
+>
 > 深度文档索引：
 > | 文件 | 覆盖范围 | 何时必读 |
 > |---|---|---|
@@ -68,6 +70,23 @@ scripts/                  # 仓库工具脚本（proactive-api-server / send-pro
 `src/` 下另有 7 个框架侧通道适配器（`src/*-adapter.ts`：message / messaging / outbound / gateway / heartbeat / status / agent-prompt）与 `src/types*.ts`——它们是**框架侧适配层**，与树里的 `adapter/` 目录（插件自己的 probe / media / webhook）不是一回事。
 
 Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendText`, `sendMedia`, `parseTarget`, `dispatchToOpenClaw`, `StreamingController`, `PersistedRefIndexStore`, `ReplyLimiter`, quota management functions, and typing lifecycle functions.
+
+### 模块文档层
+
+每个源码子目录一个 `README.md`，内容 = 职责边界 / 关键文件 / **本模块相关红线的指针**（指向 `docs/agents/` 的具体小节）/ 本目录特有的坑。**只做指针，不复制正文**。
+
+| 目录 | 模块速查 | 红线主要归属 |
+|---|---|---|
+| `src/adapter/` | [README](src/adapter/README.md) | SDK 依赖面、webhook detached 准入 |
+| `src/commands/` | [README](src/commands/README.md) | 日志脱敏、群配置优先级链 |
+| `src/dispatch/` | [README](src/dispatch/README.md) | canonical session key / route 文法、入站防抖、room_event 分类 |
+| `src/features/` | [README](src/features/README.md) | 出站锚点与配额、多题问答、Secret 输入 |
+| `src/gateway/` | [README](src/gateway/README.md) | SDK 依赖面、入站事件守卫、互动事件 ack |
+| `src/middleware/` | [README](src/middleware/README.md) | 白名单回告、事件守卫、room_event 门控、typing 停发 |
+| `src/outbound/` | [README](src/outbound/README.md) | 出站锚点与配额、分块、流式 |
+| `src/setup/` | [README](src/setup/README.md) | 凭据互斥、manifest schema |
+| `src/tools/` | [README](src/tools/README.md) | 不绕过 SDK、Secret kind、主动预算 |
+| `src/utils/` | [README](src/utils/README.md) | STT 走框架管线、SSRF 假防护、日志脱敏 |
 
 ## Code style
 
