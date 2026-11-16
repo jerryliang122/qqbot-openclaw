@@ -8,6 +8,42 @@
 
 ---
 
+## [4.3.0] - 2026-11-17
+
+群聊入站重构：从「内存态插件侧合批」改为「**持久化入站队列 + lane 串行 + 租约续期 + 失败重投 + 本地到达序排序**」（PR #107），对齐 openclaw 2026.11.4 的 Telegram L1–L5 架构。**行为变更、无配置格式变更、无公开 API 破坏**。
+
+### 变更
+
+- **群聊消息「先落盘再派发」**（PR #107）。群消息不再直接进内存合批缓冲，而是先写进框架的持久化入站队列（SQLite），再由 drain 协程认领（claim）→ 组批 → 派发。**崩溃/重启后未派发的群消息不丢**：队列里的行会在恢复后重新认领；**认领失败可重投**（租约到期自动回收 stale claim）。这是本版本最大的语义变化：**群消息的送达不再依赖插件进程存活**。
+- **排序权威改为「本地到达时刻」**。原先按 QQ 平台 `timestamp` 排序——那是**客户端发送时间**，群成员设备时钟不一致 ⇒ 排出来的是错的。现在按插件本地收到消息的时刻（`receivedAtMs`）排序，**与实际到达顺序一致**。
+- **忙闲判据改为「durable lane claim」**。原先用 dispatch promise 生命周期判忙闲，但框架把 turn 挂起时 promise 就会 resolve ⇒ 旧口径会提前把 lane 判成空闲、导致合批散架。现在以**队列里的 lane 占用状态**为准（`deferredLaneOccupancy: 'hold'`），claim 租约 5 分钟、adoption stall 5 分钟。
+- **合批 = durable 行 + lane backlog 组批**（可重建）。合批窗口内的消息以持久化行存在，进程崩了重建后仍能组成同样的批次。**合批窗口时长来源改为框架 `resolveInboundDebounceMs(cfg, 'qqbot')`**（默认返回 0 ⇒ 零延迟，用户旋钮直接生效，上限 60s）——不再用插件内硬编码常量。
+- **幂等落持久化**。批次指纹走框架 `createIngressEffectOnce`（跨进程持久化），**崩溃重放不会重复派发同一批次**。已知限制：指纹按「min/max/条数」构造，崩溃点落在「副作用已提交、claim 未结算」之间、且重启间隙有新消息到达时，重组批次的裁剪边界会移动 ⇒ 极端边界下已派发消息可能随新批重复一次（框架侧自承 at-least-once，属已声明的已知限制）。
+- **新增模块**：`src/features/ingress-payload.ts`（载荷 schema v1 + 编解码 + ctx 重建）、`src/features/ingress-queue.ts`（per-account queue+drain 单例 + 生命周期 + 能力探测降级）、`src/features/ingress-batcher.ts`（组批 + 窗口收集 + 指纹 + 幂等）、`src/utils/redaction.ts`（`shortId()` / `sessionKeyDigest()` 唯一事实源）。
+- **墓碑按框架保留策略定期清理**（PR #107）：复用框架 `CHANNEL_INGRESS_RETENTION_DEFAULTS`（prune 间隔 1h、completed/failed TTL 30d、各自上限 20000 条）。**pending 行永不按 TTL 清理**——只有 completed / failed 会被 prune。
+
+### 修复
+
+- **单条群消息正文格式回归**（PR #107 评审修复）。重构初版对**任何**批次（包括单条）都走合并装配，导致模型可见正文多出 `[消息 1/1]` 伪影、Web UI 信封 `from` 从发送者昵称变成群 openid。默认配置下（窗口 0）空闲群单条消息是最主流流量，影响面大。现与内存路径特判对齐：**`kept.length === 1 && dropped === 0` 时跳过合并装配**，沿用中间件已冻结的单条正文。旁路项（斜杠命令 / 控制命令 / keyed 答案 / stt 语音）单条成批同样受益。
+- **新增 INFO 日志脱敏**（PR #107 评审修复）。重构新增的 3 处 INFO 日志原样输出完整群 openid，违反根级脱敏红线（`/bot-logs` 会把本地日志文件原样导出）⇒ 一律改走 `shortId()`；core drain 内部日志内嵌的 lane key（含群 openid）经 `redactIngressLog()` 脱敏。
+
+### 升级注意
+
+- **C2C 私聊零改动**。私聊路径（`src/features/inbound-debounce.ts` + `handleMessage` 的 `scope === 'c2c'` 分支）一行未动。
+- **群聊 legacy `user_request` 语义不变**；**`strategy: 'framework'` 路径保持 legacy** 行为。
+- **配置面零变更**。`openclaw.plugin.json` 的 `coalesce` 段（顶层 + `accounts.<id>` 两处）逐字不动，**不新增群专属配置键**。`strategy: 'plugin'` 原地替换为持久化实现。
+- **`coalesce.maxHoldMs` 在 durable 路径不再被读取**（语义由「lane 释放即派发」替代）。该键对默认路径**静默失效**——仅内存回落路径生效。
+- **空闲群单条消息也走队列**（无直发快路径）——这是刻意选择，避免出现「快路径不落盘 ⇒ 崩溃丢消息」的双语义。
+- **无配置格式变更**，升级无需改配置。
+
+### 守卫
+
+- 新增 5 个测试文件（51 例）：`tests/ingress-payload.test.ts`（8）、`tests/ingress-queue.test.ts`（10）、`tests/ingress-batch.test.ts`（17）、`tests/ingress-lifecycle.test.ts`（7）、`tests/ingress-boundary.test.ts`（11，含 C2C/配置面零变更的源码级守卫）。
+- 相关回归全绿：group-merge(33)、group-c2c-differential(4)、inbound-debounce(39)、dispatch-lifecycle(8)、room-event(21)、room-event-policy(43)、group-tool-policy(16)、manifest-config-schema(23)、sdk-surface(42)。
+- 文档：新增主题层 `docs/agents/durable-group-ingress.md`（11 节完整叙事），并在 `AGENTS.md` 根级红线、`src/features/README.md`、`docs/agents/{group-and-room-event,inbound}.md` 登记指针。
+
+---
+
 ## [4.2.0] - 2026-11-12
 
 ask_user 多题投递机制改造（issue #99，PR #101，取代 #100）：末题提交从「客户端代发机器文本」重构为「插件直提整单答案」，多题 pending 期间入站文本改插件本地暂存；另含审批路径日志脱敏（PR #102）。
