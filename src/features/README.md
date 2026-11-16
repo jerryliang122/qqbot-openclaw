@@ -84,6 +84,7 @@
 - **群工具策略红线**：`resolveToolPolicy` 返回 `{allow: []}` = 什么都不允许（连 message 工具都被过滤）→ room_event 群彻底沉默。框架回调的 groupId 派生自 session key（**小写**），QQ openid 配置键原生**大写**——`lookupGroupEntry` 必须大小写不敏感查找，否则 adapter 路径永远落默认值。
 - **群消息合并在插件侧做**——框架 collect 合批对「同群不同人」无效（分组键含 `senderId`，遇第一个不同 key 就 break）。**当前实现是持久化入站队列**（`ingress-queue.ts` + `ingress-batcher.ts`），内存合批（`group-merge.ts`）降级为回落路径。合并内容不能直接拼 N 条 agentBody（history 块会重复 N 份），历史必须取**批前基线**（最早成员的快照）。
 - **排序权威 = 本地到达时刻 `receivedAtMs`，不是平台 timestamp**——QQ timestamp 是**客户端发送时间**，群成员设备时钟不一致 ⇒ 按它排序就是排错（旧实现的真缺陷）。
+- **合批窗口时长来源 = 框架 `resolveInboundDebounceMs(cfg,'qqbot')`**（用户拍板 D-c）——**默认返回 0** ⇒ 领到队首行即刻派发（零延迟）；用户配了 `messages.inbound.byChannel.qqbot.debounceMs` 才进入窗口收集。**不得改回插件内硬编码常量**（会让该旋钮对群聊再次失效），**不得新增群专属配置键**。
 - **忙闲判据 = durable lane claim，不是 dispatch promise 生命周期**——框架把 turn **defer**（仅入队）时 promise 就 resolve ⇒ 旧 busy 口径提前归零 ⇒ 合批散架。
 - **drain 钩子抛错必须隔离**——框架 `await turnAdoptionLifecycle?.onAdopted()`，钩子抛错会冒泡成 turn 失败。
 - **旁路判定必须入队时冻结**（`payload.bypass`）——合批发生在 claim 之后，那时读不到活状态（pending question store 是进程内的、附件是活对象）；口径共用 `group-merge.ts` 的 `isBypassGroupItem`，**禁止另写一份**。

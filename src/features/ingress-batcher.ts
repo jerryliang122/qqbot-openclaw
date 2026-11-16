@@ -25,6 +25,8 @@
 import { createHash } from 'node:crypto';
 import type { MiddlewareContext, QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { PluginRuntime } from 'openclaw/plugin-sdk';
+import type { ChannelIngressQueueRecord } from 'openclaw/plugin-sdk/channel-outbound';
+import { resolveInboundDebounceMs } from 'openclaw/plugin-sdk/channel-inbound';
 import { createIngressEffectOnce } from 'openclaw/plugin-sdk/ingress-effect-once';
 import type { ResolvedQQBotAccount } from '../types.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
@@ -67,6 +69,17 @@ const SILENT_INGRESS_LOG: PluginLogger = {
 const EFFECT_TTL_MS = 24 * 60 * 60_000;
 /** 幂等记录条数上限 */
 const EFFECT_MAX_ENTRIES = 5_000;
+
+/**
+ * 合批窗口时长上限（毫秒）。
+ *
+ * 窗口期内 claim 一直持有（租约 5 分钟），窗口过长会让「一条消息等窗口」
+ * 变成用户可感知的延迟；框架 c2c 侧同款上限（60s）。
+ */
+const MAX_GROUP_MERGE_WINDOW_MS = 60_000;
+
+/** 收集窗口内的重读间隔（毫秒）——窗口期内按此节奏重读 lane backlog */
+const COLLECT_POLL_MS = 100;
 
 /** 不可重试失败：重投多少次都不会变（载荷版本不认识等） */
 export class NonRetryableIngressError extends Error {
@@ -176,10 +189,59 @@ function resolveAccount(handle: IngressAccountHandle): ResolvedQQBotAccount {
   return resolveQQBotAccount(cfg, handle.accountId);
 }
 
+/**
+ * 合批窗口时长（毫秒）——**来源是框架的 `resolveInboundDebounceMs(cfg,'qqbot')`**。
+ *
+ * 不新增群专属配置键 ⇒ `openclaw.plugin.json` 的 `coalesce` 段逐字不动
+ * ⇒ 用户已有的 `messages.inbound.byChannel.qqbot.debounceMs` 旋钮**直接生效**
+ * （此前群路径用的是插件内硬编码的 `DEFAULT_GROUP_MERGE_WINDOW_MS`，旋钮无效）。
+ *
+ * ⚠️ 框架该原语**默认返回 0**（不读插件默认、不套 c2c 的 3000）⇒ 未配框架
+ * `messages.inbound.*` 时窗口为 0 ⇒ 领到队首行即刻派发（**零延迟**，与改造前
+ * 的「空闲时零延迟直发」一致）。只有用户显式配了旋钮才会进入窗口收集。
+ */
+export function resolveGroupMergeWindowMs(runtime: PluginRuntime): number {
+  try {
+    const cfg = (getAdapters(runtime).getConfig?.() ?? {}) as never;
+    const ms = resolveInboundDebounceMs({ cfg, channel: 'qqbot' });
+    if (!Number.isFinite(ms) || ms <= 0) return 0;
+    return Math.min(ms, MAX_GROUP_MERGE_WINDOW_MS);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 可被中止打断的等待（收集窗口用）。
+ *
+ * claim 被取消（进程退出 / drain dispose）时立刻返回——不让关停等满窗口。
+ */
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    if (signal) {
+      if (signal.aborted) {
+        clearTimeout(timer);
+        resolve();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
+
 /** 读同 lane 的 pending 行（drain 提供；缺失时退化为空） */
 async function readLaneBacklog(
   lifecycle: QQBotIngressLifecycle,
-): Promise<readonly { id: string }[]> {
+): Promise<readonly ChannelIngressQueueRecord<QQBotIngressPayload>[]> {
   if (typeof lifecycle.readLaneBacklog !== 'function') return [];
   try {
     const rows = await lifecycle.readLaneBacklog();
@@ -307,31 +369,50 @@ export async function dispatchClaimedGroupEvent(
   // 合批只在「合并开启」且「队首不是旁路项」时发生：
   // - coalesce.enabled=false ⇒ 语义是"排队但不合并"（每条一个 turn）
   // - 队首是旁路项（斜杠命令 / 控制命令 / keyed 答案 / 独立语音）⇒ 单独成轮
+  //
+  // 窗口收集：领到队首行后，在**合批窗口**内反复重读 lane backlog，把窗口期内
+  // 到达的同群消息并进本批；**收满（maxBatchSize）即发**，不等窗口走完。
+  // 窗口时长来自框架 `resolveInboundDebounceMs(cfg,'qqbot')`（默认 0 ⇒ 立即派发）。
   const batchingEnabled = groupCfg.coalesce.enabled && primary.bypass !== true;
-  const backlog = batchingEnabled ? await readLaneBacklog(lifecycle) : [];
-  const extraMembers: BatchMember[] = [];
+  const maxBatchSize = Math.max(1, groupCfg.coalesce.maxBatchSize ?? DEFAULT_GROUP_MERGE_MAX_BATCH_SIZE);
+  const members: BatchMember[] = [{ payload: primary, claim }];
   const extraClaims: QQBotIngressClaim[] = [];
-  for (const row of backlog) {
-    if (row.id === claim.id) continue;
-    const rowDecoded = decodeIngressPayload((row as { payload?: unknown }).payload);
-    if (!rowDecoded.ok) continue;
-    // 旁路项不并入本批（它必须单独成轮）——留在队列里后续单独派发
-    if (rowDecoded.payload.bypass === true) continue;
-    // 自己领下这一行（拿到所有权，才能安全地一并结算）
-    const extraClaim = await handle.queue.claim(row.id, { ownerId: handle.ownerId });
-    if (!extraClaim) continue; // 已被别的 worker 领走 ⇒ 跳过，不阻塞整批
-    extraClaims.push(extraClaim);
-    extraMembers.push({ payload: rowDecoded.payload, claim: extraClaim });
-  }
+  const claimedIds = new Set<string>([claim.id]);
 
-  const members: BatchMember[] = [{ payload: primary, claim }, ...extraMembers];
+  if (batchingEnabled) {
+    const windowMs = resolveGroupMergeWindowMs(handle.runtime);
+    const deadline = windowMs > 0 ? Date.now() + windowMs : 0;
+    for (;;) {
+      const backlog = await readLaneBacklog(lifecycle);
+      for (const row of backlog) {
+        if (claimedIds.has(row.id)) continue;
+        const rowDecoded = decodeIngressPayload((row as { payload?: unknown }).payload);
+        if (!rowDecoded.ok) continue;
+        // 旁路项不并入本批（它必须单独成轮）——留在队列里后续单独派发
+        if (rowDecoded.payload.bypass === true) continue;
+        // 自己领下这一行（拿到所有权，才能安全地一并结算）
+        const extraClaim = await handle.queue.claim(row.id, { ownerId: handle.ownerId });
+        if (!extraClaim) continue; // 已被别的 worker 领走 ⇒ 跳过，不阻塞整批
+        claimedIds.add(row.id);
+        extraClaims.push(extraClaim);
+        members.push({ payload: rowDecoded.payload, claim: extraClaim });
+      }
+      // 收满即发（不等窗口走完）／窗口耗尽 ⇒ 用当前批次派发
+      if (members.length >= maxBatchSize) break;
+      if (!deadline || Date.now() >= deadline) break;
+      if (lifecycle.abortSignal?.aborted) break;
+      await sleepAbortable(
+        Math.min(COLLECT_POLL_MS, Math.max(0, deadline - Date.now())),
+        lifecycle.abortSignal,
+      );
+    }
+  }
 
   // ② 排序：本地到达时刻（**不是**平台 timestamp）
   members.sort((a, b) => ingressPayloadOrderKey(a.payload) - ingressPayloadOrderKey(b.payload));
 
   // ③ 容量裁剪（与内存路径同款语义）
-  const maxBatchSize = groupCfg.coalesce.maxBatchSize ?? DEFAULT_GROUP_MERGE_MAX_BATCH_SIZE;
-  const { kept, dropped } = trimToCapacity(members, Math.max(1, maxBatchSize), GROUP_MERGE_MAX_BODY_CHARS);
+  const { kept, dropped } = trimToCapacity(members, maxBatchSize, GROUP_MERGE_MAX_BODY_CHARS);
   const droppedNote =
     dropped > 0
       ? `[已丢弃 ${dropped} 条较早的群消息（批次上限 ${maxBatchSize} 条 / ${GROUP_MERGE_MAX_BODY_CHARS} 字）]`
