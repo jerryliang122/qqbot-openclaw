@@ -65,6 +65,20 @@ drain 领到队首行后：
 
 **批内任一条「在叫 bot」⇒ 整批按 `user_request` 投递**（否则「用户 @ 了 bot 却没回音」）。置位必须在**装配之后**——装配器按各成员自己的 mention 状态渲染 `(@you)`，先置位会把载体虚标成「叫了 bot」。
 
+### 4.2 单条批次**不合并**（正文格式必须与改造前逐字一致）
+
+`kept.length === 1 && dropped === 0` ⇒ **跳过 `assembleMergedGroupBody`**，沿用中间件链冻结在载荷里的单条正文（`payload.assembledBody`，由 `middleware-setup.ts` 的 `envelopeFormatter` → `assembleBody` 产出）。
+
+⚠️ 不做这个特判会造成**系统性正文回归**（默认配置下「空闲群单条消息」是最主流流量，所有旁路项也单条成轮）：
+
+| 字段 | 合并装配（错） | 单条装配（对） |
+|---|---|---|
+| `agentBody` | `[消息 1/1]\n…`（多分节头伪影） | 原始单条正文 |
+| `webBody` | from = **群 openid**（合批器按「批次跨发言人」刻意用群） | from = **发送者** |
+| mention 置位 | 会被改写成 `wasMentioned=true` | 沿用载荷快照 |
+
+内存路径对同一条件有显式特判（`features/group-merge.ts` 的 `dispatchItem(kept[0])`）——durable 路径必须同条件同处理。**守卫**：`tests/ingress-batch.test.ts`「单条批次不合并」组（去掉特判即变红）。
+
 ## 5. 幂等：批次指纹
 
 指纹 = `sha256(laneKey | 最小 messageId | 最大 messageId | 条数)`。同一批消息无论被重投多少次、无论谁先谁后，集合相同 ⇒ 指纹相同 ⇒ `createIngressEffectOnce` 只放行一次副作用。
@@ -101,7 +115,24 @@ enqueueDurableGroupInbound() → 'handled' | 'not_applicable' | 'unavailable'
 
 drain 循环每小时调一次 `queue.prune`，保留策略**取框架默认** `CHANNEL_INGRESS_RETENTION_DEFAULTS`（与 core 的 ingress monitor 同款）：只清 `completed` / `failed` 的墓碑行（TTL 30 天 / 上限 20000 条），**pending 行永不按 TTL 清理**——pending 是「还没送达的消息」，按 TTL 清就是丢用户消息。
 
-## 9. 已知限制
+## 9. 配置键的实际生效面（易误解项）
+
+| 配置键 | durable 路径 | 内存回落路径 |
+|---|---|---|
+| `coalesce.strategy` | `'plugin'` 走 durable；`'framework'` ⇒ `not_applicable` 直发（legacy） | `'framework'` 不接管 |
+| `coalesce.enabled` | `false` ⇒ **走 durable 但不合批**（每条一个 turn，严格保序不丢） | `false` ⇒ 不接管（直发） |
+| `coalesce.maxBatchSize` | 生效（批次条数上限 / **窗口收满即发**的判据） | 生效 |
+| `coalesce.maxHoldMs` | **不再被读取**——durable 路径的「持有期」由 **durable lane claim** 决定（lane 释放即派发，claim 租约 5 分钟 + stall 5 分钟兜底）；该键**仅对内存回落路径有效** | 生效 |
+
+⚠️ 用户若在 `groups.<id>.coalesce.maxHoldMs` 上配了值，**默认（durable）路径下它静默失效**——这是持久化模型的有意取舍（lane 串行 + 租约续期替代了「攒着等 turn 结束」的时间窗），但配置面零变更 ⇒ 不能改键名/加新键来暴露，只能在文档里讲清。
+
+## 10. 日志脱敏
+
+- 本模块自己的 INFO 日志里的群标识一律走 `shortId()`（唯一事实源：`src/utils/redaction.ts`）；
+- **core 的 drain 内部日志也会内嵌 lane key**（`qqbot:{accountId}:group:{groupOpenid}`）⇒ 桥接处（`onLog`）统一过 `redactIngressLog()` 再落盘；
+- **守卫**：`tests/ingress-queue.test.ts`「日志脱敏」组（源码级扫描 + lane key 脱敏用例）。
+
+## 11. 已知限制
 
 - **副作用仍可能重复一次**（见 §5，core 契约）。
 - **退出只保证「宽限内能跑完的 turn 把回复发完」**：`flushIngressQueues` 反复 `drainOnce` 后 `disposeIngressQueues` 停摆；deferred 的 turn 由框架队列在后台继续，无界等待会让 Ctrl+C 卡死（同 c2c 路径的取舍）。

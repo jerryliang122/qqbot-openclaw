@@ -37,6 +37,7 @@ import { getAdapters } from '../adapter/resolve.js';
 import { runWithRequestContext } from '../request-context.js';
 import { resolveGroupConfigFromAccount, resolveQQBotAccount } from '../config.js';
 import { detectEventMention } from '../utils/mention.js';
+import { shortId } from '../utils/redaction.js';
 import { withDetachedWebhookWork } from './detached-webhook-work.js';
 import { mergeProcessedAttachments } from './inbound-debounce.js';
 import { resolveWakeDecision } from './room-event.js';
@@ -284,44 +285,61 @@ async function dispatchBatch(params: {
     rebuildIngressMember({ payload: member.payload, signal: lifecycle.abortSignal }),
   );
 
-  // 整批按 user_request 投递：批内任一条"在叫 bot" ⇒ 整批不能被压成静默。
-  //
-  // ⚠️ 置位必须在**装配之后**：装配器按各成员自己的 mention 状态渲染 `(@you)`，
-  // 先置位会把载体（最后一条）虚标成"叫了 bot"（实际叫 bot 的是批内更早的成员）。
-  const anyWoken = kept.some((m) => isExplicitlyWoken(m.payload));
-
-  const assembled = assembleMergedGroupBody(
-    rebuilt.map((r) => ({ ctx: r.ctx, msg: r.msg })),
-    account,
-    () => handle.runtime,
-    droppedNote ? { droppedNote } : undefined,
-  );
-
   const carrierIndex = kept.length - 1;
   const carrier = rebuilt[carrierIndex]!;
-  if (anyWoken) {
-    const state = carrier.ctx.state as Record<string, unknown>;
-    const mention = (state.mention as { wasMentioned?: boolean; implicit?: boolean } | undefined) ?? {};
-    if (mention.wasMentioned !== true) {
-      state.mention = { ...mention, wasMentioned: true };
-    }
-  }
 
-  // 合并后的附件（多成员 concat）
-  const processedList = kept
-    .map((m) => m.payload.processedAttachments)
-    .filter((p): p is ProcessedAttachments => !!p);
-  if (processedList.length > 0) {
-    (carrier.ctx.state as Record<string, unknown>).processedAttachments =
-      mergeProcessedAttachments(processedList);
+  // ── 单条批次：**不合并**（与内存路径同款特判）────────────────────
+  //
+  // 内存路径对 `kept.length === 1 && dropped === 0` 直接派发原 ctx
+  // （features/group-merge.ts 的 `dispatchItem(kept[0])`），不���合并装配。
+  // 若这里也走 assembleMergedGroupBody，单条消息会多出两处**系统性回归**：
+  // ① 正文多一个 `[消息 1/1]` 分节头；
+  // ② webBody 的 from 从**发送者**变成**群 openid**（合批器按「批次跨发言人」
+  //    刻意用群做 from，单条时是错的）。
+  //
+  // 单条正文已由中间件链冻结在载荷的 `assembledBody` 里（middleware-setup.ts
+  // 的 envelopeFormatter → assembleBody），重建 ctx 时已还原 ⇒ 直接沿用。
+  const singleMember = kept.length === 1 && dropped === 0;
+  if (singleMember) {
+    // 附件与 mention 状态同样沿用载荷快照（合并/置位都只对多成员批次有意义）
+  } else {
+    // 整批按 user_request 投递：批内任一条"在叫 bot" ⇒ 整批不能被压成静默。
+    //
+    // ⚠️ 置位必须在**装配之后**：装配器按各成员自己的 mention 状态渲染 `(@you)`，
+    // 先置位会把载体（最后一条）虚标成"叫了 bot"（实际叫 bot 的是批内更早的成员）。
+    const anyWoken = kept.some((m) => isExplicitlyWoken(m.payload));
+
+    const assembled = assembleMergedGroupBody(
+      rebuilt.map((r) => ({ ctx: r.ctx, msg: r.msg })),
+      account,
+      () => handle.runtime,
+      droppedNote ? { droppedNote } : undefined,
+    );
+
+    if (anyWoken) {
+      const state = carrier.ctx.state as Record<string, unknown>;
+      const mention = (state.mention as { wasMentioned?: boolean; implicit?: boolean } | undefined) ?? {};
+      if (mention.wasMentioned !== true) {
+        state.mention = { ...mention, wasMentioned: true };
+      }
+    }
+
+    // 合并后的附件（多成员 concat）
+    const processedList = kept
+      .map((m) => m.payload.processedAttachments)
+      .filter((p): p is ProcessedAttachments => !!p);
+    if (processedList.length > 0) {
+      (carrier.ctx.state as Record<string, unknown>).processedAttachments =
+        mergeProcessedAttachments(processedList);
+    }
+    (carrier.ctx.state as Record<string, unknown>).assembledBody = assembled;
   }
-  (carrier.ctx.state as Record<string, unknown>).assembledBody = assembled;
 
   const carrierMsg = carrier.msg as QQBotInboundMessage;
   const targetId = `qqbot:group:${carrierMsg.replyTarget.targetId}`;
 
   log?.info(
-    `[ingress] dispatch batch count=${kept.length} dropped=${dropped} anchor=${carrierMsg.messageId} group=${carrierMsg.replyTarget.targetId}`,
+    `[ingress] dispatch batch count=${kept.length} dropped=${dropped} anchor=${carrierMsg.messageId} group=${shortId(carrierMsg.replyTarget.targetId)}`,
   );
 
   await runWithRequestContext(
@@ -419,7 +437,7 @@ export async function dispatchClaimedGroupEvent(
       : undefined;
   if (dropped > 0) {
     log?.info(
-      `[ingress] dropped ${dropped} older group message(s) (cap=${maxBatchSize} msgs / ${GROUP_MERGE_MAX_BODY_CHARS} chars, group=${primary.groupOpenid}, kept=${kept.length})`,
+      `[ingress] dropped ${dropped} older group message(s) (cap=${maxBatchSize} msgs / ${GROUP_MERGE_MAX_BODY_CHARS} chars, group=${shortId(primary.groupOpenid)}, kept=${kept.length})`,
     );
   }
 
@@ -456,7 +474,7 @@ export async function dispatchClaimedGroupEvent(
     if (outcome.kind === 'replayed') {
       // 崩溃重投：这批已经派发过了 ⇒ 不重复回复，直接结算队首行
       log?.info(
-        `[ingress] batch already dispatched (replayed) group=${primary.groupOpenid} count=${kept.length} — 跳过重复回复`,
+        `[ingress] batch already dispatched (replayed) group=${shortId(primary.groupOpenid)} count=${kept.length} — 跳过重复回复`,
       );
       return { kind: 'completed' };
     }

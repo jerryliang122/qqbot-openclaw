@@ -16,6 +16,7 @@ import type { PluginRuntime } from 'openclaw/plugin-sdk';
 import {
   buildIngressLaneKey,
   buildIngressQueueId,
+  redactIngressLog,
   enqueueGroupInbound,
   getIngressAccount,
   isIngressDurableAvailable,
@@ -260,6 +261,38 @@ await test('注册的 handler 收到 claim 与 lifecycle', async () => {
 });
 
 resetIngressStateForTest();
+group('日志脱敏（根级 Security 红线）');
+
+await test('drain 内部日志里的 lane key（内嵌群 openid）被脱敏', () => {
+  const groupOpenid = 'ABCDEFGHIJKLMNOP1234567890';
+  const laneKey = buildIngressLaneKey('acc1', groupOpenid);
+  const message = `ingress drain: spooled update row-1 on lane ${laneKey} reached retry limit; dead-lettered`;
+  const redacted = redactIngressLog(message);
+  assert.ok(!redacted.includes(groupOpenid), '群 openid 不得原样出现在日志里');
+  assert.ok(redacted.includes('group:ABCDEFGH…'), 'lane key 的群段应截断为前 8 字符');
+});
+
+await test('源码级守卫：ingress 模块不得把完整群 openid 写进日志', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const root = join(import.meta.dirname, '..');
+  for (const rel of [
+    'src/features/ingress-batcher.ts',
+    'src/features/ingress-queue.ts',
+    'src/features/ingress-payload.ts',
+  ]) {
+    const src = readFileSync(join(root, rel), 'utf8');
+    // 日志模板里出现 `group=${...}` 时必须包 shortId(...)
+    const hits = [...src.matchAll(/group=\$\{([^}]+)\}/g)].map((m) => m[1]!);
+    for (const expr of hits) {
+      assert.ok(
+        expr.startsWith('shortId('),
+        `${rel}: 日志里的群标识必须走 shortId()（发现 group=\${${expr}}）`,
+      );
+    }
+  }
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) {
   console.log('失败用例:');
