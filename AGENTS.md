@@ -1,6 +1,6 @@
 # AGENTS.md — openclaw-qqbot
 
-`openclaw-qqbot` — OpenClaw 通道插件，把 QQ Bot 官方 API 接入 OpenClaw framework。独立维护的 fork，自 v1.0.0 起独立发版（发版流程见 CHANGELOG.md，tag v* 触发 .github/workflows/release.yml）。
+OpenClaw 通道插件：把 QQ Bot 官方 API 接入 OpenClaw framework（独立维护的 fork，自 v1.0.0 起独立发版）。
 
 > **本文是「索引 + 红线」层**：只保留动手前必须知道的事（能踩的坑、必须守的约束、去哪查细节）。深度叙事在 `docs/agents/` 下按主题分文件，**改对应模块前先读该文件**——里面的「为什么」比本文的「是什么」更能防止你改出回归。
 >
@@ -11,35 +11,83 @@
 > | [docs/agents/session-and-dispatch.md](docs/agents/session-and-dispatch.md) | canonical session key 文法、route 文法、10.5 指令/投递语义 | 动 session key 构造、路由回退、指令处理 |
 > | [docs/agents/config-and-credentials.md](docs/agents/config-and-credentials.md) | 配置面、凭据读取、通道能力声明、manifest schema | 改 `src/types.ts` 配置类型、凭据路径、`capabilities` |
 > | [docs/agents/outbound-and-quota.md](docs/agents/outbound-and-quota.md) | 被动/主动配额、msg_id 锚点、媒体投递、progress card | 动发送路径、配额扣减、媒体策略 |
-> | [docs/agents/chunking.md](docs/agents/chunking.md) | 字形簇安全分块、结构上下文开销封顶 | 动 `src/outbound/chunker.ts` / `grapheme.ts` |
-> | [docs/agents/streaming.md](docs/agents/streaming.md) | 流式生命周期、段模型、final 承接判定、park 语义 | 动 `streaming-controller.ts` 或 dispatch 流式分支 |
+> | [docs/agents/chunking.md](docs/agents/chunking.md) | 字形簇安全分块、结构上下文开销封顶 | 动 `src/outbound/chunker.ts` / `src/outbound/grapheme.ts` |
+> | [docs/agents/streaming.md](docs/agents/streaming.md) | 流式生命周期、段模型、final 承接判定、park 语义 | 动 `src/outbound/streaming-controller.ts` 或 dispatch 流式分支 |
 > | [docs/agents/group-and-room-event.md](docs/agents/group-and-room-event.md) | 群三模式、room_event、合批、群历史窗口 | 动群聊策略、合批、唤醒判定 |
 > | [docs/agents/inbound.md](docs/agents/inbound.md) | 入站防抖、白名单回告、事件守卫、语音转录、限流 | 动中间件链、入站分类、附件处理 |
 > | [docs/agents/interaction.md](docs/agents/interaction.md) | ask_user 按钮卡片、Secret 输入、webhook detached 派发 | 动按钮卡片、凭据输入、webhook 传输 |
 > | [docs/agents/platform-capabilities.md](docs/agents/platform-capabilities.md) | QQ 平台语义：被动/主动/互动、流式通道、Markdown、OpenID、双传输、Telegram 对照 | 拿 Telegram 直觉套 QQ、设计平台交互时 |
 
-**构建基线：openclaw `2026.10.5`**（peer 范围 `>=2026.10.5`，devDependency 精确钉版 `2026.10.5`）。所有与 openclaw / `openclaw/plugin-sdk` 的交互以 2026.10.5 为最低兼容版本 —— 不得使用仅存在于更新版本中的 API，除非带能力探测与回退。抬地板判据、历史盯版实测与 2026.10.2/10.5 的子路径增删全量，见 [docs/agents/sdk-compat.md](docs/agents/sdk-compat.md)。
+**构建基线：openclaw `2026.10.5`**（peer 范围 `>=2026.10.5`，devDependency 精确钉版 `2026.10.5`）。所有与 openclaw / `openclaw/plugin-sdk` 的交互以 2026.10.5 为最低兼容版本 —— 不得使用仅存在于更新版本中的 API，除非带能力探测与回退。抬地板判据、历史盯版实测与子路径增删全量，见 [docs/agents/sdk-compat.md](docs/agents/sdk-compat.md)。
 
-## Commands
+## Setup commands
 
-```bash
-npm run build        # tsup → dist/index.cjs + dist/index.d.cts (CJS only, target node18)
-npm run dev          # tsup --watch
-npm run typecheck    # tsc --noEmit
-npm run lint:runtime # 扫描 adapter/ 之外的直接 runtime 访问（src/adapter/lint.ts）
+- Install deps: `npm install --no-fund --no-audit`（**不要 `npm ci`**——fresh clone 一律 `npm install`）
+- Start dev:    `npm run dev`（tsup --watch）
+- Build:        `npm run build`（tsup → `dist/index.cjs` + `dist/index.d.cts`，CJS only，target node18）
+- Typecheck:    `npm run typecheck`（tsc --noEmit）
+- Lint:         `npm run lint:runtime`（扫 `adapter/` 之外的直接 runtime 访问，`src/adapter/lint.ts`）
+- Test:         **无 `npm test` script**——测试是独立脚本，见 Testing instructions
+- Node:         开发机期望 v24.x（CI 用 Node 24；tsup target node18 只是产物目标，不限开发机版本）
+
+**隔离规则**：
+
+- 依赖只装项目内 `node_modules/`，**禁止任何全局安装**（`npm i -g`、改全局 npm 配置）；构建/测试一律 `npm run <script>` 或 `npx`（自动走项目内 `node_modules/.bin`）。
+- **npm 11 `allowScripts` 拦截是预期状态、保持不放行**：install 时 npm 会警告 5 个包的 install 脚本不在 `package.json` `allowScripts` 白名单（`openclaw` pre/postinstall、`koffi`、`tree-sitter-bash`、`protobufjs`、`@google/genai`）。刻意如此：openclaw 的 postinstall 会往用户目录写 bundled plugins（破坏环境隔离），且 CI 同样不执行这些脚本、测试照样全绿。白名单只保留 `esbuild`（tsup/tsx 的关键依赖，必须执行）——**不要 `npm install-scripts approve` 放行上述任何包**。
+- **lockfile 零 diff 预期**：`package.json` 未改动时 fresh install 后 `git diff package-lock.json` 应为空（lockfile 与 npm 11 + 主流镜像同步，cn 区域常用腾讯镜像 `https://mirrors.tencent.com/npm/`）；出现意外 diff 说明 npm 版本或 registry 漂移，先排查再继续——确属依赖变更产生的 diff 才随 PR 提交（lockfile 虽在 `.gitignore` 但实际被 git 跟踪）。
+
+## Project layout
+
+```
+index.ts                  # 入口：re-export qqbotPlugin（from src/channel.ts）
+src/channel.ts            # ChannelPlugin definition, GFM table fallback chunker
+  bot-instance.ts         # getBotForAccount(accountId) → QQBot SDK instance
+  runtime.ts              # setQQBotRuntime() / getQQBotRuntime() + exit hooks
+  config.ts               # account resolution, group config, tool policy
+  constants.ts            # TEXT_CHUNK_LIMIT 等常量
+  gateway/                # WebSocket/Webhook lifecycle, event handlers, middleware wiring
+  dispatch/               # inbound → OpenClaw: body-assembler, ctx-builder, envelope
+  outbound/               # send pipeline: text, media, TTS, streaming, cron, debounce
+  middleware/             # access-control, attachment, secret-capture, typing, policy-injector
+  commands/               # /bot-* slash commands（经 buildCommandList() 注册）
+  features/               # pairing, approval, ref-index, history, question-*, group-*, secret-*
+  adapter/                # contract probe, media, resolve, webhook, workspace
+  setup/                  # QR login (start/wait), account-key, finalize, surface wizard
+  tools/                  # platform.ts (qqbot_platform_api), remind.ts, secret-input.ts
+  utils/                  # logger, mention, pkg-version, ssrf-guard, stt
+  openclaw-plugin-sdk.d.ts  # local type stubs for openclaw/plugin-sdk
+openclaw.plugin.json      # 插件 manifest：配置 schema 的唯一来源
+preload.cjs               # 同步建 node_modules/openclaw junction
+tests/                    # 独立测试脚本（tests/*.test.ts，tsx 直跑）
+docs/agents/              # 深度文档：本文每条红线的「为什么」都在这里
+skills/qqbot-channel      # 频道 API skill（宿主 AI 加载，导行为不是构建步骤）
+scripts/                  # 仓库工具脚本（proactive-api-server / send-proactive / test-sendmedia / link-sdk-core）
+.github/workflows/        # ci.yml（typecheck·lint·build·test）、release.yml（v* tag 发版）
 ```
 
-**No `npm test` script.** Tests are standalone scripts run with `tsx`：
+`src/` 下另有 7 个框架侧通道适配器（`src/*-adapter.ts`：message / messaging / outbound / gateway / heartbeat / status / agent-prompt）与 `src/types*.ts`——它们是**框架侧适配层**，与树里的 `adapter/` 目录（插件自己的 probe / media / webhook）不是一回事。
 
-```bash
-npx tsx tests/<name>.test.ts          # run one file
-```
+Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendText`, `sendMedia`, `parseTarget`, `dispatchToOpenClaw`, `StreamingController`, `PersistedRefIndexStore`, `ReplyLimiter`, quota management functions, and typing lifecycle functions.
 
-All tests use `node:assert` + a hand-rolled `test()` helper and run directly via `tsx`.
+## Code style
 
-**全量测试是 CI 的职责**：ci.yml 在每次 push / PR 跑全部测试文件（glob `tests/*.test.ts`，当前 60 个），本地不做全量跑（tsx 冷启动太慢）。本地只在调试单个用例时跑单文件（可选，非门禁）。**覆盖率同样只在 CI 统计**：Test 步骤经 `NODE_V8_COVERAGE` 收集 V8 profile，Coverage report 步骤用 `c8`（`--all --include 'src/**' --include 'index.ts'`）聚合，逐文件表格 + 总百分比写入 Actions run 的 Step Summary——本地不要跑覆盖率。
+- TypeScript strict（`tsconfig.json`: `strict: true`），`module`/`moduleResolution`: `NodeNext`；源码是 ESM，但**发布产物是 CJS 单文件**（tsup `format: ['cjs']` + `outExtension` → `.cjs`，target node18）。
+- **仓库没有 eslint / prettier 配置**——风格靠人工一致 + `npm run typecheck`。不要顺手引入 formatter 依赖。
+- 日志：用 `createPluginLogger()`（`src/utils/plugin-logger.ts`）。**不要直接 `console.*`**，除非早期 `register()` 路径（runtime logger 尚未接好）。
+- 文本分块上限：`TEXT_CHUNK_LIMIT`（`src/constants.ts`，默认 5000 字）。
+- 斜杠命令：一命令一文件放在 `src/commands/`，经 `buildCommandList()`（`src/commands/index.ts`）注册。
+- 插件 ID：plugin 是 `openclaw-qqbot`，channel 是 `qqbot`——别混。
+- **tsup post-build 的 `sanitizeDist()` 是承重的**——把 `new Function` 改写成 `new _F`（protobufjs 模式触发安全扫描器），别剥。
 
-**守卫测试**（改动命中对应领域时，它们就是你的验收清单，不只是 CI 装饰）：
+## Testing instructions
+
+- **没有 `npm test` script**。测试是独立脚本，`node:assert` + 手写 `test()` helper，tsx 直跑：`npx tsx tests/<name>.test.ts`（单文件调试用，**非门禁**）。
+- **全量测试是 CI 的职责**：ci.yml 在每次 push / PR 跑全部 `tests/*.test.ts`（当前 64 个），本地不做全量跑（tsx 冷启动太慢）。
+- **覆盖率同样只在 CI 统计**：Test 步骤经 `NODE_V8_COVERAGE` 收集 V8 profile，Coverage report 步骤用 `c8`（`--all --include 'src/**' --include 'index.ts'`）聚合，逐文件表格 + 总百分比写入 Actions run 的 Step Summary——本地不要跑覆盖率。
+- **PR 前本地自检只做秒级项**：`npm run typecheck` + `npm run lint:runtime` + `npm run build`。**测试一律由 CI 执行**，PR 的 CI 全绿即测试通过。
+- 行为改动（尤其 `src/gateway/`、`src/dispatch/`、`src/outbound/`）在 PR 描述里注明重点看哪些测试文件（如 `tests/session-key.test.ts`、`tests/body-assembler.test.ts`、`tests/middleware-chain.test.ts`、`tests/room-event.test.ts`、`tests/dispatch-lifecycle.test.ts`、`tests/streaming-parked-finalize.test.ts`），CI 全量都会跑到。
+
+### 守卫测试（改动命中对应领域时，它们就是你的验收清单，不只是 CI 装饰）
 
 | 测试文件 | 守的是什么 |
 |---|---|
@@ -49,80 +97,45 @@ All tests use `node:assert` + a hand-rolled `test()` helper and run directly via
 | `tests/chunker-grapheme.test.ts` / `tests/chunker-context-overhead.test.ts` | 字形簇切点、结构上下文开销封顶 |
 | `tests/streaming-parked-finalize.test.ts` | 流式 park / 取消 / 补发 / 媒体完整性 |
 
-## 环境搭建与隔离（新环境 bootstrap，2026-09-21 约定）
+## PR & commit conventions
 
-新机器/新容器搭环境，与 CI 完全对齐（ci.yml：Node 24 + `npm install --no-fund --no-audit`）：
-
-```bash
-node --version                 # 期望 v24.x（tsup target node18 是产物目标，不限开发机版本）
-npm install --no-fund --no-audit
-npm run typecheck && npm run lint:runtime && npm run build   # 秒级自检，全绿即环境可用
-```
-
-**隔离规则**：
-
-- 依赖只装项目内 `node_modules/`，**禁止任何全局安装**（`npm i -g`、改全局 npm 配置）；构建/测试一律 `npm run <script>` 或 `npx`（自动走项目内 `node_modules/.bin`）。
-- **不要 `npm ci`**（fresh clone 一律 `npm install`，见下文 lockfile gotcha）。
-- **npm 11 `allowScripts` 拦截是预期状态、保持不放行**：install 时 npm 会警告 5 个包的 install 脚本不在 `package.json` `allowScripts` 白名单（`openclaw` pre/postinstall、`koffi`、`tree-sitter-bash`、`protobufjs`、`@google/genai`）。刻意如此：openclaw 的 postinstall 会往用户目录写 bundled plugins（破坏环境隔离），且 CI 同样不执行这些脚本、测试照样全绿。白名单只保留 `esbuild`（tsup/tsx 的关键依赖，必须执行）——**不要 `npm install-scripts approve` 放行上述任何包**。
-- **lockfile 零 diff 预期**：`package.json` 未改动时 fresh install 后 `git diff package-lock.json` 应为空（lockfile 与 npm 11 + 主流镜像同步，cn 区域常用腾讯镜像 `https://mirrors.tencent.com/npm/`）；出现意外 diff 说明 npm 版本或 registry 漂移，先排查再继续——确属依赖变更产生的 diff 才随 PR 提交（lockfile 虽在 `.gitignore` 但实际被 git 跟踪）。
-
-## Git workflow（main 为保护分支）
-
-- **禁止直接 push 到 main**（GitHub branch protection）。任何开发——功能、修复、文档——一律走 `分支 + PR`：
-  1. 从最新 main 切分支，命名 `<type>/<短描述>`（如 `fix/room-event-echo`、`docs/agents-md`）
+- **禁止直接 push 到 `main`**（GitHub branch protection）。任何开发——功能、修复、文档——一律走 `分支 + PR`：
+  1. 从最新 `main` 切分支，命名 `<type>/<短描述>`（如 `fix/room-event-echo`、`docs/agents-md`）
   2. 提交信息遵循 Conventional Commits（`feat:` / `fix:` / `docs:` / `chore:` / `ci:` / `refactor:`，breaking change 加 `!`，如 `refactor!:`）——与仓库现有历史一致
   3. push 分支、开 PR；CI（ci.yml，push + pull_request 双触发）必须全绿（typecheck / lint:runtime / build / 全量测试）
   4. 合并后删除远端分支
 - **PR 不自动合并（2026-09-10 约定）**：CI 全绿 ≠ 已授权合并——review 与合并由仓库主人决定。开完 PR、CI 全绿后即停，把 PR 链接交回并等待主人亲自合并或明确授权；打 `v*` tag 发版等下游动作同样必须等合并完成且主人确认后再执行。
-- **PR 提请前本地自检（秒级）**：`npm run typecheck` + `npm run build`；**测试一律由 CI 执行**（本地全量太慢），PR 的 CI 全绿即测试通过——本地 `npx tsx tests/<file>.test.ts` 仅作单用例调试
-- **发版不受分支保护影响**：release.yml 由 `v*` tag 触发，tag 打在已合并进 main 的提交上（`git tag v1.0.0 && git push origin v1.0.0`，branch protection 不拦 tag push）；完整流程见 CHANGELOG.md「发版操作手册」
-- **gh CLI 注意**：本仓库 git remote 走代理（github.jerryliang.win），gh 无法从 remote 推断仓库，PR/issue 操作需显式 `--repo jerryliang122/qqbot-openclaw`
+- **发版不受分支保护影响**：tag 打在已合并进 main 的提交上（`git tag v1.0.0 && git push origin v1.0.0`，branch protection 不拦 tag push）→ release.yml 校验版本一致性 + 跑全量检查 + 构建产物 + 自动发布 npm + 建 GitHub Release。完整流程见 CHANGELOG.md「发版操作手册」。
+- **gh CLI 注意**：本仓库 git remote 走代理（github.jerryliang.win），gh 无法从 remote 推断仓库，PR/issue 操作需显式 `--repo jerryliang122/qqbot-openclaw`。
 
-## Architecture
+## Security
 
-Entry: `index.ts` → re-exports `qqbotPlugin` from `src/channel.ts`. That file is the orchestrator; substantive logic lives in:
+- **仓库代码里不写任何密钥**：appid/secret 经 `openclaw channels add --token "appid:secret"` 或环境变量 `QQBOT_APPID` / `QQBOT_SECRET` 配置。Never hardcode or log credentials.
+- **凭据文件只在账号启动时读一次**；`resolveQQBotAccount` 是热路径（每次出站发送都解析一次账号），全程不读盘——同步 `stat`/`readFileSync` 会阻塞事件循环。
+- **内联密钥与凭据文件强制互斥**：两者同时存在时内联优先、文件静默忽略；写入必须清掉另一个，注销要清 `clientSecretFile`。
+- **`config.inspectAccount` 是只读巡检面，不 materialize 凭据**——`openclaw status` / doctor 不该为「描述配置」触发 token 交换或扫码。`secretStatus` 三态：`available` / `configured_unavailable` / `missing`。
+- **日志脱敏**：任何 INFO 以上日志不得落完整 openid / sessionKey（`/bot-logs` 会导出本地日志文件原样）——openid 一律走 `shortId()`，sessionKey 一律记 sha256 前 8 位摘要。
+- **Secret input 的消息绝不进 AI transcript**（kind 恒为 `env`）；**红线**：多问题 ask_user 待答时 capture 中间件必须放行，否则用户的答案会被写进密钥库。
+- 媒体 source 的 SSRF 防护目前是「假防护」（只按小写 `http://`/`https://` 字面量前缀判定，`HTTP://` / `http:/` / 前导空格三种拼写可绕过，平台侧 URL 解析器会归一化）。**当前决定暂不加固**（触发前提是 agent 输出被污染，那一步成立时 agent 已有更强能力）。**触发器**：① 插件侧出现「先下载再上传」媒体路径；② 媒体 source 可信度假设从「可信」改为「不可信」；③ 出现提示注入可触达外部内容的部署形态。届时改用 `new URL(source)` 按 `url.protocol` 判定，并让 `resolveMediaSource` 用同一份解析结果决定 `{url}/{localPath}/{fileData}`。
 
-```
-src/
-  channel.ts            # ChannelPlugin definition, GFM table fallback chunker
-  bot-instance.ts       # getBotForAccount(accountId) → QQBot SDK instance
-  runtime.ts            # setQQBotRuntime() / getQQBotRuntime() + exit hooks
-  config.ts             # account resolution, group config, tool policy
-  gateway/              # WebSocket/Webhook lifecycle, event handlers, middleware wiring
-  dispatch/             # inbound → OpenClaw: body-assembler, ctx-builder, envelope
-  outbound/             # send pipeline: text, media, TTS, streaming, cron, debounce
-  middleware/           # access-control, attachment, policy-injector
-  commands/             # /bot-* slash commands (registered via SDK middleware)
-  features/             # pairing, approval, ref-index, history, command-panel
-  adapter/              # contract probe, media, resolve, webhook, workspace
-  setup/                # QR login (start/wait), account-key, finalize, surface wizard
-  tools/                # platform.ts (qqbot_platform_api), remind.ts, secret-input.ts (qqbot_secret_input)
-  utils/                # logger, mention stripping, pkg-version, SSRF guard, STT
-  openclaw-plugin-sdk.d.ts  # local type stubs for openclaw/plugin-sdk
-```
-
-Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendText`, `sendMedia`, `parseTarget`, `dispatchToOpenClaw`, `StreamingController`, `PersistedRefIndexStore`, `ReplyLimiter`, quota management functions, and typing lifecycle functions.
-
-## Key gotchas
+## Key gotchas（红线）
 
 以下每条都是**红线**（改错了会出线上事故）。括号里的文件是深度说明，含「为什么」与历史踩坑——动手前必读。
 
 ### SDK 依赖面（[详情](docs/agents/sdk-compat.md)）
 
-- **SDK 子路径被删 = 插件整体加载失败，typecheck 不设防。** openclaw 删子路径时连 `.d.ts` 一起删，`dist/index.cjs` 加载期就抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`，所有功能全灭且本地完全无声。守卫在 `tests/sdk-surface.test.ts`——**它按引号字面量取子路径全集，不解析 import 语句形态**（初版只认静态 `import`，漏掉动态 import / 字面量 require / re-export 四种承重用法，评审实测确认下版本子路径删除照样全绿放行）。豁免必须显式登记 `EXEMPT_SUBPATHS`，别靠「扫不到」。运行时断言必须放**子进程**（tsx 会 patch `Module._resolveFilename`，进程内直接 require 会误报 ESM-only 依赖缺失）。`import { fn, type Opts }` 的 inline `type` 要逐项判 type，否则守卫误报「缺少运行时值」把人引向不存在的缺陷。
+- **SDK 子路径被删 = 插件整体加载失败，typecheck 不设防。** openclaw 删子路径时连 `.d.ts` 一起删，`dist/index.cjs` 加载期就抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`，功能全灭且本地完全无声。守卫在 `tests/sdk-surface.test.ts`——它**按引号字面量取子路径全集，不解析 import 语句形态**（动态 import / 字面量 require / re-export 都算），豁免必须显式登记 `EXEMPT_SUBPATHS`，别靠「扫不到」。运行时断言必须放**子进程**（tsx 会 patch `Module._resolveFilename`，进程内直接 require 会误报 ESM-only 依赖缺失）。`import { fn, type Opts }` 的 inline `type` 要逐项判 type，否则守卫误报「缺少运行时值」把人引向不存在的缺陷。
 - **裸子路径 `openclaw/plugin-sdk`（无后缀）不在包 exports 里**——运行时 require 抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`。本插件对它只有 `import type`，永远不要从裸路径做值导入。
 - **ambient stub 会遮蔽包内真实类型，留着等于没验证。** `src/openclaw-plugin-sdk.d.ts` 当前只剩两段（裸入口 + `text-utility-runtime`），升级钉版时先删掉包已提供类型的 stub 段再跑 typecheck。
 - **`preload.cjs` 不能删改名**——它同步建 `node_modules/openclaw` junction，删了插件在框架里加载失败。
-- **`tsup` post-build 的 `sanitizeDist()` 是承重的**——把 `new Function` 改写成 `new _F`（protobufjs 模式触发安全扫描器），别剥。
+- **tsup post-build 的 `sanitizeDist()` 是承重的**（见 Code style），别剥。
 - **钉版必须恒等于 peer 承诺的最低版本**——两者脱钩就测不出「误用旧版没有的 API」，虚假承诺只在用户运行时炸。
 - **Runtime contract probe 的 `REQUIRED` 列表是空的**，全部能力按 `OPTIONAL` 处理，别指望它 fail-fast。
 
 ### 配置面与凭据（[详情](docs/agents/config-and-credentials.md)）
 
 - **改配置类型必须同步 manifest schema，否则用户配置被直接拒收。** 唯一来源是 `openclaw.plugin.json` 的 `channelConfigs.qqbot.schema`（顶层 + `accounts.<id>` 两处逐字一致），框架走 `validatePluginSchemaValue`（`applyDefaults: true`，对 `additionalProperties:false` 和 `enum` 都做值校验）。typecheck 不设防——`tests/manifest-config-schema.test.ts` 是唯一防线，红了先补 manifest，不要绕过守卫。
-- **`resolveQQBotAccount` 全程不读盘**——它是热路径（每次出站发送都解析一次账号），同步 `stat`/`readFileSync` 会阻塞事件循环。凭据文件只在账号启动时读一次。
-- **内联密钥与凭据文件强制互斥**——两者同时存在时内联优先、文件静默忽略，写入时必须清掉另一个；注销要清 `clientSecretFile`。
-- **`config.inspectAccount` 是只读巡检面，不 materialize 凭据**——`openclaw status` / doctor 不该为「描述配置」触发 token 交换或扫码。`secretStatus` 三态：`available` / `configured_unavailable` / `missing`。
+- **凭据读写与巡检口径见 Security**（互斥、只读巡检、热路径不读盘）。
 - **`capabilities.tts.voice` 必须声明**，否则 TTS 被当普通音频文件发。本插件走 SILK 语音气泡，声明 `{ synthesisTarget: "voice-note", transcodesAudio: true, captionedFinalText: false }`——`captionedFinalText: false` 是必需的（QQ 语音不带文字说明，声明 true 会让终稿正文永不到达）。**`capabilities.nativeCommands` 刻意不声明**（QQ 指令面板是引导型 UI，声明会与 `commands.text=false` 冲突）。
 - **`messaging.inferTargetChatType` 必须实现**——否则宿主只能走通用路由搜索，Gateway 一直报 `waiting for route`。其余一律 `undefined`（不猜）。
 
@@ -159,7 +172,7 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 - **ask_user 问题卡必须挂本轮显式锚点（2026-11-05）**——问题卡（单题卡 / 多题卡 / 确认卡 / 状态回执）此前走 SDK 直发（请求体不带 `msg_id` ⇒ 平台按**主动消息**处理）：白烧每日 1000 条主动预算，且用户关「允许主动发送」时问题卡根本发不出去（模型空等 `ask_user` 超时）。现走 `outbound-service.sendText` + 本轮 inbound 的 `envelope.messageId` ⇒ 被动回复；锚点不可用（TTL 过期 / 平台判死）时**降级主动一次**（`src/outbound/question-send.ts`，同 progress card 口径）。**红线：禁止改回 SDK 直发**；**不得**让网关 `retryOnDeadAnchor` 兜底——那条主动重发路径不携带 keyboard（用户看到题干却无从作答），故降级必须由问题卡层自己做。
 - **QQ 语音投递口径以「体积」为准，不是「时长」**——平台文档里没有任何语音时长限制，「60 秒以内是语音条」是相关性错觉。格式只认 silk/mp3/wav/ogg 四种；超 20MB 软限制由 `resolveOutboundMediaKind` **显式**降级为文件投递。
 - **表情表态仅频道支持**（单聊/群聊 ❌），故 `capabilities.reactions: false` 是对的。
-- **Progress card 先走被动回复、锚点失效降级主动**（`passiveOnly` 首试；**锚点无存活（无 msg_id / TTL 过期 / 死锚点）或平台判死（40034005 / 40034128）⇒ 降级为主动发送**——卡片按「前置消息」处理，烧每日 1000 条主动预算但用户仍能看到进度；降级状态本轮记忆，后续快照直接走主动），支持 checklist（`📋 进度 N/M`，框架自动计数行被抑制）与 note 双形态（markdown-only 卡片 → `📋 状态`，判定式 `steps=[] && explanation 非空`；note 截断必须**字形簇安全**——复用 `outbound/grapheme.ts`，禁止按码元硬切切碎代理对；混合形态的 markdown 在框架投影层被丢弃——插件侧无解）——反应式配额下无本地次数门（`reserveQuota` 保槽配置已删除，残留会被 schema 拒收），唯一保险丝是 `maxPerTurn`。
+- **Progress card 先走被动回复、锚点失效降级主动**（`passiveOnly` 首试；**锚点无存活（无 msg_id / TTL 过期 / 死锚点）或平台判死（40034005 / 40034128）⇒ 降级为主动发送**——卡片按「前置消息」处理，烧每日 1000 条主动预算但用户仍能看到进度；降级状态本轮记忆，后续快照直接走主动），支持 checklist（`📋 进度 N/M`，框架自动计数行被抑制）与 note 双形态（markdown-only 卡片 → `📋 状态`，判定式 `steps=[] && explanation 非空`；note 截断必须**字形簇安全**——复用 `src/outbound/grapheme.ts`，禁止按码元硬切切碎代理对；混合形态的 markdown 在框架投影层被丢弃——插件侧无解）——反应式配额下无本地次数门（`reserveQuota` 保槽配置已删除，残留会被 schema 拒收），唯一保险丝是 `maxPerTurn`。
 - **typing 永不占用主动额度（2026-11-03）**——typing（msg_type=6）不占被动回复额度，但**绝不降级为「不带 msg_id 的主动形态」**：锚点不可用（TTL 过期 / 死锚点 / 平台 40034005·40034128 拒收）⇒ **本轮停发**（turn 内中间件与心跳路径同口径）。主动额度（每日 1000 条）留给正文与前置消息，typing 不参与竞争。平台拒收 typing 时须 `invalidateMsgIdQuota` 标记死锚点（本轮后续消息一律不得走被动回复）。
 
 ### 群聊与 room_event（[详情](docs/agents/group-and-room-event.md)）
@@ -185,62 +198,36 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 ### 交互面（[详情](docs/agents/interaction.md)）
 
 - **webhook 模式的 op:0 派发必须挂 detached 准入根**，且**光包 `runDetachedWebhookWork` 不够**——回调内还要等「本次委托派生的在途派发」全部落地才 settle，否则 detached 根随 ACK 释放、bug 原样复现。报错文案是四分支兜底句「temporarily unavailable」，**网关并没有 drain**。
-- **多问题 ask_user 的红线是「禁止代替用户作答」，不是「禁止程序化提交」**（2026-11-11 再界定，issue #99 / PR #100）——**答案值必须来自用户的真实输入**（按钮点选 / 手打文本），插件只负责**搬运与组合**；**禁止合成入站消息**（合成消息会被框架 steer 进 ask_user-suspended run，2026-08-24 事故）。提交通道 = 框架官方 `claimPendingAgentQuestionAnswer({ sessionKey, text })`（`openclaw/plugin-sdk/agent-harness-runtime`）——它与框架自己的入站认领走**同一套解析与校验**（`buildAgentHarnessUserInputAnswers` / `validateAnswers`）⇒ 插件组合的文本与用户手打的文本在框架侧等价。**多题问答进行中（c2c、多题 pending 武装期间）的入站文本一律本地暂存为当前题答案、不转发框架**（红线再界定）：平台无法区分「用户手打的普通消息」与「指令按钮代发的回调内容」——两者都是普通入站消息；中间态文本转发给框架只会撞上 `validateAnswers` 的 partial 拒收 + 重问循环（白烧一轮、两侧状态分裂），且靠中间态词汇猜意图必然失效。**边界**：仅多题 pending 武装期间 + 仅 c2c + 仅 `sequential` 形态；单题 pending / 无 pending 时文本照旧原样转发框架；斜杠命令（`/` 开头）照旧放行（逃生通道）。**分类只认形态**（整单 / 形态错误 / 本题答案），**不靠内容语义猜**。
-- **ask_user 卡片由插件自渲染（单题 / 多题同构）**——渲染层在 `src/features/question-card.ts`：正文走插件自己的中文版式（去掉框架 3 行英文脚手架），按钮统一 `① ②` 前缀 + 截断。**单题文本反解失败 ⇒ 回退到「框架原文 + 旧键盘」**（不得产出半解析的卡片）。单题自由作答靠正文引导，**不加**「✍️ 其他」按钮（预填前缀会污染答案）。
-- **单题作答不得被防抖合并污染**——单题卡发出后登记单问题 pending（**仅 c2c**），c2c 防抖与 secret-capture 在 pending 期间放行该会话文本；pending 清理：按钮 resolve 成功 / 卡片发送失败 / 该会话下一条入站消息 / TTL 兜底。
-- **多题必须「整单提交」——「点一题解一题」在框架层不成立**——框架 `validateAnswers` 逐题要求非空（ask_user 归一化从不设 `allowEmpty`）⇒ 任何一次提交都要带齐全部题。**红线**：禁止代替用户作答、禁止合成入站消息 ⇒ 提交只能走框架官方认领通道（`claimPendingAgentQuestionAnswer`），值全部来自用户真实作答。**空值行必须插件先拦下**（框架的 keyed 正则要求值至少一个字符，空值行会被行序兜底捡成字面量 `"N:"` **静默收下**）。
+- **多问题 ask_user 的红线是「禁止代替用户作答」，不是「禁止程序化提交」**（2026-11-11 再界定，issue #99 / PR #100）——**答案值必须来自用户的真实输入**（按钮点选 / 手打文本），插件只负责**搬运与组合**；**禁止合成入站消息**（合成消息会被框架 steer 进 ask_user-suspended run，2026-08-24 事故）。提交通道 = 框架官方 `claimPendingAgentQuestionAnswer({ sessionKey, text })`（`openclaw/plugin-sdk/agent-harness-runtime`）——它与框架自己的入站认领走**同一套解析与校验**（`buildAgentHarnessUserInputAnswers` / `validateAnswers`）⇒ 插件组合的文本与用户手打的文本在框架侧等价。
+- **多题问答进行中（c2c、多题 pending 武装期间）的入站文本一律本地暂存为当前题答案、不转发框架**——平台无法区分「用户手打的普通消息」与「指令按钮代发的回调内容」；中间态文本转发给框架只会撞上 `validateAnswers` 的 partial 拒收 + 重问循环（白烧一轮、两侧状态分裂），且靠中间态词汇猜意图必然失效。**边界**：仅多题 pending 武装期间 + 仅 c2c + 仅 `sequential` 形态；单题 pending / 无 pending 时文本照旧原样转发框架；斜杠命令（`/` 开头）照旧放行（逃生通道）。**分类只认形态**（整单 / 形态错误 / 本题答案），**不靠内容语义猜**。
+- **多题必须「整单提交」——「点一题解一题」在框架层不成立**——框架 `validateAnswers` 逐题要求非空（ask_user 归一化从不设 `allowEmpty`）⇒ 任何一次提交都要带齐全部题。**红线**：禁止代替用户作答、禁止合成入站消息 ⇒ 提交只能走框架官方认领通道，值全部来自用户真实作答。**空值行必须插件先拦下**（框架的 keyed 正则要求值至少一个字符，空值行会被行序兜底捡成字面量 `"N:"` **静默收下**）。
 - **多题 c2c 走顺序发题，全部答齐即提交**——只发第 1 题，答完才发下一题；**末题选项是回调型（type=1，与中间题同构）**，点选只记答案；**全部答齐后由插件组合整单文本并直提**（`src/features/question-submit.ts`）⇒ 用户聊天里**不再出现** `1: 1\n2: …` 的机器气泡，确认卡与「✅ 提交」按钮一并消失。中间题只有选项按钮（不挂预填按钮——框架要求整单齐备）；**末题的预填按钮恒存在**（指令型 `enter=false`，把「全部已答 + 本题空位」填进输入框但**不自动发送**，用户改完手动发送 → 命中拦截层的「整单形态」⇒ 覆盖全部答案 ⇒ 提交）：题面带 `Other:` 行显示「✍️ 其他」、否则显示「📝 填写模板」；卡片正文**必须**写清「想自己写答案怎么办」，且**按按钮实际标签写**（不得指引不存在的按钮）。**群聊路径保持旧形态**（全部题卡 + 确认卡 + 客户端代发）——群里默认拿不到 `ask_user` 工具，多题在群里基本不会发生。**两套机制并存，别全局替换**。
 - **多题文本拦截层的三形态（`planSequentialTextCapture`）**——**整单**（行数=题数、题号 1..N、每行 `N: 值`，分隔符同框架认 `:`/`=`/`-`）⇒ 覆盖全部答案 ⇒ 答齐即提交；**形态错误**（含题号行但不合整单）⇒ 回执格式错误 + **保持武装**；**本题答案**（不含题号行）⇒ 记当前题 ⇒ 末题则提交、否则续卡。三种都**不转发框架**。**pending 终态后不得再拦截**（文本照旧转发框架）；**提交进行中（resolving）不得放行**（消费文本 + 回执「正在提交，请稍候」——既不能当答案收，也绝不转发框架）；**末题点选在 pending 终态后静默忽略**（平台会重推 interaction 事件，回执会刷屏）。**带附件的消息不捕获**（捕获会让附件凭空消失——附件价值高于「把它当答案」）；**斜杠命令 / 纯附件照旧放行**。
-- **提交失败的语义（pending 保持武装）**——`claimPendingAgentQuestionAnswer` 抛 INVALID_REQUEST ⇒ 答案非法（回执「答案格式不对」）；抛其它异常 ⇒ 传输/运行时失败（回执「提交失败」）；**20s 超时**（认领挂死 ⇒ 锁必须释放，否则该会话既进不了拦截层也重试不了 ⇒ 问卷卡死）⇒ 回执「提交失败」；子路径不可用 ⇒ `unsupported`（回执「提交失败」）。前四种都**保持 pending 武装** ⇒ 用户可再次点选或重新打字重试；`claim` 返回 false ⇒ 框架侧无挂起记录/已终态 ⇒ pending 终态 + 回执「该问题已提交、已过期或已由框架处理」。**SDK 子路径被删 = 插件整体加载失败**（`tests/sdk-surface.test.ts` 的 `mustCover` 已锁 `agent-harness-runtime`）。**日志里不得出现完整 sessionKey**（c2c 含对端 openid，而 `/bot-logs` 会导出本地日志文件）⇒ 一律记 sha256 前 8 位摘要；**同口径：任何 INFO 日志不得落完整 openid**（`event-handlers.ts` 里凡是 openid 一律走 `shortId()`——含归属校验拒绝日志、单题 resolve 日志、多题点选日志）。
+- **提交失败的语义（pending 保持武装）**——`claimPendingAgentQuestionAnswer` 抛 INVALID_REQUEST ⇒ 答案非法（回执「答案格式不对」）；抛其它异常 ⇒ 传输/运行时失败（回执「提交失败」）；**20s 超时**（认领挂死 ⇒ 锁必须释放，否则该会话既进不了拦截层也重试不了 ⇒ 问卷卡死）⇒ 回执「提交失败」；子路径不可用 ⇒ `unsupported`（回执「提交失败」）。前四种都**保持 pending 武装** ⇒ 用户可再次点选或重新打字重试；`claim` 返回 false ⇒ 框架侧无挂起记录/已终态 ⇒ pending 终态 + 回执「该问题已提交、已过期或已由框架处理」。**SDK 子路径被删 = 插件整体加载失败**（`tests/sdk-surface.test.ts` 的 `mustCover` 已锁 `agent-harness-runtime`）。**日志里不得出现完整 sessionKey**（见 Security）。
 - **多题 pending 的归属与生命周期（红线）**——**归属校验**：按钮回调只按 `questionId` 找 pending 会让**转发出去的卡片被点击者作答**（别人的点选记进原用户答案、甚至把原用户的问题 resolve 掉）⇒ 记录/提交前必须核对 **账号 + scope + 对端** 三者与 pending 一致（`handleMultiQuestionTap`）。**旧单退役**：同一会话注册新一单时**上一单必须退役**——提交通道只带 `sessionKey`（框架按 session 查挂起记录）不带 questionId ⇒ 旧卡片若仍可用，点它会用旧答案 resolve **新**问题。**questionId 复用**：同一 id 被注册到别的会话时，旧会话的映射必须清掉 + 查询时校验条目归属（否则答案串会话）。**用户没看到卡片时**（turn 在登记 pending 后、发首卡前被取消 / 首卡发送失败）**必须退役 pending**，否则他后续的普通消息会被当成「没见过的那个问题」的答案。
 - **提交进行中（resolving）的窗口——两处查表都必须是「含 resolving」的**——`findPendingMultiQuestionByConversation` 排除 resolving ⇒ ① secret-capture 的「多题让行红线」失效 ⇒ 用户的普通消息被写进密钥库；② **拦截层失效 ⇒ 文本泄漏回框架**（框架侧挂起记录还在，会拿这条文本去认领 ⇒ `validateAnswers` partial 拒收 + 重问循环——正是本机制要消灭的场景）。⇒ 两处都必须改用**含 resolving** 的查表（`hasPendingMultiQuestionForConversation` / `findMultiQuestionEntryByConversation`）。**拦截层命中 resolving 时的动作**：这一单正在提交（答案已定稿）⇒ 既不能当答案收、也**绝不转发框架** ⇒ **消费该文本 + 回执「正在提交，请稍候」**（用户稍后重发即可；窗口最长 20s = 认领超时上限）。**按钮点选同口径**：`recordSequentialAnswer` / `recordSequentialTextAnswer` 在 resolving 时返回 `resolving`（不记答案、不推进 cursor）⇒ 回执「正在提交，请稍候」，不得静默吞掉。
-- **Secret input 的消息绝不进 AI transcript**——kind 恒为 `env`（agent 可读环境值）。**红线**：多问题 ask_user 待答时 capture 中间件必须放行。
+- **ask_user 卡片由插件自渲染（单题 / 多题同构）**——渲染层在 `src/features/question-card.ts`：正文走插件自己的中文版式（去掉框架 3 行英文脚手架），按钮统一 `① ②` 前缀 + 截断。**单题文本反解失败 ⇒ 回退到「框架原文 + 旧键盘」**（不得产出半解析的卡片）。单题自由作答靠正文引导，**不加**「✍️ 其他」按钮（预填前缀会污染答案）。
+- **单题作答不得被防抖合并污染**——单题卡发出后登记单问题 pending（**仅 c2c**），c2c 防抖与 secret-capture 在 pending 期间放行该会话文本；pending 清理：按钮 resolve 成功 / 卡片发送失败 / 该会话下一条入站消息 / TTL 兜底。
 - **互动事件只有 type 11/12 需要 ack**——其余类型回应无意义（type=14 误 ack code=0 会触发「会话已清空」小灰条）。**配置面板事件按 `data.type` 匹配且必须在类型路由分支之前检查。**
 
 ### 其他红线
 
-- **No secrets in repo code**：appid/secret 经 `openclaw channels add --token "appid:secret"` 或环境变量 `QQBOT_APPID` / `QQBOT_SECRET` 配置。Never hardcode or log credentials.
 - **群消息优先级链**：`groups.{groupOpenid}.requireMention` → `groups.*.requireMention` → account 级 `defaultRequireMention` → `true`（默认）。其他群配置字段（`ignoreOtherMentions/toolPolicy/name/prompt/historyLimit/historyMode/unmentionedInbound/coalesce`）同一 ??-cascade。
-- **群历史模式 `historyMode`**：默认 `clear`（回复后整清）；`rolling`——bot 出站也记入 historyBuffer，回复后裁剪到最后一条 bot 发言之后。
-- **10.5 会主动外发「💾 Learned:」通知**——非缺陷不修，规避用 `skills.workshop.autonomous.mode: "off"`。
-- **openclaw 10.5 新增群话题（group thread）能力**——配置在**顶层 `cfg.broadcast["<channel>:<peerId>"]`**（不在 `channels.qqbot` 下），本插件尚未接入。
-- **媒体 source 的 SSRF 防护是「假防护」**——只按小写 `http://`/`https://` 字面量前缀判定，`HTTP://` / `http:/` / 前导空格三种拼写可绕过（平台侧 URL 解析器会归一化）。**当前决定暂不加固**（触发前提是 agent 输出被污染，那一步成立时 agent 已有更强能力）。**触发器**：① 插件侧出现「先下载再上传」媒体路径；② 媒体 source 可信度假设从「可信」改为「不可信」；③ 出现提示注入可触达外部内容的部署形态。届时改用 `new URL(source)` 按 `url.protocol` 判定，并让 `resolveMediaSource` 用同一份解析结果决定 `{url}/{localPath}/{fileData}`。
-
-## Skills (under `/skills/`)
-
-- `qqbot-channel` — Guild/Channel API operations (notes/posts/schedules). Trigger: 用户提到「频道」「子频道」等.
-
-These are loaded by the host AI; they guide behavior, not build steps.
-
-## Verification
-
-本地门禁只做秒级检查（2026-09-10 约定：全量测试太慢，一律交给 CI）：
-
-```bash
-npm run typecheck                   # tsc --noEmit
-npm run build                       # ensure tsup post-build succeeds
-```
-
-**测试由 CI 执行**：push 分支 / 开 PR 后，以 ci.yml 的全量测试结果为准。行为改动（尤其 `src/gateway/`、`src/dispatch/`、`src/outbound/`）在 PR 描述里注明重点看哪些测试文件（如 `session-key.test.ts`、`body-assembler.test.ts`、`middleware-chain.test.ts`、`room-event.test.ts`、`dispatch-lifecycle.test.ts`、`streaming-parked-finalize.test.ts`），CI 全量都会跑到。
-
-## Misc
-
-- Plugin IDs: `openclaw-qqbot` (plugin), `qqbot` (channel). Don't confuse them.
-- Slash commands live in `src/commands/` — each is a separate file, registered via `buildCommandList()` in `src/commands/index.ts`.
-- Default text chunk limit: 5000 chars (`TEXT_CHUNK_LIMIT` in `src/constants.ts`).
-- Logging: use `createPluginLogger()` from `src/utils/plugin-logger.ts`. Don't use `console.*` directly except in early `register()` paths where the runtime logger isn't wired up yet.
+- **群历史模式 `historyMode`**（`clear` 默认 / `rolling`）、**10.5 的「💾 Learned:」主动通知**（非缺陷不修，规避用 `skills.workshop.autonomous.mode: "off"`）、**10.5 群话题能力**（配置在**顶层 `cfg.broadcast["<channel>:<peerId>"]`**，不在 `channels.qqbot` 下，本插件尚未接入）——细节见 [docs/agents/group-and-room-event.md](docs/agents/group-and-room-event.md) 与 [docs/agents/sdk-compat.md](docs/agents/sdk-compat.md)。
 
 ## QQ Bot 平台能力 vs 其他 OpenClaw 通道
 
-QQ Bot 跟 Telegram / Discord / Slack 等其他通道在平台 API 形态上差异较大，这些差异是不可消解的，设计时必须以此为前提。**别拿 Telegram 的 thread_id / topic / supergroup 之类概念来对齐 QQBot**——写代码前先确认这个能力在 QQ 上压根不存在。
+QQ Bot 跟 Telegram / Discord / Slack 等其他通道在平台 API 形态上差异较大，这些差异是不可消解的，设计时必须以此为前提。**别拿 Telegram 的 thread_id / topic / supergroup 之类概念来对齐 QQBot**——写代码前先确认这个能力在 QQ 上压根不存在。（注释里说的「对齐 telegram」指的是**用户体验层面**：typing、失败兜底、debounce、abort、per-user session，不是 API 调用一一对应。）
 
-要点摘要（完整语义、被动/主动/互动配额表、Telegram 能力对照表见 [docs/agents/platform-capabilities.md](docs/agents/platform-capabilities.md)）：
+完整语义、被动/主动/互动配额表、Telegram 能力对照表见 [docs/agents/platform-capabilities.md](docs/agents/platform-capabilities.md)：
 
-- **底层依赖**：官方 Node.js SDK `@tencent-connect/qqbot-nodejs`（v1.0.4），`@tencent-connect/qqbot-connector`（1.2.0 精确钉版）仅用于扫码登录 setup。**SDK 版本滞后于平台文档**——REST 新接口今天就可经 `qqbot_platform_api` 工具调用（SDK `bot.api` 是任意 path 的通用网关），但入群申请**事件**与 `force_verify_image_resource` 参数依赖 SDK 更新。**不要在本仓库中绕过 SDK 直接 fetch QQ API**。
 - **没有话题 / 频道 / Forum**——会话只有 `c2c` 与 `group` 两种 scope；频道是独立产品（有自己 OpenID 域，不共享 session / dispatch / streaming 路径），要做得单独开 skill / 模块。
-- **同一个 API，通过是否带 `msg_id` / `event_id` 区分被动回复 / 主动推送 / 互动召回，三者互斥。** 被动：私聊 4 次/msg、群 5 次/msg（窗口私聊 60min、群 5min）；主动：私聊 Bot 维度 10/qps、接收方 20/qpm 且 1 天最多 1000 条；互动召回：30 天内 4 周期。错误码 `40034128` = 被动超限、`40034100` = 主动超限、`40034122` = 互动召回达上限。
-- **「流式」是另一种发送通道，不是回复模式**——`openStream` / `session.update` / `session.complete`（**仅 c2c**），流式没有独立配额但其推送消息仍占 C2C 被动配额。已下发 prefix 不可修改（改了 40007）。
-- **Markdown 由客户端原生渲染**（`msg_type: markdown`），**没有 Telegram 那种服务端 parse_mode 转换，也没有 HTML parse 失败回退**——写得越界的 Markdown 会渲染异常，代码层无兜底。
+- **同一个 API 靠带不带 `msg_id` / `event_id` 区分三种互斥的发送形态**（被动回复 / 主动推送 / 互动召回）；错误码 `40034128` = 被动超限、`40034100` = 主动超限、`40034122` = 互动召回达上限。**流式是第四种「通道」不是回复模式**——`openStream` / `session.update` / `session.complete`（仅 c2c），流式没有独立配额但其推送消息仍占 C2C 被动配额，已下发 prefix 不可修改（改了 40007）。
+- **Markdown 由客户端原生渲染**（`msg_type: markdown`）——没有 Telegram 那种服务端 parse_mode 转换，也没有 HTML parse 失败回退；写得越界的 Markdown 会渲染异常，代码层无兜底。
 - **OpenID 跨账号不通用**——bot A 的 user openid 在 bot B 上完全无意义，影响 allowFrom / pairing store / URL 路由。
-- **WebSocket（默认）/ Webhook 双传输**——插件层消息处理行为无差异；唯一例外是 webhook 模式专属的**准入跟踪**（见 Key gotchas 的 webhook 条目），那是对「HTTP 请求级准入 vs 常驻连接级准入」这一宿主差异的补偿，不是行为分叉。
-- **「对齐 telegram」注释指的是用户体验层面**（typing、失败兜底、debounce、abort、per-user session），不是 API 调用一一对应。
+- **底层依赖官方 SDK，不要绕过**——`@tencent-connect/qqbot-nodejs`（v1.0.4）+ `@tencent-connect/qqbot-connector`（1.2.0 精确钉版，仅扫码登录 setup）。**SDK 版本滞后于平台文档**——REST 新接口今天就可经 `qqbot_platform_api` 工具调用（SDK `bot.api` 是任意 path 的通用网关），但入群申请**事件**与 `force_verify_image_resource` 参数依赖 SDK 更新。**不要在本仓库中绕过 SDK 直接 fetch QQ API**。
+- **WebSocket（默认）/ Webhook 双传输**——插件层消息处理行为无差异；唯一例外是 webhook 模式专属的**准入跟踪**（见 Key gotchas 的 webhook 条目）。
+
+## Skills
+
+- `qqbot-channel` — Guild/Channel API operations（notes / posts / schedules）。触发词：用户提到「频道」「子频道」等。由宿主 AI 加载，导行为而不是构建步骤。
