@@ -239,7 +239,9 @@ function makeFakeRuntime(captured: Captured[], cfg: Record<string, unknown> = {}
         recordInboundSession: async () => {},
       },
     },
-    config: { current: cfg },
+    // ⚠️ `config.current` 必须是**函数**（框架 getConfig 探针按函数取）——
+    // 写成对象会让 getConfig 为 null ⇒ cfg 恒为空 ⇒ 群配置不可见
+    config: { current: () => cfg },
   } as unknown as PluginRuntime;
 }
 

@@ -14,6 +14,7 @@
  * 运行方式: npx tsx tests/ingress-batch.test.ts
  */
 import assert from 'node:assert/strict';
+import type { PluginRuntime } from 'openclaw/plugin-sdk';
 import { createIngressEffectOnce } from 'openclaw/plugin-sdk/ingress-effect-once';
 import {
   batchFingerprint,
@@ -22,6 +23,15 @@ import {
   type BatchMember,
 } from '../src/features/ingress-batcher.js';
 import { INGRESS_PAYLOAD_VERSION, type QQBotIngressPayload } from '../src/features/ingress-payload.js';
+
+/**
+ * 每次运行的唯一后缀。
+ *
+ * ⚠️ 幂等守卫（`createIngressEffectOnce` → `createClaimableDedupe`）是**跨进程
+ * 持久化**的：批次指纹一旦用过就再也���会重放。测试的指纹必须每次运行唯一，
+ * 否则第二次跑本文件会被判 replayed ⇒ 派发被跳过 ⇒ 断言全灭。
+ */
+const RUN_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 let passed = 0;
 let failed = 0;
@@ -200,7 +210,7 @@ await test('同一 eventId 第二次命中 ⇒ 不重复执行副作用', async 
   let sideEffects = 0;
   const run = async () => {
     const first = await guard.runOnce({
-      eventId: 'fp-1',
+      eventId: `fp-${RUN_ID}`,
       effect: 'dispatch',
       run: async () => {
         sideEffects += 1;
@@ -210,7 +220,7 @@ await test('同一 eventId 第二次命中 ⇒ 不重复执行副作用', async 
     assert.equal(first.kind, 'executed');
 
     const second = await guard.runOnce({
-      eventId: 'fp-1',
+      eventId: `fp-${RUN_ID}`,
       effect: 'dispatch',
       run: async () => {
         sideEffects += 1;
@@ -221,6 +231,134 @@ await test('同一 eventId 第二次命中 ⇒ 不重复执行副作用', async 
   };
   await run();
   assert.equal(sideEffects, 1, '副作用只应执行一次');
+});
+
+group('合批窗口收集（D-c：窗口来源 = 框架 resolveInboundDebounceMs）');
+
+/** 最小假 runtime：只需要 getConfig（窗口来源）+ dispatch 链路 */
+function makeWindowRuntime(cfg: Record<string, unknown>) {
+  let capturedBody = '';
+  return {
+    runtime: {
+      version: '2026.10.5',
+      channel: {
+        inbound: {
+          run: async (params: any) => {
+            capturedBody = String(params.adapter.resolveTurn?.({}, {}, {}).ctxPayload?.message?.bodyForAgent ?? '');
+            return { dispatched: true };
+          },
+          buildContext: (params: any) => ({ ...params }),
+        },
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: async () => ({
+            queuedFinal: true,
+            counts: { final: 1 },
+          }),
+        },
+        routing: {
+          resolveAgentRoute: () => ({ sessionKey: 's', accountId: 'acc1', agentId: 'default' }),
+        },
+        session: { resolveStorePath: () => '', recordInboundSession: async () => {} },
+      },
+      config: { current: () => cfg },
+    } as unknown as PluginRuntime,
+    body: () => capturedBody,
+  };
+}
+
+await test('窗口来源 = 框架旋钮：未配 ⇒ 0（零延迟）；配了 ⇒ 取该值', async () => {
+  const { resolveGroupMergeWindowMs } = await import('../src/features/ingress-batcher.js');
+  assert.equal(resolveGroupMergeWindowMs(makeWindowRuntime({}).runtime), 0);
+  assert.equal(
+    resolveGroupMergeWindowMs(
+      makeWindowRuntime({ messages: { inbound: { byChannel: { qqbot: 250 } } } }).runtime,
+    ),
+    250,
+  );
+  assert.equal(
+    resolveGroupMergeWindowMs(
+      makeWindowRuntime({ messages: { inbound: { debounceMs: 400 } } }).runtime,
+    ),
+    400,
+  );
+});
+
+/**
+ * 跑一次「领队首行 → 窗口收集 → 派发」。
+ *
+ * backlog 用「按调用次数返回」模拟「窗口期内又来了一条消息」。
+ */
+async function runWindowDispatch(params: {
+  cfg: Record<string, unknown>;
+  backlogCalls: number;
+}): Promise<string> {
+  const { dispatchClaimedGroupEvent } = await import('../src/features/ingress-batcher.js');
+  const { resetIngressEffectGuardsForTest } = await import('../src/features/ingress-batcher.js');
+  resetIngressEffectGuardsForTest();
+
+  const env = makeWindowRuntime(params.cfg);
+  const groupOpenid = `g1-${RUN_ID}`;
+  const head = makePayload({
+    groupOpenid,
+    messageId: 'head',
+    content: 'AAA',
+    rawContent: 'AAA',
+  });
+  const later = makePayload({
+    groupOpenid,
+    messageId: 'later',
+    content: 'BBB',
+    rawContent: 'BBB',
+    receivedAtMs: head.receivedAtMs + 1,
+  });
+
+  let backlogCalls = 0;
+  const lifecycle = {
+    abortSignal: new AbortController().signal,
+    readLaneBacklog: async () => {
+      backlogCalls += 1;
+      // 第一次读时「窗口期内的新消息」还没到；第二次读才出现
+      return backlogCalls <= 1 ? [] : [{ id: 'row-later', payload: later }];
+    },
+    onAdopted: () => {},
+    onDeferred: () => {},
+    onAdoptionFinalizing: () => {},
+    onAbandoned: () => {},
+  };
+
+  const handle = {
+    accountId: 'acc1',
+    ownerId: 'test-owner',
+    runtime: env.runtime,
+    queue: {
+      claim: async (id: string) => ({ id, payload: later, receivedAt: later.receivedAtMs, laneKey: 'l' }),
+      complete: async () => true,
+      release: async () => true,
+    },
+    log: undefined,
+  } as never;
+
+  await dispatchClaimedGroupEvent(
+    { id: 'row-head', payload: head, receivedAt: head.receivedAtMs, laneKey: 'l' } as never,
+    lifecycle as never,
+    handle,
+  );
+  return env.body();
+}
+
+await test('窗口 = 0 ⇒ 领到队首行即派发（窗口期内到达的消息不并入本批）', async () => {
+  const body = await runWindowDispatch({ cfg: {}, backlogCalls: 1 });
+  assert.ok(body.includes('AAA'), '队首消息应在正文里');
+  assert.ok(!body.includes('BBB'), '窗口为 0 时不应等待后来者');
+});
+
+await test('窗口 > 0 ⇒ 窗口期内到达的消息并入本批', async () => {
+  const body = await runWindowDispatch({
+    cfg: { messages: { inbound: { byChannel: { qqbot: 150 } } } },
+    backlogCalls: 1,
+  });
+  assert.ok(body.includes('AAA'), '队首消息应在正文里');
+  assert.ok(body.includes('BBB'), '窗口期内到达的消息应并入本批');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

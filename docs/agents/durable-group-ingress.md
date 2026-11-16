@@ -46,11 +46,20 @@
 
 drain 领到队首行后：
 
-1. 读同 lane 的 pending 行（`lifecycle.readLaneBacklog`），逐行 `queue.claim` 领下**额外行**（领不到就跳过，不阻塞整批）；
+1. **窗口收集**：在**合批窗口**内反复重读同 lane 的 pending 行（`lifecycle.readLaneBacklog`），逐行 `queue.claim` 领下**额外行**（领不到就跳过，不阻塞整批）；**收满（`maxBatchSize`）即发**，不等窗口走完；窗口耗尽 ⇒ 用当前批次派发。等待期间 claim 一直持有（租约 5 分钟），且可被 `abortSignal` 打断（退出 / drain dispose 立刻放行，不等满窗口）；
 2. 按 `receivedAtMs` 排序；
 3. 容量裁剪（沿用 `maxBatchSize` / `GROUP_MERGE_MAX_BODY_CHARS`，超限丢弃**较早**的并在前置一行 `[已丢弃 N 条…]`）；
 4. 复用 `assembleMergedGroupBody` 装配正文（格式与改造前逐字一致）；
 5. 派发（`dispatchToOpenClaw` + `ingressLifecycle`）。
+
+### 4.1 合批窗口的来源（用户拍板 D-c）
+
+窗口时长 = **框架 `resolveInboundDebounceMs(cfg,'qqbot')`**（`src/features/ingress-batcher.ts` 的 `resolveGroupMergeWindowMs`）：
+
+- **不新增群专属配置键** ⇒ `openclaw.plugin.json` 的 `coalesce` 段（顶层 + `accounts.<id>` 两处）逐字不动 ⇒ `tests/manifest-config-schema.test.ts` 无需改动；
+- 用户已有的 `messages.inbound.byChannel.qqbot.debounceMs`（或 `messages.inbound.debounceMs`）旋钮**直接生效**——此前群路径用的是插件内硬编码的 `DEFAULT_GROUP_MERGE_WINDOW_MS`（3000），该旋钮对群聊**完全无效**；
+- ⚠️ 框架该原语**默认返回 0**（不读插件默认、不套 c2c 的 3000）⇒ 未配框架 `messages.inbound.*` 时窗口为 0 ⇒ 领到队首行**即刻派发**（零延迟，与改造前的「空闲时零延迟直发」一致）；
+- 窗口上限 60s（框架 c2c 侧同款上限）——窗口过长会让「一条消息等窗口」变成用户可感知的延迟。
 
 **旁路项不并入批次**（斜杠命令 / 控制命令 / ask_user keyed 答案 / stt·fallback 来源语音），必须单独成轮。判定在**入队时**做并**冻结进载荷**（`payload.bypass`）——合批发生在 claim 之后，那时已读不到活状态（pending question store 是进程内的、附件是活对象）。判定口径**共用** `group-merge.ts` 的 `isBypassGroupItem`（单一事实源，两处各写一份必然漂移）。
 
@@ -86,6 +95,7 @@ enqueueDurableGroupInbound() → 'handled' | 'not_applicable' | 'unavailable'
 - **配置面零变更**：`openclaw.plugin.json` 的 `coalesce` 段（顶层 + `accounts.<id>` 两处）逐字不动 ⇒ 不新增群专属配置键，合批窗口复用框架 `resolveInboundDebounceMs(cfg,'qqbot')`。**改配置类型必须同步 manifest schema**（根 `AGENTS.md` 红线）。
 - **`strategy:'framework'` 路径保持 legacy**：显式交回框架队列 ⇒ `not_applicable` ⇒ 直发，与改造前一致。
 - **群聊 legacy `user_request` 语义不变**：被 @ 的那条在 room_event 群里仍然分类为 `user_request`（不被压成静默）——分类口径仍是 `classifyInboundEventKind`，输入是重建后的同一份 mention 状态。
+- **合批窗口时长来源是框架旋钮**（D-c）——不得改回插件内硬编码常量（会让用户已有的 `messages.inbound.byChannel.qqbot.debounceMs` 旋钮再次失效），也不得新增群专属配置键。
 
 ## 8. 已知限制
 
