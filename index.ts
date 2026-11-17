@@ -71,7 +71,10 @@ export * from './src/config.js';
 export { qqbotChannelOutbound } from './src/outbound-adapter.js';
 
 // Quota management
+// （checkAndConsumePassiveReplyQuota 是 ReplyLimiter 移除后 CHANGELOG 迁移指引
+//   承诺的公开替代——2026-11-17 评审发现该承诺未兑现，此处补齐。）
 export {
+  checkAndConsumePassiveReplyQuota,
   checkPassiveReplyQuota,
   inferQQBotScope,
   clearQuotaCache,
