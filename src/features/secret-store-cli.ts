@@ -40,9 +40,6 @@ export type SecretStoreKind = 'env' | 'secret';
 /** CLI 同款命名规则：^[A-Z][A-Z0-9_]{0,127}$ */
 const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,127}$/;
 
-/** CLI 单值上限 64 KiB（超出 CLI 直接 exit 2，插件侧提前拦截） */
-export const SECRET_VALUE_MAX_BYTES = 65_536;
-
 const SET_TIMEOUT_MS = 30_000;
 const RELOAD_TIMEOUT_MS = 15_000;
 /** 子进程输出保留上限（诊断用，已 scrub） */

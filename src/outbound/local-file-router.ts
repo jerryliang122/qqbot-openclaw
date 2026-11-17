@@ -61,18 +61,6 @@ export function isDataUrl(source: string): boolean {
 }
 
 /**
- * 验证本地文件存在且可读
- */
-export function validateLocalFile(filePath: string): boolean {
-  try {
-    fs.accessSync(filePath, fs.constants.R_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * 获取本地文件大小（字节），不存在返回 -1
  */
 export function getFileSize(filePath: string): number {
@@ -119,14 +107,6 @@ export function inferMediaKindFromMime(mime: string): MediaKind {
   if (lower.startsWith('audio/') || lower === 'voice') return 'voice';
   if (lower.startsWith('video/')) return 'video';
   return 'file';
-}
-
-/**
- * 从 data URL 提取 MIME type
- */
-export function extractMimeFromDataUrl(dataUrl: string): string | undefined {
-  const match = dataUrl.match(/^data:([^;,]+)/);
-  return match?.[1];
 }
 
 // ── 路径安全校验 ──

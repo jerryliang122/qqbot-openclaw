@@ -454,12 +454,6 @@ async function handleSimple(req: any, res: any, path: string, log: PluginLogger)
   }
 }
 
-function mapHeaders(req: any): Record<string, string | string[]> {
-  const h: Record<string, string | string[]> = {};
-  for (const [k, v] of Object.entries(req.headers ?? {})) h[k.toLowerCase()] = v as string | string[];
-  return h;
-}
-
 function getHeader(req: any, key: string): string | undefined {
   const val = req.headers[key];
   return Array.isArray(val) ? val[0] : val;

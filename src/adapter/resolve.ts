@@ -76,21 +76,6 @@ function probeFunction(rt: any, paths: ProbePath[]): ((...args: any[]) => any) |
   return null;
 }
 
-/**
- * 从 runtime 对象沿路径探测值（非函数也可）。返回值或 null。
- */
-function probeValue(rt: any, paths: ProbePath[]): any {
-  for (const path of paths) {
-    let target = rt;
-    for (const key of path) {
-      target = target?.[key];
-      if (target === undefined || target === null) break;
-    }
-    if (target !== undefined && target !== null) return target;
-  }
-  return null;
-}
-
 // ── 主入口 ──
 
 /**

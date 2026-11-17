@@ -8,6 +8,23 @@
 
 ---
 
+## [未发布]
+
+> 本节汇总已合入 `main`、尚未打 tag 发版的条目。发版时由主人确认版本号与 tag。
+
+### 维护
+
+- **移除零引用的内部死代码**（无行为变更、无公开 API 变更、无配置格式变更）。
+  - 删 `src/outbound/index.ts`——2026-07 架构重构遗留的 barrel，自引入起从未被任何文件引用。
+  - `src/utils/platform.ts` 只保留**有调用方**的三个函数（`getHomeDir` / `getQQBotDataDir` / `getQQBotMediaDir`）：移除 `getPlatform` / `isWindows` / `getTempDir` / `expandTilde` / `normalizePath` / `sanitizeFileName` / `isLocalPath` / `looksLikeLocalPath` / ffmpeg 探测 / silk-wasm 探测 / `runDiagnostics`。其中 `normalizePath` 有一份**活体**在 `src/outbound/local-file-router.ts`（媒体发送路径用它，那份额外处理 `file:///C:/…` 的 Windows 盘符）——**路径规范化统一用那份**，不要在 `utils/platform.ts` 另起一份，否则两处语义必然分叉。
+  - `src/features/proactive.ts` 移除零引用的 `removeKnownUser` / `clearKnownUsers` / `sendBulkProactiveMessage` / `getUserGroups` / `getGroupMembers`；**保留** `getKnownUser` / `recordKnownUser` / `broadcastMessage` / `sendProactiveMessageDirect` / `listKnownUsers` / `getKnownUsersStats`（被随包发布的 `scripts/send-proactive.ts`、`scripts/proactive-api-server.ts` 消费，且 `sendProactive` 路径内的主动预算记账不可动）。
+  - `src/types-plugin.ts` 移除零引用的 `QQBotProbe` / `QQBotAudit` / `QQBotSessionRoute` / `QuotaConsumeParams`（前三者的唯一「消费者」是 `tests/types-plugin.test.ts` 里的类型存在性烟雾测试，已同步删除对应用例）。
+  - 单符号死导出：`validateLocalFile` / `extractMimeFromDataUrl`（`src/outbound/local-file-router.ts`）、`renderQQBotPresentationFallbackText`（`src/outbound/presentation-buttons.ts`，活的是 `backfillQQBotPresentationFallbackText`）、`cancelQrLogin`（`src/setup/login.ts`）、`_resetRoomEventDegradedWarnings`（`src/dispatch/dispatch.ts`）、`QQBotIngressRecord`（`src/features/ingress-queue.ts`）。
+  - 模块私有化（实现保留，仅去掉 `export`）：`buildGroupMergeKey` / `DEFAULT_GROUP_MERGE_WINDOW_MS`（`src/features/group-merge.ts`）、`renderSequentialCard`（`src/features/question-flow.ts`）；删除两个未使用的模块私有函数 `probeValue`（`src/adapter/resolve.ts`）、`mapHeaders`（`src/adapter/webhook.ts`）。`flushGroupMergeQueue` / `DEFAULT_GROUP_MERGE_MAX_HOLD_MS` **保持导出**——它们是 `tests/group-merge.test.ts` 的测试缝。
+  - `src/features/secret-store-cli.ts` 移除 `SECRET_VALUE_MAX_BYTES`：该常量的注释声称「插件侧提前拦截 64 KiB」，但**插件侧从未有过这个检查**（全仓无消费点）——删掉这个不兑现的承诺（CLI 侧自身的上限不受影响）。
+
+---
+
 ## [4.3.0] - 2026-11-17
 
 群聊入站重构：从「内存态插件侧合批」改为「**持久化入站队列 + lane 串行 + 租约续期 + 失败重投 + 本地到达序排序**」（PR #107），对齐 openclaw 2026.11.4 的 Telegram L1–L5 架构。**行为变更、无配置格式变更、无公开 API 破坏**。
