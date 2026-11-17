@@ -100,14 +100,6 @@ export async function waitQrLogin(accountId?: string): Promise<QrLoginWaitResult
   }
 }
 
-// ── 主动取消 ──
-
-export function cancelQrLogin(accountId?: string): void {
-  const key = accountId ?? 'default';
-  pendingSessions.get(key)?.dispose();
-  pendingSessions.delete(key);
-}
-
 // ── 解析 channelInput (appId:clientSecret) ──
 
 export function parseChannelInput(channelInput?: string | null): { appId: string; clientSecret: string } | null {

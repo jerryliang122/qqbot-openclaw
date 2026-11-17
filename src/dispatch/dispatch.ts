@@ -90,11 +90,6 @@ function warnRoomEventDegraded(
   );
 }
 
-/** 测试用：清空降级告警去重集合 */
-export function _resetRoomEventDegradedWarnings(): void {
-  roomEventDegradedGroups.clear();
-}
-
 /**
  * 取本条消息生效的 room_event 策略。
  *

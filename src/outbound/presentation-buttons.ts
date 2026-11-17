@@ -458,16 +458,6 @@ export function countDroppedPresentationControls(
 }
 
 /**
- * 渲染 presentation 的纯文本兜底（供按钮全部被丢弃时使用）。
- *
- * 与框架的 `renderMessagePresentationFallbackText` 同源，保证
- * 「有按钮的模型消息」在 QQ 上退化成文本时，措辞与框架一致。
- */
-export function renderQQBotPresentationFallbackText(presentation: MessagePresentation): string {
-  return renderMessagePresentationFallbackText({ presentation });
-}
-
-/**
  * fallback 模式下回填被框架剥离的正文文本。
  *
  * 框架在 `presentationTextMode === "fallback"` 且 presentation 含交互块时，

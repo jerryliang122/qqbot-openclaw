@@ -68,7 +68,7 @@ export interface SequentialCard {
  * 答完后才推进到最后一题）降级为收集态——宁可不提交，也不提交一份
  * 缺题的答案（框架会整单拒绝，白白让用户多点一次）。
  */
-export function renderSequentialCard(
+function renderSequentialCard(
   state: PendingMultiQuestionState,
   index: number,
 ): SequentialCard | null {

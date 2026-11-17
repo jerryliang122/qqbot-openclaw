@@ -68,7 +68,7 @@ import { resolveWakeDecision } from './room-event.js';
 import { mergeProcessedAttachments } from './inbound-debounce.js';
 
 /** 静默期窗口（仅用于 hold 检查的重排节奏；实际放行由 turn 结束事件驱动） */
-export const DEFAULT_GROUP_MERGE_WINDOW_MS = 3000;
+const DEFAULT_GROUP_MERGE_WINDOW_MS = 3000;
 /** 批次条数上限（超出丢弃较早的消息） */
 export const DEFAULT_GROUP_MERGE_MAX_BATCH_SIZE = 10;
 /** 最长持有时长（兜底强制冲刷；0 = 永不强制） */
@@ -99,7 +99,7 @@ const debouncers = new Map<string, {
 const activeCompletions = new Set<Promise<void>>();
 
 /** 合批 key：账号 + 群（**按群**，不同发言人可同批） */
-export function buildGroupMergeKey(item: GroupMergeItem): string {
+function buildGroupMergeKey(item: GroupMergeItem): string {
   return `qqbot:${item.account.accountId}:group:${item.msg.replyTarget.targetId}`;
 }
 

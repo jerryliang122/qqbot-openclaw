@@ -13,7 +13,7 @@
 |---|---|
 | `plugin-logger.ts` | `createPluginLogger`——**全仓日志的唯一正规入口** |
 | `mention.ts` | `stripMentionText` / `detectWasMentioned` / `detectEventMention` / `matchesNamePattern`——@ 提及解析与判定 |
-| `platform.ts` | `getPlatform` / `getHomeDir` / `getTempDir` / `getQQBotDataDir` / `getQQBotMediaDir` / `isWindows`——跨平台路径 |
+| `platform.ts` | `getHomeDir` / `getQQBotDataDir` / `getQQBotMediaDir`——跨平台路径（2026-11-17 清理后只剩这三个有调用方） |
 | `ssrf-guard.ts` | `validateRemoteUrl` / `isReservedAddr`——远程 URL 校验 |
 | `stt.ts` | `transcribeAudioViaFramework` / `isFrameworkSttConfigured` / `hasLegacySttConfig`——走框架转录管线 |
 | `voice-text.ts` | `formatVoiceText` / `formatDuration`——语音消息文案渲染 |
@@ -33,3 +33,4 @@
 - **`ssrf-guard.ts` 的判定口径与平台解析器可能不一致**——`HTTP://` / `http:/` / 前导空格三种拼写能绕过字面量前缀判定；当前决定暂不加固，触发条件见 [`docs/agents/platform-capabilities.md`](../../docs/agents/platform-capabilities.md)。
 - **`stt.ts` 的 `hasLegacySttConfig` 只用于识别废弃配置**——`channels.qqbot.stt` 整块已被忽略，不要复活它。
 - **`platform.ts` 的路径函数要考虑 Windows**——别在别处直接拼 `~` 或 `/tmp`。
+- **`platform.ts` 不再提供 `normalizePath`**——2026-11-17 清理时移除（与 `src/outbound/local-file-router.ts` 的同名函数语义分叉：后者处理 `file:///C:/…` 盘符且不做 trim）。**路径规范化一律用 `local-file-router.ts` 那份**，别在这里另起一份。

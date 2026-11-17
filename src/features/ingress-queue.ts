@@ -93,9 +93,6 @@ export interface QQBotIngressLifecycle {
 /** 队列里的一行（含 claim 引用） */
 export type QQBotIngressClaim = ChannelIngressQueueClaim<QQBotIngressPayload>;
 
-/** 队列里的 pending 行 */
-export type QQBotIngressRecord = ChannelIngressQueueRecord<QQBotIngressPayload>;
-
 /** 单账号的入站句柄 */
 export interface IngressAccountHandle {
   accountId: string;
