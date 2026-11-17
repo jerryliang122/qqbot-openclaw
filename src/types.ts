@@ -1,11 +1,19 @@
 // ── QQ 消息类型常量（message_type 枚举值） ──
-/** 普通文本消息 */
+/**
+ * @deprecated 平台 msg_type 常量请用 SDK 侧的常量定义；本插件内部不使用。
+ * 保留仅为兼容旧标注，**勿据此判断消息类型**——消息类型由框架 SDK 解析。
+ */
 export const MSG_TYPE_TEXT = 0;
-/** 引用（回复）消息 */
+/**
+ * @deprecated 同 `MSG_TYPE_TEXT`——请改用 SDK 侧的 msg_type 常量。
+ */
 export const MSG_TYPE_QUOTE = 103;
 
 /**
  * QQ Bot 配置类型
+ *
+ * @deprecated 通道配置请用框架的通道配置类型，或本文件的 `QQBotAccountConfig` /
+ * `QQBotChannelConfig`；本插件内部不使用本接口。
  */
 export interface QQBotConfig {
   appId: string;
@@ -471,6 +479,9 @@ export interface MessageAttachment {
 
 /**
  * C2C 消息事件
+ *
+ * @deprecated QQ 平台事件形状请用框架 SDK 的对应事件类型；本插件内部不使用。
+ * 保留仅为兼容旧标注。
  */
 export interface C2CMessageEvent {
   author: {
@@ -495,6 +506,9 @@ export interface C2CMessageEvent {
 
 /**
  * 频道 AT 消息事件
+ *
+ * @deprecated QQ 平台事件形状请用框架 SDK 的对应事件类型；本插件内部不使用。
+ * 保留仅为兼容旧标注。
  */
 export interface GuildMessageEvent {
   id: string;
@@ -530,6 +544,9 @@ export interface MsgElement {
 
 /**
  * 群聊 AT 消息事件
+ *
+ * @deprecated QQ 平台事件形状请用框架 SDK 的对应事件类型；本插件内部不使用。
+ * 保留仅为兼容旧标注。
  */
 export interface GroupMessageEvent {
   author: {
@@ -784,6 +801,9 @@ export type InlineKeyboard = {
 
 /**
  * WebSocket 事件负载
+ *
+ * @deprecated 请用框架 SDK 的 WebSocket 事件类型；本插件内部不使用。
+ * 保留仅为兼容旧标注。
  */
 export interface WSPayload {
   op: number;
@@ -821,6 +841,9 @@ export type StreamContentType = (typeof StreamContentType)[keyof typeof StreamCo
 /**
  * 流式消息请求体
  * 对应 StreamReq proto
+ *
+ * @deprecated 请用框架自己的流式类型；本插件内部不使用。
+ * 保留仅为兼容旧标注。
  */
 export interface StreamMessageRequest {
   /** 输入模式 */

@@ -26,7 +26,6 @@
 | `target.ts` | `isQQBotTarget` / OpenID 与 scope 前缀解析 |
 | `debounce.ts` | `DeliverDebouncer`——出站合并 |
 | `sanitize.ts` | `sanitizeQQBotText`——剥离框架内部脚手架标签（`system-reminder` / `thinking` / `reasoning` 等），保留 Markdown 渲染 |
-| `reply-limiter.ts` | `ReplyLimiter`——**独立的老工具类，与 quota-manager 无关** |
 
 ## 相关红线
 

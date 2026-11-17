@@ -487,32 +487,12 @@ declare module "openclaw/plugin-sdk" {
   /** 群组访问策略类型："open" | "disabled" | "allowlist" */
   export type GroupPolicy = "open" | "disabled" | "allowlist";
 
-  /** 基于白名单匹配的群访问决策原因 */
-  export type MatchedGroupAccessReason =
-    | "allowed"
-    | "disabled"
-    | "missing_match_input"
-    | "empty_allowlist"
-    | "not_allowlisted";
-
-  /** 基于白名单匹配的群访问决策结果 */
-  export type MatchedGroupAccessDecision = {
-    allowed: boolean;
-    groupPolicy: GroupPolicy;
-    reason: MatchedGroupAccessReason;
-  };
-
-  /**
-   * 核心框架标准群访问策略评估引擎（基于 policy + allowlist 匹配）
-   * @see openclaw/src/plugin-sdk/group-access.ts
-   */
-  export function evaluateMatchedGroupAccessForPolicy(params: {
-    groupPolicy: GroupPolicy;
-    allowlistConfigured: boolean;
-    allowlistMatched: boolean;
-    requireMatchInput?: boolean;
-    hasMatchInput?: boolean;
-  }): MatchedGroupAccessDecision;
+  // ⚠️ 此处**不**声明 `evaluateMatchedGroupAccessForPolicy`：该函数在已安装的
+  // openclaw 包里**完全不存在**（dist/ 全目录无该符号），框架只在内部源码
+  // `openclaw/src/plugin-sdk/group-access.ts` 里有，未通过任何 plugin-sdk 子路径
+  // 导出。声明它等于对外谎报框架 API——会诱导人从裸路径 import 后撞上
+  // ERR_PACKAGE_PATH_NOT_EXPORTED。2026-11-17 移除本插件对该函数的本地代偿
+  // 实现（其唯一调用方 isGroupAllowed 已删除）时一并清掉这段陈旧声明。
 
   // ============ 审批运行时类型（minimal） ============
   // 这些类型只覆盖本项目真实使用到的字段，

@@ -31,6 +31,26 @@
   - **5 处 `openclaw/plugin-sdk` 能力探测保留，并补注「探测的是子路径是否还在、不是版本兼容」**（`grapheme.ts` / `detached-webhook-work.ts` / `webhook.ts` ×2 / `question-submit.ts`）。地板 `2026.10.5` 下这些分支技术上不可达，但它们守的是「上游删子路径 ⇒ 插件加载期整体炸裂」这条底线（2026-10-02 `channel-message` 事故的教训），`docs/agents/sdk-compat.md` 有明确政策，**不删**。
   - `src/outbound/chunker.ts` 的本地 chunker 回退**保留**（它是**运行时能力探测**而非版本分支——runtime contract probe 的 `REQUIRED` 列表为空，能力按 `OPTIONAL` 处理），只把「高版本 / 低版本降级」的措辞改成「运行时提供时优先 / 未提供时降级」。
 
+### ⚠️ Breaking（公开 API 导出面）
+
+> 下列**公开导出**被移除。若你从本包 `import` 过它们，请改用括号内的新位置。
+
+- **移除 `ReplyLimiter`**（`src/outbound/reply-limiter.ts` 整文件 + `index.ts` 的 re-export）。
+  - 它实现的是「每 msg_id 最多 4 次被动回复」的**抢占式阻断**模型，而 v4.0.0 已用探针实测证明**平台并不执行该次数上限**（同一 msg_id 连发 25 次全部送达）⇒ 这个类对外表达的是一份**错误的**配额语义，留着会诱导使用者重新引入抢占式阻断——而那正是 v4.0.0 刻意拆掉的、会把正文逼去烧每日 1000 条主动预算的设计。
+  - 自 v4.0.0 起插件内部零实例化（该类自身的文档也写明「与 quota-manager 无关，是历史遗留工具」）。
+  - **迁移指引**：配额相关一律改用 `checkAndConsumePassiveReplyQuota()`（存活预检 + 发号 + 观测计数）与 `checkPassiveReplyQuota()`（只判 TTL / 死锚点），二者均已在 `index.ts` 导出。
+- **移除 `src/config.ts` 的 6 个旧群配置解析器**：`resolveGroupAllowFrom` / `isGroupAllowed` / `resolveHistoryLimit` / `resolveGroupPrompt` / `resolveIgnoreOtherMentions` / `resolveGroupName`。
+  - 全部零内部引用（现役群配置解析走 `resolveGroupConfigFromAccount`，被 `dispatch.ts` / `event-handlers.ts` / `group-merge.ts` / `ingress-queue.ts` / `ingress-batcher.ts` 使用）。
+  - 其中 `resolveHistoryLimit` / `resolveGroupPrompt` / `resolveIgnoreOtherMentions` / `resolveGroupName` 只是 `resolveGroupConfig`（本身即 `resolveGroupConfigFromAccount` 的薄包装，**含大小写不敏感查找**）的字段读取捷径，语义与现役路径一致。
+  - `isGroupAllowed` 则是**口径已错**的那一个：它用一份**本地重实现**的 `evaluateMatchedGroupAccessForPolicy`（openclaw dist 未导出该函数时的旧代偿）做策略裁决，而插件真正的群准入判定在 `src/middleware/access-control.ts`——两份口径可能分叉。该本地重实现随之删除（它也只在 `isGroupAllowed` 里被调用）。
+  - **迁移指引**：群配置一律改用 `resolveGroupConfigFromAccount(account, groupOpenid)`（返回 `ResolvedGroupConfig`）或 `resolveGroupConfig(cfg, groupOpenid, accountId)`；群准入判定请走框架侧策略，不要在插件外自行复刻。
+- **8 个零内部引用的类型标记为 `@deprecated`**（**保留导出，不删**）：`QQBotConfig` / `C2CMessageEvent` / `GuildMessageEvent` / `GroupMessageEvent` / `WSPayload` / `StreamMessageRequest` / `MSG_TYPE_TEXT` / `MSG_TYPE_QUOTE`。
+  - 它们是纯类型形状 / 数值常量，外部可能用于标注 QQ 平台事件，故**只标废弃、不破坏导出**；每个已在 JSDoc 里写明替代方向（框架 SDK 的对应类型 / 通道配置类型 / SDK 侧 msg_type 常量）。
+  - ⚠️ 其中 `MSG_TYPE_TEXT` / `MSG_TYPE_QUOTE` 是**值导出**——它们是公开 API 面上的数值常量，标废弃后请勿再用于判断消息类型。
+- **移除 ambient stub 里一段陈旧声明**：`src/openclaw-plugin-sdk.d.ts` 此前声明了 `evaluateMatchedGroupAccessForPolicy`（及配套的 `MatchedGroupAccessReason` / `MatchedGroupAccessDecision` 类型），但该函数在已安装的 openclaw 包里**完全不存在**（`dist/` 全目录无此符号，框架只在内部源码 `openclaw/src/plugin-sdk/group-access.ts` 里有，未通过任何 plugin-sdk 子路径导出）。声明它等于对外谎报框架 API，会诱导人从裸路径 `import` 后撞上 `ERR_PACKAGE_PATH_NOT_EXPORTED`。已删除并留下说明。stub 的 `GroupPolicy` 类型**保留**（`src/config.ts` 仍在用）。
+
+
+
 ---
 
 ## [4.3.0] - 2026-11-17

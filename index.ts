@@ -71,7 +71,6 @@ export * from './src/config.js';
 export { qqbotChannelOutbound } from './src/outbound-adapter.js';
 
 // Quota management
-export { ReplyLimiter } from './src/outbound/reply-limiter.js';
 export {
   checkPassiveReplyQuota,
   inferQQBotScope,

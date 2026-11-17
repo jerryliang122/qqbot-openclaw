@@ -3,7 +3,6 @@
  *
  * 覆盖：
  * - 续期间隔钳制（QPS 约束：不低于 20s）
- * - ReplyLimiter.tryAcquire 的占用语义
  * - 中间件行为：C2C-only、首次立即发送、完成后清理定时器、
  *   **锚点过期/判死 ⇒ 本轮停发（绝不降级为主动形态）**、
  *   平台拒收（40034005）⇒ 停发 + 标记死锚点
@@ -29,7 +28,6 @@ import {
   clearQuotaCache,
   __test_getQuotaCache,
 } from '../src/features/quota-manager.js';
-import { ReplyLimiter } from '../src/outbound/reply-limiter.js';
 import {
   subscribeOutboundMessage,
   notifyOutboundMessageSent,
@@ -104,29 +102,7 @@ await test('高于 20s 的配置保留原值', () => {
   assert.strictEqual(resolveTypingIntervalMs(45_000), 45_000);
 });
 
-group('ReplyLimiter.tryAcquire 占用语义');
-
-await test('limit=4 时最多占用 4 次，之后拒绝', () => {
-  const limiter = new ReplyLimiter({ limit: 4 });
-  for (let i = 0; i < 4; i++) {
-    assert.strictEqual(limiter.tryAcquire('m1'), true, `第 ${i + 1} 次应成功`);
-  }
-  assert.strictEqual(limiter.tryAcquire('m1'), false, '配额耗尽后应拒绝');
-});
-
-await test('每次占用后剩余额度递减（与回复共享记账）', () => {
-  const limiter = new ReplyLimiter({ limit: 4 });
-  limiter.tryAcquire('m2');
-  limiter.tryAcquire('m2');
-  assert.strictEqual(limiter.checkLimit('m2').remaining, 2, '占用 2 次后应剩 2 条');
-});
-
-await test('不同 msgId 的配额互不影响', () => {
-  const limiter = new ReplyLimiter({ limit: 4 });
-  limiter.tryAcquire('m3a');
-  limiter.tryAcquire('m3a');
-  assert.strictEqual(limiter.tryAcquire('m3b'), true, '新消息有独立配额');
-});
+group('锚点存活探测');
 
 await test('无 msgId 时无法走被动通道（探测返回 false）', () => {
   assert.strictEqual(probePassiveAnchorAlive('acct-x', undefined), false);

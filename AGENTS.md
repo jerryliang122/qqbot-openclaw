@@ -72,7 +72,7 @@ scripts/                  # 仓库工具脚本（proactive-api-server / send-pro
 .github/workflows/        # ci.yml（typecheck·lint·build·test）、release.yml（v* tag 发版）
 ```
 
-Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendText`, `sendMedia`, `parseTarget`, `dispatchToOpenClaw`, `StreamingController`, `PersistedRefIndexStore`, `ReplyLimiter`, quota management functions, and typing lifecycle functions.
+Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendText`, `sendMedia`, `parseTarget`, `dispatchToOpenClaw`, `StreamingController`, `PersistedRefIndexStore`, quota management functions, and typing lifecycle functions.
 
 ### 模块文档层
 
