@@ -23,6 +23,14 @@
   - 模块私有化（实现保留，仅去掉 `export`）：`buildGroupMergeKey` / `DEFAULT_GROUP_MERGE_WINDOW_MS`（`src/features/group-merge.ts`）、`renderSequentialCard`（`src/features/question-flow.ts`）；删除两个未使用的模块私有函数 `probeValue`（`src/adapter/resolve.ts`）、`mapHeaders`（`src/adapter/webhook.ts`）。`flushGroupMergeQueue` / `DEFAULT_GROUP_MERGE_MAX_HOLD_MS` **保持导出**——它们是 `tests/group-merge.test.ts` 的测试缝。
   - `src/features/secret-store-cli.ts` 移除 `SECRET_VALUE_MAX_BYTES`：该常量的注释声称「插件侧提前拦截 64 KiB」，但**插件侧从未有过这个检查**（全仓无消费点）——删掉这个不兑现的承诺（CLI 侧自身的上限不受影响）。
 
+- **清理钉版遗留与过时版本叙事**（无行为变更、无公开 API 变更、无配置格式变更）。
+  - **移除 `scripts/link-sdk-core.cjs` 的 `2026.3.22` 版本闸门**——这是全仓**最后一处**真正的「为已不存在的问题而引入」的老版本兼容代码。该闸门用于「openclaw < 2026.3.22 时不建 `node_modules/openclaw` symlink」，但 peer 地板 `>=2026.10.5` 比它高 7 个 minor，且闸门在版本探测失败时**保守返回「需要建链」**⇒ `if (!isOpenclawVersionRequiresSymlink()) return true;` 分支在任何受支持安装下**都不可能命中**。symlink 现在无条件创建；`ensurePluginSdkSymlink` 的其余分支（无效链重建 / 找不到全局安装时 WARN / 创建 junction）**未动**。同时修掉文件头注释里对**不存在的** `scripts/postinstall-link-sdk.js` 的引用。
+  - **纠正一处事实性文档错误**：`docs/agents/platform-capabilities.md` 此前把 `ReplyLimiter`（`默认 4/msg_id,10k LRU,C2C TTL 60 min`）描述为现役限流器——那是 **v4.0.0 已废止的抢占式计数模型**（平台实测不执行该次数上限，现役实现是 `src/features/quota-manager.ts` 的反应式配额）。这条描述会直接误导后续维护者重新引入抢占式阻断，现已改为指向现役实现与口径。
+  - **ambient stub 段数纠正**：根 `AGENTS.md` 与 `docs/agents/sdk-compat.md` 均写「当前 stub 只剩两段（裸入口 + `text-utility-runtime`）」，实际是**三段**——抬地板时新增的 `text-grapheme` 段（`src/openclaw-plugin-sdk.d.ts`）从未被记进去。已按三段改写并补上该段的来历。
+  - **过时版本叙事改写**（只改注释与文档，不改行为）：把「2026.9.1 只保证 phase/steps」「openclaw 2026.9.x 现行形态」「2026.9.6+ 框架会…」「2026.9.1 schema 中模型列表只…」等**当前行为**描述上的旧版本锚点，改为对框架现行行为的表述；**事故史与盯版史**（`docs/agents/sdk-compat.md` 的钉版沿革、`docs/agents/inbound.md` / `interaction.md` 的 2026-08-30 事故链、`src/features/secret-store-cli.ts` 的同源 CLI 约束）**原样保留**——那些是历史证据，不是版本兼容代码。
+  - **5 处 `openclaw/plugin-sdk` 能力探测保留，并补注「探测的是子路径是否还在、不是版本兼容」**（`grapheme.ts` / `detached-webhook-work.ts` / `webhook.ts` ×2 / `question-submit.ts`）。地板 `2026.10.5` 下这些分支技术上不可达，但它们守的是「上游删子路径 ⇒ 插件加载期整体炸裂」这条底线（2026-10-02 `channel-message` 事故的教训），`docs/agents/sdk-compat.md` 有明确政策，**不删**。
+  - `src/outbound/chunker.ts` 的本地 chunker 回退**保留**（它是**运行时能力探测**而非版本分支——runtime contract probe 的 `REQUIRED` 列表为空，能力按 `OPTIONAL` 处理），只把「高版本 / 低版本降级」的措辞改成「运行时提供时优先 / 未提供时降级」。
+
 ---
 
 ## [4.3.0] - 2026-11-17

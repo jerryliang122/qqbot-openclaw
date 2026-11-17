@@ -51,7 +51,7 @@ QQ 跟 Telegram 的最大差异在**回复机制**:
   - `session.complete` 收尾
 - 流式**没有"流式配额"**,但流式通道里的回复消息(`session.update` 推送)仍是 C2C 被动回复(同上表口径;次数上限实测不执行,60 min 窗口真实)。
 - 见 `src/middleware/typing.ts`:typing 只做锚点存活探测(判 TTL/死锚点),不占回复额度(实测) — **锚点过期/判死 ⇒ 本轮停发**,绝不降级为不带 msg_id 的主动形态(主动额度留给正文与前置消息);平台当场拒收 typing(40034005/40034128)同样停发并标记死锚点。
-- 见 `src/outbound/reply-limiter.ts`(`ReplyLimiter`,默认 4/msg_id,10k LRU,C2C TTL 60 min)。
+- 见 `src/features/quota-manager.ts`:**反应式配额模型**——平台实测不执行文档口径的「C2C 4 次/msg_id、群 5 次/群」次数上限，故本地**不按次数阻断**，count 仅观测（超上限打一次 INFO 留证）；本地强制的只有两个平台真实硬约束：TTL 窗口预检（c2c 60min/group 5min）与 `msg_seq` 单调发号。存活探测走 `checkPassiveReplyQuota()`（typing 等用，只判 TTL/dead），消耗走 `checkAndConsumePassiveReplyQuota()`。
 - 见 `src/features/msgid-cache.ts`:C2C `msg_id` 缓存 60 分钟、群 5 分钟——与 quota-manager 共用 `PLATFORM_PASSIVE_WINDOW`（平台被动回复窗口），条目时间戳为平台事件时间。
 
 ### 平台一级概念:Markdown 渲染

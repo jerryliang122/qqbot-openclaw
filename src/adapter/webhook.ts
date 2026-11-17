@@ -41,6 +41,9 @@ export function createPluginWebhookAdapter(params: {
 
   return {
     async listen(_port: number, path: string, handler: WebhookRequestHandler): Promise<void> {
+      // 探测的是「子路径是否还在」而非版本兼容——地板 2026.10.5 起恒在，
+      // 此处守的是「上游删子路径 ⇒ 插件整体加载失败」的底线（守卫见
+      // tests/sdk-surface.test.ts，该子路径**不在**豁免名单里）。
       const ingress = await import('openclaw/plugin-sdk/webhook-ingress').catch(() => null);
       if (!ingress?.registerWebhookTargetWithPluginRoute) {
         params.log.error('Webhook ingress not available');
@@ -107,7 +110,9 @@ function createSharedHandler(path: string, log: PluginLogger) {
     try {
       const ingress = await import('openclaw/plugin-sdk/webhook-ingress').catch((err) => {
         // 管线缺失会让所有请求降级到 handleSimple（无签名匹配多账号路由），
-        // 此前完全无痕迹——至少留一条 WARN 说明降级发生及原因
+        // 此前完全无痕迹——至少留一条 WARN 说明降级发生及原因。
+        // ⚠️ 探测的是「子路径是否还在」而非版本兼容——地板 2026.10.5 起恒在，
+        // 此处守的是「上游删子路径 ⇒ 插件整体加载失败」的底线。
         log.warn?.(`[webhook] ingress pipeline unavailable, downgrading to simple handler: ${err instanceof Error ? err.message : String(err)}`);
         return null;
       });

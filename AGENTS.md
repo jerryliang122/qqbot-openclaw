@@ -149,7 +149,7 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 
 - **SDK 子路径被删 = 插件整体加载失败，typecheck 不设防。** openclaw 删子路径时连 `.d.ts` 一起删，`dist/index.cjs` 加载期就抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`，功能全灭且本地完全无声。守卫在 `tests/sdk-surface.test.ts`——它**按引号字面量取子路径全集，不解析 import 语句形态**（动态 import / 字面量 require / re-export 都算），豁免必须显式登记 `EXEMPT_SUBPATHS`，别靠「扫不到」。运行时断言必须放**子进程**（tsx 会 patch `Module._resolveFilename`，进程内直接 require 会误报 ESM-only 依赖缺失）。`import { fn, type Opts }` 的 inline `type` 要逐项判 type，否则守卫误报「缺少运行时值」把人引向不存在的缺陷。
 - **裸子路径 `openclaw/plugin-sdk`（无后缀）不在包 exports 里**——运行时 require 抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`。本插件对它只有 `import type`，永远不要从裸路径做值导入。
-- **ambient stub 会遮蔽包内真实类型，留着等于没验证。** `src/openclaw-plugin-sdk.d.ts` 当前只剩两段（裸入口 + `text-utility-runtime`），升级钉版时先删掉包已提供类型的 stub 段再跑 typecheck。
+- **ambient stub 会遮蔽包内真实类型，留着等于没验证。** `src/openclaw-plugin-sdk.d.ts` 当前只剩三段（裸入口 + `text-utility-runtime` + `text-grapheme`），升级钉版时先删掉包已提供类型的 stub 段再跑 typecheck。
 - **`preload.cjs` 不能删改名**——它同步建 `node_modules/openclaw` junction，删了插件在框架里加载失败。
 - **tsup post-build 的 `sanitizeDist()` 是承重的**（见 Code style），别剥。
 - **钉版必须恒等于 peer 承诺的最低版本**——两者脱钩就测不出「误用旧版没有的 API」，虚假承诺只在用户运行时炸。

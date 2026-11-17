@@ -61,7 +61,7 @@ import type { PluginLogger } from '../utils/plugin-logger.js';
 import { isAnchorDeadBizCode } from '../features/quota-manager.js';
 import { resolveFindGraphemeChunkEnd } from './grapheme.js';
 
-/** 框架 plan 事件载荷（宽容解析：未知字段忽略，2026.9.1 只保证 phase/steps） */
+/** 框架 plan 事件载荷（宽容解析：按当前钉版宽容接收，未知字段忽略） */
 export interface PlanUpdatePayload {
   phase?: string;
   title?: string;
@@ -185,7 +185,7 @@ function truncateGraphemeSafe(text: string, maxChars: number): string {
  *   ▢ 运行回归测试
  *   ▢ 清理临时文件
  *
- * explanation 存在时（2026.9.1 事件不含该字段，纯前向兼容）插在头部之后。
+ * explanation 存在时（早期框架事件不含该字段，纯前向兼容）插在头部之后。
  */
 export function renderProgressCardText(
   steps: NormalizedPlanStep[],
