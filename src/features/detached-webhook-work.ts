@@ -24,8 +24,10 @@ let detachedGuards: { runDetachedWebhookWork: RunDetachedWebhookWork } | null | 
 /**
  * 加载 guards 模块（进程内缓存；不可用一次性 WARN）。
  *
- * 基线 2026.10.5 起该子路径即存在；模块加载失败与导出缺失都缓存为 null
- * ——这两种形态都是运行时环境的持久属性，重试无意义。
+ * 基线 2026.10.5 起该子路径即存在 —— 此处的探测**不是版本兼容**，
+ * 而是「上游把子路径删掉/改名」的防御：守卫在 `tests/sdk-surface.test.ts`
+ *（子路径被删即 CI 红），但生产环境要先不崩。模块加载失败与导出缺失都
+ * 缓存为 null ——这两种形态都是运行时环境的持久属性，重试无意义。
  */
 export async function loadDetachedWebhookGuards(log: PluginLogger): Promise<{ runDetachedWebhookWork: RunDetachedWebhookWork } | null> {
   if (detachedGuards !== undefined) return detachedGuards;

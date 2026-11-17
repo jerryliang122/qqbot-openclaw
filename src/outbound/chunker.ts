@@ -1,8 +1,13 @@
 /**
  * QQBot Markdown 文本分块
  *
- * 优先使用框架 runtime 提供的 chunkMarkdownText（高版本）；
- * 不可用时回退到本地 GFM 表格感知 chunker —— 保证不在表格内部切分。
+ * 优先使用框架 runtime 提供的 chunkMarkdownText；
+ * 运行时未提供时回退到本地 GFM 表格感知 chunker —— 保证不在表格内部切分。
+ *
+ * ⚠️ 注意：这是**运行时能力探测**（`runtime.channel.text.chunkMarkdownText`
+ * 是否被提供），不是 openclaw 版本分支——runtime contract probe 的 `REQUIRED`
+ * 列表为空，能力按 `OPTIONAL` 处理，故本地实现必须始终保留（它是
+ * `tests/chunker-table.test.ts` 的独立被测对象）。
  */
 
 import { getAdapters } from '../adapter/resolve.js';
@@ -362,7 +367,7 @@ export function enforceChunkLimit(chunks: string[], limit: number): string[] {
 
 /**
  * chunker 入口（框架 ChannelOutboundAdapter.chunker 契约）：
- * runtime adapter 的 chunkMarkdownText 优先，低版本降级到本地实现。
+ * runtime adapter 的 chunkMarkdownText 优先，运行时未提供时降级到本地实现。
  *
  * 两条路径都过一遍 `enforceChunkLimit`——**超限块**（长中文句 / 超长表格行 /
  * 超长单行围栏）在这里按字形簇安全切开；长度恰好等于 limit 的块由框架自身的

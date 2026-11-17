@@ -686,8 +686,8 @@ export interface KeyboardPermission {
  *   点击者身份，非授权者的点击被框架侧拒绝。
  * - ask_user：走 `qqbot:qm:` 回调前缀，问题选项绑定具体 questionId。
  *
- * 待办：若未来框架在 approval request 中提供发起者标识（当前 2026.9.1
- * 与 10.5 均无），应改为 `type: 0` + `specify_user_ids`，把可见性收窄到
+ * 待办：若未来框架在 approval request 中提供发起者标识（当前框架版本
+ * 均未提供），应改为 `type: 0` + `specify_user_ids`，把可见性收窄到
  * 发起者。届时需同步改 `tests/keyboard-permission-semantics.test.ts`。
  */
 export const KEYBOARD_PERMISSION_EVERYONE = 2 as const;

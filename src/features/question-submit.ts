@@ -105,6 +105,9 @@ let harnessRuntimePromise: Promise<ClaimPendingQuestionAnswerFn> | undefined;
  *
  * 这里用**动态 import + 运行时捕获**：子路径缺失时只在提交那一刻降级成
  * `unsupported`（回执「提交失败」），而不是让整个插件加载不起来。
+ *
+ * ⚠️ 这**不是版本兼容分支**：peer 地板 `>=2026.10.5` ⇒ 该子路径恒在。
+ * 探测守的是「上游把子路径删掉/改名」这条底线。
  */
 async function loadClaimFn(): Promise<ClaimPendingQuestionAnswerFn> {
   harnessRuntimePromise ??= import('openclaw/plugin-sdk/agent-harness-runtime')

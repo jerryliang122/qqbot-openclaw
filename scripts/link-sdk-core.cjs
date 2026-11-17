@@ -1,7 +1,7 @@
 /**
  * 公共模块：openclaw plugin-sdk symlink 创建逻辑。
  *
- * 被 preload.cjs 和 postinstall-link-sdk.js 共同使用，避免代码重复。
+ * 被 preload.cjs 共同使用，避免代码重复。
  * 必须是 CJS 格式，因为 preload.cjs 需要同步 require()。
  *
  * 注意：本模块不使用 child_process，避免被 openclaw 安全检查拦截。
@@ -13,21 +13,6 @@ const fs = require("node:fs");
 const os = require("node:os");
 
 const CLI_NAMES = ["openclaw"];
-
-/**
- * 比较版本号是否 >= target
- * Strip pre-release suffix (e.g. "2026.3.23-2" → "2026.3.23")
- */
-function compareVersionGte(version, target) {
-  const parts = version.replace(/-.*$/, "").split(".").map(Number);
-  for (let i = 0; i < target.length; i++) {
-    const v = parts[i] || 0;
-    const t = target[i];
-    if (v > t) return true;
-    if (v < t) return false;
-  }
-  return true;
-}
 
 /**
  * 获取全局 node_modules 候选目录列表（按优先级排序）。
@@ -116,49 +101,6 @@ function resolveGlobalRootFromBin(binPath, cliName) {
 }
 
 /**
- * 读取 package.json 中的版本号。
- */
-function readPkgVersion(pkgPath) {
-  try {
-    const v = JSON.parse(fs.readFileSync(pkgPath, "utf-8")).version;
-    return v || null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 检查 openclaw 版本是否 >= 2026.3.22（需要 symlink 的最低版本）。
- * 如果无法检测版本，返回 true（保守策略：宁可多创建也不遗漏）。
- */
-function isOpenclawVersionRequiresSymlink() {
-  const REQUIRED = [2026, 3, 22];
-
-  // Strategy 1: 从全局 node_modules 读取 package.json 版本
-  for (const name of CLI_NAMES) {
-    const pkgPath = findPackageInGlobalDirs(name);
-    if (pkgPath) {
-      const v = readPkgVersion(pkgPath);
-      if (v) return compareVersionGte(v, REQUIRED);
-    }
-  }
-
-  // Strategy 2: 从 CLI 二进制反查到 package.json
-  for (const name of CLI_NAMES) {
-    const binPath = findCliInPath(name);
-    if (binPath) {
-      const pkgPath = resolveGlobalRootFromBin(binPath, name);
-      if (pkgPath) {
-        const v = readPkgVersion(pkgPath);
-        if (v) return compareVersionGte(v, REQUIRED);
-      }
-    }
-  }
-
-  return true;
-}
-
-/**
  * 查找全局 openclaw 安装路径。
  * 三种策略依次尝试：全局 node_modules、$PATH 反查、extensions 目录推断。
  */
@@ -240,8 +182,6 @@ function ensurePluginSdkSymlink(pluginRoot, tag) {
       } catch {}
     }
 
-    if (!isOpenclawVersionRequiresSymlink()) return true;
-
     const openclawRoot = findOpenclawRoot(pluginRoot);
     if (!openclawRoot) {
       console.error(`${tag} WARNING: could not find openclaw global installation, symlink not created`);
@@ -260,8 +200,6 @@ function ensurePluginSdkSymlink(pluginRoot, tag) {
 
 module.exports = {
   CLI_NAMES,
-  compareVersionGte,
-  isOpenclawVersionRequiresSymlink,
   findOpenclawRoot,
   isLinkValid,
   ensurePluginSdkSymlink,

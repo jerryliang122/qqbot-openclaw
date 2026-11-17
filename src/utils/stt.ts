@@ -22,7 +22,7 @@ type TranscribeParams = Parameters<typeof transcribeAudioFile>[0];
  * - `tools.media.audio.enabled === false` → 框架级 per-capability 关闭
  * - `tools.media.models` 无显式 `capabilities` 含 `"audio"` 的条目 → 未配置
  *
- * 规范路径是 `tools.media.models`——openclaw 2026.9.1 schema 中模型列表只
+ * 规范路径是 `tools.media.models`——框架 schema 中模型列表只
  * 存在于此（`tools.media.audio` 块的类型为 `Omit<…, "models">`，不含
  * models 键）。**只认显式 `capabilities` 标签**（有意保守）：无标签 CLI
  * 条目按框架语义本就不参与共享列表的 audio 匹配；无标签 provider 条目框

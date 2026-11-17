@@ -75,7 +75,7 @@ export const qqbotThreadingAdapter = {
  * （或反之）的错配。
  *
  * ⚠️ 红线（2026-10-06 线上事故，openclaw 9.5→9.7 升级后复发）：
- * 2026.9.6+ 框架会把 groups.resolveToolPolicy 的返回值作为会话工具策略真正
+ * 框架会把 groups.resolveToolPolicy 的返回值作为会话工具策略真正
  * 应用到 run 的工具集——`{ allow: [] }`（空允许清单）= 什么都不允许，连
  * message 工具都会被过滤掉。room_event 群的最终文本被结构性压制
  * （message_tool_only），发言必须走 message 工具——工具没了 = 群彻底沉默。
