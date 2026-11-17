@@ -39,6 +39,7 @@
   - 它实现的是「每 msg_id 最多 4 次被动回复」的**抢占式阻断**模型，而 v4.0.0 已用探针实测证明**平台并不执行该次数上限**（同一 msg_id 连发 25 次全部送达）⇒ 这个类对外表达的是一份**错误的**配额语义，留着会诱导使用者重新引入抢占式阻断——而那正是 v4.0.0 刻意拆掉的、会把正文逼去烧每日 1000 条主动预算的设计。
   - 自 v4.0.0 起插件内部零实例化（该类自身的文档也写明「与 quota-manager 无关，是历史遗留工具」）。
   - **迁移指引**：配额相关一律改用 `checkAndConsumePassiveReplyQuota()`（存活预检 + 发号 + 观测计数）与 `checkPassiveReplyQuota()`（只判 TTL / 死锚点），二者均已在 `index.ts` 导出。
+  - ✅ **2026-11-17 评审修正**：上一条迁移指引声称「二者均已在 `index.ts` 导出」，实际当时只导出了 `checkPassiveReplyQuota`——`checkAndConsumePassiveReplyQuota` 漏在 `src/features/quota-manager.js` 内部。已补进 `index.ts` 的 quota 导出块，指引现已成立（发版前修正，无外部使用者受影响）。
 - **移除 `src/config.ts` 的 6 个旧群配置解析器**：`resolveGroupAllowFrom` / `isGroupAllowed` / `resolveHistoryLimit` / `resolveGroupPrompt` / `resolveIgnoreOtherMentions` / `resolveGroupName`。
   - 全部零内部引用（现役群配置解析走 `resolveGroupConfigFromAccount`，被 `dispatch.ts` / `event-handlers.ts` / `group-merge.ts` / `ingress-queue.ts` / `ingress-batcher.ts` 使用）。
   - 其中 `resolveHistoryLimit` / `resolveGroupPrompt` / `resolveIgnoreOtherMentions` / `resolveGroupName` 只是 `resolveGroupConfig`（本身即 `resolveGroupConfigFromAccount` 的薄包装，**含大小写不敏感查找**）的字段读取捷径，语义与现役路径一致。
