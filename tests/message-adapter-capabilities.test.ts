@@ -13,6 +13,9 @@
  * - `draftPreview` 保持 false（QQ 无「草稿占位 + 原地改写」两阶段结构）
  * - `inlineButtons` 声明**必须**有对应的落地实现（renderPresentation +
  *   presentationCapabilities）——防止将来回退成「声明但不落地」
+ * - `questionInputMode === 'buttons'`（openclaw 2026.11.5 起 core 按频道
+ *   能力发放 `ask_user`；漏声明 ⇒ 工具目录里没有 ask_user ⇒ agent 静默
+ *   退化为纯文本提问，issue #113），且该声明**必须**有原生按钮落地实现
  *
  * 运行方式：npx tsx tests/message-adapter-capabilities.test.ts
  */
@@ -20,6 +23,12 @@
 import assert from 'node:assert';
 import { qqbotMessageAdapter } from '../src/message-adapter.js';
 import { qqbotAgentPromptAdapter } from '../src/agent-prompt-adapter.js';
+import {
+  readQQQuestionContext,
+  renderQQBotKeyboard,
+} from '../src/outbound/presentation-buttons.js';
+import { buildQuestionOptionKeyboard } from '../src/features/question-card.js';
+import type { MessagePresentation } from 'openclaw/plugin-sdk/interactive-runtime';
 
 let passed = 0;
 let failed = 0;
@@ -129,6 +138,83 @@ async function main() {
     assert.ok(
       typeof outbound.sendPayload === 'function',
       '框架对含 channelData 的 payload 走 sendPayload 路径；缺它按钮到不了发送层',
+    );
+  });
+
+  // ── questionInputMode（ask_user 工具目录闸门）──────────────────────
+  //
+  // ⚠️ openclaw 2026.11.5 起，core 按频道能力发放 `ask_user`：
+  // `shouldIncludePrimarySessionToolForOpenClawTools` 读
+  // `questionInputMode`，既不是 "native" 也不是 "buttons" 就把 ask_user
+  // 从**工具目录**里剔除（缺省 "none"）。core 的解析来源是入站频道插件：
+  //   getChannelPlugin(channel)?.agentPrompt?.questionInputMode ?? "none"
+  //
+  // 漏声明的后果是**静默降级**：插件不报错、编译不通过也不会提示，
+  // 只是 ask_user 从目录消失 ⇒ agent 改用纯文本提问，QQ 用户看到的
+  // 单题 / 多题卡片与按钮全部消失（issue #113，11.4 → 11.5 升级触发）。
+
+  await test('questionInputMode 声明为 buttons（ask_user 进入工具目录的前提）', () => {
+    assert.strictEqual(
+      qqbotAgentPromptAdapter.questionInputMode,
+      'buttons',
+      'questionInputMode 必须是 "buttons"——删掉/写错会让 core 把 ask_user ' +
+        '从工具目录剔除，agent 静默退化为纯文本提问（issue #113）',
+    );
+  });
+
+  await test('questionInputMode 只使用 core 认可的字面量', () => {
+    const mode = qqbotAgentPromptAdapter.questionInputMode as string;
+    assert.ok(
+      mode === 'buttons' || mode === 'native' || mode === 'none',
+      `非法 questionInputMode 值：${mode}（core 字面量联合：buttons | native | none）`,
+    );
+    assert.notStrictEqual(
+      mode,
+      'none',
+      '"none" 等同于未声明——core 会把 ask_user 从工具目录剔除',
+    );
+  });
+
+  await test('声明 buttons 则必须存在原生按钮落地实现（question action → qqbot:q: 回调）', () => {
+    // 框架 presentation 的 question action → QQ 回调型按钮的落地通路。
+    // 声明 questionInputMode = "buttons" 是对「QQ 有原生 ask_user 控件」
+    // 的承诺，这条通路消失时声明就成了空头支票。
+    const context = readQQQuestionContext({
+      askUser: { questionId: 'ask_1', optionValues: ['选项A', '选项B'] },
+    });
+    assert.ok(context, '应解析出 ask_user 上下文');
+
+    const kb = renderQQBotKeyboard(
+      {
+        blocks: [
+          {
+            type: 'buttons',
+            buttons: [
+              {
+                label: '选项B',
+                action: { type: 'question', questionId: 'ask_1', optionValue: '选项B' },
+              },
+            ],
+          },
+        ],
+      } as unknown as MessagePresentation,
+      context,
+    );
+    assert.ok(kb, 'question action 应渲染出 QQ 原生键盘');
+    const btn = kb.content.rows[0].buttons[0];
+    assert.strictEqual(btn.action.type, 1, 'question action 应落地为 QQ 回调型按钮');
+    assert.strictEqual(
+      btn.action.data,
+      'qqbot:q:ask_1:1',
+      'question action 应生成 qqbot:q:<questionId>:<optionIndex> 回调',
+    );
+  });
+
+  await test('ask_user 选项键盘渲染原语存在（question-card）', () => {
+    assert.strictEqual(
+      typeof buildQuestionOptionKeyboard,
+      'function',
+      '单题/多题共用的选项键盘渲染原语必须存在——它是 ask_user 卡片按钮的来源',
     );
   });
 

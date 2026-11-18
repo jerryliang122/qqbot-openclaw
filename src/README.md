@@ -34,6 +34,7 @@
 - **群消息优先级链** → [`docs/agents/config-and-credentials.md`](../docs/agents/config-and-credentials.md) §「Group message priority chain」
 - **SDK 子路径被删 = 插件整体加载失败** → [`docs/agents/sdk-compat.md`](../docs/agents/sdk-compat.md)
 - **ambient stub 会遮蔽包内真实类型** → [`docs/agents/sdk-compat.md`](../docs/agents/sdk-compat.md) §「`src/openclaw-plugin-sdk.d.ts`」
+- **`agentPrompt.questionInputMode` 必须声明 `"buttons"`** → [`docs/agents/interaction.md`](../docs/agents/interaction.md) §「`agentPrompt.questionInputMode` 必须声明为 `"buttons"`」
 - **凭据互斥 / 热路径不读盘 / 只读巡检** → 根 [`AGENTS.md`](../AGENTS.md) § Security
 
 ## 本目录特有的坑
@@ -41,6 +42,7 @@
 - **改 `types.ts` 前先看 manifest**——唯一来源是 `openclaw.plugin.json` 的 `channelConfigs.qqbot.schema`（顶层 + `accounts.<id>` 两处逐字一致）。框架走 `validatePluginSchemaValue`（`applyDefaults: true`，对 `additionalProperties:false` 和 `enum` 都做值校验），**typecheck 不设防**——`tests/manifest-config-schema.test.ts` 是唯一防线，红了先补 manifest，不要绕过守卫。
 - **`capabilities.tts.voice` 的 `captionedFinalText` 必须是 `false`**——QQ 语音不带文字说明，声明 true 会让终稿正文永不到达。声明整个形态：`{ synthesisTarget: "voice-note", transcodesAudio: true, captionedFinalText: false }`（走 SILK 语音气泡；不声明则 TTS 被当普通音频文件发）。
 - **`capabilities.nativeCommands` 刻意不声明**——QQ 指令面板是引导型 UI，声明会与 `commands.text=false` 冲突。
+- **`agentPrompt.questionInputMode` 必须声明 `"buttons"`，且不能删**——openclaw 2026.11.5 起 core 按频道能力发放 `ask_user`（读 `questionInputMode`，缺省 `"none"` ⇒ `ask_user` 不进工具目录 ⇒ agent 静默改用纯文本提问，issue #113）。**删掉不会有任何编译 / 运行期信号**，只有线上静默降级 ⇒ 声明处有类型层断言，守卫测试见 [`tests/message-adapter-capabilities.test.ts`](../tests/message-adapter-capabilities.test.ts)。叙事见 [`docs/agents/interaction.md`](../docs/agents/interaction.md)。
 - **`messaging.inferTargetChatType` 必须实现**——否则宿主只能走通用路由搜索，Gateway 一直报 `waiting for route`。其余能力一律 `undefined`（不猜）。
 - **`resolveQQBotAccount` 是热路径，全程不读盘**——每次出站发送都会解析一次账号，同步 `stat`/`readFileSync` 会阻塞事件循环。凭据文件只在账号启动时读一次。
 - **`inspectAccount` 不能 materialize 凭据**——`openclaw status` / doctor 不该为「描述配置」触发 token 交换或扫码。`secretStatus` 三态：`available` / `configured_unavailable` / `missing`。
