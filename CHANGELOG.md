@@ -12,6 +12,16 @@
 
 > 本节汇总已合入 `main`、尚未打 tag 发版的条目。发版时由主人确认版本号与 tag。
 
+### 修复
+
+- **`ask_user` 工具在 openclaw 2026.11.5 起被 core 静默拒发**（issue #113）——**行为变更：无配置格式变更、无公开 API 破坏**。
+  - **现象**：升级 OpenClaw 2026.11.4 → 2026.11.5 后，QQ 频道上 agent 不再调用 `ask_user`，改为在正文里用纯文本提问，单题 / 多题卡片与按钮全部消失。
+  - **根因**：11.5 为 `ask_user` 引入了**按频道能力发放**的门槛——core 的 `shouldIncludePrimarySessionToolForOpenClawTools` 读 `questionInputMode`，取值既不是 `"native"` 也不是 `"buttons"` 就把 `ask_user` 从**工具目录**里剔除（缺省 `"none"`）；其解析来源是**入站频道插件**：`getChannelPlugin(channel)?.agentPrompt?.questionInputMode ?? "none"`。本插件此前**未声明**该字段 ⇒ 取默认值 `"none"` ⇒ `ask_user` 被拒发。11.4 完全不检查该字段，故升级前功能正常、升级后**静默降级**（插件不报错、编译不失败、零告警）。
+  - **修复**：`src/agent-prompt-adapter.ts` 补上 `questionInputMode: 'buttons'`（与内置 Telegram 频道同值——`"native"` 指**客户端**自带的提问控件，QQ 属**频道自带按钮**）。**声明与既有实现一致**，不是空头支票：QQ 的 `keyboard` 是发送接口的一等字段，`src/features/question-card.ts` 渲染选项按钮（`qqbot:q:` / `qqbot:qm:` 回调数据）、`src/gateway/event-handlers.ts` 路由按钮回调、`src/features/question-submit.ts` 走框架官方 `claimPendingAgentQuestionAnswer` 回流答案。
+  - **归属说明**：core 把「省略声明 ⇒ `ask_user` 不进工具目录 ⇒ agent 改用纯文本提问」写成了**有意设计**（core 文档 `docs/plugins/sdk-channel-plugins.md` § Question input），所以修复归属在插件侧——必须显式声明自己支持按钮。对既有插件而言这是一次**无迁移提示的静默能力回归**，故本条同时补齐文档与守卫。
+  - **兼容性**：11.4 及更早的 openclaw 不读该字段，声明对其**无副作用**；可观测差异只在 openclaw ≥ 2026.11.5 上出现（`ask_user` 卡片恢复可用）。**未抬钉版**（peer 地板仍是 `>=2026.10.5`，devDependency 钉版仍是 `2026.10.5`）——本修复是纯数据声明，不需要新 API。
+  - **防回归**：① 声明处加**类型层断言**（推断类型必须是字面量 `"buttons"`，不能退化成 `string`——钉版抬到声明了该字段的 openclaw 时 `string` 会 typecheck 报错，把失败前移到编译期）；② `tests/message-adapter-capabilities.test.ts` 锁定声明值 + 「声明 `buttons` 就必须有原生按钮落地实现（框架 `question` action → QQ `qqbot:q:` 回调）」的一致性检查。
+
 ### 维护
 
 - **移除零引用的内部死代码**（无行为变更、无公开 API 变更、无配置格式变更）。

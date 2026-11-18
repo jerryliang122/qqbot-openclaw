@@ -187,6 +187,7 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 
 ### 交互面（[详情](docs/agents/interaction.md)）
 
+- **`agentPrompt.questionInputMode` 必须声明 `"buttons"`，且这一行不能删**（2026-11-18 修复，issue #113）——openclaw 2026.11.5 起，core 把 `ask_user` 是否进入**工具目录**改为**按频道能力发放**（读 `questionInputMode`，缺省 `"none"` ⇒ `ask_user` 被剔除 ⇒ agent 改用纯文本提问，QQ 用户看到的卡片与按钮全部消失）。本插件此前未声明 ⇒ 11.4 → 11.5 升级即**静默降级**（插件不报错、编译不失败、零告警）。core 把「省略即不发放」写成有意设计，**修复归属在插件侧**。**红线：删掉这一行没有任何编译 / 运行期信号**，只有线上静默降级 ⇒ 声明处有类型层断言，守卫测试见 `tests/message-adapter-capabilities.test.ts`。→ 叙事见 [`docs/agents/interaction.md`](docs/agents/interaction.md)
 - **多问题 ask_user 的红线是「禁止代替用户作答」，不是「禁止程序化提交」**（2026-11-11 再界定，issue #99 / PR #100）——**答案值必须来自用户的真实输入**（按钮点选 / 手打文本），插件只负责**搬运与组合**；**禁止合成入站消息**（合成消息会被框架 steer 进 ask_user-suspended run，2026-08-24 事故）。提交通道 = 框架官方 `claimPendingAgentQuestionAnswer({ sessionKey, text })`（`openclaw/plugin-sdk/agent-harness-runtime`）——它与框架自己的入站认领走**同一套解析与校验**（`buildAgentHarnessUserInputAnswers` / `validateAnswers`）⇒ 插件组合的文本与用户手打的文本在框架侧等价。
 - **多题问答进行中（c2c、多题 pending 武装期间）的入站文本一律本地暂存为当前题答案、不转发框架**——平台无法区分「用户手打的普通消息」与「指令按钮代发的回调内容」；中间态文本转发给框架只会撞上 `validateAnswers` 的 partial 拒收 + 重问循环（白烧一轮、两侧状态分裂），且靠中间态词汇猜意图必然失效。**边界**：仅多题 pending 武装期间 + 仅 c2c + 仅 `sequential` 形态；单题 pending / 无 pending 时文本照旧原样转发框架；斜杠命令（`/` 开头）照旧放行（逃生通道）。**分类只认形态**（整单 / 形态错误 / 本题答案），**不靠内容语义猜**。
 - **Secret input 的消息绝不进 AI transcript**——kind 恒为 `env`；多问题 ask_user 待答时 capture 中间件必须放行。→ 实现见 [`src/features/README.md`](src/features/README.md) 与 [`src/middleware/README.md`](src/middleware/README.md)
