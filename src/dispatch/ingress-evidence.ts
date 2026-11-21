@@ -11,28 +11,43 @@
  *   → custody 缺失 → sessions_spawn 100% 失败
  *
  * 修法对齐 Telegram 参照实现（extensions/telegram 的 ingress.ts +
- * bot-message-context.session.ts）：每 turn 用 `channel.inbound.ingress.resolve`
- * resolve 出**新鲜**结果（单次移交约束：resolved 对象 `handoff.consumed` 只能
- * 消费一次，绝不跨消息复用），作为 `channelIngress` 传入 buildContext。
+ * bot-message-context.session.ts）：每 turn resolve 出**新鲜**结果（单次移交
+ * 约束：resolved 对象 `handoff.consumed` 只能消费一次，绝不跨消息复用），
+ * 作为 `channelIngress` 传入 buildContext。所需 API（`channel.inbound.ingress.*`
+ * 注入、`plugin-sdk/channel-ingress-runtime` 子路径）自 2026.10.5 起就存在——
+ * 11.5 的新增物是 core 侧守卫，不是插件 API，故本修复跨 10.5–11.6 工作，
+ * 无需抬 peer 地板。
  *
- * 所需 API（`channel.inbound.ingress.*` 注入、`plugin-sdk/channel-ingress-runtime`
- * 子路径）自 2026.10.5 起就存在——11.5 的新增物是 core 侧守卫，不是插件 API，
- * 故本修复跨 10.5–11.6 工作，无需抬 peer 地板。
+ * ## 多参与者（跨发言人合批）
+ *
+ * 群合批会把多条不同成员的消息并成一个 turn；evidence 若只记载体（最后一
+ * 条）的 sender，requester provenance 就误归载体。core 原生支持参与者数组
+ * （`prepareHostChannelContextAdmissionEvidence` 逐项校验，上限 16；合批去重
+ * sender ≤ maxBatchSize=10）：**数组末项的 rawPrincipalRef 必须等于
+ * buildContext 的 `sender.id`（= 载体 sender），其余项用各自的 stableId**。
+ * 因此 participants 按「到达序去重、载体 sender 强制排最后」构造（由合批
+ * 路径写入 `ctx.state.ingressParticipants`，dispatch 侧缺省回退单载体）。
  *
  * 契约对齐要点（dist/admission-evidence + host-context-builder 的
  * contextHandoffMatches / bindParticipants 逐字段校验，错一个字段 evidence 就
  * 静默降级、守卫依旧触发）：
  * - `contextBinding.{agentId,sessionKey,messageId,inboundEventKind}` 必须与
  *   buildContext 入参的 `route.agentId ?? 'default'` / `route.routeSessionKey` /
- *   `messageId` / `message.inboundEventKind ?? 'user_request'` 逐字相等；
+ *   `messageId` / `message.inboundEventKind ?? "user_request"` 逐字相等；
  * - `conversation {kind, id}` 与 buildContext 的 conversation 同形（无 thread 字段）；
- * - `subject.stableId` === buildContext 的 `sender.id`（rawPrincipalRef 校验）；
- * - resolver `accountId` === buildContext 的 `route.accountId ?? 顶层 accountId`；
+ * - `subject.stableId`（末项）=== buildContext 的 `sender.id`（rawPrincipalRef 校验）；
+ * - resolve `accountId` === buildContext 的 `route.accountId`（dispatch 侧已归一，
+ *   两侧同源传入）；
  * - resolution 必须得出 allow（`ingress.admission === 'dispatch'`）才携带 custody。
+ *
+ * 完整叙事见 docs/agents/ingress-custody.md。
  */
 import { defineStableChannelIngressIdentity } from 'openclaw/plugin-sdk/channel-ingress-runtime';
 import type { RuntimeAdapters } from '../adapter/resolve.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
+
+/** 单次 ingress resolve 的等待上限（超时按「该参与者不可用」降级，不阻断派发） */
+const INGRESS_RESOLVE_TIMEOUT_MS = 5000;
 
 /**
  * QQ openid 身份描述（对齐 telegram ingress identity 形态）。
@@ -56,7 +71,7 @@ export interface IngressAccessPolicyInput {
   isGroup: boolean;
   /** c2c 模式：open | allowlist | pairing | disabled（默认 allowlist） */
   c2cMode: string;
-  /** 群模式：open | allowlist | disabled（默认 allowlist） */
+  /** 群模式：open | allowlist | disabled（默认 allowlist；见 mapIngressPolicy 的语义错向说明） */
   groupMode: string;
   allowFrom: string[];
   groupAllowFrom: string[];
@@ -65,9 +80,9 @@ export interface IngressAccessPolicyInput {
 /** 映射后的 ingress resolve 策略参数（undefined = 不携带 evidence，降级） */
 export interface IngressPolicyParams {
   dmPolicy: 'open' | 'allowlist' | 'pairing';
-  groupPolicy: 'open' | 'allowlist';
+  /** 恒为 open：插件在服务群内没有 sender 级限制（见 mapIngressPolicy） */
+  groupPolicy: 'open';
   allowFrom?: string[];
-  groupAllowFrom?: string[];
 }
 
 /** 过滤空白项；返回 undefined 表示无有效条目 */
@@ -79,19 +94,30 @@ function cleanEntries(entries: string[] | undefined): string[] | undefined {
 /**
  * 插件准入语义 → ingress resolve 策略映射。
  *
+ * ## c2c（dmPolicy）
+ *
  * 原则：**到达 dispatch 的消息都已被 access-control 放行**，evidence 必须如实
  * 反射同一裁决且得出 allowed（否则拿不到 dispatch custody）。access-control 的
  * 语义是「allowlist 且名单为空/含 `*` ⇒ 放行所有人」——直传空表给 resolver 会被
  * 判 not-allowlisted，故空/通配名单折叠为 `open`（语义等价，非放宽——那条消息
  * 本来就放行了）。`pairing` 直传：插件 pairing 走框架 pairing store
  * （adapter/pairing.ts 的 readChannelAllowFromStore），与 resolver 的默认
- * store 读取同库，已配对用户可被命中。
+ * store 读取同库，已配对用户可被命中。`disabled` 理论上到不了 dispatch
+ * （access-control 已拦），防御性整体降级。
  *
- * `disabled` 理论上到不了 dispatch（access-control 已拦），防御性返回 undefined
- * 走降级（不带 evidence，不阻断派发）。
+ * ## 群（groupPolicy 恒 'open'）
+ *
+ * ⚠️ **语义错向防护（评审自查）**：插件 `groupAllowFrom` 是「哪些**群**被服务」
+ * 的群 id 白名单（access-control 按 `groupOpenid` 匹配，types.ts「群白名单」）；
+ * 而 core resolver 的 `groupAllowFrom` 是「群内哪些 **sender** 被允许」。把插件的
+ * 群 id 名单直传给 core 会让每个 sender 判 not-allowlisted —— 恰好让配置了群
+ * 白名单的群全部拿不到 custody。插件在服务群内没有 sender 级限制（「哪些群被
+ * 服务」已由 access-control 在 dispatch 前裁决），故群侧恒传 `open`、**永不传
+ * groupAllowFrom**。代价：`groupPolicy:'open'` 下 evidence 的
+ * `participantOutcomeAffecting` 为 false（wildcard 放行）——只影响 attribution
+ * 丰富度，不影响 custody。
  */
 export function mapIngressPolicy(input: IngressAccessPolicyInput): IngressPolicyParams | undefined {
-  // ── c2c（dmPolicy）──
   let dmPolicy: IngressPolicyParams['dmPolicy'] | undefined;
   let allowFrom: string[] | undefined;
   if (input.c2cMode === 'open') {
@@ -106,36 +132,15 @@ export function mapIngressPolicy(input: IngressAccessPolicyInput): IngressPolicy
       allowFrom = entries;
     }
   }
-  // c2cMode 'disabled' 或未知值 → dmPolicy 保持 undefined
-
-  // ── 群（groupPolicy）──
-  let groupPolicy: IngressPolicyParams['groupPolicy'] | undefined;
-  let groupAllowFrom: string[] | undefined;
-  if (input.groupMode === 'open') {
-    groupPolicy = 'open';
-  } else if (input.groupMode === 'allowlist') {
-    const entries = cleanEntries(input.groupAllowFrom);
-    if (!entries || entries.includes('*')) {
-      groupPolicy = 'open';
-    } else {
-      groupPolicy = 'allowlist';
-      groupAllowFrom = entries;
-    }
-  }
-  // groupMode 'disabled' 或未知值 → groupPolicy 保持 undefined
-
-  // 会话所在一侧的策略不可用（disabled/未知）→ 整体降级
-  if (input.isGroup ? groupPolicy === undefined : dmPolicy === undefined) {
+  // c2cMode 'disabled' 或未知值（群消息时 c2c 分支不参与决策，走 open 兜底）
+  if (!input.isGroup && dmPolicy === undefined) {
     return undefined;
   }
 
   return {
-    // 上面的分支保证：isGroup 时 groupPolicy 已定义；非群时 dmPolicy 已定义，
-    // 另一侧用 open 兜底（resolver 只按会话 kind 评估对应一侧）
     dmPolicy: dmPolicy ?? 'open',
-    groupPolicy: groupPolicy ?? 'open',
+    groupPolicy: 'open',
     ...(allowFrom ? { allowFrom } : {}),
-    ...(groupAllowFrom ? { groupAllowFrom } : {}),
   };
 }
 
@@ -167,32 +172,52 @@ export function resolveAccessPolicyInput(
 
 export interface ResolveIngressEvidenceParams {
   adapters: RuntimeAdapters;
-  envelope: {
-    chatScope: string;
-    senderId: string;
-    messageId: string;
-  };
+  /** 路由绑定：binding.agentId 取 `route.agentId ?? 'default'`（对齐 ctx-builder） */
   route: {
     agentId?: string;
     sessionKey: string;
-    accountId?: string;
   };
-  /** route.accountId 缺失时的账号兜底（与 resolveAgentRoute 的入参同源） */
-  fallbackAccountId: string;
+  /** 已归一的 accountId（与 buildContext 的 route.accountId / 顶层 accountId 同源） */
+  accountId: string;
+  /** 载体消息 id（= buildContext 的 messageId） */
+  messageId: string;
   isGroup: boolean;
   /** 与 ctx-builder 的 conversation.id 同源（dispatch 侧 resolveDispatchPeerId） */
   peerId: string;
   inboundEventKind: string;
+  /**
+   * 本 turn 的参与 sender 清单：到达序去重、**载体 sender 强制排最后**
+   * （core 契约：数组末项的 rawPrincipalRef 必须等于 buildContext 的
+   * sender.id）。合批路径写入 `ctx.state.ingressParticipants`；单条消息
+   * 为 `[envelope.senderId]`。
+   */
+  participants: string[];
   policy: IngressAccessPolicyInput;
+  /** 单次 resolve 等待上限（默认 5s；测试注入用） */
+  timeoutMs?: number;
   log?: PluginLogger;
+}
+
+/** 有界等待：超时返回 undefined（迟到的结果被丢弃——handoff 未消费，无核心侧副作用） */
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
  * 为本轮 turn resolve 出 channelIngress admission evidence。
  *
- * 返回 undefined = 不携带 evidence（probe 缺失 / 策略映射降级 / resolve 失败 /
- * 决策未 allow），调用方照旧不传 `channelIngress`——绝不阻断入站派发。
- * 每次调用都产生**新鲜** resolution（单次移交约束）。
+ * 返回 undefined = 不携带 evidence（probe 缺失 / 策略映射降级 / 载体参与者失败
+ * / 全部参与者失败），调用方照旧不传 `channelIngress`——绝不阻断入站派发。
+ * 每个参与者都产生**新鲜** resolution（单次移交约束）；单参与者返回单对象，
+ * 多参与者返回数组（core 两者都接受）。
  */
 export async function resolveIngressEvidence(
   params: ResolveIngressEvidenceParams,
@@ -205,8 +230,13 @@ export async function resolveIngressEvidence(
   const mapped = mapIngressPolicy(params.policy);
   if (!mapped) {
     params.log?.debug(
-      `[ingress-evidence] degraded (policy disabled/unknown): c2cMode=${params.policy.c2cMode} groupMode=${params.policy.groupMode}`,
+      `[ingress-evidence] degraded (policy disabled/unknown): c2cMode=${params.policy.c2cMode}`,
     );
+    return undefined;
+  }
+
+  const participants = params.participants.filter((s) => typeof s === 'string' && s.length > 0);
+  if (participants.length === 0) {
     return undefined;
   }
 
@@ -214,46 +244,74 @@ export async function resolveIngressEvidence(
   const contextBinding = {
     agentId: params.route.agentId ?? 'default',
     sessionKey: params.route.sessionKey,
-    messageId: params.envelope.messageId,
+    messageId: params.messageId,
     inboundEventKind: params.inboundEventKind,
   };
 
-  let result: unknown;
-  try {
-    result = await resolve({
-      channelId: 'qqbot',
-      accountId: params.route.accountId ?? params.fallbackAccountId,
-      identity: qqbotIngressIdentity,
-      subject: { stableId: params.envelope.senderId },
-      conversation: {
-        kind: params.isGroup ? 'group' : 'direct',
-        id: params.peerId,
-      },
-      event: { kind: 'message', authMode: 'inbound', mayPair: !params.isGroup },
-      contextBinding,
-      policy: { dmPolicy: mapped.dmPolicy, groupPolicy: mapped.groupPolicy },
-      ...(mapped.allowFrom ? { allowFrom: mapped.allowFrom } : {}),
-      ...(mapped.groupAllowFrom ? { groupAllowFrom: mapped.groupAllowFrom } : {}),
-    });
-  } catch (err) {
-    params.log?.warn(
-      `[ingress-evidence] resolve failed, dispatching without custody: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return undefined;
+  const timeoutMs = params.timeoutMs ?? INGRESS_RESOLVE_TIMEOUT_MS;
+
+  const resolveParticipant = async (stableId: string): Promise<unknown | undefined> => {
+    try {
+      const result = await withTimeout(
+        resolve({
+          channelId: 'qqbot',
+          accountId: params.accountId,
+          identity: qqbotIngressIdentity,
+          subject: { stableId },
+          conversation: {
+            kind: params.isGroup ? 'group' : 'direct',
+            id: params.peerId,
+          },
+          event: { kind: 'message', authMode: 'inbound', mayPair: !params.isGroup },
+          contextBinding,
+          policy: { dmPolicy: mapped.dmPolicy, groupPolicy: mapped.groupPolicy },
+          ...(mapped.allowFrom ? { allowFrom: mapped.allowFrom } : {}),
+        }),
+        timeoutMs,
+      );
+      if (result === undefined) {
+        params.log?.warn(`[ingress-evidence] resolve timeout after ${timeoutMs}ms (sender dropped)`);
+        return undefined;
+      }
+      // 只有 allow 决策（admission === 'dispatch'）才携带 custody；
+      // 未 allow 时带上去也是 invalid evidence，降级并留痕 reasonCode 便于排障
+      const decision = (result as { ingress?: { admission?: string; reasonCode?: string } } | null)?.ingress;
+      if (decision?.admission !== 'dispatch') {
+        params.log?.warn(
+          `[ingress-evidence] ingress not admitted (reason=${decision?.reasonCode ?? 'unknown'}), `
+          + 'participant dropped — sessions_spawn may be rejected on openclaw >= 2026.11.5',
+        );
+        return undefined;
+      }
+      return result;
+    } catch (err) {
+      params.log?.warn(
+        `[ingress-evidence] resolve failed, participant dropped: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return undefined;
+    }
+  };
+
+  const resolved: unknown[] = [];
+  for (let i = 0; i < participants.length; i++) {
+    const isCarrier = i === participants.length - 1;
+    const one = await resolveParticipant(participants[i]!);
+    if (one === undefined) {
+      // 末项（载体）必须匹配 buildContext 的 sender.id——缺了它数组必 invalid，
+      // 整体降级（不如不带）；非载体失败只丢弃该项，剩余顺序不变、载体仍在末位
+      if (isCarrier) {
+        params.log?.warn('[ingress-evidence] carrier participant failed, dispatching without custody');
+        return undefined;
+      }
+      continue;
+    }
+    resolved.push(one);
   }
 
-  // 只有 allow 决策（admission === 'dispatch'）才携带 custody；
-  // 未 allow 时带上去也是 invalid evidence，降级并留痕 reasonCode 便于排障
-  const decision = (result as { ingress?: { admission?: string; reasonCode?: string } } | null)?.ingress;
-  if (decision?.admission !== 'dispatch') {
-    params.log?.warn(
-      `[ingress-evidence] ingress not admitted (reason=${decision?.reasonCode ?? 'unknown'}), `
-      + 'dispatching without custody — sessions_spawn may be rejected on openclaw >= 2026.11.5',
-    );
+  if (resolved.length === 0) {
     return undefined;
   }
-
-  return result;
+  return resolved.length === 1 ? resolved[0] : resolved;
 }

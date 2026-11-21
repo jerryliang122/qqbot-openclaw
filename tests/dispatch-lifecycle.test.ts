@@ -37,6 +37,7 @@ async function test(name: string, fn: () => Promise<void> | void) {
 const { dispatchToOpenClaw } = await import('../src/dispatch/dispatch.ts');
 const { registerGateway, sendText } = await import('../src/outbound/outbound-service.ts');
 const { _resetAdaptersCache } = await import('../src/adapter/resolve.ts');
+const { isGroupBusy, resetGroupBusyStateForTests } = await import('../src/features/group-session-busy.ts');
 
 // ── 测试基础设施 ──
 
@@ -397,7 +398,6 @@ await test('c2c turn：queueModeOverride 不传（c2c 插嘴语义不变）', as
 // ── channelIngress admission evidence（issue #116）──
 
 group('修3: channelIngress admission evidence（openclaw 11.5+ spawn custody）');
-
 await test('dispatch 全链路：buildContext 收到 channelIngress 与 message.inboundEventKind', async () => {
   _resetAdaptersCache();
   const { msg, ctx, messageId } = makeMsgAndCtx();
@@ -508,6 +508,105 @@ await test('runtime 无 ingress API（旧桩）→ 行为同现状，不传 chan
 
   assert.ok(builtParams, 'buildContext 正常调用');
   assert.equal('channelIngress' in builtParams, false, '无 ingress 时保持旧版入参形态');
+});
+
+// ── 评审补强：busy 窗口 / accountId 归一 / 多参与者透传 ──
+
+group('修5: 群 busy 窗口（evidence resolve 不得阻塞 busy 标记，评审 #4）');
+
+await test('evidence 挂起期间群 busy 已标记；resolve 放行后 turn 完成且 busy 归零', async () => {
+  _resetAdaptersCache();
+  resetGroupBusyStateForTests();
+  const { msg, ctx } = makeMsgAndCtx({ scope: 'group', targetId: 'GROUP_BUSY' });
+
+  let release!: (v: any) => void;
+  const gate = new Promise<any>((res) => { release = res; });
+  let builtParams: any;
+  const runtime = makeFakeRuntime({
+    onInboundRun: async () => ({ dispatched: true }),
+    ingressResolve: () => gate,
+    onBuildContext: (params) => { builtParams = params; },
+  });
+
+  const account = makeAccount();
+  installFakeGateway();
+  const dispatchPromise = dispatchToOpenClaw(ctx, msg, account, runtime);
+
+  // gate 未放行 ⇒ dispatch 停在 try 内 await evidence；但 markGroupTurnStarted
+  // 已同步执行——合批判定（isGroupBusy）必须立即看到「该群在忙」，否则
+  // 窗口内到达的群消息会绕过合批直发（并发 turn / 语义退化）
+  assert.ok(isGroupBusy('test-account', 'GROUP_BUSY'), 'evidence 挂起期间群 busy 必须已标记');
+  assert.equal(builtParams, undefined, 'evidence 未决时 buildContext 不得先行');
+
+  release({ ingress: { admission: 'dispatch' }, senderAccess: { allowed: true } });
+  await dispatchPromise;
+  assert.ok(builtParams, 'evidence 放行后 buildContext 执行');
+  assert.notEqual(builtParams.channelIngress, undefined);
+  assert.ok(!isGroupBusy('test-account', 'GROUP_BUSY'), 'turn 结束后 busy 归零');
+});
+
+group('修6: accountId 归一（evidence 与 context 同源，评审 #1）');
+
+await test('route 缺 accountId → evidence 与 buildContext 两侧同用归一 accountId', async () => {
+  _resetAdaptersCache();
+  const { msg, ctx } = makeMsgAndCtx();
+
+  const ingressCalls: any[] = [];
+  let builtParams: any;
+  const runtime = makeFakeRuntime({
+    onInboundRun: async () => ({ dispatched: true }),
+    ingressResolve: async (p: any) => {
+      ingressCalls.push(p);
+      return { ingress: { admission: 'dispatch' }, senderAccess: { allowed: true } };
+    },
+    onBuildContext: (params) => { builtParams = params; },
+  });
+  // 模拟 resolveAgentRoute 返回缺 accountId 的 route（防御边角）
+  runtime.channel.routing.resolveAgentRoute = () => ({ sessionKey: 'qqbot:test:USER_123', agentId: 'default' });
+
+  const account = makeAccount();
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, runtime);
+
+  assert.equal(ingressCalls.length, 1);
+  assert.equal(ingressCalls[0].accountId, 'test-account', 'evidence 用归一 accountId');
+  assert.equal(builtParams.route.accountId, 'test-account', 'context 的 route.accountId 同源');
+  assert.equal(builtParams.accountId, 'test-account', '顶层 accountId 同源');
+});
+
+group('修7: 多参与者证据透传（跨发言人合批，评审 #3）');
+
+await test('载体 ctx.state.ingressParticipants → 逐参与者 resolve，buildContext 收到数组', async () => {
+  _resetAdaptersCache();
+  resetGroupBusyStateForTests();
+  const { msg, ctx } = makeMsgAndCtx({ scope: 'group', targetId: 'GROUP_M' });
+  // 到达序去重、载体（msg.senderId）末位——与合批路径写入的形态一致
+  (ctx.state as Record<string, unknown>).ingressParticipants = ['A_OPENID', 'B_OPENID', 'USER_123'];
+
+  const ingressCalls: any[] = [];
+  let builtParams: any;
+  const runtime = makeFakeRuntime({
+    onInboundRun: async () => ({ dispatched: true }),
+    ingressResolve: async (p: any) => {
+      ingressCalls.push(p);
+      return { ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, n: ingressCalls.length };
+    },
+    onBuildContext: (params) => { builtParams = params; },
+  });
+
+  const account = makeAccount();
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, runtime);
+
+  assert.deepEqual(
+    ingressCalls.map((p) => p.subject.stableId),
+    ['A_OPENID', 'B_OPENID', 'USER_123'],
+    '逐参与者 resolve，载体（= sender.id）末位',
+  );
+  assert.ok(Array.isArray(builtParams.channelIngress), '多参与者透传为数组');
+  assert.equal(builtParams.channelIngress.length, 3);
+  // 末项必须对应载体（core 契约：末项 rawPrincipalRef === buildContext sender.id）
+  assert.equal(ingressCalls[2].subject.stableId, builtParams.sender.id);
 });
 
 console.log('\n' + '='.repeat(60));

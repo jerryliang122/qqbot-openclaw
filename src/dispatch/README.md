@@ -12,14 +12,16 @@
 | 文件 | 作用 |
 |---|---|
 | `dispatch.ts` | 主流程：`dispatchToOpenClaw`；`buildFallbackRouteSessionKey`（routing API 探测失败时的兜底 key）、`resolveDispatchPeerId` |
+| `ingress-evidence.ts` | **channelIngress admission evidence**（11.5+ spawn custody）：identity / 策略映射 / 多参与者 resolve / 超时降级 → [`docs/agents/ingress-custody.md`](../../docs/agents/ingress-custody.md) |
 | `body-assembler.ts` | `assembleBody` / `assembleMergedGroupBody`——正文装配与群消息合并 |
-| `ctx-builder.ts` | `buildCtxPayload`——构造框架 ctx |
+| `ctx-builder.ts` | `buildCtxPayload`——构造框架 ctx（透传 `channelIngress` 与 `message.inboundEventKind`，契约见 custody 叙事） |
 | `envelope-builder.ts` | `buildEnvelope`——构造 OpenClaw 入站 envelope（`OpenClawInboundMessage`） |
 | `index.ts` | re-export |
 
 ## 相关红线
 
 - **canonical session key 文法是 10.x 硬门槛**（根级）→ 根 [`AGENTS.md`](../../AGENTS.md) §「Session key 与投递」
+- **channelIngress admission evidence 是 11.5+ sessions_spawn 的唯一 custody 来源**（根级红线）→ [`docs/agents/ingress-custody.md`](../../docs/agents/ingress-custody.md)——逐字段契约 / 多参与者数组（载体末位）/ 群 busy 不变量（dispatch 入口 → markGroupTurnStarted 零 await）
 - **route 文法是 canonical 之外的第二道门** → [`docs/agents/session-and-dispatch.md`](../../docs/agents/session-and-dispatch.md)
 - **10.5 的 admission ticket 发生在 replyResolver 之前** → [`docs/agents/session-and-dispatch.md`](../../docs/agents/session-and-dispatch.md) §「10.5 指令/投递语义实测」
 - **c2c 入站防抖合并 + 三类旁路** → [`docs/agents/inbound.md`](../../docs/agents/inbound.md) §「c2c 入站防抖合并」
