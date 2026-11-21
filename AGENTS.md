@@ -20,6 +20,7 @@ OpenClaw 通道插件：把 QQ Bot 官方 API 接入 OpenClaw framework（独立
 |---|---|---|
 | [docs/agents/sdk-compat.md](docs/agents/sdk-compat.md) | openclaw 版本盯版、plugin-sdk 子路径增删、ambient stub、守卫测试 | 动 `openclaw/plugin-sdk/*` 引用、升级钉版 |
 | [docs/agents/session-and-dispatch.md](docs/agents/session-and-dispatch.md) | canonical session key 文法、route 文法、10.5 指令/投递语义 | 动 session key 构造、路由回退、指令处理 |
+| [docs/agents/ingress-custody.md](docs/agents/ingress-custody.md) | channelIngress admission evidence、spawn custody 契约、多参与者数组、群 busy 不变量 | 动 `src/dispatch/ingress-evidence.ts`、ctx-builder 的 channelIngress、合批参与者清单、群 busy 标记时序 |
 | [docs/agents/config-and-credentials.md](docs/agents/config-and-credentials.md) | 配置面、凭据读取、通道能力声明、manifest schema | 改 `src/types.ts` 配置类型、凭据路径、`capabilities` |
 | [docs/agents/outbound-and-quota.md](docs/agents/outbound-and-quota.md) | 被动/主动配额、msg_id 锚点、媒体投递、progress card | 动发送路径、配额扣减、媒体策略 |
 | [docs/agents/chunking.md](docs/agents/chunking.md) | 字形簇安全分块、结构上下文开销封顶 | 动 `src/outbound/chunker.ts` / `src/outbound/grapheme.ts` |
@@ -99,7 +100,7 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 - 日志：用 `createPluginLogger()`（`src/utils/plugin-logger.ts`）。**不要直接 `console.*`**，除非早期 `register()` 路径（runtime logger 尚未接好）。
 - 文本分块上限：`TEXT_CHUNK_LIMIT`（`src/constants.ts`，默认 5000 字）。
 - 斜杠命令：一命令一文件放在 `src/commands/`，经 `buildCommandList()`（`src/commands/index.ts`）注册。
-- 插件 ID：plugin 是 `openclaw-qqbot`，channel 是 `qqbot`——别混。
+- 插件 ID：**manifest 插件 id 已与 channel id 对齐为 `qqbot`（2026-11-22，custody 前提——core 按插件 record id 建 owner，id 不一致则 owner 绑定与 evidence handoff 互斥）**；npm 包名仍是 `@jerryliang122/openclaw-qqbot`，内部自用字符串（队列 lease 前缀 / 面板 remark / Symbol key）沿用 `openclaw-qqbot` 不迁移。
 - **tsup post-build 的 `sanitizeDist()` 是承重的**——把 `new Function` 改写成 `new _F`（protobufjs 模式触发安全扫描器），别剥。
 
 ## Testing instructions
@@ -170,6 +171,11 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 - **所有 c2c 用户默认共享 `agent:main:main` 一个 session**——要多用户隔离得让用户配 `session.dmScope: "per-peer"`。
 - **10.5 的 admission ticket 发生在 replyResolver 之前**——忙碌会话里非 abort 类指令要等活动 turn 结束才被解释，「群里任务跑着发指令没反应」是预期排队语义，不是丢消息。→ 实现见 [`src/dispatch/README.md`](src/dispatch/README.md)
 
+### 入站 custody（channelIngress admission evidence，[详情](docs/agents/ingress-custody.md)）
+
+- **openclaw 11.5 起 `sessions_spawn` 守卫要求 buildContext 入参携带 `channelIngress`**——缺失即 QQ 渠道子代理派发 100% 失败（issue #116）。证据由 `resolveIngressEvidence`（`src/dispatch/ingress-evidence.ts`）每 turn 新鲜 resolve（单次移交）；跨发言人合批传**多参与者数组、载体 sender 恒末位**（core 上限 16，合批路径写 `ctx.state.ingressParticipants`）；binding 四元组与 buildContext 入参逐字相等、accountId 两侧归一同源。
+- **三条硬红线**：① 禁止把插件 `groupAllowFrom`（群 id 白名单）当 core 的群 sender 白名单传——群侧恒 `groupPolicy:'open'`；② 「dispatch 入口 → `markGroupTurnStarted` 零 await」不变量——evidence 只启动 promise、try 内取用；③ 一切 evidence 失败（probe 缺失/抛错/超时/未 allow/载体失败）**降级不传、绝不阻断派发**。→ 实现见 [`src/dispatch/README.md`](src/dispatch/README.md)
+
 ### 出站锚点与配额（[详情](docs/agents/outbound-and-quota.md)）
 
 - **出站锚点模型：显式锚点 or 主动（2026-11-03 移除池化选取）**——挂 msg_id 的被动消息在平台语义上是「对用户消息的回复」，锚点必须来自显式回复意图。网关 `resolveOutboundAnchor` 只透传显式 `opts.msgId`；**无显式锚点（message 工具不带 replyTo、remind/cron、框架直发）一律走主动发送**（烧每日预算）。**红线：禁止重新引入「从缓存挑 msg_id」的池化选取**——它会把回复引用挂到更早的错误消息上（历史演进 7a59a2c→bbed520→e3e2be7 为省预算引入，已按平台语义移除；代价：1000 条/天预算消耗、用户关「允许主动发送」时该类消息拒发）。
@@ -203,6 +209,7 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 | 主题 | 结论在 | 叙事在 |
 |---|---|---|
 | 分块（字形簇 / 上下文开销） | [`src/outbound/README.md`](src/outbound/README.md) | [docs/agents/chunking.md](docs/agents/chunking.md) |
+| 入站 custody（channelIngress / 多参与者 / 群 busy 不变量） | [`src/dispatch/README.md`](src/dispatch/README.md) | [docs/agents/ingress-custody.md](docs/agents/ingress-custody.md) |
 | 流式（段模型 / final 三态 / park） | [`src/outbound/README.md`](src/outbound/README.md) | [docs/agents/streaming.md](docs/agents/streaming.md) |
 | 进度卡 / 问题卡 / 媒体投递 | [`src/outbound/README.md`](src/outbound/README.md) | [docs/agents/outbound-and-quota.md](docs/agents/outbound-and-quota.md) |
 | 入站（防抖 / 守卫 / 语音 / 回告 / 限流） | [`src/middleware/README.md`](src/middleware/README.md) [`src/features/README.md`](src/features/README.md) | [docs/agents/inbound.md](docs/agents/inbound.md) |

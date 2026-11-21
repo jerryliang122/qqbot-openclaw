@@ -40,6 +40,7 @@ import { detectEventMention } from '../utils/mention.js';
 import { shortId } from '../utils/redaction.js';
 import { withDetachedWebhookWork } from './detached-webhook-work.js';
 import { mergeProcessedAttachments } from './inbound-debounce.js';
+import { buildIngressParticipants } from './group-merge.js';
 import { resolveWakeDecision } from './room-event.js';
 import {
   decodeIngressPayload,
@@ -333,6 +334,14 @@ async function dispatchBatch(params: {
         mergeProcessedAttachments(processedList);
     }
     (carrier.ctx.state as Record<string, unknown>).assembledBody = assembled;
+
+    // 参与者清单（channelIngress 多参与者证据，评审 #3）：与内存合批路径
+    // （group-merge 的 buildMergedCarrier）同构——到达序去重、载体 sender 末位。
+    // dispatch 侧读取后逐参与者 resolve；单成员批次不写（走载体缺省）。
+    (carrier.ctx.state as Record<string, unknown>).ingressParticipants = buildIngressParticipants(
+      rebuilt.map((r) => r.msg.senderId),
+      carrier.msg.senderId,
+    );
   }
 
   const carrierMsg = carrier.msg as QQBotInboundMessage;

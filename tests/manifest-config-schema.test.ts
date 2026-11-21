@@ -170,7 +170,7 @@ async function main() {
   await test('manifest 能被框架的 loadPluginManifest 正常解析', () => {
     const res = fw.manifest.r(process.cwd()) as { ok: boolean; manifest?: Manifest; error?: unknown };
     assert.ok(res.ok, `manifest 解析失败：${JSON.stringify(res.error ?? {}, null, 2)}`);
-    assert.strictEqual(res.manifest?.id, 'openclaw-qqbot');
+    assert.strictEqual(res.manifest?.id, 'qqbot');
     assert.ok(res.manifest?.channels?.includes('qqbot'), '应声明 qqbot 通道');
   });
 

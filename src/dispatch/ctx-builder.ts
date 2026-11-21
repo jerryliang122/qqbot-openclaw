@@ -17,10 +17,24 @@ export interface CtxPayloadParams {
   msg: QQBotInboundMessage;
   ctx: MiddlewareContext;
   adapters: RuntimeAdapters;
+  /**
+   * 入站 admission evidence（issue #116）：openclaw 11.5+ 的 sessions_spawn
+   * 派发守卫要求 context 携带 owner 绑定的 ingress resolution（custody）。
+   * 由 dispatch 侧每 turn 新鲜 resolve（dispatch/ingress-evidence.ts）；
+   * undefined = 不携带（旧版行为，其余功能不受影响）。
+   */
+  channelIngress?: unknown;
+  /**
+   * 入站事件分类（user_request / room_event）。
+   * 必须作为 buildContext 入参 `message.inboundEventKind` 传入——admission
+   * evidence 的 binding 校验读的是入参（构建后补 `ctxPayload.InboundEventKind`
+   * 对 evidence 无效，后者保留以兼容其他消费方）。
+   */
+  inboundEventKind?: string;
 }
 
 export function buildCtxPayload(params: CtxPayloadParams): any {
-  const { assembled, envelope, route, msg, ctx, adapters } = params;
+  const { assembled, envelope, route, msg, ctx, adapters, channelIngress, inboundEventKind } = params;
 
   const isSlashCommand = /^\//.test(assembled.rawBody ?? '');
   const convKind = envelope.chatScope === 'group' ? 'group' : 'direct';
@@ -68,6 +82,9 @@ export function buildCtxPayload(params: CtxPayloadParams): any {
     provider: 'qqbot',
     surface: 'qqbot',
     messageId: envelope.messageId,
+    // admission evidence（issue #116）：owner 绑定的 ingress resolution，
+    // 11.5+ spawn custody 的唯一来源；undefined 时不传（保持旧版行为）
+    ...(channelIngress !== undefined ? { channelIngress } : {}),
     timestamp: msgTimestamp ? new Date(msgTimestamp).getTime() : Date.now(),
     from: envelope.targetId,
     sender: { id: envelope.senderId, name: envelope.senderName, ...(senderRoles ? { roles: senderRoles } : {}) },
@@ -81,6 +98,9 @@ export function buildCtxPayload(params: CtxPayloadParams): any {
       bodyForAgent: assembled.agentBody,
       rawBody: assembled.rawBody,
       commandBody: assembled.rawBody,
+      // admission evidence 的 binding 校验读入参（缺省按 "user_request" 比对），
+      // room_event turn 必须显式传入，否则 contextBinding.inboundEventKind 对不上
+      ...(inboundEventKind ? { inboundEventKind } : {}),
     },
     route: {
       agentId: route.agentId ?? 'default',
