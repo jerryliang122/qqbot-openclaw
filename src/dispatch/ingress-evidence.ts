@@ -45,9 +45,17 @@
 import { defineStableChannelIngressIdentity } from 'openclaw/plugin-sdk/channel-ingress-runtime';
 import type { RuntimeAdapters } from '../adapter/resolve.js';
 import type { PluginLogger } from '../utils/plugin-logger.js';
+import { shortId, sessionKeyDigest } from '../utils/redaction.js';
 
 /** 单次 ingress resolve 的等待上限（超时按「该参与者不可用」降级，不阻断派发） */
 const INGRESS_RESOLVE_TIMEOUT_MS = 5000;
+
+/**
+ * 参与者证据数组的 core 上限（`CHANNEL_ADMISSION_EVIDENCE_MAX_CONTRIBUTIONS`，
+ * 10.5/11.6 同值）。合批去重 sender 正常 ≤ maxBatchSize(10)，此为配置放宽/
+ * 未来演进时的硬保险：超出时**保留最新 16 个**（载体恒在末位不受影响）。
+ */
+const MAX_EVIDENCE_PARTICIPANTS = 16;
 
 /**
  * QQ openid 身份描述（对齐 telegram ingress identity 形态）。
@@ -239,6 +247,15 @@ export async function resolveIngressEvidence(
   if (participants.length === 0) {
     return undefined;
   }
+  if (participants.length > MAX_EVIDENCE_PARTICIPANTS) {
+    // core 拒绝超过上限的证据数组 ⇒ 超出部分静默丢 custody；保留最新 16 个
+    // （载体恒在末位），最早的参与者被舍弃——批次正文仍完整，只是 provenance 少记
+    const droppedCount = participants.length - MAX_EVIDENCE_PARTICIPANTS;
+    participants.splice(0, droppedCount);
+    params.log?.warn(
+      `[ingress-evidence] participants capped to ${MAX_EVIDENCE_PARTICIPANTS} (dropped ${droppedCount} earliest, core array limit)`,
+    );
+  }
 
   // 契约：binding 四元组与 ctx-builder 传给 buildContext 的最终值逐字相等
   const contextBinding = {
@@ -250,7 +267,17 @@ export async function resolveIngressEvidence(
 
   const timeoutMs = params.timeoutMs ?? INGRESS_RESOLVE_TIMEOUT_MS;
 
-  const resolveParticipant = async (stableId: string): Promise<unknown | undefined> => {
+  /**
+   * 错误信息脱敏：resolver 的 err.message 可能内嵌参与者 openid / binding 的
+   * sessionKey——INFO 以上日志不得落完整标识符（/bot-logs 原样导出本地日志）。
+   * openid → shortId()，sessionKey → sha256 前 8 位。
+   */
+  const redactErrorDetail = (text: string, stableId: string): string =>
+    text
+      .split(stableId).join(shortId(stableId))
+      .split(contextBinding.sessionKey).join(sessionKeyDigest(contextBinding.sessionKey));
+
+  const resolveParticipant = async (stableId: string, budgetMs: number): Promise<unknown | undefined> => {
     try {
       const result = await withTimeout(
         resolve({
@@ -267,10 +294,10 @@ export async function resolveIngressEvidence(
           policy: { dmPolicy: mapped.dmPolicy, groupPolicy: mapped.groupPolicy },
           ...(mapped.allowFrom ? { allowFrom: mapped.allowFrom } : {}),
         }),
-        timeoutMs,
+        budgetMs,
       );
       if (result === undefined) {
-        params.log?.warn(`[ingress-evidence] resolve timeout after ${timeoutMs}ms (sender dropped)`);
+        params.log?.warn(`[ingress-evidence] resolve timeout after ${budgetMs}ms (sender=${shortId(stableId)} dropped)`);
         return undefined;
       }
       // 只有 allow 决策（admission === 'dispatch'）才携带 custody；
@@ -278,7 +305,7 @@ export async function resolveIngressEvidence(
       const decision = (result as { ingress?: { admission?: string; reasonCode?: string } } | null)?.ingress;
       if (decision?.admission !== 'dispatch') {
         params.log?.warn(
-          `[ingress-evidence] ingress not admitted (reason=${decision?.reasonCode ?? 'unknown'}), `
+          `[ingress-evidence] ingress not admitted (reason=${decision?.reasonCode ?? 'unknown'}, sender=${shortId(stableId)}), `
           + 'participant dropped — sessions_spawn may be rejected on openclaw >= 2026.11.5',
         );
         return undefined;
@@ -286,19 +313,30 @@ export async function resolveIngressEvidence(
       return result;
     } catch (err) {
       params.log?.warn(
-        `[ingress-evidence] resolve failed, participant dropped: ${
-          err instanceof Error ? err.message : String(err)
+        `[ingress-evidence] resolve failed (sender=${shortId(stableId)}), participant dropped: ${
+          redactErrorDetail(err instanceof Error ? err.message : String(err), stableId)
         }`,
       );
       return undefined;
     }
   };
 
+  // 并发 resolve + **共享截止时间**：逐个串行 await 会让 N 个停滞参与者拖成
+  // N×timeout 的总延迟（10 人批最坏 ~50s，群全程 busy）。所有参与者并发起跑，
+  // 每人只分得「剩余预算」；Promise.all 保序，失败者为 undefined。
+  const deadline = Date.now() + timeoutMs;
+  const settled = await Promise.all(
+    participants.map((stableId) => {
+      const remaining = Math.max(0, deadline - Date.now());
+      return resolveParticipant(stableId!, remaining);
+    }),
+  );
+
   const resolved: unknown[] = [];
-  for (let i = 0; i < participants.length; i++) {
-    const isCarrier = i === participants.length - 1;
-    const one = await resolveParticipant(participants[i]!);
+  for (let i = 0; i < settled.length; i++) {
+    const one = settled[i];
     if (one === undefined) {
+      const isCarrier = i === settled.length - 1;
       // 末项（载体）必须匹配 buildContext 的 sender.id——缺了它数组必 invalid，
       // 整体降级（不如不带）；非载体失败只丢弃该项，剩余顺序不变、载体仍在末位
       if (isCarrier) {

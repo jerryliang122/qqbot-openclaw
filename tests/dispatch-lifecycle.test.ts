@@ -437,11 +437,12 @@ await test('dispatch 全链路：buildContext 收到 channelIngress 与 message.
   assert.deepEqual(ingressCalls[0].conversation, { kind: builtParams.conversation.kind, id: builtParams.conversation.id });
 });
 
-await test('两次 dispatch → 两次独立 resolve（单次移交，无复用）', async () => {
+await test('两次 dispatch → 两次独立 resolve，buildContext 各收本 turn 的新证据（评审）', async () => {
   _resetAdaptersCache();
 
   const ingressCalls: any[] = [];
   const ingressResults: any[] = [];
+  const builtInputs: any[] = [];
   const runtime = makeFakeRuntime({
     onInboundRun: async () => ({ dispatched: true }),
     ingressResolve: async (params) => {
@@ -451,6 +452,7 @@ await test('两次 dispatch → 两次独立 resolve（单次移交，无复用�
       ingressResults.push(result);
       return result;
     },
+    onBuildContext: (params) => { builtInputs.push(params); },
   });
 
   const account = makeAccount();
@@ -469,6 +471,11 @@ await test('两次 dispatch → 两次独立 resolve（单次移交，无复用�
     '两个 turn 的 binding 各自新鲜（绑定各自的消息）',
   );
   assert.notStrictEqual(ingressResults[0], ingressResults[1], '两次 resolve 返回不同对象（无复用）');
+  // 证据新鲜度必须穿透到 buildContext：每个 context 收到的正是本 turn resolve
+  // 返回的那个对象（防「resolve 两次却复用第一次结果」的回归）
+  assert.equal(builtInputs.length, 2);
+  assert.strictEqual(builtInputs[0].channelIngress, ingressResults[0], '第 1 个 context 收到第 1 次的证据');
+  assert.strictEqual(builtInputs[1].channelIngress, ingressResults[1], '第 2 个 context 收到第 2 次的证据');
 });
 
 await test('resolve 失败 → 派发继续且不传 channelIngress（降级不阻断）', async () => {
@@ -589,7 +596,7 @@ await test('载体 ctx.state.ingressParticipants → 逐参与者 resolve，buil
     onInboundRun: async () => ({ dispatched: true }),
     ingressResolve: async (p: any) => {
       ingressCalls.push(p);
-      return { ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, n: ingressCalls.length };
+      return { ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, stableId: p.subject.stableId };
     },
     onBuildContext: (params) => { builtParams = params; },
   });
@@ -605,7 +612,11 @@ await test('载体 ctx.state.ingressParticipants → 逐参与者 resolve，buil
   );
   assert.ok(Array.isArray(builtParams.channelIngress), '多参与者透传为数组');
   assert.equal(builtParams.channelIngress.length, 3);
-  // 末项必须对应载体（core 契约：末项 rawPrincipalRef === buildContext sender.id）
+  // 数组成员与顺序如实（评审：防换序/替换回归），载体末项对应 sender.id
+  assert.deepEqual(
+    builtParams.channelIngress.map((r: any) => r.stableId),
+    ['A_OPENID', 'B_OPENID', 'USER_123'],
+  );
   assert.equal(ingressCalls[2].subject.stableId, builtParams.sender.id);
 });
 

@@ -173,11 +173,8 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 
 ### 入站 custody（channelIngress admission evidence，[详情](docs/agents/ingress-custody.md)）
 
-- **openclaw 11.5 起 `sessions_spawn` 守卫要求 buildContext 携带 `channelIngress`**——缺失即 QQ 渠道子代理派发 100% 失败（issue #116，报 `Requester provenance requires trusted in-process Gateway dispatch.`）。证据由 `resolveIngressEvidence`（`src/dispatch/ingress-evidence.ts`）逐 turn 新鲜 resolve（单次移交，绝不复用），经 ctx-builder 以 `channelIngress` + `message.inboundEventKind` **入参**传入（构建后补 `ctxPayload.InboundEventKind` 对 evidence 检查无效）。binding 四元组（agentId/sessionKey/messageId/inboundEventKind）与 buildContext 入参逐字相等；accountId 两侧归一同源。
-- **跨发言人合批必须传多参与者数组、载体 sender 强制末位**（core 契约：末项 rawPrincipalRef === buildContext 的 `sender.id`）——合批路径在载体 `ctx.state.ingressParticipants` 写到达序去重清单；载体参与者失败整体降级，非载体失败仅丢弃该项。
-- **禁止把插件 `groupAllowFrom`（群 id 白名单，access-control 按 groupOpenid 匹配）当 core 的群 sender 白名单传**——语义错向，会让每个 sender 判 not-allowlisted、配置群白名单的群全部丢 custody。群侧恒 `groupPolicy:'open'`、永不传该参数。
-- **「dispatch 入口 → `markGroupTurnStarted` 之间零 await」是不变量**——evidence resolve 只启动 promise（上游不等待），结果在 try 块内取用、`buildCtxPayload` 也在 try 内构建（异常路径与 busy 归零配对）。新增需 await 的逻辑必须放到 busy 标记之后。
-- **降级语义**：probe 缺失 / resolve 抛错 / 超时（5s）/ 决策未 allow / 载体失败 ⇒ 一律不传 `channelIngress`，**绝不阻断入站派发**。→ 实现见 [`src/dispatch/README.md`](src/dispatch/README.md)
+- **openclaw 11.5 起 `sessions_spawn` 守卫要求 buildContext 入参携带 `channelIngress`**——缺失即 QQ 渠道子代理派发 100% 失败（issue #116）。证据由 `resolveIngressEvidence`（`src/dispatch/ingress-evidence.ts`）每 turn 新鲜 resolve（单次移交）；跨发言人合批传**多参与者数组、载体 sender 恒末位**（core 上限 16，合批路径写 `ctx.state.ingressParticipants`）；binding 四元组与 buildContext 入参逐字相等、accountId 两侧归一同源。
+- **三条硬红线**：① 禁止把插件 `groupAllowFrom`（群 id 白名单）当 core 的群 sender 白名单传——群侧恒 `groupPolicy:'open'`；② 「dispatch 入口 → `markGroupTurnStarted` 零 await」不变量——evidence 只启动 promise、try 内取用；③ 一切 evidence 失败（probe 缺失/抛错/超时/未 allow/载体失败）**降级不传、绝不阻断派发**。→ 实现见 [`src/dispatch/README.md`](src/dispatch/README.md)
 
 ### 出站锚点与配额（[详情](docs/agents/outbound-and-quota.md)）
 

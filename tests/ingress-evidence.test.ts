@@ -67,13 +67,15 @@ function makeIngressRuntime(resolve?: (params: any) => Promise<any>) {
   } as any;
 }
 
-/** dispatch-allowed 的 resolve 桩，捕获入参（每个参与者返回新鲜对象） */
+/** dispatch-allowed 的 resolve 桩，捕获入参（每参与者返回带标记的新鲜对象） */
 function makeAdmittedResolve(captured: any[] = []) {
   return async (params: any) => {
     captured.push(params);
     return {
       ingress: { admission: 'dispatch', reasonCode: 'dm_policy_allowlisted' },
       senderAccess: { allowed: true, reasonCode: 'dm_policy_allowlisted' },
+      // 参与者标记：断言输出数组的成员与顺序（防换序/替换回归）
+      stableId: params.subject.stableId,
       n: captured.length,
     };
   };
@@ -354,6 +356,11 @@ await test('按到达序逐参与者 resolve，载体末位；返回数组且各
   assert.equal(result.length, 3);
   assert.equal(captured.length, 3, '每个参与者独立 resolve');
   assert.deepEqual(captured.map((p) => p.subject.stableId), ['SENDER_A', 'SENDER_B', 'SENDER_CARRIER'], '载体在末位');
+  // 输出数组与参与者一一对应、顺序一致（防换序/替换回归）
+  assert.deepEqual(
+    (result as any[]).map((r) => r.stableId),
+    ['SENDER_A', 'SENDER_B', 'SENDER_CARRIER'],
+  );
   // 各项是不同对象（新鲜 resolve，无复用）
   assert.notStrictEqual(result[0], result[1]);
   assert.notStrictEqual(result[1], result[2]);
@@ -364,20 +371,25 @@ await test('按到达序逐参与者 resolve，载体末位；返回数组且各
   assert.equal(binding.agentId, 'main');
 });
 
-await test('非载体参与者失败 → 仅丢弃该项，剩余顺序不变、载体仍在末位', async () => {
+await test('非载体参与者失败 → 仅丢弃该项，输出成员与顺序如实（不含失败者）', async () => {
   _resetAdaptersCache();
   let call = 0;
   const result = await resolveIngressEvidence(makeGroupEvidenceParams({
-    adapters: getAdapters(makeIngressRuntime(async () => {
+    adapters: getAdapters(makeIngressRuntime(async (p: any) => {
       call++;
       if (call === 1) return { ingress: { admission: 'drop', reasonCode: 'x' } }; // SENDER_A 失败
-      return { ingress: { admission: 'dispatch' }, senderAccess: { allowed: true } };
+      return { ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, stableId: p.subject.stableId };
     })),
     participants: ['SENDER_A', 'SENDER_B', 'SENDER_CARRIER'],
   }));
   assert.ok(Array.isArray(result));
   assert.equal(result.length, 2, '失败的非载体被丢弃');
   assert.equal(call, 3, '全部参与者都被尝试');
+  assert.deepEqual(
+    (result as any[]).map((r) => r.stableId),
+    ['SENDER_B', 'SENDER_CARRIER'],
+    '输出恰好是获准参与者、顺序不变、载体末位',
+  );
 });
 
 await test('载体（末位）失败 → 整体降级返回 undefined', async () => {
@@ -431,6 +443,65 @@ await test('脏数据防御：空串/非字符串被过滤；carrierSenderId 缺
     buildIngressParticipants(['A', 'B', 'A'], undefined),
     ['A', 'B'],
   );
+});
+
+// ── 7. 上限 / 并发截止时间 / 日志脱敏 ──
+
+group('评审补强：core 上限 / 共享截止时间 / 错误脱敏');
+
+await test('参与者超过 core 上限 16 → 只 resolve/保留最新 16 个，载体仍在末位', async () => {
+  _resetAdaptersCache();
+  const captured: any[] = [];
+  const many = Array.from({ length: 18 }, (_, i) => `SENDER_${String(i).padStart(2, '0')}`);
+  const result = await resolveIngressEvidence(makeGroupEvidenceParams({
+    adapters: getAdapters(makeIngressRuntime(makeAdmittedResolve(captured))),
+    participants: many,
+  }));
+  assert.ok(Array.isArray(result));
+  assert.equal(result.length, 16, '输出恰好 16 项（core CHANNEL_ADMISSION_EVIDENCE_MAX_CONTRIBUTIONS）');
+  assert.equal(captured.length, 16, '被舍弃的最早参与者不再触发 resolve');
+  const kept = many.slice(-16);
+  assert.deepEqual((result as any[]).map((r) => r.stableId), kept);
+  assert.equal(kept[kept.length - 1], 'SENDER_17', '载体（原末位）保持末位');
+});
+
+await test('共享截止时间：N 个停滞参与者的总耗时 ≈ 一个 timeout（非 N×timeout）', async () => {
+  _resetAdaptersCache();
+  const participants = Array.from({ length: 6 }, (_, i) => `SENDER_${i}`);
+  const timeoutMs = 150;
+  const startedAt = Date.now();
+  const result = await resolveIngressEvidence(makeGroupEvidenceParams({
+    adapters: getAdapters(makeIngressRuntime(() => new Promise(() => {}))),
+    participants,
+    timeoutMs,
+  }));
+  const elapsed = Date.now() - startedAt;
+  assert.equal(result, undefined, '全部超时（含载体）→ 整体降级');
+  // 串行实现最坏 6×150=900ms；共享截止时间实现 ≈150ms。阈值取 500ms，
+  // 两侧都不重叠、CI 抖动安全
+  assert.ok(elapsed < 500, `共享截止时间内完成（elapsed=${elapsed}ms < 500ms，串行最坏 900ms）`);
+});
+
+await test('resolve 抛错 → WARN 不落完整 openid/sessionKey（脱敏红线）', async () => {
+  _resetAdaptersCache();
+  const { shortId } = await import('../src/utils/redaction.ts');
+  const warnings: string[] = [];
+  const log = { debug() {}, info() {}, warn: (m: string) => warnings.push(m) } as any;
+  const result = await resolveIngressEvidence(makeEvidenceParams({
+    adapters: getAdapters(makeIngressRuntime(async () => {
+      throw new Error('resolver blew up for OPENID_LEAK_TEST in session agent:main:qqbot:direct:OPENID_LEAK_TEST');
+    })),
+    route: { sessionKey: 'agent:main:qqbot:direct:OPENID_LEAK_TEST' },
+    participants: ['OPENID_LEAK_TEST'],
+    log,
+  }));
+  assert.equal(result, undefined);
+  // 单参与者=载体：失败 WARN + 载体降级 WARN 各一条，都不得含完整标识符
+  assert.equal(warnings.length, 2);
+  for (const line of warnings) {
+    assert.ok(!line.includes('OPENID_LEAK_TEST'), `日志不得含完整 openid / sessionKey 原文：${line}`);
+  }
+  assert.ok(warnings[0]!.includes(shortId('OPENID_LEAK_TEST')), 'openid 以 shortId 形式呈现');
 });
 
 // ── 汇总 ──

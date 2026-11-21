@@ -1254,7 +1254,9 @@ export async function dispatchToOpenClaw(
 
     await adapters.inboundRun!({
       channel: 'qqbot',
-      accountId: route.accountId,
+      // 归一 accountId：inboundRun / resolveTurn 与 ctxPayload / evidence 同源
+      // （评审：route 缺 accountId 时 core 会拿到 undefined 的账号归属）
+      accountId: routeAccountId,
       raw: envelope,
       adapter: {
         ingest: (raw: any) => ({
@@ -1266,7 +1268,7 @@ export async function dispatchToOpenClaw(
         }),
         resolveTurn: (_input: unknown, _eventClass: unknown, _preflight: unknown) => ({
           channel: 'qqbot',
-          accountId: route.accountId,
+          accountId: routeAccountId,
           routeSessionKey: route.sessionKey,
           storePath,
           ctxPayload,

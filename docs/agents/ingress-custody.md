@@ -26,7 +26,7 @@ sessions_spawn（带 requester）
 | 位置 | 职责 |
 |---|---|
 | `src/adapter/resolve.ts` | probe `['channel','inbound','ingress','resolve']` → `adapters.resolveChannelMessageIngress`（Capability Probe 模式，与 buildContext 同款） |
-| `src/dispatch/ingress-evidence.ts` | identity（`defineStableChannelIngressIdentity`：key `qqbot-openid` / verified / pii）、策略映射 `mapIngressPolicy`、多参与者逐个 resolve（`resolveIngressEvidence`）、有界等待 |
+| `src/dispatch/ingress-evidence.ts` | identity（`defineStableChannelIngressIdentity`：key `qqbot-openid` / verified / pii）、策略映射 `mapIngressPolicy`、多参与者**并发** resolve（共享截止时间）、core 上限 16 裁剪、错误脱敏 |
 | `src/dispatch/ctx-builder.ts` | 把 `channelIngress` 与 `message.inboundEventKind` 透传进 `buildInboundContext` 入参 |
 | `src/dispatch/dispatch.ts` | 编排：只**启动** evidence promise（不 await）→ 群 busy 标记 → try 内 await + `buildCtxPayload` |
 
@@ -46,7 +46,9 @@ core 的 `contextHandoffMatches` / `bindParticipants` 逐字段校验（admissio
 4. **subject / rawPrincipalRef**：末项的 `subject.stableId` === buildContext 的 `sender.id`（= 载体 sender）。
 5. **决策必须 allow**：`ingress.admission === 'dispatch'` 只在最终决策 allow 时出现——策略映射必须让 resolution 得出 allowed（到达 dispatch 的消息都已被 access-control 放行，映射如实反射即可）。
 6. **单次移交**：每个 resolved 对象 `handoff.consumed` 只能消费一次、数组内引用重复判 invalid ⇒ **每参与者每次独立新鲜 resolve**，绝不跨消息/跨 turn 复用。
-7. **数组多参与者**（core 原生支持，上限 16；合批去重 sender ≤ maxBatchSize=10）：**载体必须是数组末项**（末项 rawPrincipalRef 取 `sender.id`，非末项取各自 binding 的）；Telegram 先例就是传数组。
+7. **数组多参与者**（core 原生支持，上限 16——`CHANNEL_ADMISSION_EVIDENCE_MAX_CONTRIBUTIONS`；插件在 `resolveIngressEvidence` 入口**硬裁剪到最新 16 个**，载体恒末位不受影响，被舍弃的最早参与者不触发 resolve）：**载体必须是数组末项**（末项 rawPrincipalRef 取 `sender.id`，非末项取各自 binding 的）；Telegram 先例就是传数组。合批去重 sender 正常 ≤ maxBatchSize(10)，裁剪是配置放宽/未来演进的保险。
+8. **参与者并发 + 共享截止时间**：逐个串行 await 会让 N 个停滞参与者拖成 N×timeout（10 人批最坏 ~50s、群全程 busy）——所有参与者并发起跑（`Promise.all` 保序），每人只分得剩余预算，总等待恒 ≈ 一个 timeout。
+9. **日志脱敏**：resolver 的 `err.message` 可能内嵌 openid / sessionKey——WARN 前用 `shortId()` / `sessionKeyDigest()`（`src/utils/redaction.ts`）替换原文（根级红线：INFO 以上日志不得落完整标识符，`/bot-logs` 原样导出）。
 
 ## 策略映射（`mapIngressPolicy`）与「语义错向」坑
 
@@ -66,8 +68,9 @@ core 的 `contextHandoffMatches` / `bindParticipants` 逐字段校验（admissio
 | 场景 | 行为 |
 |---|---|
 | probe 缺失（`adapters.resolveChannelMessageIngress` null） | 不传；行为=旧版（无 custody，11.5+ 上 spawn 失败但其余功能不受影响；10.x 无守卫无感） |
-| resolve 抛错 / 超时（默认 5s，`timeoutMs` 可注入） | 该参与者丢弃 + WARN；迟到的 resolve 结果被丢弃（handoff 未消费，无核心侧副作用） |
-| 决策未 allow（`admission !== 'dispatch'`） | 该参与者丢弃 + WARN（含 reasonCode） |
+| resolve 抛错 / 超时（默认 5s **共享截止时间**，`timeoutMs` 可注入） | 该参与者丢弃 + WARN（错误信息经 shortId/sessionKeyDigest 脱敏）；迟到的 resolve 结果被丢弃（handoff 未消费，无核心侧副作用） |
+| 决策未 allow（`admission !== 'dispatch'`） | 该参与者丢弃 + WARN（含 reasonCode，sender 以 shortId 记） |
+| 参与者超过 core 上限 16 | 裁剪保留最新 16 个（载体末位不受影响）+ WARN；被舍弃者不触发 resolve |
 | 非载体参与者失败 | 仅丢弃该项（剩余顺序不变、载体仍在末位） |
 | **载体（末项）失败** | **整体降级 undefined**（末项必须匹配 `sender.id`，缺它数组必 invalid，不如不带） |
 | 策略映射降级（c2c disabled） | 不调 resolver |
@@ -80,5 +83,5 @@ core 的 `contextHandoffMatches` / `bindParticipants` 逐字段校验（admissio
 
 ## 测试索引
 
-- `tests/ingress-evidence.test.ts`（27 例）：probe 哨兵（防绑错函数）、identity 形状（`{primary:{key,authentication,normalize,sensitivity}}`）、策略映射表驱动（含群语义错向防护）、单/多参与者契约、超时、全部降级路径、`buildIngressParticipants` 去重与载体末位。
-- `tests/dispatch-lifecycle.test.ts`：全链路透传、每 turn 新鲜 resolve、失败降级、旧 runtime 形态不变、**busy 窗口**（evidence 挂起期间 `isGroupBusy` 已标记）、**accountId 归一**、**多参与者数组透传**（载体=sender.id 末位）。
+- `tests/ingress-evidence.test.ts`（30 例）：probe 哨兵（防绑错函数）、identity 形状（`{primary:{key,authentication,normalize,sensitivity}}`）、策略映射表驱动（含群语义错向防护）、单/多参与者契约（输出成员与顺序断言）、超时、**共享截止时间**（N 停滞参与者总耗时 ≈ 一个 timeout）、**16 上限裁剪**、**错误脱敏**（不落完整 openid/sessionKey）、全部降级路径、`buildIngressParticipants` 去重与载体末位。
+- `tests/dispatch-lifecycle.test.ts`：全链路透传、**每 turn 证据新鲜度穿透到 buildContext**（identity 比对）、失败降级、旧 runtime 形态不变、**busy 窗口**（evidence 挂起期间 `isGroupBusy` 已标记）、**accountId 归一**、**多参与者数组透传**（成员顺序 + 载体=sender.id 末位）。
