@@ -21,6 +21,7 @@ import { sendQuestionMessage } from '../outbound/question-send.js';
 import { sendMedia } from '../outbound/media-send.js';
 import { deliverReply, resolveMediaUrls, formatMediaFailureNotice, type DeliverPayload, type DeliverInfo, type DeliverContext } from '../outbound/deliver-pipeline.js';
 import { buildCtxPayload } from './ctx-builder.js';
+import { resolveIngressEvidence, resolveAccessPolicyInput } from './ingress-evidence.js';
 
 import { DeliverDebouncer } from '../outbound/debounce.js';
 import { StreamingController, shouldUseStreaming } from '../outbound/streaming-controller.js';
@@ -577,7 +578,33 @@ export async function dispatchToOpenClaw(
   }
   const storePath = adapters.resolveStorePath?.((cfg as any)?.session?.store, { agentId }) ?? '';
 
-  const ctxPayload = buildCtxPayload({ assembled, envelope, route, msg, ctx, adapters });
+  // ── channelIngress admission evidence（issue #116）──
+  // openclaw 11.5+ 的 sessions_spawn 派发守卫要求 context 携带 owner 绑定的
+  // ingress resolution（custody）。每 turn 新鲜 resolve（单次移交约束），
+  // 失败/不可用一律降级为不传——绝不阻断入站派发。所有入站路径（直发、
+  // 群合批、durable 队列 drain）都汇入本函数，修一处全覆盖。
+  const channelIngress = await resolveIngressEvidence({
+    adapters,
+    envelope,
+    route,
+    fallbackAccountId: account.accountId,
+    isGroup,
+    peerId,
+    inboundEventKind,
+    policy: resolveAccessPolicyInput(ctx, account, isGroup),
+    log: dlog,
+  });
+
+  const ctxPayload = buildCtxPayload({
+    assembled,
+    envelope,
+    route,
+    msg,
+    ctx,
+    adapters,
+    channelIngress,
+    inboundEventKind,
+  });
   // room_event 分类标记：框架据此压制自动回复投递 / typing / steer
   // （对齐 telegram 的 ctxPayload.InboundEventKind 约定）
   ctxPayload.InboundEventKind = inboundEventKind;

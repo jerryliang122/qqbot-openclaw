@@ -53,13 +53,21 @@ interface CapturedDispatch {
 function makeFakeRuntime(opts: {
   onInboundRun?: (params: any) => Promise<any>;
   dispatchReply?: (params: any) => any;
+  /** 可选：channel.inbound.ingress.resolve 桩（channelIngress admission evidence） */
+  ingressResolve?: (params: any) => Promise<any>;
+  /** 可选：捕获 buildContext 入参 */
+  onBuildContext?: (params: any) => void;
 } = {}) {
   return {
     version: 'test',
     channel: {
       inbound: {
         ...(opts.onInboundRun ? { run: (params: any) => opts.onInboundRun!(params) } : {}),
-        buildContext: (params: any) => ({ ...params, __built: true }),
+        buildContext: (params: any) => {
+          opts.onBuildContext?.(params);
+          return { ...params, __built: true };
+        },
+        ...(opts.ingressResolve ? { ingress: { resolve: opts.ingressResolve } } : {}),
       },
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: (params: any) => {
@@ -384,6 +392,122 @@ await test('c2c turn：queueModeOverride 不传（c2c 插嘴语义不变）', as
 
   const replyOptions = (capturedDispatch as any)?.replyOptions;
   assert.equal(replyOptions?.queueModeOverride, undefined, 'c2c 不传 queueModeOverride');
+});
+
+// ── channelIngress admission evidence（issue #116）──
+
+group('修3: channelIngress admission evidence（openclaw 11.5+ spawn custody）');
+
+await test('dispatch 全链路：buildContext 收到 channelIngress 与 message.inboundEventKind', async () => {
+  _resetAdaptersCache();
+  const { msg, ctx, messageId } = makeMsgAndCtx();
+
+  const ingressCalls: any[] = [];
+  const resolvedEvidence = { ingress: { admission: 'dispatch' }, senderAccess: { allowed: true } };
+  let builtParams: any;
+
+  const runtime = makeFakeRuntime({
+    onInboundRun: async () => ({ dispatched: true }),
+    ingressResolve: async (params) => {
+      ingressCalls.push(params);
+      return resolvedEvidence;
+    },
+    onBuildContext: (params) => { builtParams = params; },
+  });
+
+  const account = makeAccount();
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, runtime);
+
+  assert.ok(builtParams, 'buildContext 应被调用');
+  assert.strictEqual(builtParams.channelIngress, resolvedEvidence, 'channelIngress 必须原样透传');
+  assert.equal(builtParams.message.inboundEventKind, 'user_request', 'c2c turn 的入参 inboundEventKind');
+  assert.equal(ingressCalls.length, 1, '每 turn 恰好一次 ingress resolve');
+
+  // resolve 入参的 binding 与 buildContext 入参逐字段对齐（evidence 契约）
+  const binding = ingressCalls[0].contextBinding;
+  assert.equal(binding.messageId, messageId);
+  assert.equal(binding.messageId, builtParams.messageId);
+  assert.equal(binding.sessionKey, builtParams.route.routeSessionKey);
+  assert.equal(binding.agentId, builtParams.route.agentId);
+  assert.equal(binding.inboundEventKind, builtParams.message.inboundEventKind);
+  assert.equal(binding.nativeChannelId, undefined, 'binding 不含 nativeChannelId（与 buildContext 一致）');
+  assert.equal(ingressCalls[0].channelId, 'qqbot');
+  assert.equal(ingressCalls[0].subject.stableId, builtParams.sender.id);
+  assert.deepEqual(ingressCalls[0].conversation, { kind: builtParams.conversation.kind, id: builtParams.conversation.id });
+});
+
+await test('两次 dispatch → 两次独立 resolve（单次移交，无复用）', async () => {
+  _resetAdaptersCache();
+
+  const ingressCalls: any[] = [];
+  const ingressResults: any[] = [];
+  const runtime = makeFakeRuntime({
+    onInboundRun: async () => ({ dispatched: true }),
+    ingressResolve: async (params) => {
+      ingressCalls.push(params);
+      // 每次 resolve 返回新鲜对象，模拟 recordChannelIngressResolution 单次移交语义
+      const result = { ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, n: ingressCalls.length };
+      ingressResults.push(result);
+      return result;
+    },
+  });
+
+  const account = makeAccount();
+  installFakeGateway();
+  {
+    const a = makeMsgAndCtx();
+    const b = makeMsgAndCtx();
+    await dispatchToOpenClaw(a.ctx, a.msg, account, runtime);
+    await dispatchToOpenClaw(b.ctx, b.msg, account, runtime);
+  }
+
+  assert.equal(ingressCalls.length, 2, '每个 turn 独立 resolve');
+  assert.notEqual(
+    ingressCalls[0].contextBinding.messageId,
+    ingressCalls[1].contextBinding.messageId,
+    '两个 turn 的 binding 各自新鲜（绑定各自的消息）',
+  );
+  assert.notStrictEqual(ingressResults[0], ingressResults[1], '两次 resolve 返回不同对象（无复用）');
+});
+
+await test('resolve 失败 → 派发继续且不传 channelIngress（降级不阻断）', async () => {
+  _resetAdaptersCache();
+  const { msg, ctx } = makeMsgAndCtx();
+
+  let builtParams: any;
+  let dispatchReached = false;
+  const runtime = makeFakeRuntime({
+    onInboundRun: async () => { dispatchReached = true; return { dispatched: true }; },
+    ingressResolve: async () => { throw new Error('ingress unavailable'); },
+    onBuildContext: (params) => { builtParams = params; },
+  });
+
+  const account = makeAccount();
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, runtime);
+
+  assert.ok(dispatchReached, 'resolve 失败不得阻断派发');
+  assert.equal(builtParams.channelIngress, undefined, '失败时不携带 channelIngress');
+  assert.equal('channelIngress' in builtParams, false);
+});
+
+await test('runtime 无 ingress API（旧桩）→ 行为同现状，不传 channelIngress', async () => {
+  _resetAdaptersCache();
+  const { msg, ctx } = makeMsgAndCtx();
+
+  let builtParams: any;
+  const runtime = makeFakeRuntime({
+    onInboundRun: async () => ({ dispatched: true }),
+    onBuildContext: (params) => { builtParams = params; },
+  });
+
+  const account = makeAccount();
+  installFakeGateway();
+  await dispatchToOpenClaw(ctx, msg, account, runtime);
+
+  assert.ok(builtParams, 'buildContext 正常调用');
+  assert.equal('channelIngress' in builtParams, false, '无 ingress 时保持旧版入参形态');
 });
 
 console.log('\n' + '='.repeat(60));

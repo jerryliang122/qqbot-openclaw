@@ -27,6 +27,17 @@ export interface RuntimeAdapters {
   buildAgentSessionKey: ((params: any) => string) | null;
   /** 构建入站上下文 */
   buildInboundContext: ((params: any) => any) | null;
+  /**
+   * 入站 ingress 准入解析（owner 绑定，`runtime.channel.inbound.ingress.resolve`）。
+   *
+   * 产出可传入 buildContext `channelIngress` 的 admission evidence——openclaw
+   * 2026.11.5 起 `sessions_spawn` 派发守卫要求 context 携带该 evidence 暗携带的
+   * Gateway resolver（custody），否则 QQ 渠道子代理派发 100% 失败（issue #116）。
+   * 该 API 自 2026.10.5 起注入（registry `createHostChannelIngressRuntime`），
+   * 与 buildContext 的 evidence 包装共用同一 owner，`ownerMatches` 天然成立。
+   * 缺失时调用方不传 `channelIngress`（行为=旧版：无 custody，其余功能不受影响）。
+   */
+  resolveChannelMessageIngress: ((params: any) => Promise<any>) | null;
   /** Session store path 解析 */
   resolveStorePath: ((storeConfig: any, opts: any) => string) | null;
   /** Session 记录 */
@@ -114,6 +125,10 @@ export function resolveRuntimeAdapters(
     ? (params) => rawBuildContext(params)
     : null;
 
+  const resolveChannelMessageIngress = probeFunction(rt, [
+    ['channel', 'inbound', 'ingress', 'resolve'],
+  ]);
+
   const resolveStorePath = probeFunction(rt, [
     ['channel', 'session', 'resolveStorePath'],
   ]);
@@ -160,6 +175,7 @@ export function resolveRuntimeAdapters(
     resolveAgentRoute && 'resolveAgentRoute',
     buildAgentSessionKey && 'buildAgentSessionKey',
     buildInboundContext && 'buildInboundContext',
+    resolveChannelMessageIngress && 'resolveChannelMessageIngress',
     resolveStorePath && 'resolveStorePath',
     recordInboundSession && 'recordInboundSession',
     formatEnvelope && 'formatEnvelope',
@@ -179,6 +195,7 @@ export function resolveRuntimeAdapters(
     resolveAgentRoute,
     buildAgentSessionKey,
     buildInboundContext,
+    resolveChannelMessageIngress,
     resolveStorePath,
     recordInboundSession,
     formatEnvelope,
