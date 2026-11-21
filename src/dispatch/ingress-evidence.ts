@@ -54,13 +54,15 @@
  *    也忽略 channelIngress 入参）。
  * 2. **plugin record id 必须等于 channel id**：core 按**插件 record id**（不是
  *    channel id）建 owner（`channelId: e.id`），而 handoff 校验要求 binding 的
- *    channelId === buildContext 的 `channel`。本插件 manifest id 是
- *    `openclaw-qqbot` ≠ channel `qqbot` ⇒ 两个要求互斥，**当前形态无解**；
- *    bundled Telegram 的插件 id 恰好就是 `telegram`，所以只有它工作。
+ *    channelId === buildContext 的 `channel`。⇒ 2026-11-22 起插件 id 已与
+ *    channel id 对齐为 `qqbot`（manifest + package.json + webhook 路由），此前
+ *    `openclaw-qqbot` ≠ `qqbot` 的形态两个要求互斥、无解；bundled Telegram 的
+ *    插件 id 恰好就是 `telegram`，所以只有它工作。
  *
- * ⇒ 在前提满足前，本模块是「上游依赖下的插件侧预备」：机制、契约、策略映射、
- * 降级语义全部就位且被测试锁定；core 侧前提落地（插件 id 对齐 + owner 面开放）
- * 后即生效。上游对齐方案见 docs/agents/ingress-custody.md「生效前提与上游依赖」。
+ * ⇒ 前提 1（owner 面门禁）仍开放：在 core 向非 bundled/trusted 安装开放
+ * owner 面之前，本模块是「上游依赖下的插件侧预备」：机制、契约、策略映射、
+ * 降级语义全部就位且被测试锁定；core 侧前提落地后即生效。上游对齐方案见
+ * docs/agents/ingress-custody.md「生效前提与上游依赖」。
  *
  * 完整叙事见 docs/agents/ingress-custody.md。
  */

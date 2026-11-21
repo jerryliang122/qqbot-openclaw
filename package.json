@@ -28,7 +28,7 @@
     "!src/**/README.md"
   ],
   "openclaw": {
-    "id": "openclaw-qqbot",
+    "id": "qqbot",
     "extensions": [
       "./preload.cjs"
     ],

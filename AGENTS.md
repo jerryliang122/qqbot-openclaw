@@ -100,7 +100,7 @@ Plugin exports include `qqbotPlugin`, `getBotForAccount`, `QQBotGateway`, `sendT
 - 日志：用 `createPluginLogger()`（`src/utils/plugin-logger.ts`）。**不要直接 `console.*`**，除非早期 `register()` 路径（runtime logger 尚未接好）。
 - 文本分块上限：`TEXT_CHUNK_LIMIT`（`src/constants.ts`，默认 5000 字）。
 - 斜杠命令：一命令一文件放在 `src/commands/`，经 `buildCommandList()`（`src/commands/index.ts`）注册。
-- 插件 ID：plugin 是 `openclaw-qqbot`，channel 是 `qqbot`——别混。
+- 插件 ID：**manifest 插件 id 已与 channel id 对齐为 `qqbot`（2026-11-22，custody 前提——core 按插件 record id 建 owner，id 不一致则 owner 绑定与 evidence handoff 互斥）**；npm 包名仍是 `@jerryliang122/openclaw-qqbot`，内部自用字符串（队列 lease 前缀 / 面板 remark / Symbol key）沿用 `openclaw-qqbot` 不迁移。
 - **tsup post-build 的 `sanitizeDist()` 是承重的**——把 `new Function` 改写成 `new _F`（protobufjs 模式触发安全扫描器），别剥。
 
 ## Testing instructions
