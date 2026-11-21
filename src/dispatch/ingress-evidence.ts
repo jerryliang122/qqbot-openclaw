@@ -40,6 +40,28 @@
  *   两侧同源传入）；
  * - resolution 必须得出 allow（`ingress.admission === 'dispatch'`）才携带 custody。
  *
+ * ## 生效前提（⚠️ 二轮评审 2026-11-22 坐实——插件侧无法单独保证）
+ *
+ * evidence → custody 的转换依赖 core 侧两个前提，**任一不满足时本模块产出
+ * 的 evidence 会被 core 静默丢弃**（binding 是 `#binding` 私有字段，插件无
+ * 法探测失败）：
+ *
+ * 1. **owner 绑定面只发给受信安装**（registry `resolveRecordChannelRuntime` 门禁）：
+ *    `origin === 'bundled' || trustedOfficialInstall === true` 才注入 owner 绑定
+ *    的 ingress 与 evidence 包装的 buildContext。自发布 npm 插件默认两者皆否——
+ *    probe 命中的是**无 owner 的基础面**（resolve 存在、admission 照常计算，
+ *    但 `recordChannelIngressResolution` owner=undefined ⇒ 裸 result，buildContext
+ *    也忽略 channelIngress 入参）。
+ * 2. **plugin record id 必须等于 channel id**：core 按**插件 record id**（不是
+ *    channel id）建 owner（`channelId: e.id`），而 handoff 校验要求 binding 的
+ *    channelId === buildContext 的 `channel`。本插件 manifest id 是
+ *    `openclaw-qqbot` ≠ channel `qqbot` ⇒ 两个要求互斥，**当前形态无解**；
+ *    bundled Telegram 的插件 id 恰好就是 `telegram`，所以只有它工作。
+ *
+ * ⇒ 在前提满足前，本模块是「上游依赖下的插件侧预备」：机制、契约、策略映射、
+ * 降级语义全部就位且被测试锁定；core 侧前提落地（插件 id 对齐 + owner 面开放）
+ * 后即生效。上游对齐方案见 docs/agents/ingress-custody.md「生效前提与上游依赖」。
+ *
  * 完整叙事见 docs/agents/ingress-custody.md。
  */
 import { defineStableChannelIngressIdentity } from 'openclaw/plugin-sdk/channel-ingress-runtime';
@@ -79,16 +101,13 @@ export interface IngressAccessPolicyInput {
   isGroup: boolean;
   /** c2c 模式：open | allowlist | pairing | disabled（默认 allowlist） */
   c2cMode: string;
-  /** 群模式：open | allowlist | disabled（默认 allowlist；见 mapIngressPolicy 的语义错向说明） */
-  groupMode: string;
   allowFrom: string[];
-  groupAllowFrom: string[];
 }
 
 /** 映射后的 ingress resolve 策略参数（undefined = 不携带 evidence，降级） */
 export interface IngressPolicyParams {
   dmPolicy: 'open' | 'allowlist' | 'pairing';
-  /** 恒为 open：插件在服务群内没有 sender 级限制（见 mapIngressPolicy） */
+  /** 恒为 open：core 的群 open 是无条件放行（senderGateForGroup）；插件在服务群内没有 sender 级限制 */
   groupPolicy: 'open';
   allowFrom?: string[];
 }
@@ -102,43 +121,59 @@ function cleanEntries(entries: string[] | undefined): string[] | undefined {
 /**
  * 插件准入语义 → ingress resolve 策略映射。
  *
- * ## c2c（dmPolicy）
+ * ## c2c（dmPolicy）——对齐 core `senderGateForDirect` 的真实判定
  *
  * 原则：**到达 dispatch 的消息都已被 access-control 放行**，evidence 必须如实
- * 反射同一裁决且得出 allowed（否则拿不到 dispatch custody）。access-control 的
- * 语义是「allowlist 且名单为空/含 `*` ⇒ 放行所有人」——直传空表给 resolver 会被
- * 判 not-allowlisted，故空/通配名单折叠为 `open`（语义等价，非放宽——那条消息
- * 本来就放行了）。`pairing` 直传：插件 pairing 走框架 pairing store
- * （adapter/pairing.ts 的 readChannelAllowFromStore），与 resolver 的默认
- * store 读取同库，已配对用户可被命中。`disabled` 理论上到不了 dispatch
- * （access-control 已拦），防御性整体降级。
+ * 反射同一裁决且得出 allowed（否则拿不到 dispatch custody）。
+ *
+ * ⚠️ **core 的 dm `open` 不是「放行所有人」**（二轮评审核实，2026-11-22）：
+ * `senderGateForDirect` 对 `dmPolicy:'open'` 仍要求 `allowFrom` 带通配符或命中
+ * （`hasWildcard → allow` / `matched → allow` / 否则 `dm_policy_not_allowlisted`）；
+ * 只有**群** `open` 是无条件放行。因此 access-control 的「空名单/含 `*` ⇒ 放行
+ * 所有人」语义折叠到 dm 侧时，**必须同时传 `allowFrom: ['*']`**（让 core 的
+ * `hasWildcard` 成立）——只折叠 policy 不带名单，默认配置（allowlist+空名单）
+ * 会被判 not-allowlisted、c2c 静默丢 custody。
+ *
+ * `pairing` **永不折叠**：core 的 `mergeDmAllowFromSources` 在 dmPolicy 为
+ * open/allowlist 时直接丢弃 pairing store（`? [] : storeAllowFrom`）——折叠会
+ * 让「静态名单为空的配对模式」（最常见配对配置）丢掉 store 命中。保留
+ * 'pairing' 让 store 与静态名单共同生效（插件 pairing 走框架 pairing store，
+ * 与 resolver 默认 store 读取同库，已配对用户可被命中）。
+ *
+ * `disabled` 理论上到不了 dispatch（access-control 已拦），防御性整体降级。
  *
  * ## 群（groupPolicy 恒 'open'）
  *
- * ⚠️ **语义错向防护（评审自查）**：插件 `groupAllowFrom` 是「哪些**群**被服务」
- * 的群 id 白名单（access-control 按 `groupOpenid` 匹配，types.ts「群白名单」）；
- * 而 core resolver 的 `groupAllowFrom` 是「群内哪些 **sender** 被允许」。把插件的
- * 群 id 名单直传给 core 会让每个 sender 判 not-allowlisted —— 恰好让配置了群
- * 白名单的群全部拿不到 custody。插件在服务群内没有 sender 级限制（「哪些群被
- * 服务」已由 access-control 在 dispatch 前裁决），故群侧恒传 `open`、**永不传
- * groupAllowFrom**。代价：`groupPolicy:'open'` 下 evidence 的
- * `participantOutcomeAffecting` 为 false（wildcard 放行）——只影响 attribution
- * 丰富度，不影响 custody。
+ * ⚠️ **语义错向防护（一轮评审自查）**：插件 `groupAllowFrom` 是「哪些**群**被
+ * 服务」的群 id 白名单（access-control 按 `groupOpenid` 匹配）；core resolver
+ * 的 `groupAllowFrom` 是「群内哪些 **sender** 被允许」。直传会让每个 sender 判
+ * not-allowlisted。插件在服务群内没有 sender 级限制（「哪些群被服务」已由
+ * access-control 在 dispatch 前裁决），故群侧恒传 `open`（core 群 open =
+ * 无条件放行）、**永不传 groupAllowFrom**。代价：群 evidence 的
+ * `participantOutcomeAffecting` 为 false——只影响 attribution 丰富度。
  */
 export function mapIngressPolicy(input: IngressAccessPolicyInput): IngressPolicyParams | undefined {
   let dmPolicy: IngressPolicyParams['dmPolicy'] | undefined;
   let allowFrom: string[] | undefined;
   if (input.c2cMode === 'open') {
+    // core dm open 仍要求通配符命中——「放行所有人」必须带 ['*']
     dmPolicy = 'open';
-  } else if (input.c2cMode === 'allowlist' || input.c2cMode === 'pairing') {
+    allowFrom = ['*'];
+  } else if (input.c2cMode === 'allowlist') {
     const entries = cleanEntries(input.allowFrom);
-    // 空/通配名单 = access-control 放行所有人 ⇒ 语义折叠为 open
+    // 空/通配名单 = access-control 放行所有人 ⇒ 折叠 open，但必须随行 ['*']
     if (!entries || entries.includes('*')) {
       dmPolicy = 'open';
+      allowFrom = ['*'];
     } else {
-      dmPolicy = input.c2cMode;
+      dmPolicy = 'allowlist';
       allowFrom = entries;
     }
+  } else if (input.c2cMode === 'pairing') {
+    // 永不折叠：core 只在 dmPolicy='pairing' 下合并 pairing store
+    dmPolicy = 'pairing';
+    const entries = cleanEntries(input.allowFrom);
+    if (entries) allowFrom = entries;
   }
   // c2cMode 'disabled' 或未知值（群消息时 c2c 分支不参与决策，走 open 兜底）
   if (!input.isGroup && dmPolicy === undefined) {
@@ -172,9 +207,7 @@ export function resolveAccessPolicyInput(
   return {
     isGroup,
     c2cMode: String(policy?.c2cMode ?? cfg.dmPolicy ?? 'allowlist'),
-    groupMode: String(policy?.groupMode ?? cfg.groupPolicy ?? 'allowlist'),
     allowFrom: asList(policy?.allowFrom ?? cfg.allowFrom),
-    groupAllowFrom: asList(policy?.groupAllowFrom ?? cfg.groupAllowFrom),
   };
 }
 
@@ -206,11 +239,11 @@ export interface ResolveIngressEvidenceParams {
   log?: PluginLogger;
 }
 
-/** 有界等待：超时返回 undefined（迟到的结果被丢弃——handoff 未消费，无核心侧副作用） */
-async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+/** 有界等待：超时返回 timeoutValue（迟到的结果被丢弃——handoff 未消费，无核心侧副作用） */
+async function withTimeout<T, V>(promise: Promise<T>, ms: number, timeoutValue: V): Promise<T | V> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<undefined>((resolve) => {
-    timer = setTimeout(() => resolve(undefined), ms);
+  const timeout = new Promise<V>((resolve) => {
+    timer = setTimeout(() => resolve(timeoutValue), ms);
   });
   try {
     return await Promise.race([promise, timeout]);
@@ -218,6 +251,9 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | unde
     clearTimeout(timer);
   }
 }
+
+/** 每进程只打一次「evidence 已挂载」的可观测性 INFO（运维信号，见叙事「生效前提」） */
+let custodyAttachedNoticeLogged = false;
 
 /**
  * 为本轮 turn resolve 出 channelIngress admission evidence。
@@ -268,18 +304,31 @@ export async function resolveIngressEvidence(
   const timeoutMs = params.timeoutMs ?? INGRESS_RESOLVE_TIMEOUT_MS;
 
   /**
-   * 错误信息脱敏：resolver 的 err.message 可能内嵌参与者 openid / binding 的
-   * sessionKey——INFO 以上日志不得落完整标识符（/bot-logs 原样导出本地日志）。
-   * openid → shortId()，sessionKey → sha256 前 8 位。
+   * 错误信息脱敏（二轮评审补强）：resolver 的 err.message 可能内嵌**任意**
+   * 参与者 openid、binding 的 sessionKey、或会话对端的裸 openid（群轮次的
+   * sessionKey 里就含群 openid）——INFO 以上日志不得落完整标识符
+   * （/bot-logs 原样导出本地日志）。全部纳入替换：openid → shortId()，
+   * sessionKey → sha256 前 8 位。
    */
-  const redactErrorDetail = (text: string, stableId: string): string =>
-    text
-      .split(stableId).join(shortId(stableId))
-      .split(contextBinding.sessionKey).join(sessionKeyDigest(contextBinding.sessionKey));
+  const sensitiveIds = [
+    contextBinding.sessionKey,
+    params.peerId,
+    ...participants,
+  ].filter((id): id is string => typeof id === 'string' && id.length > 0);
+  const redactErrorDetail = (text: string): string => {
+    let out = text;
+    for (const id of sensitiveIds) {
+      if (out.includes(id)) out = out.split(id).join(shortId(id));
+    }
+    return out.split(contextBinding.sessionKey).join(sessionKeyDigest(contextBinding.sessionKey));
+  };
 
   const resolveParticipant = async (stableId: string, budgetMs: number): Promise<unknown | undefined> => {
     try {
-      const result = await withTimeout(
+      // 哨兵区分「超时」与「resolver 合法返回 undefined」——两者都降级，
+      // 但日志语义不同（排障时避免把空返回误读为超时）
+      const TIMEOUT = Symbol('ingress-resolve-timeout');
+      const raced = await withTimeout(
         resolve({
           channelId: 'qqbot',
           accountId: params.accountId,
@@ -293,11 +342,21 @@ export async function resolveIngressEvidence(
           contextBinding,
           policy: { dmPolicy: mapped.dmPolicy, groupPolicy: mapped.groupPolicy },
           ...(mapped.allowFrom ? { allowFrom: mapped.allowFrom } : {}),
-        }),
+        }).then(
+          (value) => ({ timeout: false as const, value }),
+          (err) => ({ timeout: false as const, err }),
+        ),
         budgetMs,
+        TIMEOUT,
       );
-      if (result === undefined) {
+      if (raced === TIMEOUT || raced === undefined) {
         params.log?.warn(`[ingress-evidence] resolve timeout after ${budgetMs}ms (sender=${shortId(stableId)} dropped)`);
+        return undefined;
+      }
+      if ('err' in raced) throw raced.err;
+      const result = raced.value;
+      if (result === undefined || result === null) {
+        params.log?.warn(`[ingress-evidence] resolver returned empty (sender=${shortId(stableId)} dropped)`);
         return undefined;
       }
       // 只有 allow 决策（admission === 'dispatch'）才携带 custody；
@@ -314,7 +373,7 @@ export async function resolveIngressEvidence(
     } catch (err) {
       params.log?.warn(
         `[ingress-evidence] resolve failed (sender=${shortId(stableId)}), participant dropped: ${
-          redactErrorDetail(err instanceof Error ? err.message : String(err), stableId)
+          redactErrorDetail(err instanceof Error ? err.message : String(err))
         }`,
       );
       return undefined;
@@ -351,5 +410,18 @@ export async function resolveIngressEvidence(
   if (resolved.length === 0) {
     return undefined;
   }
+
+  // 一次性运维信号：evidence「已生成并挂到 buildContext」≠「custody 已生效」——
+  // 生效还依赖 core 侧前提（owner 绑定面：bundled/trusted-official 安装 + plugin id
+  // 与 channel id 一致），插件侧无法探测（binding 是私有字段）。见叙事「生效前提」。
+  if (!custodyAttachedNoticeLogged) {
+    custodyAttachedNoticeLogged = true;
+    params.log?.info(
+      `[ingress-evidence] admission evidence attached (participants=${resolved.length}) — `
+      + 'custody 仅在 core 提供 owner 绑定面时生效（bundled/trusted-official 安装且 plugin id === channel id），'
+      + '若 sessions_spawn 仍被拒见 docs/agents/ingress-custody.md「生效前提」',
+    );
+  }
+
   return resolved.length === 1 ? resolved[0] : resolved;
 }

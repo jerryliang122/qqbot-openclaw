@@ -1,21 +1,27 @@
 /**
- * channelIngress admission evidence 单元测试 — issue #116（含评审补强）
+ * channelIngress admission evidence 单元测试 — issue #116（含两轮评审补强）
  *
  * 锁定的契约：
  * 1. adapter probe：`runtime.channel.inbound.ingress.resolve` → adapters 字段
  *    （哨兵调用验证绑定的是正确函数；缺失时 null，调用方降级）。
- * 2. 策略映射 mapIngressPolicy：插件准入语义（access-control 同源）→ ingress
- *    resolve 入参；空/通配名单折叠为 open；**群侧恒 open 且永不传
- *    groupAllowFrom**（插件群白名单是群 id 语义，core 是群 sender 语义——
- *    语义错向直传会让每个 sender 判 not-allowlisted）；c2c disabled 降级。
+ * 2. 策略映射 mapIngressPolicy——**对齐 core senderGateForDirect 的真实判定**：
+ *    - dm `open` 不是「放行所有人」：core 仍要求 allowFrom 带通配符或命中 ⇒
+ *      「空名单/含 `*`」折叠到 open 时**必须随行 `allowFrom: ['*']`**（二轮
+ *      评审：否则默认配置 c2c 被判 dm_policy_not_allowlisted、静默丢 custody）；
+ *    - `pairing` **永不折叠**：core 的 mergeDmAllowFromSources 在 open/allowlist
+ *      下丢弃 pairing store，折叠会让「空静态名单的配对模式」丢 store 命中；
+ *    - 群侧恒 open（core 群 open = 无条件放行）且永不传 groupAllowFrom
+ *      （插件群白名单是群 id 语义，core 是群 sender 语义——语义错向）。
  * 3. resolveIngressEvidence：
  *    - 单参与者：resolve 入参逐字段（binding 四元组 / conversation / subject /
- *      event / policy / identity 形状）；
+ *      event / policy / identity 形状 / **通配名单随行**）；
  *    - 多参与者（跨发言人合批）：到达序去重、载体末位、逐参与者独立新鲜
  *      resolve、共享同一 binding；非载体失败仅丢弃该项、载体失败整体降级；
  *      1 人返回单对象、≥2 人返回数组；
  *    - 降级：resolve 抛错 / 非 dispatch 决策 / 超时（注入 timeoutMs）/
- *      probe 缺失 / participants 为空，全部返回 undefined 且不抛。
+ *      probe 缺失 / participants 为空 / resolver 空返回（与超时分日志），全部
+ *      返回 undefined 且不抛；
+ *    - 16 上限裁剪；共享截止时间；错误脱敏（不落完整 openid/sessionKey）。
  * 4. buildIngressParticipants（group-merge）：去重 / 载体末位 / 载体重复折叠。
  *
  * 运行方式: npx tsx tests/ingress-evidence.test.ts
@@ -67,15 +73,39 @@ function makeIngressRuntime(resolve?: (params: any) => Promise<any>) {
   } as any;
 }
 
-/** dispatch-allowed 的 resolve 桩，捕获入参（每参与者返回带标记的新鲜对象） */
-function makeAdmittedResolve(captured: any[] = []) {
-  return async (params: any) => {
-    captured.push(params);
+/**
+ * 按 core 真实语义判定的 resolve 桩（二轮评审：无条件 admitted 的桩测不出
+ * 策略映射错误）。对齐 dist/runtime 的 senderGateForDirect / senderGateForGroup：
+ * - dm open：hasWildcard（名单含 '*'）或 matched ⇒ allow，否则 not_allowlisted
+ * - dm allowlist：matched ⇒ allow，否则 not_allowlisted
+ * - dm pairing：静态名单或（桩内不可得的）store 命中 ⇒ allow
+ * - 群 open：无条件 allow（group_policy_open）
+ * 桩读不到 pairing store——需要 pairing 命中的测试把 sender 放进静态名单。
+ */
+function makeCoreLikeResolve(captured: any[] = []) {
+  return async (p: any) => {
+    captured.push(p);
+    const allowFrom: string[] = Array.isArray(p.allowFrom) ? p.allowFrom : [];
+    let allowed: boolean;
+    let reasonCode: string;
+    if (p.conversation.kind === 'group') {
+      allowed = p.policy.groupPolicy === 'open';
+      reasonCode = allowed ? 'group_policy_open' : 'group_policy_not_allowlisted';
+    } else if (p.policy.dmPolicy === 'open') {
+      allowed = allowFrom.includes('*') || allowFrom.includes(p.subject.stableId);
+      reasonCode = allowed ? (allowFrom.includes('*') ? 'dm_policy_open' : 'dm_policy_allowlisted') : 'dm_policy_not_allowlisted';
+    } else if (p.policy.dmPolicy === 'pairing') {
+      allowed = allowFrom.includes(p.subject.stableId); // store 命中桩内不可得
+      reasonCode = allowed ? 'dm_policy_allowlisted' : 'dm_pairing_required';
+    } else {
+      allowed = allowFrom.includes(p.subject.stableId);
+      reasonCode = allowed ? 'dm_policy_allowlisted' : 'dm_policy_not_allowlisted';
+    }
     return {
-      ingress: { admission: 'dispatch', reasonCode: 'dm_policy_allowlisted' },
-      senderAccess: { allowed: true, reasonCode: 'dm_policy_allowlisted' },
+      ingress: { admission: allowed ? 'dispatch' : 'drop', reasonCode },
+      senderAccess: { allowed, reasonCode },
       // 参与者标记：断言输出数组的成员与顺序（防换序/替换回归）
-      stableId: params.subject.stableId,
+      stableId: p.subject.stableId,
       n: captured.length,
     };
   };
@@ -83,7 +113,7 @@ function makeAdmittedResolve(captured: any[] = []) {
 
 function makeEvidenceParams(overrides: Record<string, unknown> = {}) {
   return {
-    adapters: getAdapters(makeIngressRuntime(makeAdmittedResolve())),
+    adapters: getAdapters(makeIngressRuntime(makeCoreLikeResolve())),
     route: { sessionKey: 'agent:main:qqbot:direct:USER_OPENID_1' },
     accountId: 'acc-1',
     messageId: 'MSG_1',
@@ -94,9 +124,7 @@ function makeEvidenceParams(overrides: Record<string, unknown> = {}) {
     policy: {
       isGroup: false,
       c2cMode: 'allowlist',
-      groupMode: 'allowlist',
       allowFrom: ['USER_OPENID_1'],
-      groupAllowFrom: [],
     },
     ...overrides,
   } as any;
@@ -106,7 +134,7 @@ function makeEvidenceParams(overrides: Record<string, unknown> = {}) {
 
 group('adapter probe: channel.inbound.ingress.resolve');
 
-await test('哨兵调用：probe 绑定的确是 runtime 的 ingress.resolve（评审 #5）', async () => {
+await test('哨兵调用：probe 绑定的确是 runtime 的 ingress.resolve（一轮评审 #5）', async () => {
   _resetAdaptersCache();
   const received: any[] = [];
   const sentinelResult = { ingress: { admission: 'dispatch' } };
@@ -130,55 +158,53 @@ await test('runtime 无 ingress 路径 → probe 为 null（调用方降级）',
 
 // ── 2. 策略映射 ──
 
-group('mapIngressPolicy: 准入语义 → resolve 策略');
+group('mapIngressPolicy: 准入语义 → resolve 策略（对齐 core senderGateForDirect）');
 
-await test('c2c open → dmPolicy open', () => {
-  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'open', groupMode: 'allowlist', allowFrom: [], groupAllowFrom: [] });
-  assert.deepEqual(mapped, { dmPolicy: 'open', groupPolicy: 'open' });
+await test('c2c open → dmPolicy open 且必须随行 allowFrom:["*"]（core dm open 仍要求通配/命中）', () => {
+  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'open', allowFrom: [] });
+  assert.equal(mapped!.dmPolicy, 'open');
+  assert.deepEqual(mapped!.allowFrom, ['*'], 'core dm open 无通配 ⇒ dm_policy_not_allowlisted');
 });
 
 await test('c2c allowlist + 非空名单 → allowlist + entries', () => {
-  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'allowlist', groupMode: 'allowlist', allowFrom: ['A', 'B', ' '], groupAllowFrom: [] });
+  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'allowlist', allowFrom: ['A', 'B', ' '] });
   assert.equal(mapped!.dmPolicy, 'allowlist');
   assert.deepEqual(mapped!.allowFrom, ['A', 'B']);
 });
 
-await test('c2c allowlist + 空名单 → open（access-control 放行所有人）', () => {
-  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'allowlist', groupMode: 'allowlist', allowFrom: [], groupAllowFrom: [] });
+await test('c2c allowlist + 空名单 → open + ["*"]（默认配置不得静默丢 custody）', () => {
+  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'allowlist', allowFrom: [] });
   assert.equal(mapped!.dmPolicy, 'open');
-  assert.equal(mapped!.allowFrom, undefined);
+  assert.deepEqual(mapped!.allowFrom, ['*'], '折叠 open 必须让 core hasWildcard 成立');
 });
 
-await test("c2c allowlist + 含 '*' → open", () => {
-  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'allowlist', groupMode: 'allowlist', allowFrom: ['*'], groupAllowFrom: [] });
+await test("c2c allowlist + 含 '*' → open + [\"*\"]", () => {
+  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'allowlist', allowFrom: ['*'] });
   assert.equal(mapped!.dmPolicy, 'open');
+  assert.deepEqual(mapped!.allowFrom, ['*']);
 });
 
-await test('c2c pairing + 名单 → pairing + entries（store 命中由 resolver 评估）', () => {
-  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'pairing', groupMode: 'allowlist', allowFrom: ['A'], groupAllowFrom: [] });
+await test('c2c pairing + 静态名单 → pairing + entries（store 命中由 core 评估）', () => {
+  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'pairing', allowFrom: ['A'] });
   assert.equal(mapped!.dmPolicy, 'pairing');
   assert.deepEqual(mapped!.allowFrom, ['A']);
 });
 
+await test('c2c pairing + 空名单 → 恒 pairing 不折叠（core 在 open/allowlist 下丢 pairing store）', () => {
+  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'pairing', allowFrom: [] });
+  assert.equal(mapped!.dmPolicy, 'pairing', '折叠 open 会丢掉 store 命中（mergeDmAllowFromSources）');
+  assert.equal(mapped!.allowFrom, undefined);
+});
+
 await test('c2c disabled → undefined（降级，不携带 evidence）', () => {
-  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'disabled', groupMode: 'allowlist', allowFrom: [], groupAllowFrom: [] });
+  const mapped = mapIngressPolicy({ isGroup: false, c2cMode: 'disabled', allowFrom: [] });
   assert.equal(mapped, undefined);
 });
 
-await test('群侧恒 open：任意 groupMode/groupAllowFrom 都不映射成 allowlist/entries（语义错向防护）', () => {
-  // groupMode=allowlist + 群 id 名单：插件语义是「哪些群被服务」（群 id 白名单），
-  // core 的 groupAllowFrom 却是「群内哪些 sender 被允许」——直传必错向
-  const mapped = mapIngressPolicy({ isGroup: true, c2cMode: 'allowlist', groupMode: 'allowlist', allowFrom: [], groupAllowFrom: ['GROUP_1', 'GROUP_2'] });
+await test('群侧恒 open：groupPolicy 恒 open（core 群 open=无条件放行），永不传 groupAllowFrom', () => {
+  const mapped = mapIngressPolicy({ isGroup: true, c2cMode: 'allowlist', allowFrom: [] });
   assert.equal(mapped!.groupPolicy, 'open');
-  assert.equal((mapped as any).groupAllowFrom, undefined, '永不传 groupAllowFrom 给 core');
-
-  const openMode = mapIngressPolicy({ isGroup: true, c2cMode: 'allowlist', groupMode: 'open', allowFrom: [], groupAllowFrom: [] });
-  assert.equal(openMode!.groupPolicy, 'open');
-
-  // 群 disabled 也不再整体降级：disabled 群到不了 dispatch（access-control 已拦），
-  // evidence 只需 sender 级如实（无 sender 级限制 ⇒ open）
-  const disabledMode = mapIngressPolicy({ isGroup: true, c2cMode: 'allowlist', groupMode: 'disabled', allowFrom: [], groupAllowFrom: [] });
-  assert.equal(disabledMode!.groupPolicy, 'open');
+  assert.equal((mapped as any).groupAllowFrom, undefined, '永不传 groupAllowFrom（语义错向）');
 });
 
 // ── 3. resolveAccessPolicyInput ──
@@ -200,7 +226,6 @@ await test('优先读 ctx.state.policy；缺失时按同一默认链从 account.
 
   const defaults = resolveAccessPolicyInput({ state: {} } as any, { config: {} } as any, true);
   assert.equal(defaults.c2cMode, 'allowlist');
-  assert.equal(defaults.groupMode, 'allowlist');
   assert.deepEqual(defaults.allowFrom, []);
 });
 
@@ -212,7 +237,7 @@ await test('c2c：binding 四元组 / subject / conversation / policy / identity
   _resetAdaptersCache();
   const captured: any[] = [];
   const result = await resolveIngressEvidence(makeEvidenceParams({
-    adapters: getAdapters(makeIngressRuntime(makeAdmittedResolve(captured))),
+    adapters: getAdapters(makeIngressRuntime(makeCoreLikeResolve(captured))),
   }));
   assert.ok(result, 'admitted resolve 应返回结果');
   assert.ok(!Array.isArray(result), '单参与者返回单对象（非数组）');
@@ -238,11 +263,43 @@ await test('c2c：binding 四元组 / subject / conversation / policy / identity
   assert.equal(p.identity?.primary?.normalize?.(''), null);
 });
 
+await test('默认配置（allowlist+空名单）端到端：折叠 open 且 allowFrom:["*"] 随行 → core 语义下 admitted', async () => {
+  _resetAdaptersCache();
+  const captured: any[] = [];
+  const result = await resolveIngressEvidence(makeEvidenceParams({
+    adapters: getAdapters(makeIngressRuntime(makeCoreLikeResolve(captured))),
+    policy: { isGroup: false, c2cMode: 'allowlist', allowFrom: [] },
+  }));
+  assert.ok(result, '空名单不得静默丢 custody（二轮评审高危项）');
+  assert.equal(captured[0].policy.dmPolicy, 'open');
+  assert.deepEqual(captured[0].allowFrom, ['*'], '通配符必须随行');
+});
+
+await test('pairing + 空名单端到端：dmPolicy=pairing 直传（store 由 core 评估，不折叠）', async () => {
+  _resetAdaptersCache();
+  const captured: any[] = [];
+  // pairing 且 sender 不在静态名单 → 桩按 core 语义判 pairing_required → 降级
+  const dropped = await resolveIngressEvidence(makeEvidenceParams({
+    adapters: getAdapters(makeIngressRuntime(makeCoreLikeResolve(captured))),
+    policy: { isGroup: false, c2cMode: 'pairing', allowFrom: [] },
+  }));
+  assert.equal(dropped, undefined, '未配对用户到不了 dispatch，evidence 如实降级');
+  assert.equal(captured[0].policy.dmPolicy, 'pairing', '不折叠为 open');
+  // 配对用户（静态名单兜底命中）→ admitted
+  const captured2: any[] = [];
+  const admitted = await resolveIngressEvidence(makeEvidenceParams({
+    adapters: getAdapters(makeIngressRuntime(makeCoreLikeResolve(captured2))),
+    policy: { isGroup: false, c2cMode: 'pairing', allowFrom: ['USER_OPENID_1'] },
+  }));
+  assert.ok(admitted, '静态名单命中的配对用户拿到 evidence');
+  assert.equal(captured2[0].policy.dmPolicy, 'pairing');
+});
+
 await test('route.agentId 缺失 → binding.agentId 归一为 default（对齐 ctx-builder）', async () => {
   _resetAdaptersCache();
   const captured: any[] = [];
   await resolveIngressEvidence(makeEvidenceParams({
-    adapters: getAdapters(makeIngressRuntime(makeAdmittedResolve(captured))),
+    adapters: getAdapters(makeIngressRuntime(makeCoreLikeResolve(captured))),
     route: { sessionKey: 'k' },
   }));
   assert.equal(captured[0].contextBinding.agentId, 'default');
@@ -252,7 +309,7 @@ await test('群 room_event turn：conversation 取群 id，binding.inboundEventK
   _resetAdaptersCache();
   const captured: any[] = [];
   await resolveIngressEvidence(makeEvidenceParams({
-    adapters: getAdapters(makeIngressRuntime(makeAdmittedResolve(captured))),
+    adapters: getAdapters(makeIngressRuntime(makeCoreLikeResolve(captured))),
     route: { agentId: 'main', sessionKey: 'agent:main:qqbot:group:GROUP_1' },
     messageId: 'MSG_G1',
     accountId: 'acc-1',
@@ -260,7 +317,7 @@ await test('群 room_event turn：conversation 取群 id，binding.inboundEventK
     peerId: 'GROUP_1',
     inboundEventKind: 'room_event',
     participants: ['SENDER_1'],
-    policy: { isGroup: true, c2cMode: 'allowlist', groupMode: 'allowlist', allowFrom: [], groupAllowFrom: ['GROUP_1'] },
+    policy: { isGroup: true, c2cMode: 'allowlist', allowFrom: [] },
   }));
   const p = captured[0];
   assert.deepEqual(p.conversation, { kind: 'group', id: 'GROUP_1' });
@@ -268,6 +325,19 @@ await test('群 room_event turn：conversation 取群 id，binding.inboundEventK
   assert.equal(p.contextBinding.inboundEventKind, 'room_event');
   assert.equal(p.policy.groupPolicy, 'open');
   assert.equal((p as any).groupAllowFrom, undefined, '群 id 名单不得传给 core（语义错向）');
+});
+
+await test('策略映射错误会被 core 语义桩当场证伪：折叠 open 不带通配 → not admitted', async () => {
+  _resetAdaptersCache();
+  // 模拟「策略映射漏带 allowFrom:["*"]」的回归：构造直传空 allowFrom 的入参
+  const result = await resolveIngressEvidence(makeEvidenceParams({
+    adapters: getAdapters(makeIngressRuntime(async (p: any) => {
+      const allowed = p.policy.dmPolicy !== 'open' || (p.allowFrom ?? []).includes('*') || (p.allowFrom ?? []).includes(p.subject.stableId);
+      return { ingress: { admission: allowed ? 'dispatch' : 'drop', reasonCode: 'dm_policy_not_allowlisted' }, senderAccess: { allowed } };
+    })),
+    policy: { isGroup: false, c2cMode: 'allowlist', allowFrom: [] },
+  }));
+  assert.ok(result, '当前映射带 ["*"]，core 语义下 admitted');
 });
 
 await test('resolve 抛错 → 返回 undefined 且不抛', async () => {
@@ -287,6 +357,19 @@ await test("resolve 返回非 dispatch 决策 → 返回 undefined（evidence �
     }))),
   }));
   assert.equal(result, undefined);
+});
+
+await test('resolver 合法返回 undefined → 降级且日志语义是「空返回」而非「超时」（二轮评审）', async () => {
+  _resetAdaptersCache();
+  const warnings: string[] = [];
+  const log = { debug() {}, info() {}, warn: (m: string) => warnings.push(m) } as any;
+  const result = await resolveIngressEvidence(makeEvidenceParams({
+    adapters: getAdapters(makeIngressRuntime(async () => undefined)),
+    log,
+  }));
+  assert.equal(result, undefined);
+  assert.ok(warnings.some((m) => m.includes('resolver returned empty')), '空返回与超时须分日志语义');
+  assert.ok(!warnings.some((m) => m.includes('resolve timeout')), '不得把空返回误记为超时');
 });
 
 await test('超时（注入 timeoutMs + 永不 settle 的 resolve）→ undefined 且不抛（评审 #2）', async () => {
@@ -310,8 +393,8 @@ await test('策略映射降级（c2c disabled）→ 不调 resolver', async () =
   _resetAdaptersCache();
   const captured: any[] = [];
   const result = await resolveIngressEvidence(makeEvidenceParams({
-    adapters: getAdapters(makeIngressRuntime(makeAdmittedResolve(captured))),
-    policy: { isGroup: false, c2cMode: 'disabled', groupMode: 'allowlist', allowFrom: [], groupAllowFrom: [] },
+    adapters: getAdapters(makeIngressRuntime(makeCoreLikeResolve(captured))),
+    policy: { isGroup: false, c2cMode: 'disabled', allowFrom: [] },
   }));
   assert.equal(result, undefined);
   assert.equal(captured.length, 0);
@@ -321,7 +404,7 @@ await test('participants 为空 → undefined，不调 resolver', async () => {
   _resetAdaptersCache();
   const captured: any[] = [];
   const result = await resolveIngressEvidence(makeEvidenceParams({
-    adapters: getAdapters(makeIngressRuntime(makeAdmittedResolve(captured))),
+    adapters: getAdapters(makeIngressRuntime(makeCoreLikeResolve(captured))),
     participants: [],
   }));
   assert.equal(result, undefined);
@@ -340,7 +423,7 @@ function makeGroupEvidenceParams(overrides: Record<string, unknown> = {}) {
     isGroup: true,
     peerId: 'GROUP_1',
     inboundEventKind: 'user_request',
-    policy: { isGroup: true, c2cMode: 'allowlist', groupMode: 'allowlist', allowFrom: [], groupAllowFrom: [] },
+    policy: { isGroup: true, c2cMode: 'allowlist', allowFrom: [] },
     ...overrides,
   });
 }
@@ -349,7 +432,7 @@ await test('按到达序逐参与者 resolve，载体末位；返回数组且各
   _resetAdaptersCache();
   const captured: any[] = [];
   const result = await resolveIngressEvidence(makeGroupEvidenceParams({
-    adapters: getAdapters(makeIngressRuntime(makeAdmittedResolve(captured))),
+    adapters: getAdapters(makeIngressRuntime(makeCoreLikeResolve(captured))),
     participants: ['SENDER_A', 'SENDER_B', 'SENDER_CARRIER'],
   }));
   assert.ok(Array.isArray(result), '多参与者返回数组');
@@ -454,7 +537,7 @@ await test('参与者超过 core 上限 16 → 只 resolve/保留最新 16 个�
   const captured: any[] = [];
   const many = Array.from({ length: 18 }, (_, i) => `SENDER_${String(i).padStart(2, '0')}`);
   const result = await resolveIngressEvidence(makeGroupEvidenceParams({
-    adapters: getAdapters(makeIngressRuntime(makeAdmittedResolve(captured))),
+    adapters: getAdapters(makeIngressRuntime(makeCoreLikeResolve(captured))),
     participants: many,
   }));
   assert.ok(Array.isArray(result));
@@ -482,16 +565,17 @@ await test('共享截止时间：N 个停滞参与者的总耗时 ≈ 一个 tim
   assert.ok(elapsed < 500, `共享截止时间内完成（elapsed=${elapsed}ms < 500ms，串行最坏 900ms）`);
 });
 
-await test('resolve 抛错 → WARN 不落完整 openid/sessionKey（脱敏红线）', async () => {
+await test('resolve 抛错 → WARN 不落完整 openid/sessionKey/群 openid（脱敏红线，二轮评审扩大覆盖）', async () => {
   _resetAdaptersCache();
   const { shortId } = await import('../src/utils/redaction.ts');
   const warnings: string[] = [];
   const log = { debug() {}, info() {}, warn: (m: string) => warnings.push(m) } as any;
-  const result = await resolveIngressEvidence(makeEvidenceParams({
+  const result = await resolveIngressEvidence(makeGroupEvidenceParams({
     adapters: getAdapters(makeIngressRuntime(async () => {
-      throw new Error('resolver blew up for OPENID_LEAK_TEST in session agent:main:qqbot:direct:OPENID_LEAK_TEST');
+      throw new Error('resolver blew up for OPENID_LEAK_TEST / peer GROUP_LEAK / session agent:main:qqbot:group:GROUP_LEAK');
     })),
-    route: { sessionKey: 'agent:main:qqbot:direct:OPENID_LEAK_TEST' },
+    route: { agentId: 'main', sessionKey: 'agent:main:qqbot:group:GROUP_LEAK' },
+    peerId: 'GROUP_LEAK',
     participants: ['OPENID_LEAK_TEST'],
     log,
   }));
@@ -499,7 +583,8 @@ await test('resolve 抛错 → WARN 不落完整 openid/sessionKey（脱敏红�
   // 单参与者=载体：失败 WARN + 载体降级 WARN 各一条，都不得含完整标识符
   assert.equal(warnings.length, 2);
   for (const line of warnings) {
-    assert.ok(!line.includes('OPENID_LEAK_TEST'), `日志不得含完整 openid / sessionKey 原文：${line}`);
+    assert.ok(!line.includes('OPENID_LEAK_TEST'), `不得含完整 openid：${line}`);
+    assert.ok(!line.includes('GROUP_LEAK'), `不得含完整群 openid（含 sessionKey 片段内的）：${line}`);
   }
   assert.ok(warnings[0]!.includes(shortId('OPENID_LEAK_TEST')), 'openid 以 shortId 形式呈现');
 });

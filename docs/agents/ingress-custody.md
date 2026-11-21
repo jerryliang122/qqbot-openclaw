@@ -4,6 +4,15 @@
 
 - **背景（issue #116，2026-11-21）**：openclaw **2026.11.5** 起 core 给 `sessions_spawn` 加了 requester-provenance 派发守卫——带 requester 归属的子代理派发要求本轮运行持有「可信的进程内 Gateway 上下文」（**custody**），否则直接抛 `Requester provenance requires trusted in-process Gateway dispatch.`。QQ 渠道当时 100% 撞守卫（`subagent_runs` 表 2026-11-17 后零成功），Telegram 不受影响。守卫坐标（2026.11.6 npm 包 dist）：`subagent-spawn-gateway` / `in-process-gateway`；10.5 dist 全量无此检查。
 
+## ⚠️ 生效前提与上游依赖（二轮评审 2026-11-22 坐实）
+
+**本插件的 evidence → custody 转换目前被 core 侧两个前提卡死**；任一不满足时 evidence 被 core **静默丢弃**（binding 是 `#binding` 私有字段，插件无法探测失败、连降级日志都没有）。当前定位是「**上游依赖下的插件侧预备**」——机制/契约/映射/降级语义全部就位且被测试锁定，前提落地后即生效：
+
+1. **owner 绑定面只发给受信安装**：registry 的 `resolveRecordChannelRuntime` 门禁——`origin === 'bundled' || trustedOfficialInstall === true` 才注入 owner 绑定的 ingress 与 evidence 包装的 buildContext；门禁外返回基础面（ingress 存在但无 owner ⇒ `recordChannelIngressResolution` 返回裸 result；buildContext 不包装 ⇒ `channelIngress` 入参被完全忽略）。自发布 npm 插件（openclaw-qqbot）默认两者皆否——**probe 成功、admission=dispatch 都会照常出现，但 evidence 无效且无告警**。Telegram 不受影响正因它是 bundled。
+2. **plugin record id 必须等于 channel id**：core 按**插件 record id**（`registry: channelId: e.id`）建 owner，而 evidence handoff 校验（`scopedParticipantRef = JSON.stringify([channelId, accountId, rawPrincipalRef])`）要求 binding 的 channelId === buildContext 的 `channel`。本插件 manifest id 是 `openclaw-qqbot` ≠ channel `qqbot` ⇒ branding 要求传 `openclaw-qqbot`、handoff 要求传 `qqbot`，**互斥无解**。bundled Telegram 的插件 id 恰好就是 `telegram`，所以只有它工作。
+   - 对齐路径（需主人决策）：① manifest `id` 改为 `"qqbot"`（连带 `package.json` 的 `openclaw.id`；影响已安装用户的插件身份）；② 向上游反馈 core 按 channel id 建 owner / 向非受信插件开放 owner 面。
+3. **运维信号**：`resolveIngressEvidence` 首次成功挂载 evidence 时打一次性 INFO（注明「custody 仅在 owner 绑定面可用时生效」）——线上据此区分「修好了」和「evidence 被静默丢弃」。
+
 ## 证据链（为什么缺 `channelIngress` 会全灭）
 
 ```
@@ -50,16 +59,16 @@ core 的 `contextHandoffMatches` / `bindParticipants` 逐字段校验（admissio
 8. **参与者并发 + 共享截止时间**：逐个串行 await 会让 N 个停滞参与者拖成 N×timeout（10 人批最坏 ~50s、群全程 busy）——所有参与者并发起跑（`Promise.all` 保序），每人只分得剩余预算，总等待恒 ≈ 一个 timeout。
 9. **日志脱敏**：resolver 的 `err.message` 可能内嵌 openid / sessionKey——WARN 前用 `shortId()` / `sessionKeyDigest()`（`src/utils/redaction.ts`）替换原文（根级红线：INFO 以上日志不得落完整标识符，`/bot-logs` 原样导出）。
 
-## 策略映射（`mapIngressPolicy`）与「语义错向」坑
+## 策略映射（`mapIngressPolicy`）——对齐 core `senderGateForDirect` 真实判定
 
 | 插件语义（access-control 同源） | resolver 入参 | 说明 |
 |---|---|---|
-| c2c `open` | `dmPolicy:'open'` | |
+| c2c `open` | `dmPolicy:'open'` + **`allowFrom:['*']`** | ⚠️ core 的 dm `open` **不是「放行所有人」**（二轮评审坐实）：`senderGateForDirect` 对 open 仍要求名单带通配符或命中（空名单 ⇒ `dm_policy_not_allowlisted`）；只有**群** open 是无条件放行（`senderGateForGroup`）。「放行所有人」必须让 `hasWildcard` 成立 |
 | c2c `allowlist` + 非空名单（无 `*`） | `'allowlist'` + entries | |
-| c2c `allowlist` + 空名单 / 含 `*` | `'open'` | access-control 语义=放行所有人；直传空表会被判 `dm_policy_not_allowlisted` 拿不到 custody（**语义折叠，不是放宽**——那条消息本来就被放行了） |
-| c2c `pairing` + 名单 | `'pairing'` + entries | 插件 pairing 走框架 pairing store（`adapter/pairing.ts` 的 readChannelAllowFromStore），与 resolver 默认 store 读取**同库**，已配对用户可命中 |
+| c2c `allowlist` + 空名单 / 含 `*` | `'open'` + **`allowFrom:['*']`** | access-control 语义=放行所有人 ⇒ 折叠 open；**通配必须随行**——漏带即默认配置（allowlist+空名单）c2c 被判 not-allowlisted、静默丢 custody（二轮评审高危项） |
+| c2c `pairing`（任意静态名单） | **恒 `'pairing'`** + entries（可空） | ⚠️ **永不折叠**（二轮评审坐实）：core 的 `mergeDmAllowFromSources` 在 dmPolicy 为 open/allowlist 时直接丢弃 pairing store——折叠会让「空静态名单的配对模式」（最常见配对配置）丢掉 store 命中。保留 'pairing' 让 store 与静态名单共同生效；插件 pairing 走框架 pairing store（与 resolver 默认 store 读取同库） |
 | c2c `disabled` | 整体降级 | 理论上到不了 dispatch（access-control 已拦），防御处理 |
-| 群（任意 groupMode/groupAllowFrom） | **恒 `groupPolicy:'open'`、永不传 groupAllowFrom** | ⚠️ **语义错向坑（评审自查）**：插件 `groupAllowFrom` 是「哪些**群**被服务」的群 id 白名单（access-control 按 `groupOpenid` 匹配），core 的 `groupAllowFrom` 却是「群内哪些 **sender** 被允许」——直传会让每个 sender 判 not-allowlisted，恰好让配置了群白名单的群全部拿不到 custody。插件在服务群内没有 sender 级限制（服务群集合由 access-control 在 dispatch 前裁决）。代价：`'open'` 下 `participantOutcomeAffecting` 为 false（wildcard 放行）——只影响 attribution 丰富度，不影响 custody。 |
+| 群（任意群配置） | **恒 `groupPolicy:'open'`、永不传 groupAllowFrom** | ⚠️ **语义错向坑（评审自查）**：插件 `groupAllowFrom` 是「哪些**群**被服务」的群 id 白名单（access-control 按 `groupOpenid` 匹配），core 的 `groupAllowFrom` 却是「群内哪些 **sender** 被允许」——直传会让每个 sender 判 not-allowlisted。插件在服务群内没有 sender 级限制（服务群集合由 access-control 在 dispatch 前裁决）。代价：`'open'` 下 `participantOutcomeAffecting` 为 false（wildcard 放行）——只影响 attribution 丰富度。**`groupMode`/`groupAllowFrom` 已从 `IngressAccessPolicyInput` 移除（二轮评审：读了不用的死参数）** |
 
 不传 `route` descriptors、不传 `mentionFacts`（只影响 activation gate 诊断，不影响 allow 与 custody）、slash 命令不传 `event:{kind:'native-command'...}` 覆盖（QQ 是 text-slash、走框架命令检测；若将来命令归属需要 custody 再议）。
 
