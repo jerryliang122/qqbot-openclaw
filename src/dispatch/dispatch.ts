@@ -21,6 +21,7 @@ import { sendQuestionMessage } from '../outbound/question-send.js';
 import { sendMedia } from '../outbound/media-send.js';
 import { deliverReply, resolveMediaUrls, formatMediaFailureNotice, type DeliverPayload, type DeliverInfo, type DeliverContext } from '../outbound/deliver-pipeline.js';
 import { buildCtxPayload } from './ctx-builder.js';
+import { resolveIngressEvidence, resolveAccessPolicyInput } from './ingress-evidence.js';
 
 import { DeliverDebouncer } from '../outbound/debounce.js';
 import { StreamingController, shouldUseStreaming } from '../outbound/streaming-controller.js';
@@ -577,10 +578,41 @@ export async function dispatchToOpenClaw(
   }
   const storePath = adapters.resolveStorePath?.((cfg as any)?.session?.store, { agentId }) ?? '';
 
-  const ctxPayload = buildCtxPayload({ assembled, envelope, route, msg, ctx, adapters });
-  // room_event 分类标记：框架据此压制自动回复投递 / typing / steer
-  // （对齐 telegram 的 ctxPayload.InboundEventKind 约定）
-  ctxPayload.InboundEventKind = inboundEventKind;
+  // ── channelIngress admission evidence（issue #116）──
+  // openclaw 11.5+ 的 sessions_spawn 派发守卫要求 context 携带 owner 绑定的
+  // ingress resolution（custody）。所有入站路径（直发、群合批、durable 队列
+  // drain）都汇入本函数，修一处全覆盖。
+  //
+  // accountId 归一（评审 #1）：evidence（resolver accountId）与 context
+  // （route.accountId / 顶层 accountId）必须同源——core 的 contextHandoffMatches
+  // 逐字段比对，route 缺 accountId 时两侧会各自归一出不同值导致 evidence 被拒。
+  // 正常路径 resolveAgentRoute / 兜底路由恒带 accountId，此为防御归一。
+  const routeAccountId = route.accountId ?? account.accountId;
+
+  // 跨发言人合批：载体 ctx.state 携带去重 sender 清单（载体排最后，由
+  // features/group-merge.ts / ingress-batcher.ts 写入）；单条/未合批回退为
+  // 载体 sender 本身。参与者证据走 core 原生数组语义（评审 #3）。
+  const stashedParticipants = (ctx.state as Record<string, unknown>).ingressParticipants;
+  const ingressParticipants = Array.isArray(stashedParticipants)
+    ? (stashedParticipants as unknown[]).filter((s): s is string => typeof s === 'string' && s.length > 0)
+    : [];
+
+  // ⚠️ 这里只**启动** resolve（不 await）：dispatch 入口到 markGroupTurnStarted
+  // 之间必须保持零 await（见下方标记处的不变量注释，评审 #4）；结果在 try 块
+  // 内、buildCtxPayload 之前 await。每 turn 新鲜 resolve（单次移交约束），
+  // 失败/超时/不可用一律降级为不传——绝不阻断入站派发。
+  const evidencePromise = resolveIngressEvidence({
+    adapters,
+    route,
+    accountId: routeAccountId,
+    messageId: envelope.messageId,
+    isGroup,
+    peerId,
+    inboundEventKind,
+    participants: ingressParticipants.length > 0 ? ingressParticipants : [envelope.senderId],
+    policy: resolveAccessPolicyInput(ctx, account, isGroup),
+    log: dlog,
+  });
 
   // TTS 扩展点探测（runtime.tts / runtimeContexts），非核心 channel API
   const ttsRuntime = (runtime as any)?.tts ?? (runtime as any)?.channel?.runtimeContexts?.get?.('tts'); // @adapter-bypass: TTS extension point probe
@@ -1197,12 +1229,34 @@ export async function dispatchToOpenClaw(
   // 群消息全部进批、且只能靠 maxHoldMs 兜底放出（系统性延迟 5 分钟，
   // 静默无感）。挪到 try 前无行为差异：此处到 try 之间全是同步代码
   // （无顶层 await），单线程下不会有别的入站消息在此窗口被处理。
+  // ⚠️ 「dispatch 入口 → 本标记之间零 await」是不变量（评审 #4）：上游的
+  // channelIngress evidence resolve 只启动 promise、不在此窗口 await（结果
+  // 在 try 内取用）；新增逻辑若需 await，必须放到 markGroupTurnStarted 之后。
   if (groupTurnOpenid) markGroupTurnStarted(account.accountId, groupTurnOpenid);
 
   try {
+    // channelIngress evidence 结果在此取用（busy 已标记，见上不变量）。
+    // ctxPayload 也在 try 内构建——构建抛错时 finally 的 busy 归零仍配对执行。
+    const channelIngress = await evidencePromise;
+    const ctxPayload = buildCtxPayload({
+      assembled,
+      envelope,
+      route: { ...route, accountId: routeAccountId },
+      msg,
+      ctx,
+      adapters,
+      channelIngress,
+      inboundEventKind,
+    });
+    // room_event 分类标记：框架据此压制自动回复投递 / typing / steer
+    // （对齐 telegram 的 ctxPayload.InboundEventKind 约定）
+    ctxPayload.InboundEventKind = inboundEventKind;
+
     await adapters.inboundRun!({
       channel: 'qqbot',
-      accountId: route.accountId,
+      // 归一 accountId：inboundRun / resolveTurn 与 ctxPayload / evidence 同源
+      // （评审：route 缺 accountId 时 core 会拿到 undefined 的账号归属）
+      accountId: routeAccountId,
       raw: envelope,
       adapter: {
         ingest: (raw: any) => ({
@@ -1214,7 +1268,7 @@ export async function dispatchToOpenClaw(
         }),
         resolveTurn: (_input: unknown, _eventClass: unknown, _preflight: unknown) => ({
           channel: 'qqbot',
-          accountId: route.accountId,
+          accountId: routeAccountId,
           routeSessionKey: route.sessionKey,
           storePath,
           ctxPayload,

@@ -236,6 +236,31 @@ function arrivalMs(item: GroupMergeItem): number {
 }
 
 /**
+ * 构造 channelIngress 多参与者清单：按到达序去重，**载体 sender 强制排最后**
+ * （core 契约：证据数组末项的 rawPrincipalRef 必须等于 buildContext 的
+ * `sender.id`，即载体；非末项用各自的 stableId）。载体 sender 若已在列表中，
+ * 只保留末位那一项（数组内不重复出现）。
+ *
+ * 清单只存 openid、不打日志；如需日志一律走 `shortId()`。
+ */
+export function buildIngressParticipants(
+  senderIds: readonly string[],
+  carrierSenderId: string | undefined,
+): string[] {
+  const seen = new Set<string>();
+  const participants: string[] = [];
+  for (const id of senderIds) {
+    if (typeof id !== 'string' || !id || id === carrierSenderId || seen.has(id)) continue;
+    seen.add(id);
+    participants.push(id);
+  }
+  if (typeof carrierSenderId === 'string' && carrierSenderId) {
+    participants.push(carrierSenderId);
+  }
+  return participants;
+}
+
+/**
  * 构造合并载体：改写最后一条消息的 ctx.state（dispatch 侧只从
  * ctx.state.assembledBody / ctx.state.processedAttachments 读取，不复制
  * ctx——上面还挂着 bot/replyTarget/log 等原语，复制丢语义）。
@@ -263,6 +288,13 @@ function buildMergedCarrier(
   if (processedList.length > 0) {
     state.processedAttachments = mergeProcessedAttachments(processedList);
   }
+
+  // 参与者清单（channelIngress 多参与者证据，评审 #3）：dispatch 侧读取后
+  // 逐参与者 resolve（载体末位）；本函数只被多成员批次调用，单条路径不写
+  state.ingressParticipants = buildIngressParticipants(
+    items.map((i) => i.msg.senderId),
+    last.msg.senderId,
+  );
   return last.ctx;
 }
 

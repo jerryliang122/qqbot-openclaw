@@ -78,7 +78,7 @@ export function createPluginWebhookAdapter(params: {
         route: {
           auth: 'plugin',
           match: 'exact',
-          pluginId: 'openclaw-qqbot',
+          pluginId: 'qqbot',
           source: 'qqbot-webhook',
           accountId,
           replaceExisting: true,

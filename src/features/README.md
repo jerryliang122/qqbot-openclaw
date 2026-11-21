@@ -64,6 +64,7 @@
 ## 相关红线
 
 - **出站锚点模型 / 反应式配额**（根级）→ 根 [`AGENTS.md`](../../AGENTS.md) §「出站锚点与配额」
+- **群合批必须在载体 ctx.state 写 `ingressParticipants`**（到达序去重、载体 sender 末位；`group-merge.ts` / `ingress-batcher.ts` 两个组批路径同构，单成员批不写）——那是 channelIngress 多参与者证据的唯一来源 → [`docs/agents/ingress-custody.md`](../../docs/agents/ingress-custody.md) §「插件实现」
 - **多题问答进行中的入站文本本地暂存、不转发框架** → [`docs/agents/interaction.md`](../../docs/agents/interaction.md) §「多题问答进行中」
 - **Secret input 消息绝不进 AI transcript** → [`docs/agents/interaction.md`](../../docs/agents/interaction.md) §「Secret input flow」
 - **群消息合并在插件侧做** → [`docs/agents/group-and-room-event.md`](../../docs/agents/group-and-room-event.md) §「群消息合并在插件侧做」
