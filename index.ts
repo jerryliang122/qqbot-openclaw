@@ -20,7 +20,12 @@ import { verifyRuntimeContract } from './src/adapter/contract.js';
 let registered = false;
 
 const plugin = {
-  id: 'openclaw-qqbot',
+  // 插件 record id——必须与 openclaw.plugin.json 的 id / package.json 的
+  // openclaw.id 逐字一致（custody 前提：core 按 record id 建 ingress owner；
+  // loader 也会校验 manifest id === 导出 id，不一致直接拒载——issue #120 的
+  // 6.0.0 事故即此处理漏改所致，tests/manifest-config-schema.test.ts 有
+  // 三处一致性守卫）
+  id: 'qqbot',
   name: 'QQ Bot',
   description: 'QQ Bot channel plugin',
   configSchema: emptyPluginConfigSchema(),
@@ -32,7 +37,7 @@ const plugin = {
       const contract = verifyRuntimeContract(api.runtime);
       if (!contract.ok) {
         throw new Error(
-          `openclaw-qqbot incompatible with openclaw ${contract.version}: ` +
+          `qqbot plugin incompatible with openclaw ${contract.version}: ` +
           `missing required APIs: ${contract.missing.join(', ')}. ` +
           `Please upgrade openclaw or downgrade the plugin.`,
         );
