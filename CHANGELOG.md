@@ -12,6 +12,32 @@
 
 > 本节汇总已合入 `main`、尚未打 tag 发版的条目。发版时由主人确认版本号与 tag。
 
+## [6.0.0] - 2026-11-22
+
+v6.0.0 = **修复 openclaw 2026.11.5 起 QQ 渠道 `sessions_spawn` 100% 失败**（issue #116 / PR #117：补齐 channelIngress admission evidence 全链路）+ **插件 id 与 channel id 对齐**（⚠️ Breaking，升 Major 的原因——core 按插件 record id 建 ingress owner，id 不一致则 owner 绑定与 evidence handoff 互斥）。**配置格式零变更、运行要求不变**（openclaw `>=2026.10.5`，未抬钉版）。
+
+### 修复
+
+- **`sessions_spawn` 在 openclaw ≥ 2026.11.5 全灭**（issue #116）：core 新增 requester-provenance 派发守卫（`Requester provenance requires trusted in-process Gateway dispatch.`），要求本轮 context 持有 custody，而 custody 的唯一来源是 buildContext 入参 `channelIngress`（owner 绑定的 ingress resolution）——本插件此前从未传入 ⇒ evidence 无效 ⇒ QQ 渠道子代理派发 100% 失败（Telegram 是 bundled 渠道不受影响）。本版落地完整证据链（`src/dispatch/ingress-evidence.ts` 等，叙事见 `docs/agents/ingress-custody.md`）：
+  - **probe + resolve + 透传**：adapter probe `['channel','inbound','ingress','resolve']`（该 API 自 2026.10.5 起注入，与 buildContext 的 evidence 包装共用同一 owner）；每 turn 新鲜 resolve（单次移交，绝不复用）；`ctx-builder` 透传 `channelIngress` 与 `message.inboundEventKind`（evidence 的 binding 校验读 buildContext **入参**，构建后补 `ctxPayload.InboundEventKind` 对其无效；后者保留兼容其他消费方）。binding 四元组（agentId/sessionKey/messageId/inboundEventKind）与 buildContext 入参逐字相等，accountId 三处（evidence/context/turn 提交）归一同源。
+  - **多参与者证据**（跨发言人合批，core 原生数组语义）：群合批两条路径（`group-merge` / `ingress-batcher`）在载体 `ctx.state.ingressParticipants` 写到达序去重清单、**载体 sender 强制末位**（core 契约：末项 rawPrincipalRef 必须等于 buildContext 的 `sender.id`）；逐参与者**并发** resolve（共享截止时间，N 个停滞参与者总等待 ≈ 一个 timeout 而非 N×5s）、core 16 上限裁剪（保留最新 16）；载体失败整体降级、非载体失败仅丢弃该项。
+  - **策略映射对齐 core `senderGateForDirect` 真实判定**：core 的 dm `open` **不是「放行所有人」**（仍要求名单带通配符或命中）——「空名单/含 `*`」折叠到 open 时**必须随行 `allowFrom:['*']`**，否则默认配置 c2c 被判 not-allowlisted 静默丢 custody；`pairing` **永不折叠**（core 在 open/allowlist 下丢弃 pairing store）；群侧恒 `groupPolicy:'open'`、**永不传 groupAllowFrom**（插件 `groupAllowFrom` 是「哪些群被服务」的群 id 白名单，core 同名参数是「群内哪些 sender 被允许」——语义错向直传会让每个 sender 判拒）。
+  - **群 busy 不变量保持**：「dispatch 入口 → `markGroupTurnStarted` 零 await」——evidence 只启动 promise 不等待，`buildCtxPayload` 移入 try 块内（异常路径与 busy 归零配对不破）。
+  - **降级与可观测性**：probe 缺失 / resolve 抛错 / 超时（默认 5s，`timeoutMs` 可注入）/ 决策未 allow / 载体失败 ⇒ 一律不传 `channelIngress`，**绝不阻断入站派发**；错误日志经 `shortId()`/`sessionKeyDigest()` 脱敏（覆盖群 openid 与全体参与者）；首次挂载 evidence 打一次性 INFO 运维信号。
+  - **测试**：新增 `tests/ingress-evidence.test.ts` 35 例（probe 哨兵、identity 形状、按 core 真实语义判定的策略映射桩——映射错误会被桩当场证伪、多参与者契约、16 上限、共享截止时间、脱敏、全部降级路径）；`tests/dispatch-lifecycle.test.ts` 补 7 例（全链路透传、每 turn 证据新鲜度穿透、busy 窗口、accountId 归一、多参与者数组）。
+- **文档**：新增 `docs/agents/ingress-custody.md` 完整叙事（证据链 / 逐字段契约 / 多参与者 / 策略映射表 / 降级语义 / **生效前提与上游依赖**）；根 `AGENTS.md` 三处登记（深度文档索引 / Key gotchas 红线 / 红线归位索引）；`src/dispatch/README.md`、`src/features/README.md` 指针同步。
+
+### ⚠️ Breaking（插件身份）
+
+- **manifest 插件 id 与 channel id 对齐：`openclaw-qqbot` → `qqbot`**（`openclaw.plugin.json` 与 `package.json` 的 `openclaw.id`；webhook 路由的 `pluginId` 同步——`registerPluginHttpRoute` 按 `entry.id === params.pluginId` 查 record）。
+  - **原因**：core 按**插件 record id** 建 ingress owner，而 evidence handoff 要求 binding 的 channelId === buildContext 的 `channel`——id 不一致则两个要求互斥，evidence 永远挂不上（bundled Telegram 的插件 id 恰为 `telegram`，所以只有它工作）。
+  - **影响与迁移**：插件 id 变更 = 框架侧新插件身份，**已安装用户升级后需重新启用一次**；`channels.qqbot` 配置按 channel id 键控、零变更。npm 包名仍为 `@jerryliang122/openclaw-qqbot`；内部自用字符串（durable 队列 lease 前缀 / 指令面板 remark / gateways Symbol key）沿用 `openclaw-qqbot` 不迁移。
+
+### 已知限制（上游依赖）
+
+- **custody 生效依赖 openclaw core 开放 owner 绑定面**：registry 门禁（`origin === 'bundled' || trustedOfficialInstall`）当前只对 bundled/官方信任插件注入 owner 面与 evidence 包装的 buildContext；自发布 npm 插件两侧皆否 ⇒ evidence 会被 core **静默丢弃**（无告警，插件侧无法探测——故有一次性 INFO 运维信号）。上游落地前本修复为「插件侧预备」：机制/契约/映射/降级全部就位且被测试锁定，前提满足即零改动生效。跟踪与自托管过渡 patch 方案见 **#118**；上游 issue 草稿见 PR #117 评论区。
+
+
 ## [5.0.0] - 2026-11-18
 
 v5.0.0 = **修复 ask_user 在 openclaw 2026.11.5 的静默降级**（issue #113 / PR #114）+ **清理死代码与过时版本叙事** + **移除口径已废的公开导出（⚠️ Breaking，升 Major 的原因）**。**配置格式零变更、运行要求不变**（openclaw `>=2026.10.5`，未抬钉版）——升级本插件无需改任何配置；openclaw < 2026.11.5 的用户无感知差异，≥ 2026.11.5 的用户 ask_user 卡片恢复可用。
