@@ -634,6 +634,33 @@ async function main() {
     }
   });
 
+  // ── 插件 id 一致性守卫（issue #120：6.0.0 曾因 index.ts 顶层导出漏改被 loader 拒载）──
+
+  await test('插件 id 三处一致：manifest / package.json openclaw.id / index.ts 默认导出（#120 守卫）', async () => {
+    const manifest = JSON.parse(
+      readFileSync(join(process.cwd(), 'openclaw.plugin.json'), 'utf-8'),
+    ) as { id?: string; channels?: string[] };
+    const pkg = JSON.parse(
+      readFileSync(join(process.cwd(), 'package.json'), 'utf-8'),
+    ) as { openclaw?: { id?: string } };
+    const pluginDefault = (await import('../index.ts')).default as { id?: string };
+    assert.ok(manifest.id, 'manifest.id 必须存在');
+    assert.ok(pkg.openclaw?.id, 'package.json openclaw.id 必须存在');
+    assert.ok(pluginDefault.id, 'index.ts 默认导出的 plugin.id 必须存在');
+    // loader 的拒载校验点：manifest id（config 侧）必须与导出 id 逐字相等
+    assert.strictEqual(
+      pluginDefault.id,
+      manifest.id,
+      'index.ts 导出 id 与 manifest id 不一致——loader 会以 "plugin id mismatch" 拒载（6.0.0 事故，issue #120）',
+    );
+    assert.strictEqual(pkg.openclaw.id, manifest.id, 'package.json openclaw.id 必须与 manifest id 一致');
+    // custody 前提：插件 record id 与 channel id 对齐（core 按 record id 建 ingress owner）
+    assert.ok(
+      manifest.channels?.includes(manifest.id),
+      `manifest id（${manifest.id}）必须与其 channels 声明一致（custody 前提，见 docs/agents/ingress-custody.md）`,
+    );
+  });
+
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) {
     console.error(`\n失败用例：\n${failedTests.map((t) => `  - ${t}`).join('\n')}`);

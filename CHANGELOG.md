@@ -12,6 +12,17 @@
 
 > 本节汇总已合入 `main`、尚未打 tag 发版的条目。发版时由主人确认版本号与 tag。
 
+## [6.0.1] - 2026-11-22
+
+### 修复
+
+- **6.0.0 发布级事故：插件 id 不一致导致完全无法加载**（issue #120）。v6.0.0 的插件 id 对齐只改了 manifest / package.json / webhook 路由，**漏了 `index.ts` 顶层导出**（`plugin.id` 仍为 `'openclaw-qqbot'`）——框架 loader 校验 `manifest id === 导出 id`，不一致直接拒载：`plugin load failed: qqbot: plugin id mismatch (config uses "qqbot", export uses "openclaw-qqbot")`，升级到 6.0.0 的用户 QQ 渠道整体停机。
+  - **修复**：`index.ts` 的 `plugin.id` 对齐为 `'qqbot'`（兼容性错误信息前缀同步）。
+  - **根因（流程）**：id 站点排查时 grep 输出被 `head` 截断，`index.ts` 排在截断点之后被漏掉——「同一语义散落多处」靠人工清单核对不可靠。
+  - **防回归**：`tests/manifest-config-schema.test.ts` 新增三处一致性守卫——`openclaw.plugin.json` 的 `id` === `package.json` 的 `openclaw.id` === `index.ts` 默认导出的 `plugin.id`，且 manifest id 必须出现在其 `channels` 声明里（custody 前提）。任何一处漂移 CI 即红。
+  - **受影响用户恢复**：安装 `@jerryliang122/openclaw-qqbot@6.0.1` 后执行 `openclaw plugins enable qqbot`；若此前停在「旧 id 已停、新 id 启用失败」的中间态，此步即可恢复（渠道回到服务状态）。
+  - **复核结论（#120 提问）**：`src/features/ingress-batcher.ts` 的 `createIngressEffectOnce({ pluginId: 'openclaw-qqbot' })` **保留不改**——该参数只是 `createPluginStateKeyedStore` 的**状态命名空间键**（框架仅拦 `core:` 前缀、不校验调用方 record id），与 ingress owner 绑定无关；保留可维持 durable 入站幂等状态跨版本连续，改名反而会孤儿化现有状态。
+
 ## [6.0.0] - 2026-11-22
 
 v6.0.0 = **修复 openclaw 2026.11.5 起 QQ 渠道 `sessions_spawn` 100% 失败**（issue #116 / PR #117：补齐 channelIngress admission evidence 全链路）+ **插件 id 与 channel id 对齐**（⚠️ Breaking，升 Major 的原因——core 按插件 record id 建 ingress owner，id 不一致则 owner 绑定与 evidence handoff 互斥）。**配置格式零变更、运行要求不变**（openclaw `>=2026.10.5`，未抬钉版）。
